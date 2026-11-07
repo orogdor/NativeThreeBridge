@@ -15,7 +15,7 @@ jobs:
           s=Path("benchmarks/NativeThreeBridge-v016-WebGL2-RENDER-FIX.html").read_text()
           lines=s.splitlines()
           needles=('SpotLight','PointLight','DirectionalLight','AmbientLight','shadowMap','shadowCount','castShadow','receiveShadow','Light(', 'light.position','light.target','setPixelRatio')
-          hits=[i for i in range(86175,min(86242,len(lines)))]
+          hits=[i for i in range(86105,min(86175,len(lines)))]
           print('HTML lines',len(lines),'light matches',len(hits))
           for i in hits:
               print(f'### line {i+1}\n'+'\n'.join(f'{j+1}: {lines[j][:400]}' for j in range(max(0,i-3),min(len(lines),i+4))))
