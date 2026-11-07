@@ -85,38 +85,69 @@ test('long GPU frames are not limited to old 60ms movement cap',()=>{
   }
 });
 
-test('tree barrier forces real A* detours and exports visible route geometry',()=>{
-  const x=create(), nav=x.__nativeNavTest();
-  const barrier=nav.trees.filter(([cx,cz])=>cx===79 && cz>=36 && cz<=121);
-  assert.ok(barrier.length>=65, 'visible forest barrier did not generate');
+test('random forest has irregular positions, safe spacing and accurate A* obstacle cells',()=>{
+  const x=create(),nav=x.__nativeNavTest();
+  const positions=nav.worldTreePositions;
+  assert.equal(positions.length,1000);
+  assert.ok(nav.forestAttempts>=1000);
+  const navigable=new Set(nav.trees.map(([gx,gz])=>gz*160+gx));
+  assert.equal(navigable.size,1000);
+  let offsetFromCellCentre=0;
+  const uniqueX=new Set(),uniqueZ=new Set();
+  for(let i=0;i<positions.length;i++){
+    const [worldX,worldZ]=positions[i];
+    const gxFloat=worldX/3+(160-1)/2;
+    const gzFloat=worldZ/3+(160-1)/2;
+    const [gx,gz]=nav.trees[i];
+    assert.equal(nav.blocked[gz*160+gx],1,'tree cell not marked blocked');
+    assert.ok(Math.abs(gxFloat-gx)<0.501 && Math.abs(gzFloat-gz)<0.501);
+    if(Math.abs(gxFloat-gx)>0.08 || Math.abs(gzFloat-gz)>0.08)
+      offsetFromCellCentre++;
+    uniqueX.add(Math.round(worldX*1000));
+    uniqueZ.add(Math.round(worldZ*1000));
+  }
+  assert.ok(offsetFromCellCentre>900,'forest should not be planted at grid cell centres');
+  assert.ok(uniqueX.size>950 && uniqueZ.size>950,'trees must not align in regular rows');
+  // Poisson-style minimum distance keeps trunks from sitting on top of each other.
+  for(let i=0;i<positions.length;i++)for(let j=i+1;j<positions.length;j++){
+    const dx=positions[i][0]-positions[j][0];
+    const dz=positions[i][1]-positions[j][1];
+    assert.ok(dx*dx+dz*dz>6.1*6.1,'overlapping or too-close tree trunks');
+  }
+});
+test('500 genuine A* routes still avoid randomly placed tree obstacles and turn',()=>{
+  const x=create(),nav=x.__nativeNavTest();
   const routes=nav.paths;
-  let forcedDetours=0, turned=0;
-  for(let i=0;i<routes.length;i++){
-    const path=routes[i];
+  let detours=0,turning=0;
+  for(const path of routes){
+    assert.ok(path.length>1);
     const start=path[0],goal=path[path.length-1];
     const sx=start%160,sz=Math.floor(start/160);
     const tx=goal%160,tz=Math.floor(goal/160);
-    const manhattan=Math.abs(tx-sx)+Math.abs(tz-sz);
-    if(path.length-1>manhattan)forcedDetours++;
-    let previous=0, turns=0;
-    for(let k=1;k<path.length;k++){
-      const direction=path[k]-path[k-1];
-      if(previous && direction!==previous)turns++;
-      previous=direction;
+    if(path.length-1>Math.abs(tx-sx)+Math.abs(tz-sz))detours++;
+    let lastDelta=0,turnCount=0;
+    for(let i=0;i<path.length;i++){
+      assert.equal(nav.blocked[path[i]],0,'A* crosses a tree');
+      if(i>0){
+        const delta=path[i]-path[i-1];
+        assert.ok(Math.abs(delta)===1||Math.abs(delta)===160,'A* teleported');
+        if(lastDelta!==0&&delta!==lastDelta)turnCount++;
+        lastDelta=delta;
+      }
     }
-    if(turns>=2)turned++;
+    if(turnCount>=2)turning++;
   }
-  assert.ok(forcedDetours>=30, 'at least 30 soldiers must avoid barrier with nontrivial A* detours');
-  assert.ok(turned>=300, 'hundreds of soldiers must visibly change direction');
+  assert.ok(detours>=30,'randomized forest should produce visible obstacle detours');
+  assert.ok(turning>=300,'most soldiers should have multi-turn A* paths');
   const segments=x.__nativeThreeDebugSegments();
-  assert.ok(ArrayBuffer.isView(segments),'cross-realm Float32Array should remain a typed array');
+  assert.ok(ArrayBuffer.isView(segments));
   assert.equal(segments.length%5,0);
-  assert.ok(segments.length>5000,'draw enough segments for visible paths');
+  assert.ok(segments.length>5000,'visible path debug data missing');
   assert.equal(x.__nativeThreeDiagnostics().debugSegments,segments.length/5);
-  let reds=0,blues=0;
-  for(let n=0;n<segments.length;n+=5){
-    if(segments[n]===0)reds++;
-    if(segments[n]===1)blues++;
+  let redSegments=0,blueSegments=0;
+  for(let i=0;i<segments.length;i+=5){
+    if(segments[i]===0)redSegments++;
+    if(segments[i]===1)blueSegments++;
   }
-  assert.ok(reds>50 && blues>50,'both armies need route visuals');
+  assert.ok(redSegments>50&&blueSegments>50);
 });
