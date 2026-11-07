@@ -14,6 +14,7 @@ constexpr std::size_t MATRIX_FLOATS = 1020 * 16;
 JSRuntime *runtime = nullptr;
 JSContext *context = nullptr;
 JSValue frameFunction = JS_UNDEFINED;
+JSValue lightFunction = JS_UNDEFINED;
 bool ready = false;
 
 [[noreturn]] void die(const char *msg) {
@@ -94,9 +95,11 @@ void NativeThreeJS_Init() {
 
     JSValue global = JS_GetGlobalObject(context);
     frameFunction = JS_GetPropertyStr(context, global, "__nativeThreeFrame");
+    lightFunction = JS_GetPropertyStr(context, global, "__nativeThreeLightFrame");
     JSValue diagnostics = JS_GetPropertyStr(context, global, "__nativeThreeDiagnostics");
-    if (!JS_IsFunction(context, frameFunction) || !JS_IsFunction(context, diagnostics))
-        die("Real Three.js scene bridge API missing");
+    if (!JS_IsFunction(context, frameFunction) ||
+        !JS_IsFunction(context, lightFunction) || !JS_IsFunction(context, diagnostics))
+        die("Real Three.js scene or dynamic light bridge API missing");
     JSValue check = JS_Call(context, diagnostics, JS_UNDEFINED, 0, nullptr);
     if (JS_IsException(check)) dieWithJS("Three.js scene diagnostics failed");
     JSValue count = JS_GetPropertyStr(context, check, "unitCount");
@@ -140,12 +143,31 @@ void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t cap
     JS_FreeValue(context, arrayBuffer);
     JS_FreeValue(context, transforms);
 }
+void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
+    constexpr size_t FLOATS = 20 * 8;
+    if (!ready || !outLights || capacity < FLOATS)
+        die("NativeThreeJS_Lights invalid state");
+    JSValue result = JS_Call(context, lightFunction, JS_UNDEFINED, 0, nullptr);
+    if (JS_IsException(result)) dieWithJS("Three.js light bridge failed");
+    size_t offset=0, bytes=0, elementBytes=0;
+    JSValue buffer = JS_GetTypedArrayBuffer(context, result, &offset, &bytes, &elementBytes);
+    if (JS_IsException(buffer) || elementBytes != sizeof(float) ||
+        bytes != FLOATS * sizeof(float)) die("Expected 20 Three.js SpotLight records");
+    size_t totalBytes=0;
+    uint8_t *address = JS_GetArrayBuffer(context, &totalBytes, buffer);
+    if (!address || offset + bytes > totalBytes) die("Three.js lights array bounds error");
+    std::memcpy(outLights, address+offset, bytes);
+    JS_FreeValue(context, buffer);
+    JS_FreeValue(context, result);
+}
 void NativeThreeJS_Shutdown() {
     if (!ready) return;
+    JS_FreeValue(context,lightFunction);
     JS_FreeValue(context,frameFunction);
     JS_FreeContext(context);
     JS_FreeRuntime(runtime);
     frameFunction=JS_UNDEFINED;
+    lightFunction=JS_UNDEFINED;
     context=nullptr;
     runtime=nullptr;
     ready=false;
