@@ -86270,7 +86270,7 @@ function tick(now){
  controls.update();renderer.render(scene,camera);
  renderedFrames++;
  if(shaderBroken&&!fallback)activateFallback('WebGL-varjutaja kompileerimine ebaõnnestus');
- if(renderedFrames===12&&!fallback){
+ if(renderedFrames===1&&!fallback){
   const gl=renderer.getContext(),pixels=new Uint8Array(128*128*4);
   const pathVisibility=paths.map(o=>o.visible);paths.forEach(o=>o.visible=false);
   renderer.render(scene,camera);
@@ -86369,8 +86369,8 @@ async function boot(){
   const gpu=info?gl.getParameter(info.UNMASKED_RENDERER_WEBGL):'WebGL2 GPU';
   msg('Valmis: 1000 päris puud + 500 päris odameest · '+gpu);
   $('overlay').style.display='none';$('hud').style.display='block';$('measure').disabled=false;
+  running=true;tick(performance.now());
   window.__BENCH_READY=true;document.body.dataset.ready='true';
-  running=true;requestAnimationFrame(tick);
  }catch(e){
   console.error('Offline benchmark failed',e);
   window.__BENCH_ERROR=String(e?.stack||e);
