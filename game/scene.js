@@ -88,86 +88,127 @@
   treeBark.instanceMatrix.needsUpdate=true;
   treeNeedles.instanceMatrix.needsUpdate=true;
 
-  // Binary-heap A*: every one of the 500 soldiers independently plans around trees.
-  // Paths are computed at initialization, not inside the render loop.
-  function findPath(sx,sz,tx,tz){
-    const start=gridIndex(sx,sz),goal=gridIndex(tx,tz),size=GRID*GRID;
-    if(blocked[start]||blocked[goal])return [];
-    const cost=new Float32Array(size),prev=new Int32Array(size),closed=new Uint8Array(size);
-    cost.fill(Infinity);prev.fill(-1);cost[start]=0;
-    const queue=[];
-    const heuristic=n=>Math.abs(n%GRID-tx)+Math.abs(Math.floor(n/GRID)-tz);
-    function push(n,p){
-      const entry={n,p};let k=queue.length;queue.push(entry);
-      while(k>0){const j=(k-1)>>1;if(queue[j].p<=entry.p)break;queue[k]=queue[j];k=j;}
-      queue[k]=entry;
-    }
-    function pop(){
-      const result=queue[0].n,tail=queue.pop();
-      if(queue.length){
-        let k=0;
-        while((k*2+1)<queue.length){
-          let j=k*2+1;
-          if(j+1<queue.length&&queue[j+1].p<queue[j].p)j++;
-          if(queue[j].p>=tail.p)break;
-          queue[k]=queue[j];k=j;
-        }
-        queue[k]=tail;
+  // Each unit plans on demand while the simulation is running.
+  // Live cell occupancy AND in-transit reservations are A* obstacles.
+  // No 500-route upfront computation or overlapping/swap moves.
+  const occupants=new Int16Array(GRID*GRID), reservations=new Int16Array(GRID*GRID);
+  occupants.fill(-1); reservations.fill(-1);
+  const pathCosts=new Float32Array(GRID*GRID);
+  const pathParents=new Int32Array(GRID*GRID);
+  const seen=new Uint32Array(GRID*GRID), closed=new Uint32Array(GRID*GRID);
+  let searchId=0,searches=0,replans=0,blockedMoves=0,routeFailures=0;
+  const MAX_PLANS_PER_FRAME=12; // budget planning to avoid JS frame spikes
+  const pathHeap=[];
+  function findPath(unit) {
+    const start=unit.cell,goal=unit.goal;
+    if(blocked[start] || blocked[goal])return [];
+    searchId++;
+    if(searchId>=0xfffffffe){seen.fill(0);closed.fill(0);searchId=1;}
+    const epoch=searchId;
+    pathHeap.length=0;
+    const tx=goal%GRID,tz=(goal/GRID)|0;
+    const heuristic=n=>Math.abs(n%GRID-tx)+Math.abs(((n/GRID)|0)-tz);
+    function push(node,p) {
+      const entry={node,p};let i=pathHeap.length;
+      pathHeap.push(entry);
+      while(i>0){const parent=(i-1)>>1;
+        if(pathHeap[parent].p<=entry.p)break;
+        pathHeap[i]=pathHeap[parent];i=parent;
       }
-      return result;
+      pathHeap[i]=entry;
     }
+    function pop() {
+      const top=pathHeap[0].node,last=pathHeap.pop();
+      if(pathHeap.length){
+        let i=0;
+        while(i*2+1<pathHeap.length){
+          let child=i*2+1;
+          if(child+1<pathHeap.length && pathHeap[child+1].p<pathHeap[child].p)child++;
+          if(pathHeap[child].p>=last.p)break;
+          pathHeap[i]=pathHeap[child];i=child;
+        }
+        pathHeap[i]=last;
+      }
+      return top;
+    }
+    function canVisit(cell) {
+      return !blocked[cell] &&
+          (occupants[cell]===-1 || occupants[cell]===unit.id) &&
+          (reservations[cell]===-1 || reservations[cell]===unit.id);
+    }
+    seen[start]=epoch;pathCosts[start]=0;pathParents[start]=-1;
     push(start,heuristic(start));
-    while(queue.length){
-      const n=pop();if(closed[n])continue;
+    while(pathHeap.length){
+      const n=pop();
+      if(closed[n]===epoch)continue;
       if(n===goal){
         const path=[];
-        for(let v=n;v!==-1;v=prev[v]){path.push(v);if(v===start)break;}
-        return path.reverse();
+        for(let p=n;p!==-1;p=pathParents[p]){
+          path.push(p);
+          if(p===start)break;
+        }
+        path.reverse();return path;
       }
-      closed[n]=1;
+      closed[n]=epoch;
       const x=n%GRID,z=(n/GRID)|0;
       const adj=[x>0?n-1:-1,x<GRID-1?n+1:-1,z>0?n-GRID:-1,z<GRID-1?n+GRID:-1];
       for(const next of adj){
-        if(next<0||closed[next]||blocked[next])continue;
-        const d=cost[n]+1;
-        if(d<cost[next]){cost[next]=d;prev[next]=n;push(next,d+heuristic(next)*1.0001);}
+        if(next<0 || closed[next]===epoch || !canVisit(next))continue;
+        const candidate=pathCosts[n]+1;
+        if(seen[next]!==epoch || candidate<pathCosts[next]){
+          seen[next]=epoch;pathCosts[next]=candidate;
+          pathParents[next]=n;
+          push(next,candidate+heuristic(next)*1.0001);
+        }
       }
     }
     return [];
   }
-
+  function planFor(unit) {
+    if(unit.next!==-1 || unit.arrived)return false;
+    const oldPlans=unit.plans;
+    const path=findPath(unit);
+    searches++; if(oldPlans>0)replans++;
+    unit.plans++;unit.wait=0;unit.path=path;unit.at=0;
+    if(path.length<2){
+      unit.path=[];unit.retry=0.30+(unit.id%9)*0.045;
+      if(unit.cell===unit.goal)unit.arrived=true;
+      return false;
+    }
+    unit.retry=0;
+    return true;
+  }
   const units=[],soldierLights=[];
   const matrices=new Float32Array(TOTAL*16);
   const lightData=new Float32Array(SOLDIERS*8);
   const lightColors=[new THREE.Color(0xffbc88),new THREE.Color(0x94c5ff)];
-  let pathFailures=0,totalPathCells=0,arrivals=0;
+  let arrivals=0,planningCursor=0,simFrames=0;
   for(let team=0;team<2;team++)for(let i=0;i<PER_ARMY;i++){
-    // 10 columns by 25 rows on each side (250 separate starting tiles).
+    // Two-spaced formations leave a free cell between soldiers: physically
+    // viable queues that can get around one another without spawning overlaps.
     const column=i%10,row=(i/10)|0;
-    const sx=team===0?20+column:139-column;
-    const sz=68+row;
-    const tx=team===0?139-column:20+column;
-    // Equal start/goal rows force A* to detour around the solid forest
-    // barrier instead of hiding its turns in a necessary diagonal route.
-    const tz=68+row;
-    const path=findPath(sx,sz,tx,tz);
-    if(path.length===0)pathFailures++;
-    totalPathCells+=path.length;
-    const unit={team,index:i,path,at:0,x:toWorld(sx),z:toWorld(sz),
-      startX:toWorld(sx),startZ:toWorld(sz),yaw:team===0?1.57:-1.57,
-      // 160x160 nav grid spans a much larger world than the original test.
-      // A faster walking speed keeps long routes visibly progressing.
-      speed:10.5+(i%5)*0.35,arrived:false};
+    const sx=team===0?20+column*2:139-column*2;
+    const sz=50+row*2;
+    // Destinations are distinct and not initially occupied by enemy spawns.
+    const tx=team===0?145-column*2:14+column*2, tz=sz;
+    const id=team*PER_ARMY+i,cell=gridIndex(sx,sz),goal=gridIndex(tx,tz);
+    if(blocked[cell]||occupants[cell]!==-1||blocked[goal])
+      throw new Error('Invalid soldier start/goal '+id);
+    occupants[cell]=id;
+    const unit={id,team,index:i,cell,goal,next:-1,progress:0,
+      path:[],at:0,plans:0,wait:0,retry:0,arrived:false,
+      x:toWorld(sx),z:toWorld(sz),startX:toWorld(sx),startZ:toWorld(sz),
+      yaw:team===0?1.57:-1.57,speed:10.5+(i%5)*0.35};
     units.push(unit);
     const lamp=new THREE.SpotLight(lightColors[team],4.0,LIGHT_RADIUS,Math.PI/3,0.25,1.5);
     lamp.name=(team===0?'Red':'Blue')+' spotlight '+i;
-    lamp.castShadow=true; // DX12 selectively budgets 16 shadow-map updates/frame.
+    lamp.castShadow=true;
     lamp.shadow.mapSize.set(256,256);lamp.shadow.bias=-0.0008;
     lamp.position.set(unit.x,LIGHT_HEIGHT,unit.z);
     lamp.target.position.set(unit.x,0,unit.z);
     scene.add(lamp,lamp.target);
     soldierLights.push(lamp);
-    const base=(team*PER_ARMY+i)*8;
+    const base=id*8;
     lightData[base+1]=LIGHT_HEIGHT;
     lightData[base+3]=LIGHT_RADIUS;
     lightData[base+4]=lamp.color.r;
@@ -177,36 +218,79 @@
     put(team===0?red:blue,i,unit.x,unit.z,unit.yaw);
   }
 
+  function planPending(dt) {
+    // Fair round-robin, max 12 independent A* searches per frame. Solders
+    // request a route only when needed; a stuck unit can request a new one.
+    let budget=MAX_PLANS_PER_FRAME;
+    for(let checked=0;checked<SOLDIERS && budget>0;checked++){
+      const unit=units[planningCursor];
+      planningCursor=(planningCursor+1)%SOLDIERS;
+      if(unit.arrived||unit.next!==-1||unit.path.length>1||unit.retry>0)continue;
+      planFor(unit);budget--;
+    }
+  }
   function updateSoldiers(dt){
-    // A* routes are waypoint-based: one update can safely cross several cells.
-    // Old 0.06s clamp made gameplay run at 30% speed at 5 FPS (5 * 0.06).
-    // Cap only long stalls (e.g. alt-tab), not normal 2–10 FPS frames.
     dt=Math.min(0.5,Math.max(0,Number(dt)||0));
-    for(const unit of units){
-      let advance=unit.speed*dt;
-      while(advance>0.00001 && unit.at+1<unit.path.length){
-        const [gx,gz]=fromIndex(unit.path[unit.at+1]);
-        const vx=toWorld(gx)-unit.x,vz=toWorld(gz)-unit.z;
-        const len=Math.hypot(vx,vz),step=Math.min(len,advance);
-        if(len>0.000001){
-          unit.x+=vx/len*step;unit.z+=vz/len*step;
-          unit.yaw=Math.atan2(vx,vz);advance-=step;
-        }else advance=0;
-        if(len<=step+0.00001)unit.at++;
-      }
-      if(unit.path.length && unit.at===unit.path.length-1 && !unit.arrived){
-        unit.arrived=true;arrivals++;
+    simFrames++;
+    // Retry clocks progress even for soldiers who cannot currently find a route.
+    for(const unit of units)if(unit.retry>0)unit.retry=Math.max(0,unit.retry-dt);
+    if(dt>0)planPending(dt);
+    // Rotate priority every frame to avoid permanent starvation.
+    const first=simFrames%SOLDIERS;
+    for(let j=0;j<SOLDIERS;j++){
+      const unit=units[(j+first)%SOLDIERS];
+      let distance=unit.speed*dt,segments=0;
+      while(distance>0.000001 && segments<8 && !unit.arrived){
+        if(unit.next===-1){
+          if(unit.cell===unit.goal){unit.arrived=true;arrivals++;break;}
+          if(unit.path.length<2 || unit.at+1>=unit.path.length)break;
+          const next=unit.path[unit.at+1];
+          // Source remains occupied until the whole edge is traversed,
+          // while destination is separately reserved. Prevents overlap,
+          // head-on swaps and walking through stationary/moving soldiers.
+          if(blocked[next] || occupants[next]!==-1 || reservations[next]!==-1){
+            unit.wait+=dt;blockedMoves++;
+            if(unit.wait>0.28+(unit.id%5)*0.05){
+              unit.path=[];unit.at=0;unit.wait=0;
+              unit.retry=0.08+(unit.id%7)*0.025; // re-plan on demand
+            }
+            break;
+          }
+          reservations[next]=unit.id;
+          unit.next=next;unit.progress=0;unit.wait=0;
+        }
+        const remaining=CELL-unit.progress;
+        const step=Math.min(distance,remaining);
+        unit.progress+=step;distance-=step;
+        const [sx,sz]=fromIndex(unit.cell),[tx,tz]=fromIndex(unit.next);
+        const t=unit.progress/CELL;
+        unit.x=toWorld(sx)+(toWorld(tx)-toWorld(sx))*t;
+        unit.z=toWorld(sz)+(toWorld(tz)-toWorld(sz))*t;
+        unit.yaw=Math.atan2(tx-sx,tz-sz);
+        if(unit.progress>=CELL-0.00001){
+          // The occupied and reserved tiles are updated atomically.
+          if(occupants[unit.cell]!==unit.id ||
+             reservations[unit.next]!==unit.id ||
+             occupants[unit.next]!==-1)
+            throw new Error('Soldier occupancy conflict '+unit.id);
+          occupants[unit.cell]=-1;
+          occupants[unit.next]=unit.id;
+          reservations[unit.next]=-1;
+          unit.cell=unit.next;unit.next=-1;unit.progress=0;
+          unit.at++;segments++;
+          if(unit.cell===unit.goal){unit.arrived=true;arrivals++;break;}
+        }
       }
       put(unit.team===0?red:blue,unit.index,unit.x,unit.z,unit.yaw);
-      const li=unit.team*PER_ARMY+unit.index,base=li*8;
-      const lamp=soldierLights[li];
+      const base=unit.id*8,lamp=soldierLights[unit.id];
       lamp.position.x=unit.x;lamp.position.z=unit.z;
       lamp.target.position.x=unit.x;lamp.target.position.z=unit.z;
       lightData[base]=unit.x;lightData[base+2]=unit.z;
     }
-    red.instanceMatrix.needsUpdate=true;blue.instanceMatrix.needsUpdate=true;
+    red.instanceMatrix.needsUpdate=true;
+    blue.instanceMatrix.needsUpdate=true;
   }
-  updateSoldiers(0);
+  updateSoldiers(0); // Creates no paths: planning only starts on actual frames.
 
   const scratch=new THREE.Matrix4();
   function writeMatrices(mesh,offset){
@@ -231,39 +315,43 @@
       shadowLights:soldierLights.filter(l=>l.castShadow).length,
       lightsAreSpotLights:soldierLights.every(l=>l.isSpotLight),
       floats:matrices.length,lightFloatCount:lightData.length,
-      routes:units.length,routeFailures:pathFailures,totalRouteCells:totalPathCells,
+      routes:units.filter(u=>u.plans>0).length,routeFailures,
+      searches,replans,blockedMoves,unplanned:units.filter(u=>!u.plans).length,
       moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
       arrived:arrivals,treeCells:treeCells.length,
       placementMode:'seeded-random',forestAttempts:attempts,
-      debugSegments:debugPathData.length/5,
-      active:units.filter(u=>u.path.length>1 && !u.arrived).length,
+      debugSegments:0, // generated on demand for the native F4 overlay
+      active:units.filter(u=>!u.arrived).length,
       routeSteps:units.reduce((n,u)=>n+u.at,0),
+    replans,blockedMoves,
       scene:scene.isScene,group:forest.isGroup,mesh:ground.isMesh,
       instances:red.isInstancedMesh};
   }
   globalThis.__nativeThreeNavStats=()=>({
-    routeFailures:pathFailures,
+    routeFailures,
     moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
-    active:units.filter(u=>u.path.length>1 && !u.arrived).length,
+    active:units.filter(u=>!u.arrived).length,
     arrived:arrivals,
     routeSteps:units.reduce((n,u)=>n+u.at,0)
   });
-  // Visual diagnostics: six selected A* routes per army. Each record:
-  // [army, world-x1, world-z1, world-x2, world-z2]. This is real A* output,
-  // not native-generated decorative curves. The DX12 renderer draws these
-  // as emissive colored ground lines that can be toggled with F4.
-  const debugSegments=[];
+  // Only F4 diagnostic sampling requests these twelve individual paths.
+  // All remaining 488 soldiers still start with no precomputed route.
   const sampleUnits=[0,29,79,129,179,229];
-  for(let team=0;team<2;team++)for(const unitIndex of sampleUnits){
-    const path=units[team*PER_ARMY+unitIndex].path;
-    for(let j=1;j<path.length;j++){
-      const [aX,aZ]=fromIndex(path[j-1]);
-      const [bX,bZ]=fromIndex(path[j]);
-      debugSegments.push(team,toWorld(aX),toWorld(aZ),toWorld(bX),toWorld(bZ));
+  function debugSegments() {
+    const output=[];
+    for(let team=0;team<2;team++)for(const index of sampleUnits){
+      const unit=units[team*PER_ARMY+index];
+      if(!unit.plans)planFor(unit); // on-demand render inspection, not a bulk preload
+      const path=unit.path;
+      for(let j=unit.at+1;j<path.length;j++){
+        const [ax,az]=fromIndex(path[j-1]);
+        const [bx,bz]=fromIndex(path[j]);
+        output.push(team,toWorld(ax),toWorld(az),toWorld(bx),toWorld(bz));
+      }
     }
+    return new Float32Array(output);
   }
-  const debugPathData=new Float32Array(debugSegments);
-  globalThis.__nativeThreeDebugSegments=()=>debugPathData;
+  globalThis.__nativeThreeDebugSegments=debugSegments;
   globalThis.__nativeThreeScene=scene;
   globalThis.__nativeThreeFrame=frame;
   globalThis.__nativeThreeLightFrame=()=>lightData;
@@ -273,6 +361,10 @@
     worldTreePositions:treePositions.map(([x,z])=>[toWorld(x),toWorld(z)]),
     forestAttempts:attempts,
     paths:units.map(u=>u.path.slice()),
+    occupancy:Array.from(occupants),reservations:Array.from(reservations),
+    cells:units.map(u=>u.cell),nextCells:units.map(u=>u.next),
+    goals:units.map(u=>u.goal),planCounts:units.map(u=>u.plans),
+    movementProgress:units.map(u=>u.progress),
     positions:units.map(u=>[u.x,u.z]),
     lights:soldierLights.map(l=>[l.position.x,l.position.y,l.position.z])
   });
