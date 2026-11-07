@@ -18,7 +18,7 @@ call npm install --no-audit --no-fund
 if errorlevel 1 (echo npm install failed & pause & exit /b 1)
 call npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
 if errorlevel 1 (echo esbuild install failed & pause & exit /b 1)
-call npx esbuild threejs-native\scene.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated\three-scene.bundle.js
+call npx esbuild threejs-native\three-runtime-entry.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated\three-runtime.bundle.js
 if errorlevel 1 (echo ThreeJS bundle failed & pause & exit /b 1)
 python -m pip install Pillow
 if errorlevel 1 (echo Pillow failed & pause & exit /b 1)
@@ -32,5 +32,12 @@ set CI=1
 build\Release\ThreeSceneSmoke.exe
 if errorlevel 1 (echo JavaScript runtime smoke test failed & pause & exit /b 1)
 echo NativeThreeBridge ThreeJS DX12 build succeeded.
-echo The executable is at build\Release\NativeThree-Diagnostics.exe
+if not exist dist\game mkdir dist\game
+copy /Y build\Release\NativeThree-Diagnostics.exe dist\NativeThree-Game.exe >nul
+copy /Y game\scene.js dist\game\scene.js >nul
+cl /nologo /O2 /W3 /TC launcher\NativeThree-Updater.c /Fe:dist\NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+if errorlevel 1 (echo Independent updater compile failed & pause & exit /b 1)
+echo Standalone game: dist\NativeThree-Game.exe
+echo Independent GitHub updater: dist\NativeThree-Updater.exe
+echo Editable game code: dist\game\scene.js
 pause
