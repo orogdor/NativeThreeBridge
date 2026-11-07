@@ -1,0 +1,59 @@
+name: Offline Three.js WebGL2 benchmark smoke
+on:
+  push:
+    paths:
+      - "benchmarks/NativeThreeBridge-v015-WebGL2-OFFLINE.html"
+      - ".github/workflows/offline-webgl2-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  offline-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify benchmark has embedded assets and no external fetch
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib
+          s=pathlib.Path('benchmarks/NativeThreeBridge-v015-WebGL2-OFFLINE.html').read_text()
+          assert len(s)>2000000,len(s)
+          for x in ['id="vend-core"','id="vend-main"','id="vend-loader"','id="vend-orbit"','id="scene-src"','id="pine-glb"','id="soldier-glb"','__nativeThreeSetDestination','500']:
+              assert x in s,x
+          assert 'fetch(' not in s
+          assert 'cdn.jsdelivr.net' not in s
+          print('PASS: offline HTML embeds three r181, both GLBs and exact v0.15 A* scene')
+          PY
+      - name: Chromium offline WebGL2 launch with software GPU
+        shell: bash
+        run: |
+          set -uo pipefail
+          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)
+          if [ -z "$CHROME" ]; then
+            echo "No Chrome binary on runner"; exit 3
+          fi
+          PAGE="$(pwd)/benchmarks/NativeThreeBridge-v015-WebGL2-OFFLINE.html"
+          echo "Chrome: $CHROME"
+          timeout 95s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+            --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
+            --disable-background-networking --no-first-run \
+            --virtual-time-budget=16000 --dump-dom "file://$PAGE?autotest=1" \
+            > /tmp/offline-webgl-dom.html 2> /tmp/offline-webgl-chrome.log || true
+          grep -o 'data-ready="true"' /tmp/offline-webgl-dom.html | head || true
+          grep -o 'data-error="[^"]*"' /tmp/offline-webgl-dom.html | head || true
+          tail -60 /tmp/offline-webgl-chrome.log || true
+          if ! grep -q 'data-ready="true"' /tmp/offline-webgl-dom.html; then
+            echo "Offline benchmark did not reach readiness in headless browser."
+            exit 1
+          fi
+          echo "PASS: offline file:// HTML started Three.js WebGL2 and instantiated both GLB assets."
+      - name: Upload browser diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-webgl2-diagnostics
+          path: |
+            /tmp/offline-webgl-dom.html
+            /tmp/offline-webgl-chrome.log
+          retention-days: 7
