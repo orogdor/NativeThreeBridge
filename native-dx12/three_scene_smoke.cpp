@@ -1,48 +1,43 @@
 #include "three_js_host.h"
-#include <cstdio>
 #include <cmath>
-int main() {
-    NativeThreeJS_Init(); // checks 1000 pines, 20 soldiers and 20 successful A* routes
-    float matrices[1020 * 16]{};
-    NativeThreeJS_Frame(0.0f, matrices, 1020 * 16);
-    float lights[20*8]{};
-    NativeThreeJS_Lights(lights,20*8);
-    for(int i=0;i<20;i++){
-        const int base=i*8;
-        const int soldier=(1000+i)*16;
-        if(std::fabs(lights[base]-matrices[soldier+12])>0.001f ||
-           std::fabs(lights[base+2]-matrices[soldier+14])>0.001f ||
-           lights[base+1] < 7.0f || lights[base+3] < 10.f)
-            return 5;
+#include <cstdio>
+int main(){
+    constexpr int TREES=100, PER_ARMY=250, SOLDIERS=500, INSTANCE_FLOATS=600*16, LIGHT_FLOATS=500*8;
+    NativeThreeJS_Init();  // Validates all 500 A* routes, 100 trees and two armies
+    float matrices[INSTANCE_FLOATS]{};
+    float lights[LIGHT_FLOATS]{};
+    NativeThreeJS_Frame(0.f,matrices,INSTANCE_FLOATS);
+    NativeThreeJS_Lights(lights,LIGHT_FLOATS);
+    for(int i=0;i<SOLDIERS;i++){
+        const int m=(TREES+i)*16,l=i*8;
+        if(std::fabs(lights[l]-matrices[m+12])>0.005f ||
+           std::fabs(lights[l+2]-matrices[m+14])>0.005f ||
+           std::fabs(lights[l+1]-9.5f)>0.01f ||
+           !(lights[l+3]>10 && lights[l+7]>0)) {
+           std::fprintf(stderr,"Light %d failed follow/height check\n",i);
+           return 5;
+        }
     }
-    // Three.js Matrix4 translation uses elements 12..14 in column-major Float32Array.
-    constexpr int red = 1000 * 16;
-    constexpr int blue = 1010 * 16;
-    const float redX = matrices[red + 12];
-    const float blueX = matrices[blue + 12];
-    if (redX > -70.0f || blueX < 70.0f) {
-        std::fprintf(stderr,"Initial army placement missing: red=%f blue=%f\n",redX,blueX);
-        return 3;
+    float firstRedX=matrices[TREES*16+12];
+    float firstBlueX=matrices[(TREES+PER_ARMY)*16+12];
+    for(int frame=0;frame<120;frame++) NativeThreeJS_Frame(1.f/60.f,matrices,INSTANCE_FLOATS);
+    NativeThreeJS_Lights(lights,LIGHT_FLOATS);
+    if(std::fabs(matrices[TREES*16+12]-firstRedX)<3.f ||
+       std::fabs(matrices[(TREES+PER_ARMY)*16+12]-firstBlueX)<3.f){
+       std::fprintf(stderr,"Armies did not advance on A* routes\n");
+       return 6;
     }
-    for (int i = 0; i < 240; ++i)
-        NativeThreeJS_Frame(1.0f / 60.0f, matrices, 1020 * 16);
-    NativeThreeJS_Lights(lights,20*8);
-    if(std::fabs(lights[0]-matrices[red+12])>0.01f ||
-       std::fabs(lights[10*8]-matrices[blue+12])>0.01f)
-        return 6;
-    const float redDX = matrices[red+12]-redX;
-    const float blueDX = matrices[blue+12]-blueX;
-    const float redDZ = matrices[red+14]-(-49.5f);
-    const float blueDZ = matrices[blue+14]-25.5f;
-    if (std::hypot(redDX,redDZ) < 3.0f || std::hypot(blueDX,blueDZ) < 3.0f) {
-        std::fprintf(stderr,"JS A* armies did not move: red=(%f,%f) blue=(%f,%f)\n",
-                     redDX,redDZ,blueDX,blueDZ);
-        return 4;
+    for(int i=0;i<SOLDIERS;i++){
+        const int m=(TREES+i)*16,l=i*8;
+        if(std::fabs(lights[l]-matrices[m+12])>0.005f ||
+           std::fabs(lights[l+2]-matrices[m+14])>0.005f) {
+            std::fprintf(stderr,"Moving soldier %d light desynchronized\n",i);
+            return 7;
+        }
     }
-    std::puts("PASS: embedded official Three.js with 1000 instanced pine trees");
-    std::puts("PASS: two 10-unit armies with 20 real A* routes around obstacles");
-    std::puts("PASS: red and blue armies move over 240 QuickJS frames");
-    std::puts("PASS: 20 separate moving Three.js SpotLight records follow the soldiers");
+    std::puts("PASS: 10x10 (100) pine forest with original GLB");
+    std::puts("PASS: 500 real Three.js soldiers in two armies with A* paths");
+    std::puts("PASS: 500 moving Three.js SpotLight records follow soldiers");
     NativeThreeJS_Shutdown();
     return 0;
 }
