@@ -44,6 +44,8 @@ static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
 static UINT gStatFrames=0;
+static wchar_t gAdapterName[128]=L"Unknown GPU";
+static bool gUsingWARP=false;
 
 static ComPtr<ID3D12Device> gDevice;
 static ComPtr<ID3D12CommandQueue> gQueue;
@@ -541,12 +543,41 @@ static void makePipeline() {
 static void initializeDX12() {
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)),"Create DXGI factory");
-    HRESULT hr=D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice));
-    if(FAILED(hr)) {
-        ComPtr<IDXGIAdapter> warp;
-        check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"Find DX12 WARP adapter");
-        check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice)),
-              "Create DX12 device");
+    // Explicit high-performance adapter selection prevents an accidental iGPU/WARP test.
+    ComPtr<IDXGIFactory6> factory6;
+    if(SUCCEEDED(factory.As(&factory6))) {
+        for(UINT i=0;;i++) {
+            ComPtr<IDXGIAdapter1> adapter;
+            if(factory6->EnumAdapterByGpuPreference(i,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                   IID_PPV_ARGS(&adapter))==DXGI_ERROR_NOT_FOUND)break;
+            DXGI_ADAPTER_DESC1 info={};
+            adapter->GetDesc1(&info);
+            if(info.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)continue;
+            if(SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,
+                                          IID_PPV_ARGS(&gDevice)))) {
+                wcscpy_s(gAdapterName,info.Description);
+                break;
+            }
+        }
+    }
+    if(!gDevice) {
+        // Older systems without Factory6: attempt the default hardware device first.
+        HRESULT hr=D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice));
+        if(SUCCEEDED(hr)) {
+            ComPtr<IDXGIDevice> dxgiDevice;
+            ComPtr<IDXGIAdapter> adapter;
+            DXGI_ADAPTER_DESC info={};
+            if(SUCCEEDED(gDevice.As(&dxgiDevice))&&
+               SUCCEEDED(dxgiDevice->GetAdapter(&adapter))&&
+               SUCCEEDED(adapter->GetDesc(&info)))wcscpy_s(gAdapterName,info.Description);
+        } else {
+            ComPtr<IDXGIAdapter> warp;
+            check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"Find DX12 WARP adapter");
+            check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice)),
+                  "Create DX12 device");
+            gUsingWARP=true;
+            wcscpy_s(gAdapterName,L"SOFTWARE WARP");
+        }
     }
     D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(gDevice->CreateCommandQueue(&q,IID_PPV_ARGS(&gQueue)),"Create GPU queue");
@@ -1009,11 +1040,15 @@ static void renderFrame() {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         NativeThreeNavStatus navigation{};
         NativeThreeJS_GetNavStatus(&navigation);
-        wchar_t title[256];
+        UINT shadowInstances=0;
+        if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
+            shadowInstances+=2*gShadowVisibleCounts[i][0]+
+                             gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
+        wchar_t title[380];
         swprintf_s(title,
-            L"NativeThree PERF | FPS %d | A* moving %d/500, planned %d, replans %d, waits %d | shadows %s | F5 shadows F6 VSync",
-            frames,navigation.moved,navigation.planned,navigation.replans,navigation.blockedMoves,
-            gEnableShadows?L"ON":L"OFF");
+            L"DX12 %s | FPS %d | A* %d/500 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6)",
+            gAdapterName,frames,navigation.moved,navigation.planned,shadowInstances,
+            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
