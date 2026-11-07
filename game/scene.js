@@ -225,11 +225,13 @@
       matrices.set(current.elements, (offset+i)*16);
     }
   }
+  // Pine bark and foliage are static: read 1000 world transforms ONCE.
+  // Each frame only the 20 moving soldiers need new world matrix copies.
+  scene.updateMatrixWorld(true);
+  writeMatrices(treeBark, 0);
   function frame(dt = 1/60) {
     updateSoldiers(dt);
     scene.updateMatrixWorld(true);
-    // Pine bark and pine foliage share the first 1000 matrices.
-    writeMatrices(treeBark, 0);
     writeMatrices(red, TREES);
     writeMatrices(blue, TREES + PER_ARMY);
     return matrices;
