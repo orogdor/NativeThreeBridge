@@ -123,7 +123,7 @@ def main():
     download_assets(work)
     print("Converting original Kuningriigid spearman and Sapling pine ...")
     allparts = []
-    for name in ("house","pine"):
+    for name in ("soldier","pine"):
         doc,buf=read_glb(work/(name+".glb"))
         for mesh in doc.get("meshes",[]):
             for primitive in mesh.get("primitives",[]):
