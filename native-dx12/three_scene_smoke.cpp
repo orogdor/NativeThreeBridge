@@ -22,6 +22,13 @@ int main(){
     float firstBlueX=matrices[(TREES+PER_ARMY)*16+12];
     for(int frame=0;frame<120;frame++) NativeThreeJS_Frame(1.f/60.f,matrices,INSTANCE_FLOATS);
     NativeThreeJS_Lights(lights,LIGHT_FLOATS);
+    NativeThreeNavStatus nav{};
+    NativeThreeJS_GetNavStatus(&nav);
+    if(nav.routeFailures!=0 || nav.moved!=500 || nav.routeSteps<1 || nav.active<1) {
+        std::fprintf(stderr,"A* failed: missing=%d moved=%d steps=%d active=%d\n",
+            nav.routeFailures,nav.moved,nav.routeSteps,nav.active);
+        return 8;
+    }
     if(std::fabs(matrices[TREES*16+12]-firstRedX)<3.f ||
        std::fabs(matrices[(TREES+PER_ARMY)*16+12]-firstBlueX)<3.f){
        std::fprintf(stderr,"Armies did not advance on A* routes\n");
@@ -38,6 +45,7 @@ int main(){
     std::puts("PASS: 1000 original pines on 10x enlarged forest footprint");
     std::puts("PASS: 500 real Three.js soldiers in two armies with A* paths");
     std::puts("PASS: 500 moving Three.js SpotLight records follow soldiers");
+    std::puts("PASS: real-time navigation status shows 500 moving soldiers and A* waypoint progress");
     NativeThreeJS_Shutdown();
     return 0;
 }
