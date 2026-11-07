@@ -1,14 +1,14 @@
-// NativeThreeBridge Windows DX12 stress test: 10x10 pine forest + 500 units/lights.
+// NativeThreeBridge Windows DX12 stress test: 1000 pines in a ~32x32 forest + 500 units/lights.
 // Real Three.js / QuickJS-NG; independent file, editable without recompiling EXE.
 (() => {
   'use strict';
-  const GRID=64, CELL=3, FOREST_SIDE=10, TREES=100, PER_ARMY=250;
+  const GRID=160, CELL=3, FOREST_SIDE=32, TREES=1000, PER_ARMY=250;
   const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=9.5, LIGHT_RADIUS=18;
   const scene=new THREE.Scene();
-  scene.name='10x10 forest + 500 moving soldiers with spotlights';
+  scene.name='1000-tree expanded forest + 500 moving soldiers with spotlights';
   scene.background=new THREE.Color(0x1c2a3c);
   const forest=new THREE.Group(), armies=new THREE.Group();
-  forest.name='10x10 pine forest'; armies.name='Two armies of 250';
+  forest.name='1000 pine forest (~32x32 grid)'; armies.name='Two armies of 250';
   scene.add(forest,armies);
   const pineGeo=new THREE.BufferGeometry();
   pineGeo.userData.nativeMesh='assets/sapling-trees/pine_01/mid.glb';
@@ -23,8 +23,8 @@
   armies.add(red,blue);
   const ground=new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshStandardMaterial({color:0x405742}));
   ground.userData.nativePrimitive='ground';scene.add(ground);
-  const camera=new THREE.PerspectiveCamera(57,1152/768,0.1,1000);
-  camera.position.set(100,160,-200);camera.lookAt(0,0,0);scene.add(camera);
+  const camera=new THREE.PerspectiveCamera(57,1152/768,0.1,2000);
+  camera.position.set(250,380,-500);camera.lookAt(0,0,0);scene.add(camera);
 
   const blocked=new Uint8Array(GRID*GRID);
   const gridIndex=(x,z)=>z*GRID+x;
@@ -39,10 +39,12 @@
   let seed=173019;
   function rand(){seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;}
   const treeCells=[];
-  // EXACT 10 by 10 trees in a central grove; every tree blocks its nav grid tile.
-  // Three nav cells between trees leave walkable paths between the trunks.
+  // 32x32 positions cover 10.24x the original forest footprint.
+  // Omit every 43rd grid position: 1024 - 24 = exactly 1000 trees.
+  // Preserve 3 nav cells spacing so soldiers can find routes between trunks.
   for(let z=0;z<FOREST_SIDE;z++)for(let x=0;x<FOREST_SIDE;x++){
-    const gx=18+x*3, gz=18+z*3, n=treeCells.length;
+    if((z*FOREST_SIDE+x)%43===0)continue;
+    const gx=32+x*3, gz=32+z*3, n=treeCells.length;
     treeCells.push([gx,gz]);blocked[gridIndex(gx,gz)]=1;
     const tx=toWorld(gx)+(rand()-0.5)*0.55;
     const tz=toWorld(gz)+(rand()-0.5)*0.55;
@@ -109,10 +111,10 @@
   for(let team=0;team<2;team++)for(let i=0;i<PER_ARMY;i++){
     // 10 columns by 25 rows on each side (250 separate starting tiles).
     const column=i%10,row=(i/10)|0;
-    const sx=team===0?2+column:61-column;
-    const sz=12+row;
-    const tx=team===0?61-column:2+column;
-    const tz=36-row;
+    const sx=team===0?4+column:155-column;
+    const sz=68+row;
+    const tx=team===0?155-column:4+column;
+    const tz=92-row;
     const path=findPath(sx,sz,tx,tz);
     if(path.length===0)pathFailures++;
     totalPathCells+=path.length;
