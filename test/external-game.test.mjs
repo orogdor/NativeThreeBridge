@@ -53,3 +53,34 @@ test('500 THREE.SpotLight objects follow both armies and stay warm/cool',()=>{
   }
   assert.equal(box.__nativeThreeDiagnostics().moved,500);
 });
+
+
+test('A* movement advances at the same real-time speed at 5 FPS and 60 FPS',()=>{
+  const low=create(),high=create();
+  for(let i=0;i<20;i++)low.__nativeThreeFrame(0.2);
+  for(let i=0;i<240;i++)high.__nativeThreeFrame(1/60);
+  const a=low.__nativeNavTest().positions;
+  const b=high.__nativeNavTest().positions;
+  for(const i of [0,1,20,80,249,250,270,499]){
+    assert.ok(Math.hypot(a[i][0]-b[i][0],a[i][1]-b[i][1])<0.04,
+      'Soldier '+i+' moves at different simulation rates at 5 vs 60 FPS');
+  }
+  const status=low.__nativeThreeNavStats();
+  assert.equal(status.routeFailures,0);
+  assert.equal(status.moved,500);
+  assert.ok(status.routeSteps>0,'Soldiers must advance through A* waypoints');
+  assert.ok(status.active>0 && status.active<=500);
+});
+test('long GPU frames are not limited to old 60ms movement cap',()=>{
+  const a=create(),b=create();
+  a.__nativeThreeFrame(0.2);
+  b.__nativeThreeFrame(0.06);
+  const ax=a.__nativeThreeNavTest().positions;
+  const bx=b.__nativeThreeNavTest().positions;
+  for(const i of [0,250]){
+    const init=i<250?[(4-(160-1)/2)*3, (68-(160-1)/2)*3]:[(155-(160-1)/2)*3,(68-(160-1)/2)*3];
+    const da=Math.hypot(ax[i][0]-init[0],ax[i][1]-init[1]);
+    const db=Math.hypot(bx[i][0]-init[0],bx[i][1]-init[1]);
+    assert.ok(da>db*2.7, '200ms frame wrongly capped to 60ms');
+  }
+});
