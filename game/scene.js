@@ -140,7 +140,9 @@
     const sx=team===0?20+column:139-column;
     const sz=68+row;
     const tx=team===0?139-column:20+column;
-    const tz=92-row;
+    // Equal start/goal rows force A* to detour around the solid forest
+    // barrier instead of hiding its turns in a necessary diagonal route.
+    const tz=68+row;
     const path=findPath(sx,sz,tx,tz);
     if(path.length===0)pathFailures++;
     totalPathCells+=path.length;
