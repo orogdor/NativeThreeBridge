@@ -213,6 +213,13 @@ static int runUpdater(const char *args){
     files[1].limit=MAX_SCENE_BYTES;
 
     for(int i=0;i<NUM_FILES;i++)recoverBackup(files[i].dest,files[i].backup);
+    // Offline GitHub Actions validation: updater and game are distinct binaries.
+    if(args && strstr(args,"--self-test")!=NULL){
+        char digest1[65]={0},digest2[65]={0};
+        int ok=sha256File(files[0].dest,digest1) && sha256File(files[1].dest,digest2);
+        logline(ok?"Updater standalone offline self-test OK":"Updater offline self-test FAILED");
+        return ok?0:31;
+    }
     const int noLaunch=(args && strstr(args,"--check-only")!=NULL);
     char offline[MAX_PATH];makePath(offline,"NO-UPDATE.txt");
     char preserve[MAX_PATH];makePath(preserve,"PRESERVE-SCENE.txt");
