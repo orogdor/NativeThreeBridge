@@ -121,7 +121,9 @@
     totalPathCells+=path.length;
     const unit={team,index:i,path,at:0,x:toWorld(sx),z:toWorld(sz),
       startX:toWorld(sx),startZ:toWorld(sz),yaw:team===0?1.57:-1.57,
-      speed:6.2+(i%5)*0.22,arrived:false};
+      // 160x160 nav grid spans a much larger world than the original test.
+      // A faster walking speed keeps long routes visibly progressing.
+      speed:10.5+(i%5)*0.35,arrived:false};
     units.push(unit);
     const lamp=new THREE.SpotLight(lightColors[team],2.0,LIGHT_RADIUS,Math.PI/3,0.25,1.5);
     lamp.name=(team===0?'Red':'Blue')+' spotlight '+i;
@@ -142,7 +144,10 @@
   }
 
   function updateSoldiers(dt){
-    dt=Math.min(0.06,Math.max(0,Number(dt)||0));
+    // A* routes are waypoint-based: one update can safely cross several cells.
+    // Old 0.06s clamp made gameplay run at 30% speed at 5 FPS (5 * 0.06).
+    // Cap only long stalls (e.g. alt-tab), not normal 2–10 FPS frames.
+    dt=Math.min(0.5,Math.max(0,Number(dt)||0));
     for(const unit of units){
       let advance=unit.speed*dt;
       while(advance>0.00001 && unit.at+1<unit.path.length){
@@ -195,9 +200,18 @@
       routes:units.length,routeFailures:pathFailures,totalRouteCells:totalPathCells,
       moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
       arrived:arrivals,treeCells:treeCells.length,
+      active:units.filter(u=>u.path.length>1 && !u.arrived).length,
+      routeSteps:units.reduce((n,u)=>n+u.at,0),
       scene:scene.isScene,group:forest.isGroup,mesh:ground.isMesh,
       instances:red.isInstancedMesh};
   }
+  globalThis.__nativeThreeNavStats=()=>({
+    routeFailures:pathFailures,
+    moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
+    active:units.filter(u=>u.path.length>1 && !u.arrived).length,
+    arrived:arrivals,
+    routeSteps:units.reduce((n,u)=>n+u.at,0)
+  });
   globalThis.__nativeThreeScene=scene;
   globalThis.__nativeThreeFrame=frame;
   globalThis.__nativeThreeLightFrame=()=>lightData;
