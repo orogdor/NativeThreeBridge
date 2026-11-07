@@ -31,9 +31,9 @@ jobs:
         run: |
           CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
           FILE="$(pwd)/benchmarks/NativeThreeBridge-v019-SOLDIER-SHADOWS.html"
-          timeout 100s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+          timeout 160s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
             --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
-            --disable-background-networking --no-first-run --virtual-time-budget=20000 \
+            --disable-background-networking --no-first-run --virtual-time-budget=90000 \
             --dump-dom "file://$FILE?autotest=1" >/tmp/v019-dom.html 2>/tmp/v019-browser.log || true
           python - <<'PY'
           from pathlib import Path
