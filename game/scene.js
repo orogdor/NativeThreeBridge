@@ -187,10 +187,10 @@
     // Two-spaced formations leave a free cell between soldiers: physically
     // viable queues that can get around one another without spawning overlaps.
     const column=i%10,row=(i/10)|0;
-    const sx=team===0?20+column*2:139-column*2;
+    const sx=team===0?10+column*2:149-column*2;
     const sz=50+row*2;
     // Destinations are distinct and not initially occupied by enemy spawns.
-    const tx=team===0?145-column*2:14+column*2, tz=sz;
+    const tx=team===0?150+column:9-column, tz=sz;
     const id=team*PER_ARMY+i,cell=gridIndex(sx,sz),goal=gridIndex(tx,tz);
     if(blocked[cell]||occupants[cell]!==-1||blocked[goal])
       throw new Error('Invalid soldier start/goal '+id);
@@ -352,6 +352,19 @@
     return new Float32Array(output);
   }
   globalThis.__nativeThreeDebugSegments=debugSegments;
+  // Live movement orders: each soldier chooses/replans their own path.
+  // A new destination never bypasses a unit's in-progress cell reservation.
+  globalThis.__nativeThreeSetDestination=(id,gx,gz)=>{
+    if(!Number.isInteger(id)||id<0||id>=SOLDIERS ||
+       !Number.isInteger(gx)||!Number.isInteger(gz)||
+       gx<0||gx>=GRID||gz<0||gz>=GRID)return false;
+    const target=gridIndex(gx,gz);
+    if(blocked[target])return false;
+    const unit=units[id];
+    unit.goal=target;unit.arrived=false;unit.path=[];unit.at=0;
+    unit.wait=0;unit.retry=0;
+    return true;
+  };
   globalThis.__nativeThreeScene=scene;
   globalThis.__nativeThreeFrame=frame;
   globalThis.__nativeThreeLightFrame=()=>lightData;
