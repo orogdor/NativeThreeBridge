@@ -42,8 +42,7 @@ old="renderer.shadowMap.enabled=shadows;"
 assert s.count(old)==1
 s=s.replace(old,'''renderer.shadowMap.enabled=shadows;
   document.body.dataset.soldierShadowLights=String(pool.filter(l=>l.visible&&l.castShadow).length);
-  document.body.dataset.spotlightShadowsActive=String(shadows&&pool.some(l=>l.visible&&l.castShadow));
- }''',1)
+  document.body.dataset.spotlightShadowsActive=String(shadows&&pool.some(l=>l.visible&&l.castShadow));''',1)
 # Make shadowCount default 8 as previous. Add toggle status info without changing user input layout.
 old="const activeLights=16;"
 assert s.count(old)==1
