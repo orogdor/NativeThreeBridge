@@ -69,7 +69,7 @@ static Mesh gMesh[MESH_COUNT];
 
 static void fatal(const char *step,HRESULT hr) {
     char text[400];
-    sprintf_s(text,"NativeThreeBridge DX12 v0.5 failed at:\n%s\nHRESULT: 0x%08X\n\nSee the Windows graphics driver and DX12 support.",step,(unsigned int)hr);
+    sprintf_s(text,"NativeThreeBridge DX12 v0.9 failed at:\n%s\nHRESULT: 0x%08X\n\nSee the Windows graphics driver and DX12 support.",step,(unsigned int)hr);
     MessageBoxA(gWindow,text,"NativeThreeBridge DX12 error",MB_OK|MB_ICONERROR);
     ExitProcess(10);
 }
@@ -527,6 +527,79 @@ static void initializeDX12() {
     loadMesh(2,103,203,needles);
     makeGround();
 }
+struct LightConstants {
+    XMFLOAT4X4 viewProjections[SHADOW_COUNT];
+    XMFLOAT4 positionsRadius[SHADOW_COUNT];
+    XMFLOAT4 colorsIntensity[SHADOW_COUNT];
+};
+static_assert(sizeof(LightConstants)==1920,"DX12 light constant-buffer layout mismatch");
+
+static void updateLightsAndShadowCameras() {
+    float lights[SHADOW_COUNT*8]{};
+    NativeThreeJS_Lights(lights,SHADOW_COUNT*8);
+    LightConstants constants{};
+    BYTE *shadowCameras=nullptr;
+    check(gShadowCameraCB->Map(0,nullptr,(void**)&shadowCameras),
+          "Map per-soldier shadow cameras");
+    for(UINT i=0;i<SHADOW_COUNT;i++){
+        const float *l=lights+i*8;
+        const XMVECTOR eye=XMVectorSet(l[0],l[1],l[2],1.f);
+        const XMVECTOR target=XMVectorSet(l[0],l[1]-1.f,l[2],1.f);
+        const XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,0,1,0));
+        // A 118-degree downward cone matches the Three.js SpotLight angle.
+        const XMMATRIX projection=XMMatrixPerspectiveFovLH(
+            XMConvertToRadians(118.f),1.f,0.1f,32.f);
+        XMStoreFloat4x4(&constants.viewProjections[i],
+                         XMMatrixTranspose(view*projection));
+        constants.positionsRadius[i]={l[0],l[1],l[2],l[3]};
+        constants.colorsIntensity[i]={l[4],l[5],l[6],l[7]};
+        memcpy(shadowCameras+(size_t)i*256,
+               &constants.viewProjections[i],sizeof(XMFLOAT4X4));
+    }
+    gShadowCameraCB->Unmap(0,nullptr);
+    void *data=nullptr;
+    check(gLightsCB->Map(0,nullptr,&data),"Map native Three.js light constants");
+    memcpy(data,&constants,sizeof(constants));
+    gLightsCB->Unmap(0,nullptr);
+}
+
+static void drawShadowMaps() {
+    const D3D12_VIEWPORT shadowViewport={0,0,(float)SHADOW_SIZE,(float)SHADOW_SIZE,0,1};
+    const D3D12_RECT shadowScissor={0,0,(LONG)SHADOW_SIZE,(LONG)SHADOW_SIZE};
+    gCmd->SetPipelineState(gShadowPSO.Get());
+    gCmd->SetGraphicsRootSignature(gRoot.Get());
+    ID3D12DescriptorHeap *heaps[]={gSRVHeap.Get()};
+    gCmd->SetDescriptorHeaps(1,heaps);
+    gCmd->RSSetViewports(1,&shadowViewport);
+    gCmd->RSSetScissorRects(1,&shadowScissor);
+    gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
+    // and the two distinct army instance ranges. The depth texture is shared
+    // as a 20-layer texture array and sampled by the forward lighting pass.
+    for(UINT li=0;li<SHADOW_COUNT;li++) {
+        const auto dsv=gShadowDSV[li];
+        gCmd->OMSetRenderTargets(0,nullptr,FALSE,&dsv);
+        gCmd->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,1.f,0,0,nullptr);
+        gCmd->SetGraphicsRootConstantBufferView(
+            0,gShadowCameraCB->GetGPUVirtualAddress()+(UINT64)li*256);
+        const UINT order[]={1,2,0,0};
+        for(UINT p=0;p<4;p++){
+            Mesh &m=gMesh[order[p]];
+            DrawParams draw=m.draw;
+            if(p==3) draw.kind=3; // blue army matrix offset 1010
+            gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
+            gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
+            gCmd->IASetVertexBuffers(0,1,&m.vbv);
+            gCmd->IASetIndexBuffer(&m.ibv);
+            gCmd->DrawIndexedInstanced(m.indexCount,p<2?1000:10,0,0,0);
+        }
+    }
+    auto ready=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    gCmd->ResourceBarrier(1,&ready);
+}
+
 static void renderFrame() {
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
@@ -535,6 +608,7 @@ static void renderFrame() {
     const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
     gPreviousFrame=tick;
     NativeThreeJS_Frame(dt,matrices,1020*16);
+    updateLightsAndShadowCameras();
     void *instanceMapped=nullptr;
     check(gInstancesCB->Map(0,nullptr,&instanceMapped),"Map Three.js instance matrices");
     memcpy(instanceMapped,matrices,sizeof(matrices));
@@ -556,7 +630,9 @@ static void renderFrame() {
 
     const UINT back=gSwap->GetCurrentBackBufferIndex();
     check(gAllocator->Reset(),"Reset draw allocator");
-    check(gCmd->Reset(gAllocator.Get(),gPSO.Get()),"Reset draw commands");
+    check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
+    drawShadowMaps();
+    gCmd->SetPipelineState(gPSO.Get());
     auto toRT=transition(gTargets[back].Get(),
                          D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
     gCmd->ResourceBarrier(1,&toRT);
@@ -574,6 +650,8 @@ static void renderFrame() {
     gCmd->SetDescriptorHeaps(1,heaps);
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
+    gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     // Four model draws for 1020 logical objects: two tree parts,
     // 10 red soldiers, 10 blue soldiers; plus one ground draw.
@@ -594,6 +672,10 @@ static void renderFrame() {
     auto toPresent=transition(gTargets[back].Get(),
                             D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
     gCmd->ResourceBarrier(1,&toPresent);
+    // Prepare depth layers for the next frame, after the forward shading pass.
+    auto shadowWritable=transition(gShadowDepth.Get(),
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    gCmd->ResourceBarrier(1,&shadowWritable);
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
@@ -604,7 +686,7 @@ static void renderFrame() {
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         wchar_t title[256];
-        swprintf_s(title,L"NativeThreeBridge v0.8 DX12 | FPS %d | 1000 pines | Red 10 vs Blue 10 | JS A* | Chromium-free",frames);
+        swprintf_s(title,L"NativeThreeBridge v0.9 DX12 | FPS %d | 20 moving spotlights + 20 shadow maps | 1000 trees | 2 armies",frames);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -648,7 +730,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.8 | 1000 trees and 2 A* armies",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.9 | 1000 trees + 20 shadow-casting lights",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
