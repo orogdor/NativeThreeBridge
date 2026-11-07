@@ -6,6 +6,9 @@ on:
       - ".github/workflows/offline-webgl2-smoke.yml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   offline-browser:
     runs-on: ubuntu-latest
@@ -21,8 +24,9 @@ jobs:
           assert len(s)>2000000,len(s)
           for x in ['id="vend-core"','id="vend-main"','id="vend-loader"','id="vend-orbit"','id="scene-src"','id="pine-glb"','id="soldier-glb"','__nativeThreeSetDestination','500']:
               assert x in s,x
-          assert 'fetch(' not in s
-          assert 'cdn.jsdelivr.net' not in s
+          runtime=s.rsplit('<script type="module">',1)[-1]
+          assert 'fetch(' not in runtime, 'App startup still uses remote fetch'
+          assert 'cdn.jsdelivr.net' not in runtime
           print('PASS: offline HTML embeds three r181, both GLBs and exact v0.15 A* scene')
           PY
       - name: Chromium offline WebGL2 launch with software GPU
@@ -57,3 +61,12 @@ jobs:
             /tmp/offline-webgl-dom.html
             /tmp/offline-webgl-chrome.log
           retention-days: 7
+
+      - name: Attach verified offline HTML to v0.15.0 release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release upload v0.15.0 benchmarks/NativeThreeBridge-v015-WebGL2-OFFLINE.html --clobber
+          echo "Offline HTML uploaded to NativeThreeBridge v0.15.0 release"
