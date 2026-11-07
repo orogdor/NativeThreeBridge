@@ -1,0 +1,73 @@
+name: Offline v0.16 WebGL2 visible-geometry smoke
+on:
+  push:
+    paths:
+      - "benchmarks/NativeThreeBridge-v016-WebGL2-RENDER-FIX.html"
+      - ".github/workflows/offline-webgl2-v016-visual.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  browser-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify single-file benchmark and JavaScript module syntax
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s=Path("benchmarks/NativeThreeBridge-v016-WebGL2-RENDER-FIX.html").read_text()
+          assert len(s)>3000000
+          for needle in ('id="pine-glb"','id="soldier-glb"','__nativeThreeFrame','shadowCount','__BENCH_VISIBLE_PIXELS','id="vend-core"'):
+              assert needle in s,needle
+          module=s.rsplit('<script type="module">',1)[1].split('</script>',1)[0]
+          assert "fetch(" not in module
+          Path('/tmp/offline-v016.js').write_text(module)
+          PY
+          node --check /tmp/offline-v016.js
+      - name: Launch real browser and verify lit 3D geometry (not just route lines)
+        shell: bash
+        run: |
+          set -uo pipefail
+          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)
+          if [ -z "$CHROME" ]; then echo 'Chromium missing'; exit 3; fi
+          FILE="$(pwd)/benchmarks/NativeThreeBridge-v016-WebGL2-RENDER-FIX.html"
+          timeout 105s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+            --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
+            --disable-background-networking --no-first-run --virtual-time-budget=20000 \
+            --dump-dom "file://$FILE?autotest=1" \
+            > /tmp/v016-dom.html 2> /tmp/v016-chrome.log || true
+          grep -o 'data-ready="[^"]*"' /tmp/v016-dom.html | head || true
+          grep -o 'data-visible-pixels="[^"]*"' /tmp/v016-dom.html | head || true
+          grep -o 'data-drawn-triangles="[^"]*"' /tmp/v016-dom.html | head || true
+          tail -35 /tmp/v016-chrome.log || true
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          dom=Path('/tmp/v016-dom.html').read_text()
+          assert 'data-ready="true"' in dom,'HTML never started'
+          px=re.search(r'data-visible-pixels="(\d+)"',dom)
+          assert px,'No pixel evidence from WebGL (timed out or renderer failed)'
+          assert int(px.group(1))>=200, 'Background and path lines only: '+px.group(1)
+          assert 'data-fallback="true"' not in dom, 'Material fallback triggered: not a valid DX12 performance comparison'
+          triangles=re.search(r'data-drawn-triangles="(\d+)"',dom)
+          assert triangles and int(triangles.group(1))>100000, 'Missing original 3D meshes'
+          print('PASS: actual lit Three.js models visible; draw triangles:',triangles.group(1),'pixels:',px.group(1))
+          PY
+      - name: Upload browser diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-three-v016-visual-diagnostic
+          path: |
+            /tmp/v016-dom.html
+            /tmp/v016-chrome.log
+          retention-days: 7
+      - name: Attach corrected downloadable HTML to existing v0.15 release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v0.15.0 benchmarks/NativeThreeBridge-v016-WebGL2-RENDER-FIX.html --clobber
