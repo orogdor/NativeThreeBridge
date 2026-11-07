@@ -1,38 +1,35 @@
-# NativeThreeBridge — 1000 trees, A* armies, and per-soldier spotlights
+# NativeThreeBridge v0.10.0 — 10×10 forest + 500 soldiers/lights
 
-Native Windows DirectX 12 renderer using **real official Three.js in embedded QuickJS-NG**. No Chromium, Electron, WebView, browser, Node or Deno on the player's computer. This is a separate benchmark project; [Kuningriigid](https://github.com/orogdor/Kuningriigid) itself is unchanged.
+Windows-only native DirectX 12 prototype with official Three.js r181 inside embedded QuickJS-NG, no Chromium, Electron, WebView, browser, Node or Deno at runtime.
 
-## The new performance test
+## Stress-test scene
 
-- **1000 original Kuningriigid Sapling pines**, positioned deterministically across a 64×64 forest grid.
-- **Two opposing armies, 10 spearmen per side**, rendered using the original Kuningriigid `models-trellis-v262/odamees.glb` textured model (static mesh, no skeletal animation yet).
-- **20 independently computed A* routes** using 4-direction navigation around occupied tree cells. No paths through tree obstacles. The units follow waypoints over time, turning to face their movement direction.
-- Trees use two GPU-instanced draw batches (trunks and foliage). Both armies share their source mesh but are tinted red/blue and drawn in separate GPU batches.
-- **1020 genuine Three.js instance Matrix4 transforms** are passed to the native DX12 renderer, using a 64 KiB GPU constant buffer. The 1000 static tree transforms are cached; only the 20 moving unit transforms are updated in JS per frame.
-- JavaScript tests check 1000 distinct blocked cells, all A* routes, collision-free planned paths and movement over 180 frames. The Windows native smoke test verifies motion in embedded QuickJS as well.
+- 10×10 forest: 100 original Kuningriigid Sapling pine GLBs on 100 distinct navigation tiles.
+- Two opposing armies with 250 spearmen each: 500 real Kuningriigid odamees GLB instances.
+- 500 real THREE.SpotLight objects, one moving above each soldier, with warm/red or cool/blue color.
+- 500 individually calculated A* paths on a 64×64 navigation grid. Paths avoid tree obstacles; no combat or unit collision avoidance.
+- 600 actual Three.js Matrix4 instance transforms go to DirectX 12 per frame. The static 100 tree transforms are cached.
+- DX12 keeps all 500 dynamic lights but evaluates at most 16 nearest lights per 16×16 world-space illumination tile, preventing a 500-iteration pixel-shader loop.
+- 16 active 256×256 shadow-map slices (eight selected lights per army), rather than 500 full depth passes per frame. All 500 lights are present in the JS scene but only the 16 selected lights cast real-time depth-map shadows that frame.
+- Trees and armies use GPU instancing; pine foliage shadows retain the alpha cutout.
 
-## Shadow-casting soldier lights (new in v0.9)
+## Download and update
 
-Each of the 20 moving spearmen carries a **real Three.js `THREE.SpotLight`**, positioned 9.5 world units above the soldier and aimed straight down. The red army gets warm amber illumination; the blue army gets cool blue illumination. Spotlights and their targets follow each soldier's A* movement on every JavaScript frame.
+[Windows release ZIP](https://github.com/orogdor/NativeThreeBridge/releases/latest). Extract the entire ZIP keeping the game subdirectory:
 
-The native QuickJS bridge exports **20 light records** in addition to the 1020 Three.js instance matrices. The DX12 renderer now allocates a **20-layer 256×256 D32 shadow-map texture array** (one depth slice per light). For each light, it renders depth silhouettes of the 1000 trees and 20 soldiers, using the pine foliage texture's alpha mask so the foliage does not become a solid rectangular shadow. Its forward pixel shader accumulates up to 20 localized spotlights and tests the corresponding shadow depth layer.
+    NativeThree-Updater.exe    independent SHA-256 GitHub updater
+    NativeThree-Game.exe       separate native Three.js / QuickJS-NG / DX12 executable
+    game/scene.js              editable 10×10 forest and 500-unit JS code
+    installed-version.txt
 
-The implementation is deliberately a real shadow-map pipeline, **not painted dark blobs**. The 20 additional depth passes can lower performance, especially on low-end GPUs. The prototype still waits on a fence every frame and is not yet optimized to production quality. The shadow map HLSL compilation is verified separately in Windows CI; actual GPU shadow appearance and FPS on the user's computer require a manual test.
+Launch NativeThree-Game.exe without checking GitHub, or NativeThree-Updater.exe for independent per-file updates. NO-UPDATE.txt disables checking; PRESERVE-SCENE.txt protects locally modified scene.js. Close the game before updating. v0.7+ updater is compatible with this two-file layout.
 
-## Download / launch / customize
+Mouse drag rotates the camera; wheel zooms; Space pauses; Escape closes. FPS is in the title.
 
-[Download Windows x64 Releases](https://github.com/orogdor/NativeThreeBridge/releases/latest). Extract the complete ZIP to a writable folder.
+## Testing and limitations
 
-```text
-NativeThree-Updater.exe    checks GitHub Releases for updated game EXE + scene.js
-NativeThree-Game.exe       standalone native DX12 + QuickJS-NG + Three.js runtime
-game/scene.js              editable 1000-tree / two-army A* pathfinding test
-```
+GitHub Actions verifies JavaScript Three.js structure, 100 distinct tree tiles, 500 A* routes, 500 moving SpotLights, native QuickJS matrices, the MSVC Windows EXE build and the three HLSL shader entries.
 
-Start `NativeThree-Game.exe` directly to skip the update check. Or start `NativeThree-Updater.exe` to download only changed game/scene files (independent SHA-256 hashes) and launch the game. `NO-UPDATE.txt` disables checking; `PRESERVE-SCENE.txt` protects local edits to `game/scene.js` from updates.
+Real GPU shadow appearance and FPS still require a Windows test. General Three.js WebGLRenderer, GLTFLoader, generic geometry uploads, all materials, full animations, HTML/DOM and UI remain unsupported.
 
-Left mouse drag: orbit. Mouse wheel: zoom. Space: pause. Esc: close. FPS is displayed in the window title.
-
-**Limitations:** this is a native renderer prototype using true Three.js scene objects and matrix transforms, but it does **not** implement a generic Three.js `WebGLRenderer`, `GLTFLoader`, all materials/shaders, arbitrary dynamic geometry or animated skeletons. These model vertices and textures are bundled into the EXE during the GitHub Actions build. The A* paths are planned per soldier; dynamic unit-vs-unit avoidance, combat AI, and skeletal animations are not implemented. GitHub CI cannot verify visual GPU output on your PC.
-
-Source GLBs: `assets/sapling-trees/pine_01/mid.glb` and `models-trellis-v262/odamees.glb` from the pinned Kuningriigid repo commit.
+Original pinned GLBs in the unchanged [Kuningriigid repository](https://github.com/orogdor/Kuningriigid): models-trellis-v262/odamees.glb and assets/sapling-trees/pine_01/mid.glb.

@@ -1,25 +1,22 @@
-NativeThreeBridge v0.9 - 1000 trees, A* armies, and 20 soldier spotlights
+NativeThreeBridge v0.10.0 — 10x10 FOREST + 500 SOLDIERS/LIGHTS
 ===============================================================
-NativeThree-Game.exe       DirectX12 renderer + embedded official Three.js
-NativeThree-Updater.exe    independent GitHub update checker
-game\scene.js             editable forest generation + A* pathfinding
+100 original pine trees arranged 10 by 10.
+Two 250-unit spearman armies; 500 A* obstacle-avoiding routes.
+500 live moving Three.js SpotLights (one per soldier).
+DX12 uses a 16x16 spatial light grid, 16 nearest lights per tile.
+Only 16 active real-time depth shadow maps per frame (8 per army).
 
-Test contents:
- - 1000 original Kuningriigid Sapling pine trees
- - Red army: 10 original spearmen; blue army: 10 original spearmen
- - Every soldier calculates an A* path around tree obstacles on a 64x64 grid
- - Each of the 20 soldiers has an overhead warm/red or cool/blue spotlight
- - Every moving spotlight renders a dedicated 256x256 shadow map
- - Tree foliage uses alpha-tested shadow silhouettes; trees and soldiers cast shadows
- - Both armies move continuously; GPU instancing and FPS title enabled
+Extract complete ZIP; preserve game/scene.js next to the two EXEs:
+  NativeThree-Updater.exe — independent GitHub update checker
+  NativeThree-Game.exe    — native DX12 + embedded official Three.js
+  game\scene.js           — editable Three.js pathfinding and scene
 
-Unpack the complete ZIP preserving game\scene.js.
-Run NativeThree-Game.exe for direct offline gameplay; updater is optional.
-Run NativeThree-Updater.exe to download EXE and JS independently if changed.
-NO-UPDATE.txt disables updates; PRESERVE-SCENE.txt preserves edited JS.
-Mouse drag to orbit; mouse wheel zoom; Space pauses; Esc quits.
+v0.7+ updater should update game EXE and scene.js independently.
+Close old game first; remove PRESERVE-SCENE.txt if you want new JS.
+NO-UPDATE.txt disables checking. PRESERVE-SCENE.txt keeps custom JS.
+Left mouse drag = orbit. Wheel = zoom. Space = pause. Esc = exit.
 
-This is NOT a general drop-in WebGLRenderer/GLTFLoader compatibility layer.
-Models are embedded during the Windows build. Soldiers have no skeletal walk cycle.
-GitHub validates Windows compilation and JS pathfinding, but real DX12 output
-must still be verified on the user's GPU.
+Current limitation: 500 moving lights but only 16 selected lights
+have live depth-shadow maps at a given time. Other lights are
+distance-culled and unshadowed to protect FPS.
+Actual Windows GPU appearance/FPS still needs checking.
