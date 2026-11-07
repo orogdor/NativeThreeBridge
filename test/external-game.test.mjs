@@ -40,6 +40,11 @@ test('initializes 1000 randomized trees, 500 spotlights and ZERO precomputed sol
   assert.equal(d.routes,0);
   assert.equal(d.searches,0);
   assert.equal(d.unplanned,500);
+  const native=x.__nativeThreeNavStats();
+  assert.equal(native.searches,0);
+  assert.equal(native.planned,0);
+  assert.equal(native.replans,0);
+  assert.equal(native.blockedMoves,0);
   assert.ok(nav.paths.every(path=>path.length===0),'no A* routes calculated at load time');
   assert.ok(nav.planCounts.every(count=>count===0));
   safePositions(nav);
@@ -92,6 +97,10 @@ test('all soldiers individually plan while running and nobody shares occupied/re
   const d=x.__nativeThreeDiagnostics();
   assert.equal(d.unplanned,0,'every soldier must eventually request its own A* route');
   assert.ok(d.searches>=500,'must run a separate search per soldier');
+  const native=x.__nativeThreeNavStats();
+  assert.equal(native.planned,500);
+  assert.equal(native.searches,d.searches);
+  assert.equal(native.replans,d.replans);
   assert.ok(d.moved>450,'army must visibly move');
   assert.ok(d.routeSteps>0);
   safePositions(x.__nativeNavTest());
