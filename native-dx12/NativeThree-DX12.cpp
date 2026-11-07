@@ -27,7 +27,9 @@ using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
-static const UINT SHADOW_COUNT=20, SHADOW_SIZE=256;
+static const UINT SHADOW_COUNT=16, SHADOW_SIZE=256;
+static const UINT TREE_COUNT=100, LIGHT_COUNT=500, PER_ARMY=250, INSTANCE_COUNT=600;
+static const UINT GRID_DIM=16, MAX_CELL_LIGHTS=16;
 static HWND gWindow=nullptr;
 static float gYaw=0.45f, gPitch=0.90f, gDistance=270.0f;
 static bool gDrag=false,gPause=false;
@@ -45,7 +47,8 @@ static ComPtr<ID3D12GraphicsCommandList> gCmd;
 static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
-static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gLightsCB,gShadowCameraCB,gShadowDepth;
+static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static UINT gShadowSourceIndices[SHADOW_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
 static UINT gRTVStep=0,gSRVStep=0;
@@ -230,76 +233,88 @@ cbuffer Draw : register(b1) {
     float gAlphaCut;
     float4 gTint;
 };
-cbuffer InstanceTransforms : register(b2) { float4x4 gInstances[1020]; };
+cbuffer InstanceTransforms : register(b2) { float4x4 gInstances[600]; };
 cbuffer Lights : register(b3) {
-    float4x4 gLightVP[20];
-    float4 gLightPosRadius[20];
-    float4 gLightColorIntensity[20];
+    float4x4 gLightVP[16];
+    float4 gLightPosRadius[500];
+    float4 gLightColorIntensity[500];
+    float4 gShadowSlots[500];
+};
+cbuffer LightGrid : register(b4) {
+    uint4 gGridCounts[64];
+    uint4 gGridIndices[1024];
 };
 Texture2D gTexture : register(t0);
 Texture2DArray gShadowDepthTexture : register(t1);
 SamplerState gSampler : register(s0);
 SamplerState gShadowSampler : register(s1);
-struct Vin {float3 p:POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
+struct Vin { float3 p:POSITION; float3 n:NORMAL; float2 uv:TEXCOORD0; };
 struct Vout {
     float4 p:SV_POSITION;
     float3 n:NORMAL;
     float2 uv:TEXCOORD0;
     float3 worldPos:TEXCOORD1;
 };
-Vout VSMain(Vin v,uint instance:SV_InstanceID) {
+Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     Vout o;
-    float3 p = v.p*gScale + float3(0,gYOffset,0);
-    float3 normal = v.n;
-    if(gKind != 2) {
-        uint offset = gKind == 1 ? 1000 : (gKind == 3 ? 1010 : 0);
-        p = mul(gInstances[instance + offset], float4(v.p*gScale,1)).xyz
-          + float3(0,gYOffset,0);
-        normal = mul((float3x3)gInstances[instance + offset],v.n);
+    float3 p=v.p*gScale+float3(0,gYOffset,0);
+    float3 n=v.n;
+    if(gKind!=2){
+        uint offset=gKind==1?100:(gKind==3?350:0);
+        p=mul(gInstances[instance+offset],float4(v.p*gScale,1)).xyz+
+          float3(0,gYOffset,0);
+        n=mul((float3x3)gInstances[instance+offset],v.n);
     }
     o.p=mul(float4(p,1),gViewProjection);
-    o.n=normalize(normal);
+    o.n=normalize(n);
     o.uv=v.uv;
     o.worldPos=p;
     return o;
 }
-// This depth-only pixel shader discards holes in the pine foliage cards,
-// so foliage casts silhouette shadows, not solid rectangular shadows.
-void PSShadow(Vout i) {
-    if(gAlphaCut>0) clip(gTexture.Sample(gSampler,i.uv).a-gAlphaCut);
+void PSShadow(Vout v) {
+    if(gAlphaCut>0) clip(gTexture.Sample(gSampler,v.uv).a-gAlphaCut);
 }
-float visibilityFromShadowMap(float3 pos,uint lightIndex) {
-    float4 projected = mul(float4(pos,1),gLightVP[lightIndex]);
-    if(projected.w < 0.001) return 1.0;
-    float3 ndc = projected.xyz/projected.w;
+float shadowVisibility(float3 worldPos,uint li) {
+    int slot=(int)gShadowSlots[li].x;
+    if(slot<0 || slot>=16) return 1;
+    float4 shadowPos=mul(float4(worldPos,1),gLightVP[slot]);
+    if(shadowPos.w<=0.001) return 1;
+    float3 ndc=shadowPos.xyz/shadowPos.w;
     float2 uv=float2(ndc.x*0.5+0.5,0.5-ndc.y*0.5);
-    if(any(uv<0.0) || any(uv>1.0) || ndc.z<0.0 || ndc.z>1.0) return 1.0;
-    float depth=gShadowDepthTexture.SampleLevel(
-        gShadowSampler,float3(uv,(float)lightIndex),0).r;
-    return (ndc.z-0.0015<=depth)?1.0:0.16;
+    if(any(uv<0) || any(uv>1) || ndc.z<0 || ndc.z>1) return 1;
+    float sampled=gShadowDepthTexture.SampleLevel(
+        gShadowSampler,float3(uv,(float)slot),0).r;
+    return (ndc.z-0.0015<=sampled)?1.0:0.20;
 }
-float4 PSMain(Vout i):SV_TARGET {
-    float4 albedo=gTexture.Sample(gSampler,i.uv)*gTint;
-    if(gAlphaCut>0) clip(albedo.a-gAlphaCut);
-    float3 n=normalize(i.n);
-    float daylight=0.30+0.40*abs(dot(n,normalize(float3(0.32,0.84,0.41))));
-    float3 illumination=daylight.xxx;
-    [loop] for(uint li=0;li<20;li++) {
-        float3 toLight=gLightPosRadius[li].xyz-i.worldPos;
-        float radius=gLightPosRadius[li].w;
+float4 PSMain(Vout v):SV_TARGET {
+    float4 albedo=gTexture.Sample(gSampler,v.uv)*gTint;
+    if(gAlphaCut>0)clip(albedo.a-gAlphaCut);
+    float3 normal=normalize(v.n);
+    float day=0.20+0.34*abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
+    float3 illumination=day.xxx;
+    // CPU bins all 500 moving lights into 16x16 world-space tiles.
+    // Only the nearest 16 in this tile are evaluated per pixel.
+    int gx=clamp((int)floor((v.worldPos.x+96.0)/12.0),0,15);
+    int gz=clamp((int)floor((v.worldPos.z+96.0)/12.0),0,15);
+    uint cell=(uint)(gz*16+gx);
+    uint count=gGridCounts[cell/4][cell%4];
+    [loop] for(uint k=0;k<count;k++){
+        uint index=gGridIndices[cell*4+k/4][k%4];
+        if(index>=500)continue;
+        float3 toLight=gLightPosRadius[index].xyz-v.worldPos;
         float dist=length(toLight);
-        if(dist>radius || dist<0.01) continue;
-        // Each Three.js SpotLight points straight down from above the soldier.
-        float cone=toLight.y/dist;
-        if(cone<0.51)continue;
-        float coneFade=smoothstep(0.51,0.72,cone);
-        float diffuse=saturate(dot(n,toLight/dist));
-        if(diffuse<=0)continue;
-        float attenuation=saturate(1.0-dist/radius);
-        float visible=visibilityFromShadowMap(i.worldPos,li);
-        illumination+=gLightColorIntensity[li].rgb
-            *gLightColorIntensity[li].a*(attenuation*attenuation)
-            *coneFade*diffuse*visible*0.62;
+        float radius=gLightPosRadius[index].w;
+        if(dist<0.001 || dist>=radius)continue;
+        float3 direction=toLight/dist;
+        float cone=direction.y;
+        if(cone<0.5)continue;
+        float diff=saturate(dot(normal,direction));
+        if(diff<=0)continue;
+        float fade=saturate((cone-0.5)/0.22);
+        float falloff=saturate(1.0-dist/radius);
+        float vis=shadowVisibility(v.worldPos,index);
+        illumination+=gLightColorIntensity[index].rgb*
+            (gLightColorIntensity[index].a*falloff*falloff*fade*diff*vis*0.42);
     }
     return float4(saturate(albedo.rgb*illumination),1);
 }
