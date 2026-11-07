@@ -86256,7 +86256,7 @@ function activateFallback(reason){
  }
  $('measure').disabled=true;
  msg('DIAGNOSTIKA: '+reason+'. Valgustuseta varurežiim; selle FPS ei ole DX12-ga võrreldav.');
- window.__BENCH_FALLBACK=true;
+ window.__BENCH_FALLBACK=true;document.body.dataset.fallback='true';
 }
 function tick(now){
  if(!running)return;requestAnimationFrame(tick);
@@ -86279,6 +86279,8 @@ function tick(now){
   let nonBackground=0;
   for(let i=0;i<pixels.length;i+=4){if(Math.abs(pixels[i]-28)+Math.abs(pixels[i+1]-42)+Math.abs(pixels[i+2]-60)>48)nonBackground++}
   window.__BENCH_VISIBLE_PIXELS=nonBackground;
+  document.body.dataset.visiblePixels=String(nonBackground);
+  document.body.dataset.drawnTriangles=String(renderer.info.render.triangles);
   if(nonBackground<200)activateFallback('3D-geomeetria puudub pildilt ('+nonBackground+' nähtavat pikslit)');
  }
  cpu=performance.now()-begin;lastFrame=dt*1000;
