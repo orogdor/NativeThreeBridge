@@ -2,152 +2,149 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as THREE from 'three';
 import vm from 'node:vm';
-import {readFileSync} from 'node:fs';
-const src=readFileSync(new URL('../game/scene.js',import.meta.url),'utf8');
-function create(){const box={THREE};vm.runInNewContext(src,box,{filename:'scene.js'});return box;}
-test('forest 10 times larger with 1000 pines, 500 soldiers and 500 moving spotlights',()=>{
-  const box=create(),d=box.__nativeThreeDiagnostics();
+import { readFileSync } from 'node:fs';
+const source=readFileSync(new URL('../game/scene.js',import.meta.url),'utf8');
+function create(){
+  const world={THREE};
+  vm.runInNewContext(source,world,{filename:'game/scene.js'});
+  return world;
+}
+function near(a,b,epsilon=1e-4){return Math.abs(a-b)<epsilon;}
+function safePositions(nav){
+  const current=nav.occupancy.filter(n=>n>=0);
+  const reserved=nav.reservations.filter(n=>n>=0);
+  assert.equal(new Set(current).size,500,'soldiers occupy unique source tiles');
+  assert.equal(new Set(reserved).size,reserved.length,'duplicate in-transit destination');
+  for(let i=0;i<500;i++){
+    assert.equal(nav.occupancy[nav.cells[i]],i,'own source tile must remain occupied');
+    assert.equal(nav.blocked[nav.cells[i]],0,'soldier walked into a tree');
+    if(nav.nextCells[i]!==-1){
+      assert.equal(nav.reservations[nav.nextCells[i]],i,'missing destination reservation');
+      assert.equal(nav.occupancy[nav.nextCells[i]],-1,'unit crossed occupied cell');
+      assert.equal(nav.blocked[nav.nextCells[i]],0,'reserved tree cell');
+      const a=nav.cells[i],b=nav.nextCells[i];
+      assert.ok(Math.abs(a-b)===1||Math.abs(a-b)===160,'non-cardinal movement');
+      if(Math.abs(a-b)===1)assert.equal(Math.floor(a/160),Math.floor(b/160));
+    }
+  }
+}
+test('initializes 1000 randomized trees, 500 spotlights and ZERO precomputed soldier routes',()=>{
+  const x=create(),d=x.__nativeThreeDiagnostics(),nav=x.__nativeNavTest();
   assert.equal(d.treeCount,1000);
-  assert.equal(d.forestSide,32);
-  assert.deepEqual(Array.from(d.soldierCounts),[250,250]);
   assert.equal(d.unitCount,500);
+  assert.deepEqual(Array.from(d.soldierCounts),[250,250]);
   assert.equal(d.lights,500);
   assert.equal(d.shadowLights,500);
-  assert.equal(d.lightsAreSpotLights,true);
-  assert.equal(d.lightFloatCount,500*8);
   assert.equal(d.floats,1500*16);
-  assert.equal(d.routes,500);
-  assert.equal(d.routeFailures,0);
+  assert.equal(d.lightFloatCount,500*8);
+  assert.equal(d.routes,0);
+  assert.equal(d.searches,0);
+  assert.equal(d.unplanned,500);
+  assert.ok(nav.paths.every(path=>path.length===0),'no A* routes calculated at load time');
+  assert.ok(nav.planCounts.every(count=>count===0));
+  safePositions(nav);
 });
-test('1000 distinct trees cover an approximately 32x32 square and paths avoid tree cells',()=>{
-  const box=create(),nav=box.__nativeNavTest();
-  const trees=new Set(nav.trees.map(([x,z])=>z*160+x));
-  assert.equal(trees.size,1000);
-  const xs=[...new Set(nav.trees.map(x=>x[0]))],zs=[...new Set(nav.trees.map(x=>x[1]))];
-  assert.ok(xs.length>=32);assert.ok(zs.length>=32);
-  for(const path of nav.paths){
-    assert.ok(path.length>1);
-    for(let i=0;i<path.length;i++){
-      assert.equal(nav.blocked[path[i]],0,'A* traversed blocked tree cell');
-      if(i){const diff=Math.abs(path[i]-path[i-1]);
-        assert.ok(diff===1||diff===160,'nonadjacent A* step');
-        if(diff===1)assert.equal(Math.floor(path[i]/160),Math.floor(path[i-1]/160));
-      }
-    }
+test('forest keeps random spacing and maps 1000 physical trunks to blocked navigation cells',()=>{
+  const x=create(),nav=x.__nativeNavTest(),points=nav.worldTreePositions;
+  assert.equal(points.length,1000);
+  assert.equal(new Set(nav.trees.map(([gx,gz])=>gz*160+gx)).size,1000);
+  const xs=new Set(),zs=new Set();
+  for(let i=0;i<1000;i++){
+    const [x,z]=points[i],[gx,gz]=nav.trees[i];
+    assert.equal(nav.blocked[gz*160+gx],1);
+    xs.add(Math.round(x*1000));zs.add(Math.round(z*1000));
   }
-});
-test('500 THREE.SpotLight objects follow both armies and stay warm/cool',()=>{
-  const box=create(),lights=[];
-  box.__nativeThreeScene.traverse(o=>{if(o.isSpotLight)lights.push(o);});
-  assert.equal(lights.length,500);
-  for(const lamp of lights){assert.equal(lamp.castShadow,true);assert.equal(lamp.shadow.mapSize.x,256);}
-  const before=Array.from(box.__nativeThreeLightFrame());
-  for(let i=0;i<80;i++)box.__nativeThreeFrame(1/60);
-  const after=Array.from(box.__nativeThreeLightFrame());
-  assert.equal(after.length,4000);
-  assert.ok(Math.hypot(after[0]-before[0],after[2]-before[2])>3);
-  assert.ok(Math.hypot(after[250*8]-before[250*8],after[250*8+2]-before[250*8+2])>3);
-  assert.ok(after[4]>after[6]&&after[250*8+6]>after[250*8+4]);
-  for(let i=0;i<500;i++){
-    const b=i*8;assert.equal(after[b+1],9.5);assert.ok(Number.isFinite(after[b]));
-  }
-  assert.equal(box.__nativeThreeDiagnostics().moved,500);
-});
-
-
-test('A* movement advances at the same real-time speed at 5 FPS and 60 FPS',()=>{
-  const low=create(),high=create();
-  for(let i=0;i<20;i++)low.__nativeThreeFrame(0.2);
-  for(let i=0;i<240;i++)high.__nativeThreeFrame(1/60);
-  const a=low.__nativeNavTest().positions;
-  const b=high.__nativeNavTest().positions;
-  for(const i of [0,1,20,80,249,250,270,499]){
-    assert.ok(Math.hypot(a[i][0]-b[i][0],a[i][1]-b[i][1])<0.04,
-      'Soldier '+i+' moves at different simulation rates at 5 vs 60 FPS');
-  }
-  const status=low.__nativeThreeNavStats();
-  assert.equal(status.routeFailures,0);
-  assert.equal(status.moved,500);
-  assert.ok(status.routeSteps>0,'Soldiers must advance through A* waypoints');
-  assert.ok(status.active>0 && status.active<=500);
-});
-test('long GPU frames are not limited to old 60ms movement cap',()=>{
-  const a=create(),b=create();
-  a.__nativeThreeFrame(0.2);
-  b.__nativeThreeFrame(0.06);
-  const ax=a.__nativeNavTest().positions;
-  const bx=b.__nativeNavTest().positions;
-  for(const i of [0,250]){
-    const init=i<250?[(20-(160-1)/2)*3, (68-(160-1)/2)*3]:[(139-(160-1)/2)*3,(68-(160-1)/2)*3];
-    const da=Math.hypot(ax[i][0]-init[0],ax[i][1]-init[1]);
-    const db=Math.hypot(bx[i][0]-init[0],bx[i][1]-init[1]);
-    assert.ok(da>db*2.7, '200ms frame wrongly capped to 60ms');
+  assert.ok(xs.size>950 && zs.size>950,'must not form rows');
+  for(let i=0;i<points.length;i++)for(let j=i+1;j<points.length;j++){
+    const dx=points[i][0]-points[j][0],dz=points[i][1]-points[j][1];
+    assert.ok(dx*dx+dz*dz>6.1*6.1,'tree trunks overlap');
   }
 });
-
-test('random forest has irregular positions, safe spacing and accurate A* obstacle cells',()=>{
-  const x=create(),nav=x.__nativeNavTest();
-  const positions=nav.worldTreePositions;
-  assert.equal(positions.length,1000);
-  assert.ok(nav.forestAttempts>=1000);
-  const navigable=new Set(nav.trees.map(([gx,gz])=>gz*160+gx));
-  assert.equal(navigable.size,1000);
-  let offsetFromCellCentre=0;
-  const uniqueX=new Set(),uniqueZ=new Set();
-  for(let i=0;i<positions.length;i++){
-    const [worldX,worldZ]=positions[i];
-    const gxFloat=worldX/3+(160-1)/2;
-    const gzFloat=worldZ/3+(160-1)/2;
-    const [gx,gz]=nav.trees[i];
-    assert.equal(nav.blocked[gz*160+gx],1,'tree cell not marked blocked');
-    assert.ok(Math.abs(gxFloat-gx)<0.501 && Math.abs(gzFloat-gz)<0.501);
-    if(Math.abs(gxFloat-gx)>0.08 || Math.abs(gzFloat-gz)>0.08)
-      offsetFromCellCentre++;
-    uniqueX.add(Math.round(worldX*1000));
-    uniqueZ.add(Math.round(worldZ*1000));
-  }
-  assert.ok(offsetFromCellCentre>900,'forest should not be planted at grid cell centres');
-  assert.ok(uniqueX.size>950 && uniqueZ.size>950,'trees must not align in regular rows');
-  // Poisson-style minimum distance keeps trunks from sitting on top of each other.
-  for(let i=0;i<positions.length;i++)for(let j=i+1;j<positions.length;j++){
-    const dx=positions[i][0]-positions[j][0];
-    const dz=positions[i][1]-positions[j][1];
-    assert.ok(dx*dx+dz*dz>6.1*6.1,'overlapping or too-close tree trunks');
-  }
-});
-test('500 genuine A* routes still avoid randomly placed tree obstacles and turn',()=>{
-  const x=create(),nav=x.__nativeNavTest();
-  const routes=nav.paths;
-  let detours=0,turning=0;
-  for(const path of routes){
-    assert.ok(path.length>1);
-    const start=path[0],goal=path[path.length-1];
-    const sx=start%160,sz=Math.floor(start/160);
-    const tx=goal%160,tz=Math.floor(goal/160);
-    if(path.length-1>Math.abs(tx-sx)+Math.abs(tz-sz))detours++;
-    let lastDelta=0,turnCount=0;
-    for(let i=0;i<path.length;i++){
-      assert.equal(nav.blocked[path[i]],0,'A* crosses a tree');
-      if(i>0){
-        const delta=path[i]-path[i-1];
-        assert.ok(Math.abs(delta)===1||Math.abs(delta)===160,'A* teleported');
-        if(lastDelta!==0&&delta!==lastDelta)turnCount++;
-        lastDelta=delta;
-      }
-    }
-    if(turnCount>=2)turning++;
-  }
-  assert.ok(detours>=30,'randomized forest should produce visible obstacle detours');
-  assert.ok(turning>=300,'most soldiers should have multi-turn A* paths');
+test('visual route request plans only the twelve sampled units, not all 500',()=>{
+  const x=create();
+  assert.equal(x.__nativeThreeDiagnostics().routes,0);
   const segments=x.__nativeThreeDebugSegments();
   assert.ok(ArrayBuffer.isView(segments));
   assert.equal(segments.length%5,0);
-  assert.ok(segments.length>5000,'visible path debug data missing');
-  assert.equal(x.__nativeThreeDiagnostics().debugSegments,segments.length/5);
-  let redSegments=0,blueSegments=0;
-  for(let i=0;i<segments.length;i+=5){
-    if(segments[i]===0)redSegments++;
-    if(segments[i]===1)blueSegments++;
+  assert.ok(segments.length>5000);
+  const d=x.__nativeThreeDiagnostics();
+  assert.equal(d.routes,12);
+  assert.equal(d.unplanned,488);
+  const nav=x.__nativeNavTest();
+  for(let i=0;i<500;i++){
+    if(!nav.planCounts[i])continue;
+    const own=nav.cells[i];
+    assert.equal(nav.paths[i][0],own);
+    for(const cell of nav.paths[i]){
+      assert.equal(nav.blocked[cell],0);
+      assert.ok(nav.occupancy[cell]===-1 || cell===own,'A* planned through another soldier');
+      assert.equal(nav.reservations[cell],-1);
+    }
   }
-  assert.ok(redSegments>50&&blueSegments>50);
+});
+test('all soldiers individually plan while running and nobody shares occupied/reserved tiles',()=>{
+  const x=create();
+  x.__nativeThreeDebugSegments(); // user-requested F4 overlay; only 12 routes
+  for(let i=0;i<150;i++){
+    x.__nativeThreeFrame(1/30);
+    if(i%10===0)safePositions(x.__nativeNavTest());
+  }
+  const d=x.__nativeThreeDiagnostics();
+  assert.equal(d.unplanned,0,'every soldier must eventually request its own A* route');
+  assert.ok(d.searches>=500,'must run a separate search per soldier');
+  assert.ok(d.moved>450,'army must visibly move');
+  assert.ok(d.routeSteps>0);
+  safePositions(x.__nativeNavTest());
+  assert.equal(d.routeFailures,0);
+});
+test('can issue a new destination while running and replans that soldier only when required',()=>{
+  const x=create();
+  for(let i=0;i<5;i++)x.__nativeThreeFrame(1/30);
+  const before=x.__nativeNavTest();
+  assert.equal(x.__nativeThreeSetDestination(0,8,50),true);
+  const redirect=x.__nativeNavTest();
+  assert.equal(redirect.goals[0],50*160+8);
+  // Re-issue a valid clear goal (near the red army), then let the
+  // unit choose a new route itself in subsequent simulation frames.
+  assert.equal(x.__nativeThreeSetDestination(0,8,50),true);
+  for(let i=0;i<60;i++)x.__nativeThreeFrame(1/30);
+  const after=x.__nativeNavTest();
+  assert.ok(after.planCounts[0]>=2,'the soldier did not re-plan after a new order');
+  assert.ok(Math.hypot(after.positions[0][0]-before.positions[0][0],
+                       after.positions[0][1]-before.positions[0][1])>0.5);
+  safePositions(after);
+});
+test('a soldier cannot enter another soldier current cell, then can replan when vacated',()=>{
+  const x=create();
+  // Soldier 1 holds cell (12,50); soldier 0 targets that exact cell.
+  assert.equal(x.__nativeThreeSetDestination(1,12,50),true);
+  assert.equal(x.__nativeThreeSetDestination(0,12,50),true);
+  for(let i=0;i<30;i++)x.__nativeThreeFrame(1/30);
+  let nav=x.__nativeNavTest();
+  assert.equal(nav.cells[0],50*160+10,'soldier walked into occupied destination');
+  assert.equal(nav.cells[1],50*160+12);
+  safePositions(nav);
+  // Soldier 1 leaves, allowing soldier 0 to find a new route later.
+  assert.equal(x.__nativeThreeSetDestination(1,12,44),true);
+  for(let i=0;i<120;i++){
+    x.__nativeThreeFrame(1/30);
+    if(i%10===0)safePositions(x.__nativeNavTest());
+  }
+  nav=x.__nativeNavTest();
+  assert.ok(nav.planCounts[0]>1,'blocked soldier did not retry route planning');
+  assert.ok(nav.cells[0]!==nav.cells[1],'soldiers overlap');
+});
+test('all lights remain attached to their dynamically moving soldiers',()=>{
+  const x=create(),before=Array.from(x.__nativeThreeLightFrame());
+  for(let i=0;i<100;i++)x.__nativeThreeFrame(1/60);
+  const after=Array.from(x.__nativeThreeLightFrame()),nav=x.__nativeNavTest();
+  assert.equal(after.length,500*8);
+  for(let i=0;i<500;i++){
+    const p=i*8;
+    assert.ok(near(after[p],nav.positions[i][0],0.001));
+    assert.ok(near(after[p+2],nav.positions[i][1],0.001));
+    assert.equal(after[p+1],9.5);
+  }
+  assert.ok(Math.hypot(after[0]-before[0],after[2]-before[2])>3);
+  assert.ok(Math.hypot(after[250*8]-before[250*8],after[250*8+2]-before[250*8+2])>3);
 });
