@@ -10,7 +10,8 @@ test('native DX12 backend renders 1000 trees and 500 instanced soldiers with spl
   assert.match(dx,/INSTANCE_COUNT=1500/);
   assert.match(dx,/TREE_COUNT=1000/);
   assert.match(dx,/PER_ARMY=250/);
-  assert.match(dx,/gSoldierCB=uploadBuffer\(nullptr,32768\)/);
+  assert.match(dx,/gSoldierBuffers\[frame\]=uploadBuffer\(nullptr,32768\)/);
+  assert.match(dx,/gSoldierCB=gSoldierBuffers\[back\]/);
   assert.match(dx,/gInstancesCB=uploadBuffer\(nullptr,65536\)/);
   assert.match(dx,/p==1\|\|p==2\?TREE_COUNT:PER_ARMY/);
 });

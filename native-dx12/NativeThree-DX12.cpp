@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <vector>
+#include <algorithm>
 #include "three_js_host.h"
 
 #pragma comment(lib,"d3d12.lib")
@@ -38,10 +39,13 @@ static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
 static bool gShowDebugPaths=true;
 static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
+static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
 static UINT gStatFrames=0;
+static wchar_t gAdapterName[128]=L"Unknown GPU";
+static bool gUsingWARP=false;
 
 static ComPtr<ID3D12Device> gDevice;
 static ComPtr<ID3D12CommandQueue> gQueue;
@@ -59,8 +63,17 @@ static ComPtr<ID3D12Resource> gDebugPathVB;
 static D3D12_VERTEX_BUFFER_VIEW gDebugPathVBV{};
 static UINT gDebugRedVertices=0,gDebugBlueVertices=0;
 static UINT gShadowSourceIndices[SHADOW_COUNT]{};
+static UINT gShadowVisibleCounts[SHADOW_COUNT][3]{};
+static ComPtr<ID3D12Resource> gShadowIndexBuffers[FRAME_COUNT],gShadowIndexCB;
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowIndexSRV[FRAME_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
+struct RetiredResource { UINT64 fenceValue; ComPtr<ID3D12Resource> resource; };
+static std::vector<RetiredResource> gRetiredResources;
+static ComPtr<ID3D12CommandAllocator> gFrameAllocators[FRAME_COUNT];
+static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_COUNT],
+    gLightBuffers[FRAME_COUNT],gGridBuffers[FRAME_COUNT],gShadowCameraBuffers[FRAME_COUNT];
+static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{};
@@ -69,7 +82,7 @@ static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
 struct Vertex {float x,y,z,nx,ny,nz,u,v;};
 struct MeshHeader {char magic[4];uint32_t vertices,indices,reserved;};
-struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];};
+struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];UINT shadowOffset=0,shadowPass=0;};
 struct Mesh {
     ComPtr<ID3D12Resource> vertices,indices,texture;
     D3D12_VERTEX_BUFFER_VIEW vbv={};
@@ -128,6 +141,27 @@ static void waitGPU() {
         check(gFence->SetEventOnCompletion(value,gFenceEvent),"Fence event");
         WaitForSingleObject(gFenceEvent,INFINITE);
     }
+}
+// Static geometry lives in GPU-local DEFAULT memory; upload heaps are staging only.
+static ComPtr<ID3D12Resource> staticGpuBuffer(const void *bytes,UINT64 length,
+                                              D3D12_RESOURCE_STATES finalState) {
+    ComPtr<ID3D12Resource> gpu;
+    auto heap=heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc=bufferDescription(length);
+    check(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+          D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&gpu)),
+          "Create GPU-local mesh buffer");
+    auto staging=uploadBuffer(bytes,length);
+    check(gAllocator->Reset(),"Reset static mesh upload allocator");
+    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset static mesh upload commands");
+    gCmd->CopyBufferRegion(gpu.Get(),0,staging.Get(),0,length);
+    auto barrier=transition(gpu.Get(),D3D12_RESOURCE_STATE_COPY_DEST,finalState);
+    gCmd->ResourceBarrier(1,&barrier);
+    check(gCmd->Close(),"Close static mesh upload commands");
+    ID3D12CommandList *lists[]={gCmd.Get()};
+    gQueue->ExecuteCommandLists(1,lists);
+    waitGPU(); // Initialization only: GPU must complete copy before releasing staging.
+    return gpu;
 }
 static const BYTE *resourceBytes(int id,DWORD *size) {
     HRSRC res=FindResourceW(NULL,MAKEINTRESOURCEW(id),RT_RCDATA);
@@ -207,8 +241,10 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
        sizeof(h)+vertexBytes+indexBytes!=size)
         fatal("Packed mesh invalid",E_INVALIDARG);
     Mesh &m=gMesh[meshIndex];
-    m.vertices=uploadBuffer(raw+sizeof(h),vertexBytes);
-    m.indices=uploadBuffer(raw+sizeof(h)+vertexBytes,indexBytes);
+    m.vertices=staticGpuBuffer(raw+sizeof(h),vertexBytes,
+                               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m.indices=staticGpuBuffer(raw+sizeof(h)+vertexBytes,indexBytes,
+                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
     m.vbv.BufferLocation=m.vertices->GetGPUVirtualAddress();
     m.vbv.SizeInBytes=(UINT)vertexBytes;
     m.vbv.StrideInBytes=sizeof(Vertex);
@@ -250,6 +286,7 @@ static void createDebugRouteGeometry() {
     // Some units may reach their goal; one army having no remaining route
     // is normal and must not crash the renderer.
     if(red.empty()&&blue.empty()){
+        if(gDebugPathVB)gRetiredResources.push_back({gFenceValue,gDebugPathVB});
         gDebugPathVB.Reset();
         gDebugRedVertices=0;gDebugBlueVertices=0;
         return;
@@ -258,6 +295,7 @@ static void createDebugRouteGeometry() {
     gDebugBlueVertices=(UINT)blue.size();
     red.insert(red.end(),blue.begin(),blue.end());
     const UINT64 bytes=(UINT64)red.size()*sizeof(Vertex);
+    if(gDebugPathVB)gRetiredResources.push_back({gFenceValue,gDebugPathVB});
     gDebugPathVB=uploadBuffer(red.data(),bytes);
     gDebugPathVBV.BufferLocation=gDebugPathVB->GetGPUVirtualAddress();
     gDebugPathVBV.StrideInBytes=sizeof(Vertex);
@@ -271,7 +309,8 @@ static void makeGround() {
     };
     uint32_t idx[]={0,2,1,1,2,3};
     Mesh &m=gMesh[3];
-    m.vertices=uploadBuffer(v,sizeof(v));m.indices=uploadBuffer(idx,sizeof(idx));
+    m.vertices=staticGpuBuffer(v,sizeof(v),D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m.indices=staticGpuBuffer(idx,sizeof(idx),D3D12_RESOURCE_STATE_INDEX_BUFFER);
     m.vbv={m.vertices->GetGPUVirtualAddress(),sizeof(v),sizeof(Vertex)};
     m.ibv={m.indices->GetGPUVirtualAddress(),sizeof(idx),DXGI_FORMAT_R32_UINT};
     m.indexCount=6;
@@ -287,6 +326,8 @@ cbuffer Draw : register(b1) {
     float gYOffset;
     float gAlphaCut;
     float4 gTint;
+    uint gShadowOffset;
+    uint gShadowPass;
 };
 // Two CBVs: one 64000-byte buffer for 1000 static pines and one for 500 soldiers.
 cbuffer TreeTransforms : register(b2) { float4x4 gTreeInstances[1000]; };
@@ -303,6 +344,7 @@ cbuffer LightGrid : register(b4) {
 };
 Texture2D gTexture : register(t0);
 Texture2DArray gShadowDepthTexture : register(t1);
+Buffer<uint> gShadowInstanceIDs : register(t2);
 SamplerState gSampler : register(s0);
 SamplerState gShadowSampler : register(s1);
 struct Vin { float3 p:POSITION; float3 n:NORMAL; float2 uv:TEXCOORD0; };
@@ -314,12 +356,13 @@ struct Vout {
 };
 Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     Vout o;
+    uint sourceInstance=gShadowPass!=0 ? gShadowInstanceIDs[gShadowOffset+instance] : instance;
     float3 p=v.p*gScale+float3(0,gYOffset,0);
     float3 n=v.n;
     if(gKind!=2 && gKind!=4){
         float4x4 instanceTransform;
-        if(gKind==0) instanceTransform=gTreeInstances[instance];
-        else instanceTransform=gSoldierInstances[instance+(gKind==3?250:0)];
+        if(gKind==0) instanceTransform=gTreeInstances[sourceInstance];
+        else instanceTransform=gSoldierInstances[sourceInstance+(gKind==3?250:0)];
         p=mul(instanceTransform,float4(v.p*gScale,1)).xyz+
           float3(0,gYOffset,0);
         n=mul((float3x3)instanceTransform,v.n);
@@ -381,16 +424,16 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[8]={};
+    D3D12_ROOT_PARAMETER rp[9]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[1].Constants.ShaderRegister=1;
-    rp[1].Constants.Num32BitValues=8;
+    rp[1].Constants.Num32BitValues=10;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[2]={};
-    for(UINT i=0;i<2;i++){
+    D3D12_DESCRIPTOR_RANGE ranges[3]={};
+    for(UINT i=0;i<3;i++){
         ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors=1;
         ranges[i].BaseShaderRegister=i;
@@ -415,6 +458,10 @@ static void makePipeline() {
     rp[7].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[7].Descriptor.ShaderRegister=5;
     rp[7].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[8].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[8].DescriptorTable.NumDescriptorRanges=1;
+    rp[8].DescriptorTable.pDescriptorRanges=&ranges[2];
+    rp[8].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -427,7 +474,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=8;rs.pParameters=rp;
+    rs.NumParameters=9;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -496,12 +543,41 @@ static void makePipeline() {
 static void initializeDX12() {
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory)),"Create DXGI factory");
-    HRESULT hr=D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice));
-    if(FAILED(hr)) {
-        ComPtr<IDXGIAdapter> warp;
-        check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"Find DX12 WARP adapter");
-        check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice)),
-              "Create DX12 device");
+    // Explicit high-performance adapter selection prevents an accidental iGPU/WARP test.
+    ComPtr<IDXGIFactory6> factory6;
+    if(SUCCEEDED(factory.As(&factory6))) {
+        for(UINT i=0;;i++) {
+            ComPtr<IDXGIAdapter1> adapter;
+            if(factory6->EnumAdapterByGpuPreference(i,DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                   IID_PPV_ARGS(&adapter))==DXGI_ERROR_NOT_FOUND)break;
+            DXGI_ADAPTER_DESC1 info={};
+            adapter->GetDesc1(&info);
+            if(info.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)continue;
+            if(SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,
+                                          IID_PPV_ARGS(&gDevice)))) {
+                wcscpy_s(gAdapterName,info.Description);
+                break;
+            }
+        }
+    }
+    if(!gDevice) {
+        // Older systems without Factory6: attempt the default hardware device first.
+        HRESULT hr=D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice));
+        if(SUCCEEDED(hr)) {
+            ComPtr<IDXGIDevice> dxgiDevice;
+            ComPtr<IDXGIAdapter> adapter;
+            DXGI_ADAPTER_DESC info={};
+            if(SUCCEEDED(gDevice.As(&dxgiDevice))&&
+               SUCCEEDED(dxgiDevice->GetAdapter(&adapter))&&
+               SUCCEEDED(adapter->GetDesc(&info)))wcscpy_s(gAdapterName,info.Description);
+        } else {
+            ComPtr<IDXGIAdapter> warp;
+            check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"Find DX12 WARP adapter");
+            check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&gDevice)),
+                  "Create DX12 device");
+            gUsingWARP=true;
+            wcscpy_s(gAdapterName,L"SOFTWARE WARP");
+        }
     }
     D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(gDevice->CreateCommandQueue(&q,IID_PPV_ARGS(&gQueue)),"Create GPU queue");
@@ -521,7 +597,7 @@ static void initializeDX12() {
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=4;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4+FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -593,16 +669,35 @@ static void initializeDX12() {
     gFenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
-    gFrameCB=uploadBuffer(nullptr,256);
-    // A DX12 CBV must not exceed 65536 bytes. Split 1500 Matrix4 transforms:
-    // 1000 static trees = 64000B, 500 moving soldiers = 32000B.
-    gInstancesCB=uploadBuffer(nullptr,65536);
-    gSoldierCB=uploadBuffer(nullptr,32768);
-    // 16 shadow matrices + 500 lights (xyz/radius, rgb/intensity, slot).
-    gLightsCB=uploadBuffer(nullptr,32768);
-    // 16x16 world-space bins x up to 16 light indices, packed as uint4.
-    gGridCB=uploadBuffer(nullptr,17408);
-    gShadowCameraCB=uploadBuffer(nullptr,SHADOW_COUNT*256);
+    // Each in-flight backbuffer has dedicated upload buffers and allocator.
+    gInstancesCB=uploadBuffer(nullptr,65536); // 1000 static tree transforms
+    for(UINT frame=0;frame<FRAME_COUNT;frame++) {
+        if(frame==0)gFrameAllocators[frame]=gAllocator;
+        else check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   IID_PPV_ARGS(&gFrameAllocators[frame])),"Create frame allocator");
+        gCameraBuffers[frame]=uploadBuffer(nullptr,256);
+        gSoldierBuffers[frame]=uploadBuffer(nullptr,32768);
+        gLightBuffers[frame]=uploadBuffer(nullptr,32768);
+        gGridBuffers[frame]=uploadBuffer(nullptr,17408);
+        gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
+        // 16 shadow casters x 1500 possible tree/soldier instance indices.
+        gShadowIndexBuffers[frame]=uploadBuffer(nullptr,
+                                   SHADOW_COUNT*INSTANCE_COUNT*sizeof(UINT));
+        D3D12_SHADER_RESOURCE_VIEW_DESC idsView={};
+        idsView.Format=DXGI_FORMAT_R32_UINT;
+        idsView.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+        idsView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        idsView.Buffer.NumElements=SHADOW_COUNT*INSTANCE_COUNT;
+        auto idsCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        idsCpu.ptr+=(SIZE_T)(4+frame)*gSRVStep;
+        gDevice->CreateShaderResourceView(gShadowIndexBuffers[frame].Get(),&idsView,idsCpu);
+        gShadowIndexSRV[frame]=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+        gShadowIndexSRV[frame].ptr+=(UINT64)(4+frame)*gSRVStep;
+    }
+    gShadowIndexCB=gShadowIndexBuffers[0];
+    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];
+    gLightsCB=gLightBuffers[0];gGridCB=gGridBuffers[0];
+    gShadowCameraCB=gShadowCameraBuffers[0];
     makePipeline();
 
     // Original Kuningriigid odamees model is centered around y=0.
@@ -627,7 +722,7 @@ struct LightGridConstants {
 static_assert(sizeof(LightConstants)==25024,"500-light CB layout mismatch");
 static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
-static void updateLightsAndShadowCameras() {
+static void updateLightsAndShadowCameras(const float *matrices) {
     float lights[LIGHT_COUNT*8]{};
     NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
     LightConstants constants{};
@@ -660,6 +755,36 @@ static void updateLightsAndShadowCameras() {
         constants.shadowSlots[li].x=gEnableShadows?(float)k:-1.f;
     }
 
+    // Compact the visible instances per light. This avoids rendering the entire
+    // 1000-tree forest and both armies into each of the 16 spotlight shadow maps.
+    // The conservative tree margin covers wide crowns and tall branches.
+    if(gEnableShadows) {
+        UINT *ids=nullptr;
+        check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map shadow visibility indices");
+        for(UINT slot=0;slot<SHADOW_COUNT;slot++) {
+            const float *light=lights+gShadowSourceIndices[slot]*8;
+            const float lx=light[0],lz=light[2];
+            const float treeRange=light[3]+28.f,unitRange=light[3]+8.f;
+            const float treeDist2=treeRange*treeRange,unitDist2=unitRange*unitRange;
+            const UINT base=slot*INSTANCE_COUNT;
+            UINT trees=0,reds=0,blues=0;
+            for(UINT i=0;i<TREE_COUNT;i++){
+                const float dx=matrices[i*16+12]-lx,dz=matrices[i*16+14]-lz;
+                if(dx*dx+dz*dz<=treeDist2)ids[base+trees++]=i;
+            }
+            for(UINT i=0;i<PER_ARMY;i++){
+                const UINT red=TREE_COUNT+i,blue=TREE_COUNT+PER_ARMY+i;
+                const float rx=matrices[red*16+12]-lx,rz=matrices[red*16+14]-lz;
+                const float bx=matrices[blue*16+12]-lx,bz=matrices[blue*16+14]-lz;
+                if(rx*rx+rz*rz<=unitDist2)ids[base+TREE_COUNT+reds++]=i;
+                if(bx*bx+bz*bz<=unitDist2)ids[base+TREE_COUNT+PER_ARMY+blues++]=i;
+            }
+            gShadowVisibleCounts[slot][0]=trees;
+            gShadowVisibleCounts[slot][1]=reds;
+            gShadowVisibleCounts[slot][2]=blues;
+        }
+        gShadowIndexCB->Unmap(0,nullptr);
+    }
     BYTE *shadowCameras=nullptr;
     check(gShadowCameraCB->Map(0,nullptr,(void**)&shadowCameras),
           "Map 16 moving soldier shadow cameras");
@@ -722,23 +847,16 @@ static void updateLightsAndShadowCameras() {
 }
 
 static void drawShadowMaps() {
-    // Last frame leaves the depth array in shader-resource state.
-    // Transition it back before binding DSVs or clearing/writing depth.
-    // The first frame starts in DEPTH_WRITE from CreateCommittedResource.
-    static bool shadowMapsWereSampled=false;
-    if(shadowMapsWereSampled) {
-        auto toDepth=transition(gShadowDepth.Get(),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        gCmd->ResourceBarrier(1,&toDepth);
-    }
-    shadowMapsWereSampled=true;
+    // End-of-frame barrier already leaves the array in DEPTH_WRITE.
+    // No duplicate transition from SRV is needed at next frame start.
     const D3D12_VIEWPORT shadowViewport={0,0,(float)SHADOW_SIZE,(float)SHADOW_SIZE,0,1};
     const D3D12_RECT shadowScissor={0,0,(LONG)SHADOW_SIZE,(LONG)SHADOW_SIZE};
     gCmd->SetPipelineState(gShadowPSO.Get());
     gCmd->SetGraphicsRootSignature(gRoot.Get());
     ID3D12DescriptorHeap *heaps[]={gSRVHeap.Get()};
     gCmd->SetDescriptorHeaps(1,heaps);
+    gCmd->SetGraphicsRootDescriptorTable(8,
+              gShadowIndexSRV[gSwap->GetCurrentBackBufferIndex()]);
     gCmd->RSSetViewports(1,&shadowViewport);
     gCmd->RSSetScissorRects(1,&shadowScissor);
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -758,11 +876,15 @@ static void drawShadowMaps() {
             Mesh &m=gMesh[order[p]];
             DrawParams draw=m.draw;
             if(p==3) draw.kind=3; // blue soldier CBV range 250..499
-            gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
+            draw.shadowPass=1;
+            draw.shadowOffset=li*INSTANCE_COUNT+
+                (p<2?0:(p==2?TREE_COUNT:TREE_COUNT+PER_ARMY));
+            gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
             gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
             gCmd->IASetVertexBuffers(0,1,&m.vbv);
             gCmd->IASetIndexBuffer(&m.ibv);
-            gCmd->DrawIndexedInstanced(m.indexCount,p<2?TREE_COUNT:PER_ARMY,0,0,0);
+            const UINT visible=gShadowVisibleCounts[li][p<2?0:(p==2?1:2)];
+            if(visible)gCmd->DrawIndexedInstanced(m.indexCount,visible,0,0,0);
         }
     }
     auto ready=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -771,6 +893,23 @@ static void drawShadowMaps() {
 }
 
 static void renderFrame() {
+    const UINT back=gSwap->GetCurrentBackBufferIndex();
+    // Do not block after Present; wait only when reusing a busy buffer.
+    const UINT64 reuseFence=gFrameFenceValues[back];
+    if(reuseFence && gFence->GetCompletedValue()<reuseFence) {
+        check(gFence->SetEventOnCompletion(reuseFence,gFenceEvent),"Frame reuse event");
+        WaitForSingleObject(gFenceEvent,INFINITE);
+    }
+    const UINT64 completed=gFence->GetCompletedValue();
+    gRetiredResources.erase(std::remove_if(gRetiredResources.begin(),
+        gRetiredResources.end(),[completed](const RetiredResource &r){
+            return r.fenceValue<=completed;
+        }),gRetiredResources.end());
+    gAllocator=gFrameAllocators[back];
+    gFrameCB=gCameraBuffers[back];gSoldierCB=gSoldierBuffers[back];
+    gLightsCB=gLightBuffers[back];gGridCB=gGridBuffers[back];
+    gShadowCameraCB=gShadowCameraBuffers[back];
+    gShadowIndexCB=gShadowIndexBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
     float matrices[INSTANCE_COUNT*16]={};
@@ -791,7 +930,7 @@ static void renderFrame() {
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
-    updateLightsAndShadowCameras();
+    updateLightsAndShadowCameras(matrices);
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
         void *treeData=nullptr;
@@ -819,10 +958,15 @@ static void renderFrame() {
     memcpy(cbptr,&vp,sizeof(vp));
     gFrameCB->Unmap(0,nullptr);
 
-    const UINT back=gSwap->GetCurrentBackBufferIndex();
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
-    drawShadowMaps();
+    if(gEnableShadows)drawShadowMaps();
+    else {
+        // F5 now skips all shadow draw calls, not merely the final sampling.
+        auto readable=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        gCmd->ResourceBarrier(1,&readable);
+    }
     gCmd->SetPipelineState(gPSO.Get());
     auto toRT=transition(gTargets[back].Get(),
                          D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -842,6 +986,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
@@ -856,7 +1001,7 @@ static void renderFrame() {
             draw.kind=3; // selects 250 blue soldiers in second army CBV range
             draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
         }
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
@@ -869,10 +1014,10 @@ static void renderFrame() {
         gCmd->IASetVertexBuffers(0,1,&gDebugPathVBV);
         gCmd->SetGraphicsRootDescriptorTable(2,gMesh[1].srv);
         DrawParams overlay={4,1.0f,0.0f,0.0f,{1.f,0.68f,0.03f,1.f}};
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
         gCmd->DrawInstanced(gDebugRedVertices,1,0,0);
         overlay.tint[0]=0.05f;overlay.tint[1]=0.93f;overlay.tint[2]=1.0f;
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
         gCmd->DrawInstanced(gDebugBlueVertices,1,gDebugRedVertices,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
@@ -885,19 +1030,25 @@ static void renderFrame() {
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    check(gSwap->Present(1,0),"Present frame");
-    waitGPU(); // simple safe prototype; future versions will use multi-frame buffering
+    check(gSwap->Present(gVSync?1:0,0),"Present frame");
+    const UINT64 submitted=++gFenceValue;
+    check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
+    gFrameFenceValues[back]=submitted;
     ++gStatFrames;
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         NativeThreeNavStatus navigation{};
         NativeThreeJS_GetNavStatus(&navigation);
-        wchar_t title[256];
+        UINT shadowInstances=0;
+        if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
+            shadowInstances+=2*gShadowVisibleCounts[i][0]+
+                             gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
+        wchar_t title[380];
         swprintf_s(title,
-            L"NativeThree v0.15 | FPS %d | A* moving %d/500, planned %d, replans %d, waits %d | shadows %s | F1-F5",
-            frames,navigation.moved,navigation.planned,navigation.replans,navigation.blockedMoves,
-            gEnableShadows?L"ON":L"OFF");
+            L"DX12 %s | FPS %d | A* %d/500 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6)",
+            gAdapterName,frames,navigation.moved,navigation.planned,shadowInstances,
+            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -935,6 +1086,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
                 if(gShowDebugPaths)gLastPathRefresh=0;
             }
             if(wp==VK_F5)gEnableShadows=!gEnableShadows;
+            if(wp==VK_F6)gVSync=!gVSync;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
