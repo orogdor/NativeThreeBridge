@@ -323,7 +323,6 @@
       debugSegments:0, // generated on demand for the native F4 overlay
       active:units.filter(u=>!u.arrived).length,
       routeSteps:units.reduce((n,u)=>n+u.at,0),
-    replans,blockedMoves,
       scene:scene.isScene,group:forest.isGroup,mesh:ground.isMesh,
       instances:red.isInstancedMesh};
   }
@@ -332,7 +331,9 @@
     moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
     active:units.filter(u=>!u.arrived).length,
     arrived:arrivals,
-    routeSteps:units.reduce((n,u)=>n+u.at,0)
+    routeSteps:units.reduce((n,u)=>n+u.at,0),
+    searches,replans,blockedMoves,
+    planned:units.filter(u=>u.plans>0).length
   });
   // Only F4 diagnostic sampling requests these twelve individual paths.
   // All remaining 488 soldiers still start with no precomputed route.
