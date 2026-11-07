@@ -799,8 +799,12 @@ static void renderFrame() {
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
+        NativeThreeNavStatus navigation{};
+        NativeThreeJS_GetNavStatus(&navigation);
         wchar_t title[256];
-        swprintf_s(title,L"NativeThreeBridge v0.9 DX12 | FPS %d | 20 moving spotlights + 20 shadow maps | 1000 trees | 2 armies",frames);
+        swprintf_s(title,
+            L"NativeThreeBridge v0.12 | FPS %d | A*: %d/500 moved, %d steps, %d failed | 1000 trees | 500 soldiers",
+            frames,navigation.moved,navigation.routeSteps,navigation.routeFailures);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -844,7 +848,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.9 | 1000 trees + 20 shadow-casting lights",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.12 | A* navigation diagnostics + 1000 trees",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
