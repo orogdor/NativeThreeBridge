@@ -23,6 +23,10 @@ endif()
 # MSVC's resource compiler resolves resource filenames against its build directory.
 # Copy generated resources there so RCDATA relative paths resolve correctly.
 file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/generated/" DESTINATION "${CMAKE_BINARY_DIR}/generated")
+# The game script is a separate runtime file. Changing it does NOT rebuild the engine.
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/Release/game")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/game/scene.js"
+               "${CMAKE_BINARY_DIR}/Release/game/scene.js" COPYONLY)
 
 add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp

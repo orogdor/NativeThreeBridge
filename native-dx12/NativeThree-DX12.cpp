@@ -28,7 +28,7 @@ using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
 static HWND gWindow=nullptr;
-static float gYaw=0.52f, gPitch=0.53f, gDistance=78.0f;
+static float gYaw=0.45f, gPitch=0.76f, gDistance=92.0f;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0;
@@ -242,7 +242,9 @@ Vout VSMain(Vin v,uint instance:SV_InstanceID) {
         uint offset = gKind == 1 ? 10 : 0;
         p = mul(gInstances[instance + offset], float4(v.p*gScale, 1)).xyz + float3(0,gYOffset,0);
     }
-    o.p=mul(gViewProjection,float4(p,1));
+    // XMMatrixTranspose(view*proj) is uploaded in row-major float order;
+    // use row-vector mul to avoid the near-horizon camera projection bug.
+    o.p=mul(float4(p,1),gViewProjection);
     o.n=v.n; o.uv=v.uv;
     return o;
 }
@@ -415,7 +417,7 @@ static void renderFrame() {
         sinf(gYaw)*cosf(gPitch)*gDistance,
         sinf(gPitch)*gDistance,
         -cosf(gYaw)*cosf(gPitch)*gDistance,1.0f);
-    XMVECTOR target=XMVectorSet(0,2.5f,5.0f,1);
+    XMVECTOR target=XMVectorSet(0,2.5f,0.0f,1);
     XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,1,0,0));
     XMMATRIX proj=XMMatrixPerspectiveFovLH(XMConvertToRadians(57.0f),
                  (float)WIDTH/HEIGHT,0.1f,500.0f);
@@ -469,7 +471,7 @@ static void renderFrame() {
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         wchar_t title[256];
-        swprintf_s(title,L"NativeThreeBridge Three.js runtime v0.6 DX12 | FPS %d | 10 Stone Age houses + 10 pines | Chromium-free",frames);
+        swprintf_s(title,L"NativeThreeBridge Three.js runtime v0.7 DX12 | FPS %d | 10 Stone Age houses + 10 pines | Chromium-free",frames);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -513,7 +515,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.5 | Initializing DX12",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.7 | Initializing DX12",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
