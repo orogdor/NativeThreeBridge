@@ -549,39 +549,111 @@ static void initializeDX12() {
     makeGround();
 }
 struct LightConstants {
-    XMFLOAT4X4 viewProjections[SHADOW_COUNT];
-    XMFLOAT4 positionsRadius[SHADOW_COUNT];
-    XMFLOAT4 colorsIntensity[SHADOW_COUNT];
+    XMFLOAT4X4 viewProjections[SHADOW_COUNT];  // 16 actual shadow-casting lights
+    XMFLOAT4 positionsRadius[LIGHT_COUNT];    // all 500 moving spotlights
+    XMFLOAT4 colorsIntensity[LIGHT_COUNT];
+    XMFLOAT4 shadowSlots[LIGHT_COUNT];        // -1 = unshadowed this frame
 };
-static_assert(sizeof(LightConstants)==1920,"DX12 light constant-buffer layout mismatch");
+struct LightGridConstants {
+    XMUINT4 counts[GRID_DIM*GRID_DIM/4];
+    XMUINT4 indices[GRID_DIM*GRID_DIM*MAX_CELL_LIGHTS/4];
+};
+static_assert(sizeof(LightConstants)==25024,"500-light CB layout mismatch");
+static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
 static void updateLightsAndShadowCameras() {
-    float lights[SHADOW_COUNT*8]{};
-    NativeThreeJS_Lights(lights,SHADOW_COUNT*8);
+    float lights[LIGHT_COUNT*8]{};
+    NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
     LightConstants constants{};
+    for(UINT li=0;li<LIGHT_COUNT;li++) {
+        const float *l=lights+li*8;
+        constants.positionsRadius[li]={l[0],l[1],l[2],l[3]};
+        constants.colorsIntensity[li]={l[4],l[5],l[6],l[7]};
+        constants.shadowSlots[li]={-1,0,0,0};
+    }
+    // For the two armies, select eight nearest-to-forest lights each.
+    // All 500 lights contribute to illumination; 16 have up-to-date
+    // depth shadows (rather than a disastrous 500 depth passes/frame).
+    for(UINT army=0;army<2;army++) {
+        float bestD[SHADOW_COUNT/2];
+        UINT bestI[SHADOW_COUNT/2];
+        for(UINT k=0;k<SHADOW_COUNT/2;k++){bestD[k]=1.e30f;bestI[k]=army*PER_ARMY;}
+        for(UINT j=0;j<PER_ARMY;j++) {
+            UINT i=army*PER_ARMY+j;
+            float x=lights[i*8],z=lights[i*8+2],d=x*x+z*z;
+            if(d>=bestD[SHADOW_COUNT/2-1])continue;
+            UINT p=SHADOW_COUNT/2-1;
+            while(p>0 && d<bestD[p-1]) {
+                bestD[p]=bestD[p-1];bestI[p]=bestI[p-1];--p;
+            }
+            bestD[p]=d;bestI[p]=i;
+        }
+        for(UINT k=0;k<SHADOW_COUNT/2;k++){
+            const UINT slot=army*(SHADOW_COUNT/2)+k,li=bestI[k];
+            gShadowSourceIndices[slot]=li;
+            constants.shadowSlots[li].x=(float)slot;
+        }
+    }
+
     BYTE *shadowCameras=nullptr;
     check(gShadowCameraCB->Map(0,nullptr,(void**)&shadowCameras),
-          "Map per-soldier shadow cameras");
-    for(UINT i=0;i<SHADOW_COUNT;i++){
-        const float *l=lights+i*8;
+          "Map 16 moving soldier shadow cameras");
+    for(UINT i=0;i<SHADOW_COUNT;i++) {
+        const float *l=lights+gShadowSourceIndices[i]*8;
         const XMVECTOR eye=XMVectorSet(l[0],l[1],l[2],1.f);
         const XMVECTOR target=XMVectorSet(l[0],l[1]-1.f,l[2],1.f);
         const XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,0,1,0));
-        // A 118-degree downward cone matches the Three.js SpotLight angle.
         const XMMATRIX projection=XMMatrixPerspectiveFovLH(
             XMConvertToRadians(118.f),1.f,0.1f,32.f);
         XMStoreFloat4x4(&constants.viewProjections[i],
-                         XMMatrixTranspose(view*projection));
-        constants.positionsRadius[i]={l[0],l[1],l[2],l[3]};
-        constants.colorsIntensity[i]={l[4],l[5],l[6],l[7]};
+                        XMMatrixTranspose(view*projection));
         memcpy(shadowCameras+(size_t)i*256,
                &constants.viewProjections[i],sizeof(XMFLOAT4X4));
     }
     gShadowCameraCB->Unmap(0,nullptr);
+
+    LightGridConstants grid{};
+    // Fixed world-space 16x16 tiles, 12 world units per cell, [-96,+96].
+    // Each pixel evaluates at most 16 nearby lights, instead of all 500.
+    for(UINT cell=0;cell<GRID_DIM*GRID_DIM;cell++) {
+        const UINT cx=cell%GRID_DIM,cz=cell/GRID_DIM;
+        const float worldX=-96.0f+((float)cx+0.5f)*12.0f;
+        const float worldZ=-96.0f+((float)cz+0.5f)*12.0f;
+        float bestDist[MAX_CELL_LIGHTS];
+        UINT bestIndex[MAX_CELL_LIGHTS];
+        for(UINT k=0;k<MAX_CELL_LIGHTS;k++) {
+            bestDist[k]=1.e30f;bestIndex[k]=0;
+        }
+        UINT count=0;
+        for(UINT li=0;li<LIGHT_COUNT;li++) {
+            const float *l=lights+li*8;
+            const float dx=l[0]-worldX,dz=l[2]-worldZ;
+            const float d2=dx*dx+dz*dz;
+            const float radius=l[3]+8.5f; // include entire 12x12 tile
+            if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
+                continue;
+            UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
+            if(count<MAX_CELL_LIGHTS)++count;
+            while(pos>0 && d2<bestDist[pos-1]) {
+                bestDist[pos]=bestDist[pos-1];
+                bestIndex[pos]=bestIndex[pos-1];
+                --pos;
+            }
+            bestDist[pos]=d2;bestIndex[pos]=li;
+        }
+        reinterpret_cast<UINT*>(&grid.counts[cell/4])[cell%4]=count;
+        for(UINT k=0;k<count;k++) {
+            UINT word=cell*MAX_CELL_LIGHTS/4+k/4;
+            reinterpret_cast<UINT*>(&grid.indices[word])[k%4]=bestIndex[k];
+        }
+    }
     void *data=nullptr;
-    check(gLightsCB->Map(0,nullptr,&data),"Map native Three.js light constants");
+    check(gLightsCB->Map(0,nullptr,&data),"Map 500 dynamic light records");
     memcpy(data,&constants,sizeof(constants));
     gLightsCB->Unmap(0,nullptr);
+    check(gGridCB->Map(0,nullptr,&data),"Map 16x16 light index grid");
+    memcpy(data,&grid,sizeof(grid));
+    gGridCB->Unmap(0,nullptr);
 }
 
 static void drawShadowMaps() {
