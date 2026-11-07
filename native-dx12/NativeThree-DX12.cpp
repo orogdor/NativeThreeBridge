@@ -36,6 +36,7 @@ static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
 static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
 static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
 static bool gShowDebugPaths=true;
+static bool gEnableShadows=true;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
@@ -649,7 +650,7 @@ static void updateLightsAndShadowCameras() {
     for(UINT k=0;k<SHADOW_COUNT;k++){
         const UINT li=bestI[k];
         gShadowSourceIndices[k]=li;
-        constants.shadowSlots[li].x=(float)k;
+        constants.shadowSlots[li].x=gEnableShadows?(float)k:-1.f;
     }
 
     BYTE *shadowCameras=nullptr;
@@ -869,8 +870,9 @@ static void renderFrame() {
         NativeThreeJS_GetNavStatus(&navigation);
         wchar_t title[256];
         swprintf_s(title,
-            L"NativeThreeBridge v0.13 | FPS %d | A*: %d/500 moving, %d waypoints, %d failed | F1 overview F2 red F3 blue F4 routes",
-            frames,navigation.moved,navigation.routeSteps,navigation.routeFailures);
+            L"NativeThree v0.13 | FPS %d | A* %d/500, %d steps, %d errors | shadows %s | F1 overview F2 red F3 blue F4 routes F5 shadow test",
+            frames,navigation.moved,navigation.routeSteps,navigation.routeFailures,
+            gEnableShadows?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -904,6 +906,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F2){gCameraMode=1;gDistance=92.f;}
             if(wp==VK_F3){gCameraMode=2;gDistance=92.f;}
             if(wp==VK_F4)gShowDebugPaths=!gShowDebugPaths;
+            if(wp==VK_F5)gEnableShadows=!gEnableShadows;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
