@@ -1,0 +1,61 @@
+name: Build offline WebGL2 v0.17 all soldier lights
+on:
+  push:
+    paths:
+      - "tools/build_webgl2_v017.py"
+      - ".github/workflows/webgl2-v017.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate self-contained v0.17 HTML
+        run: python tools/build_webgl2_v017.py
+      - name: Syntax check extracted application module
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s=Path('benchmarks/NativeThreeBridge-v017-ALL-SOLDIER-LIGHTS.html').read_text()
+          module=s.rsplit('<script type="module">',1)[1].split('</script>',1)[0]
+          Path('/tmp/v017.mjs').write_text(module)
+          assert '500 moving soldier light footprints' in s
+          assert 'refreshSoldierGlows();' in s
+          PY
+          node --check /tmp/v017.mjs
+      - name: Headless WebGL2 geometry and spotlight test
+        shell: bash
+        run: |
+          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
+          FILE="$(pwd)/benchmarks/NativeThreeBridge-v017-ALL-SOLDIER-LIGHTS.html"
+          timeout 100s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+            --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
+            --disable-background-networking --no-first-run --virtual-time-budget=20000 \
+            --dump-dom "file://$FILE?autotest=1" >/tmp/v017-dom.html 2>/tmp/v017-browser.log || true
+          python - <<'PY'
+          from pathlib import Path
+          d=Path('/tmp/v017-dom.html').read_text()
+          assert 'data-ready="true"' in d,'WebGL2 app did not start'
+          assert 'data-fallback="true"' not in d,'3D fallback active'
+          assert '500 sõduri valgused: SEES' in d,'500-glow UI was not created'
+          import re
+          m=re.search(r'data-visible-pixels="(\d+)"',d)
+          assert m and int(m.group(1))>=200,'No rendered 3D geometry'
+          print('PASS: 500 soldier glow instances initialized; WebGL2 visible pixels:',m.group(1))
+          PY
+      - name: Publish generated HTML to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/NativeThreeBridge-v017-ALL-SOLDIER-LIGHTS.html
+          git commit -m "Publish WebGL2 v0.17 with visible lights for 500 soldiers"
+          git push origin HEAD:main
+      - name: Upload standalone HTML to v0.15 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v0.15.0 benchmarks/NativeThreeBridge-v017-ALL-SOLDIER-LIGHTS.html --clobber
