@@ -20,6 +20,9 @@ set(ASSETS "${CMAKE_CURRENT_SOURCE_DIR}/generated/model_assets.rc")
 if(NOT EXISTS "${ASSETS}")
   message(FATAL_ERROR "Run tools/pack_kuningriigid.py after esbuild scene bundle")
 endif()
+# MSVC's resource compiler resolves resource filenames against its build directory.
+# Copy generated resources there so RCDATA relative paths resolve correctly.
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/generated/" DESTINATION "${CMAKE_BINARY_DIR}/generated")
 
 add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
