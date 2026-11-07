@@ -16,8 +16,8 @@ from PIL import Image
 
 SOURCE_COMMIT = "e2bee672d626429d3f91b6158088eac23eee8c13"
 FILES = [
-    ("house", "models-stone-lod-v244/house_far.glb",
-     "48354d9bed4a856ac52bc4786dde788774eb052d"),
+    ("soldier", "models-trellis-v262/odamees.glb",
+     "96cdcb8ef0ac5107dc63a494d3b1ddffe840bf46"),
     ("pine", "assets/sapling-trees/pine_01/mid.glb",
      "da4e3cf4f358a742a65e73f5b140b17e3207fa3b"),
 ]
@@ -83,7 +83,10 @@ def texture_rgba(doc, buf, mat):
     if texture is None:
         return (1,1,b"\xff\xff\xff\xff")
     tex = doc["textures"][texture["index"]]
-    image = doc["images"][tex["source"]]
+    source = tex.get("source", tex.get("extensions",{}).get("EXT_texture_webp",{}).get("source"))
+    if source is None:
+        raise ValueError("Unsupported GLB texture source")
+    image = doc["images"][source]
     if "bufferView" not in image:
         raise ValueError("External GLB textures not supported")
     view = doc["bufferViews"][image["bufferView"]]
@@ -118,7 +121,7 @@ def build_mesh(doc, buf, primitive, out_mesh, out_tex):
 def main():
     work=pathlib.Path("generated")
     download_assets(work)
-    print("Converting original Stone Age house and Sapling pine ...")
+    print("Converting original Kuningriigid spearman and Sapling pine ...")
     allparts = []
     for name in ("house","pine"):
         doc,buf=read_glb(work/(name+".glb"))
@@ -130,7 +133,7 @@ def main():
                 info=build_mesh(doc,buf,primitive,out_m,out_t)
                 info.update({"source":name,"mesh_resource":101+i,"tex_resource":201+i})
                 allparts.append(info)
-    if [p["source"] for p in allparts] != ["house","pine","pine"]:
+    if [p["source"] for p in allparts] != ["soldier","pine","pine"]:
         raise ValueError(f"Unexpected mesh parts: {allparts}")
     rc = "// Generated from verified Kuningriigid GLB files; compiled inside EXE.\n"
     for i in range(len(allparts)):
@@ -143,7 +146,7 @@ def main():
     (work/"model_assets.rc").write_text(rc,encoding="utf-8")
     (work/"parts.json").write_text(json.dumps(allparts,indent=2),encoding="utf-8")
     print(json.dumps(allparts,indent=2))
-    print("Packaged 10 instances of each source model. 3 draw batches expected.")
+    print("Packaged 1 spearman model and 1000 tree instances; 20 army soldiers at runtime.")
 
 if __name__ == "__main__":
     main()
