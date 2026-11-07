@@ -43,7 +43,9 @@ jobs:
           print('Chrome:',Path('/tmp/v018-browser.log').read_text()[-1800:])
           assert 'data-ready="true"' in d,'WebGL2 app did not start'
           assert 'data-fallback="true"' not in d,'3D fallback active'
-          assert 'data-sunlight-shadow="true"' in d,'Directional shadow not enabled'\n          assert 'data-shadow-receiving-ground="true"' in d,'Ground cannot receive shadows'\n          assert 'data-shadow-casting-meshes="4"' in d,'Trees or soldiers do not cast shadows'
+          assert 'data-sunlight-shadow="true"' in d,'Directional shadow not enabled'
+          assert 'data-shadow-receiving-ground="true"' in d,'Ground cannot receive shadows'
+          assert 'data-shadow-casting-meshes="4"' in d,'Trees or soldiers do not cast shadows'
           import re
           m=re.search(r'data-visible-pixels="(\d+)"',d)
           assert m and int(m.group(1))>=200,'No rendered 3D geometry'
