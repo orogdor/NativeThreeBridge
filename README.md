@@ -1,4 +1,16 @@
-# NativeThreeBridge v0.11.0 — 10× larger forest
+# NativeThreeBridge v0.12.0 — A* movement fix
+
+## Why soldiers appeared stuck in v0.11
+
+The scene calculated all 500 valid A* routes, but its movement loop discarded most elapsed time at low FPS by capping every render frame to **0.06 seconds**. At 5 FPS, only 0.30 simulated seconds advanced for one real second, making long routes across the 160×160 forest appear frozen.
+
+**v0.12 fixes the time-step**: the JS waypoint-following loop accepts up to 0.5 seconds per frame (still capped against alt-tab/long suspension) and can cross multiple consecutive path cells safely. To make progress across the larger map visible, army movement speed was increased from ~6.2 to ~10.5 world units/second.
+
+Windows title now displays **FPS, moving soldiers out of 500, traversed A* waypoints, and failed routes**. This distinguishes an actual route failure from slow animation or rendering.
+
+Regression tests run **5 FPS versus 60 FPS for four simulated seconds**, verify equal soldier positions, and check that all 500 units progress. The native QuickJS/Windows smoke test additionally checks the live navigation status.
+
+## Original v0.11 10× forest benchmark
 
 Native Windows DirectX 12 prototype using official Three.js within QuickJS-NG, without a browser, Chromium or WebView.
 
