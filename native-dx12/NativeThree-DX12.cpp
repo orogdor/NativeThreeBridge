@@ -437,9 +437,9 @@ static void initializeDX12() {
     heap.NumDescriptors=FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gRTVHeap)),"Create RTV heap");
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    heap.NumDescriptors=1;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=3;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -462,6 +462,46 @@ static void initializeDX12() {
     check(gDevice->CreateCommittedResource(&defaultHeap,D3D12_HEAP_FLAG_NONE,&depth,
         D3D12_RESOURCE_STATE_DEPTH_WRITE,&clear,IID_PPV_ARGS(&gDepth)),"Create depth buffer");
     gDevice->CreateDepthStencilView(gDepth.Get(),nullptr,gDSVHeap->GetCPUDescriptorHandleForHeapStart());
+    // 20 independent hardware depth maps: one 256x256 texture-array slice
+    // per moving Three.js SpotLight. Each slice is both DSV and SRV.
+    D3D12_RESOURCE_DESC shadow={};
+    shadow.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    shadow.Width=SHADOW_SIZE;
+    shadow.Height=SHADOW_SIZE;
+    shadow.DepthOrArraySize=(UINT16)SHADOW_COUNT;
+    shadow.MipLevels=1;
+    shadow.Format=DXGI_FORMAT_R32_TYPELESS;
+    shadow.SampleDesc.Count=1;
+    shadow.Flags=D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE shadowClear={};
+    shadowClear.Format=DXGI_FORMAT_D32_FLOAT;
+    shadowClear.DepthStencil.Depth=1.0f;
+    check(gDevice->CreateCommittedResource(&defaultHeap,D3D12_HEAP_FLAG_NONE,&shadow,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,&shadowClear,IID_PPV_ARGS(&gShadowDepth)),
+        "Create 20-slice DX12 shadow map");
+    const UINT dsvStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    const auto dsvBase=gDSVHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_DEPTH_STENCIL_VIEW_DESC shadowView={};
+    shadowView.Format=DXGI_FORMAT_D32_FLOAT;
+    shadowView.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+    shadowView.Texture2DArray.ArraySize=1;
+    for(UINT i=0;i<SHADOW_COUNT;i++){
+        gShadowDSV[i]=dsvBase;
+        gShadowDSV[i].ptr+=(SIZE_T)(i+1)*dsvStep;
+        shadowView.Texture2DArray.FirstArraySlice=i;
+        gDevice->CreateDepthStencilView(gShadowDepth.Get(),&shadowView,gShadowDSV[i]);
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC shadowSrv={};
+    shadowSrv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    shadowSrv.Format=DXGI_FORMAT_R32_FLOAT;
+    shadowSrv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    shadowSrv.Texture2DArray.ArraySize=SHADOW_COUNT;
+    shadowSrv.Texture2DArray.MipLevels=1;
+    auto srvCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr+=(SIZE_T)3*gSRVStep;
+    gDevice->CreateShaderResourceView(gShadowDepth.Get(),&shadowSrv,srvCpu);
+    gShadowSRV=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+    gShadowSRV.ptr+=(UINT64)3*gSRVStep;
     check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&gAllocator)),
           "Create command allocator");
     check(gDevice->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,gAllocator.Get(),nullptr,
@@ -474,6 +514,8 @@ static void initializeDX12() {
     gFrameCB=uploadBuffer(nullptr,256);
     // 1020 x 64B matrices = 65,280B; last 256B are CBV alignment padding.
     gInstancesCB=uploadBuffer(nullptr,65536);
+    gLightsCB=uploadBuffer(nullptr,2048);
+    gShadowCameraCB=uploadBuffer(nullptr,SHADOW_COUNT*256);
     makePipeline();
 
     // Original Kuningriigid odamees model is centered around y=0.
