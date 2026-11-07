@@ -36,7 +36,8 @@
     transform.scale.setScalar(scale);transform.updateMatrix();
     mesh.setMatrixAt(index,transform.matrix);
   }
-  let seed=173019;
+  const FOREST_SEED=173019; // change this number to generate a different forest
+  let seed=FOREST_SEED;
   function rand(){seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;}
   const treeCells=[];
   const treePositions=[]; // sub-cell coordinates; prevents visible grid rows

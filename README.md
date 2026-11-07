@@ -1,4 +1,17 @@
-# NativeThreeBridge v0.13.0 — nähtavad A* rajad ja kaameralähedased varjud
+# NativeThreeBridge v0.14.0 — juhuslikult paigutatud mets
+
+## Uus mets (1000 puud)
+
+Männimudelid ei asu enam korrapäraselt 32×32 ruudustikuridades. **1000 puud** paigutatakse nüüd määratud metsapiirkonnas juhuslikesse kohtadesse, sh navigeerimisruudu keskpunktide vahele. Puudel on erinev pöördenurk ja suurus ning paiknemistihedus varieerub, tekitades looduslikuma mulje ja väikeseid lagendikke. Vähemalt umbes 6,15 maailmaühikut tüvede vahel vähendab kattumist. Kõik puud märgitakse A* takistuskaardile vastavalt nende tegelikele asukohtadele.
+
+Mets kasutab fikseeritud juhuseemet `FOREST_SEED=173019` failis `game/scene.js`, et test oleks igal käivitamisel korratav. Seemne muutmisel tekib teistsugune mets ilma C++-koodi ümber kompileerimata.
+
+Ülejäänud katse jääb samaks: **500 A* järgi liikuvat sõdurit**, **500 liikuvat valgustit**, **16 aktiivset DX12 varjukaarti** ning klahvid F1–F5 diagnostikaks. Eelmise versiooni kunstlik sirge puutõke on eemaldatud. Uued JavaScripti testid kontrollivad, et puude asukohad ei moodustaks ridu, tüved ei kattuks ja 500 sõduri teekonnad jääksid läbitavaks.
+
+**Märkus:** GitHub Actions kontrollib JavaScripti, Windowsi EXE koostamist ja HLSL-i. Tegelik GPU pilt ja FPS vajavad jätkuvalt arvutis testimist.
+
+## Eelmise v0.13 arenduse taust
+
 
 ## Mis v0.12 juures ei olnud nähtav
 

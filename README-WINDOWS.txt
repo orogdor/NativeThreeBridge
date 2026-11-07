@@ -1,4 +1,4 @@
-NativeThreeBridge v0.13.0 — VISIBLE A* ROUTES + CAMERA-NEAR SHADOWS
+NativeThreeBridge v0.14.0 — VISIBLE A* ROUTES + CAMERA-NEAR SHADOWS
 ============================================
 1000 original pine trees on a ~32x32 square forest placement grid.
 Two 250-soldier armies (500 moving real GLB models).
@@ -34,3 +34,9 @@ Only 16 of the 500 SpotLights cast depth-map shadows per frame.
 The app title displays FPS and A* route progress.
 To be CERTAIN of the installed version, extract a fresh v0.13 ZIP
 and run NativeThree-Game.exe directly. Avoid mixing old scene.js files.
+
+v0.14 FOREST: 1000 pines randomly placed (not in a 32x32 grid).
+Minimum tree-trunk spacing ~6.15 world units, varied yaw and scale.
+Seeded random locations create the same forest on each start.
+Edit FOREST_SEED in game\scene.js to regenerate a new layout.
+Each tree still marks the corresponding A* obstacle cell.
