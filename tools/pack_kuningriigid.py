@@ -136,6 +136,10 @@ def main():
     for i in range(len(allparts)):
         rc += f'{101+i} RCDATA "generated/mesh{i}.bin"\n'
         rc += f'{201+i} RCDATA "generated/tex{i}.bin"\n'
+    bundle = work/"three-scene.bundle.js"
+    if not bundle.is_file() or bundle.stat().st_size < 256:
+        raise ValueError("Missing real bundled Three.js scene script; run esbuild first")
+    rc += '301 RCDATA "generated/three-scene.bundle.js"\\n'
     (work/"model_assets.rc").write_text(rc,encoding="utf-8")
     (work/"parts.json").write_text(json.dumps(allparts,indent=2),encoding="utf-8")
     print(json.dumps(allparts,indent=2))
