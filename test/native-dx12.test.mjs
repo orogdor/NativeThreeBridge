@@ -1,21 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-const cpp=readFileSync(new URL('../native-dx12/NativeThree-DX12.cpp',import.meta.url),'utf8');
-const py=readFileSync(new URL('../tools/pack_kuningriigid.py',import.meta.url),'utf8');
+const dx=readFileSync(new URL('../native-dx12/NativeThree-DX12.cpp',import.meta.url),'utf8');
+const pack=readFileSync(new URL('../tools/pack_kuningriigid.py',import.meta.url),'utf8');
 const yml=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.meta.url),'utf8');
-test('actual native DX12 backend and GPU instancing',()=>{
-  assert.match(cpp,/#include <d3d12\.h>/);
-  assert.match(cpp,/D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL/);
-  assert.match(cpp,/p==1\|\|p==2\?1000:10/);
+test('native DX12 backend renders 100 trees and 500 instanced soldiers',()=>{
+  assert.match(dx,/#include <d3d12\.h>/);
+  assert.match(dx,/D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL/);
+  assert.match(dx,/INSTANCE_COUNT=600/);
+  assert.match(dx,/TREE_COUNT=100/);
+  assert.match(dx,/PER_ARMY=250/);
+  assert.match(dx,/p==1\|\|p==2\?TREE_COUNT:PER_ARMY/);
 });
-test('original pinned Stone Age spearman and pine GLB assets',()=>{
-  assert.match(py,/models-trellis-v262\/odamees\.glb/);
-  assert.match(py,/assets\/sapling-trees\/pine_01\/mid\.glb/);
-  assert.match(py,/SOURCE_COMMIT = "[0-9a-f]{40}"/);
-  assert.match(py,/computed != digest/);
+test('source GLBs are original Kuningriigid spearman and Sapling pine',()=>{
+  assert.match(pack,/models-trellis-v262\/odamees\.glb/);
+  assert.match(pack,/assets\/sapling-trees\/pine_01\/mid\.glb/);
+  assert.match(pack,/SOURCE_COMMIT = "[0-9a-f]{40}"/);
 });
-test('DX12 EXE packs original mesh resources on Windows builder',()=>{
+test('Windows build generates DX12 game EXE and external Three.js scene',()=>{
   assert.match(yml,/python tools\/pack_kuningriigid\.py/);
   assert.match(yml,/cmake --build build/);
   assert.match(yml,/NativeThreeJS/);

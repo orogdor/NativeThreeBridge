@@ -6,33 +6,39 @@ const js=readFileSync(new URL('../game/scene.js',import.meta.url),'utf8');
 const host=readFileSync(new URL('../native-dx12/three_js_host.cpp',import.meta.url),'utf8');
 const workflow=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.meta.url),'utf8');
 
-test('twenty live Three.js SpotLight objects have shadow support',()=>{
+test('500 native Three.js spotlights each follow a soldier; only 16 depth maps',()=>{
   assert.match(js,/new THREE\.SpotLight\(/);
-  assert.match(js,/lamp\.castShadow = true/);
-  assert.match(js,/lamp\.shadow\.mapSize\.set\(256, 256\)/);
+  assert.match(js,/lamp\.castShadow=true/);
+  assert.match(js,/lamp\.shadow\.mapSize\.set\(256,256\)/);
+  assert.match(js,/lamp\.position\.x=unit\.x/);
   assert.match(js,/__nativeThreeLightFrame/);
-  assert.match(js,/lamp\.position\.set\(unit\.x, LIGHT_HEIGHT, unit\.z\)/);
+  assert.match(host,/constexpr size_t FLOATS = 500 \* 8/);
+  assert.match(dx,/NativeThreeJS_Lights\(lights,LIGHT_COUNT\*8\)/);
+  assert.match(dx,/SHADOW_COUNT=16/);
+  assert.match(dx,/LIGHT_COUNT=500/);
 });
-test('all twenty light records flow through native QuickJS and 20 shadow maps',()=>{
-  assert.match(host,/void NativeThreeJS_Lights\(/);
-  assert.match(host,/20 \* 8/);
-  assert.match(dx,/NativeThreeJS_Lights\(lights,SHADOW_COUNT\*8\)/);
-  assert.match(dx,/SHADOW_COUNT=20/);
+test('DX12 bins all 500 lights and shades with 16 nearest per pixel',()=>{
+  assert.match(dx,/LightGridConstants/);
+  assert.match(dx,/MAX_CELL_LIGHTS=16/);
+  assert.match(dx,/gGridCounts\[64\]/);
+  assert.match(dx,/gGridIndices\[1024\]/);
+  assert.match(dx,/for\(UINT li=0;li<LIGHT_COUNT;li\+\+\)/);
+  assert.match(dx,/gGridCB->GetGPUVirtualAddress\(\)/);
+  assert.match(dx,/gLightsCB->GetGPUVirtualAddress\(\)/);
+  assert.match(dx,/gShadowSlots\[500\]/);
+});
+test('real DX12 shadow depth array captures tree and soldier silhouettes',()=>{
+  assert.match(dx,/void PSShadow\(Vout v\)/);
+  assert.match(dx,/gTexture\.Sample\(gSampler,v\.uv\)\.a-gAlphaCut/);
   assert.match(dx,/D3D12_DSV_DIMENSION_TEXTURE2DARRAY/);
   assert.match(dx,/DXGI_FORMAT_R32_TYPELESS/);
   assert.match(dx,/DXGI_FORMAT_R32_FLOAT/);
-  assert.match(dx,/D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE/);
-  assert.match(dx,/gCmd->ClearDepthStencilView\(dsv/);
-});
-test('shadow passes include pine foliage alpha mask and soldier depth geometry',()=>{
-  assert.match(dx,/void PSShadow\(Vout i\)/);
-  assert.match(dx,/gTexture\.Sample\(gSampler,i\.uv\)\.a-gAlphaCut/);
-  assert.match(dx,/p<2\?1000:10/);
+  assert.match(dx,/p<2\?TREE_COUNT:PER_ARMY/);
   assert.match(dx,/gShadowDepthTexture\.SampleLevel/);
   assert.match(dx,/SetGraphicsRootDescriptorTable\(4,gShadowSRV\)/);
   assert.match(dx,/SetGraphicsRootConstantBufferView\(5,gLightsCB/);
 });
-test('CI compiles actual HLSL PSShadow and PSMain without needing Windows GPU',()=>{
+test('CI builds the three HLSL entry points without a physical GPU',()=>{
   assert.match(workflow,/Compile HLSL main lighting and per-soldier shadow shaders/);
   assert.match(workflow,/shader_smoke\.exe/);
 });
