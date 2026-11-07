@@ -61,6 +61,9 @@ static ComPtr<ID3D12Resource> gDebugPathVB;
 static D3D12_VERTEX_BUFFER_VIEW gDebugPathVBV{};
 static UINT gDebugRedVertices=0,gDebugBlueVertices=0;
 static UINT gShadowSourceIndices[SHADOW_COUNT]{};
+static UINT gShadowVisibleCounts[SHADOW_COUNT][3]{};
+static ComPtr<ID3D12Resource> gShadowIndexBuffers[FRAME_COUNT],gShadowIndexCB;
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowIndexSRV[FRAME_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
 struct RetiredResource { UINT64 fenceValue; ComPtr<ID3D12Resource> resource; };
@@ -77,7 +80,7 @@ static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
 struct Vertex {float x,y,z,nx,ny,nz,u,v;};
 struct MeshHeader {char magic[4];uint32_t vertices,indices,reserved;};
-struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];};
+struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];UINT shadowOffset=0,shadowPass=0;};
 struct Mesh {
     ComPtr<ID3D12Resource> vertices,indices,texture;
     D3D12_VERTEX_BUFFER_VIEW vbv={};
@@ -321,6 +324,8 @@ cbuffer Draw : register(b1) {
     float gYOffset;
     float gAlphaCut;
     float4 gTint;
+    uint gShadowOffset;
+    uint gShadowPass;
 };
 // Two CBVs: one 64000-byte buffer for 1000 static pines and one for 500 soldiers.
 cbuffer TreeTransforms : register(b2) { float4x4 gTreeInstances[1000]; };
@@ -337,6 +342,7 @@ cbuffer LightGrid : register(b4) {
 };
 Texture2D gTexture : register(t0);
 Texture2DArray gShadowDepthTexture : register(t1);
+Buffer<uint> gShadowInstanceIDs : register(t2);
 SamplerState gSampler : register(s0);
 SamplerState gShadowSampler : register(s1);
 struct Vin { float3 p:POSITION; float3 n:NORMAL; float2 uv:TEXCOORD0; };
@@ -348,12 +354,13 @@ struct Vout {
 };
 Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     Vout o;
+    uint sourceInstance=gShadowPass!=0 ? gShadowInstanceIDs[gShadowOffset+instance] : instance;
     float3 p=v.p*gScale+float3(0,gYOffset,0);
     float3 n=v.n;
     if(gKind!=2 && gKind!=4){
         float4x4 instanceTransform;
-        if(gKind==0) instanceTransform=gTreeInstances[instance];
-        else instanceTransform=gSoldierInstances[instance+(gKind==3?250:0)];
+        if(gKind==0) instanceTransform=gTreeInstances[sourceInstance];
+        else instanceTransform=gSoldierInstances[sourceInstance+(gKind==3?250:0)];
         p=mul(instanceTransform,float4(v.p*gScale,1)).xyz+
           float3(0,gYOffset,0);
         n=mul((float3x3)instanceTransform,v.n);
@@ -415,16 +422,16 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[8]={};
+    D3D12_ROOT_PARAMETER rp[9]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[1].Constants.ShaderRegister=1;
-    rp[1].Constants.Num32BitValues=8;
+    rp[1].Constants.Num32BitValues=10;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[2]={};
-    for(UINT i=0;i<2;i++){
+    D3D12_DESCRIPTOR_RANGE ranges[3]={};
+    for(UINT i=0;i<3;i++){
         ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors=1;
         ranges[i].BaseShaderRegister=i;
@@ -449,6 +456,10 @@ static void makePipeline() {
     rp[7].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[7].Descriptor.ShaderRegister=5;
     rp[7].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[8].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[8].DescriptorTable.NumDescriptorRanges=1;
+    rp[8].DescriptorTable.pDescriptorRanges=&ranges[2];
+    rp[8].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -461,7 +472,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=8;rs.pParameters=rp;
+    rs.NumParameters=9;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -555,7 +566,7 @@ static void initializeDX12() {
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=4;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4+FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -638,7 +649,21 @@ static void initializeDX12() {
         gLightBuffers[frame]=uploadBuffer(nullptr,32768);
         gGridBuffers[frame]=uploadBuffer(nullptr,17408);
         gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
+        // 16 shadow casters x 1500 possible tree/soldier instance indices.
+        gShadowIndexBuffers[frame]=uploadBuffer(nullptr,
+                                   SHADOW_COUNT*INSTANCE_COUNT*sizeof(UINT));
+        D3D12_SHADER_RESOURCE_VIEW_DESC idsView={};
+        idsView.Format=DXGI_FORMAT_R32_UINT;
+        idsView.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+        idsView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        idsView.Buffer.NumElements=SHADOW_COUNT*INSTANCE_COUNT;
+        auto idsCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        idsCpu.ptr+=(SIZE_T)(4+frame)*gSRVStep;
+        gDevice->CreateShaderResourceView(gShadowIndexBuffers[frame].Get(),&idsView,idsCpu);
+        gShadowIndexSRV[frame]=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+        gShadowIndexSRV[frame].ptr+=(UINT64)(4+frame)*gSRVStep;
     }
+    gShadowIndexCB=gShadowIndexBuffers[0];
     gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];
     gLightsCB=gLightBuffers[0];gGridCB=gGridBuffers[0];
     gShadowCameraCB=gShadowCameraBuffers[0];
@@ -666,7 +691,7 @@ struct LightGridConstants {
 static_assert(sizeof(LightConstants)==25024,"500-light CB layout mismatch");
 static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
-static void updateLightsAndShadowCameras() {
+static void updateLightsAndShadowCameras(const float *matrices) {
     float lights[LIGHT_COUNT*8]{};
     NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
     LightConstants constants{};
@@ -699,6 +724,36 @@ static void updateLightsAndShadowCameras() {
         constants.shadowSlots[li].x=gEnableShadows?(float)k:-1.f;
     }
 
+    // Compact the visible instances per light. This avoids rendering the entire
+    // 1000-tree forest and both armies into each of the 16 spotlight shadow maps.
+    // The conservative tree margin covers wide crowns and tall branches.
+    if(gEnableShadows) {
+        UINT *ids=nullptr;
+        check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map shadow visibility indices");
+        for(UINT slot=0;slot<SHADOW_COUNT;slot++) {
+            const float *light=lights+gShadowSourceIndices[slot]*8;
+            const float lx=light[0],lz=light[2];
+            const float treeRange=light[3]+28.f,unitRange=light[3]+8.f;
+            const float treeDist2=treeRange*treeRange,unitDist2=unitRange*unitRange;
+            const UINT base=slot*INSTANCE_COUNT;
+            UINT trees=0,reds=0,blues=0;
+            for(UINT i=0;i<TREE_COUNT;i++){
+                const float dx=matrices[i*16+12]-lx,dz=matrices[i*16+14]-lz;
+                if(dx*dx+dz*dz<=treeDist2)ids[base+trees++]=i;
+            }
+            for(UINT i=0;i<PER_ARMY;i++){
+                const UINT red=TREE_COUNT+i,blue=TREE_COUNT+PER_ARMY+i;
+                const float rx=matrices[red*16+12]-lx,rz=matrices[red*16+14]-lz;
+                const float bx=matrices[blue*16+12]-lx,bz=matrices[blue*16+14]-lz;
+                if(rx*rx+rz*rz<=unitDist2)ids[base+TREE_COUNT+reds++]=i;
+                if(bx*bx+bz*bz<=unitDist2)ids[base+TREE_COUNT+PER_ARMY+blues++]=i;
+            }
+            gShadowVisibleCounts[slot][0]=trees;
+            gShadowVisibleCounts[slot][1]=reds;
+            gShadowVisibleCounts[slot][2]=blues;
+        }
+        gShadowIndexCB->Unmap(0,nullptr);
+    }
     BYTE *shadowCameras=nullptr;
     check(gShadowCameraCB->Map(0,nullptr,(void**)&shadowCameras),
           "Map 16 moving soldier shadow cameras");
@@ -761,23 +816,16 @@ static void updateLightsAndShadowCameras() {
 }
 
 static void drawShadowMaps() {
-    // Last frame leaves the depth array in shader-resource state.
-    // Transition it back before binding DSVs or clearing/writing depth.
-    // The first frame starts in DEPTH_WRITE from CreateCommittedResource.
-    static bool shadowMapsWereSampled=false;
-    if(shadowMapsWereSampled) {
-        auto toDepth=transition(gShadowDepth.Get(),
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        gCmd->ResourceBarrier(1,&toDepth);
-    }
-    shadowMapsWereSampled=true;
+    // End-of-frame barrier already leaves the array in DEPTH_WRITE.
+    // No duplicate transition from SRV is needed at next frame start.
     const D3D12_VIEWPORT shadowViewport={0,0,(float)SHADOW_SIZE,(float)SHADOW_SIZE,0,1};
     const D3D12_RECT shadowScissor={0,0,(LONG)SHADOW_SIZE,(LONG)SHADOW_SIZE};
     gCmd->SetPipelineState(gShadowPSO.Get());
     gCmd->SetGraphicsRootSignature(gRoot.Get());
     ID3D12DescriptorHeap *heaps[]={gSRVHeap.Get()};
     gCmd->SetDescriptorHeaps(1,heaps);
+    gCmd->SetGraphicsRootDescriptorTable(8,
+              gShadowIndexSRV[gSwap->GetCurrentBackBufferIndex()]);
     gCmd->RSSetViewports(1,&shadowViewport);
     gCmd->RSSetScissorRects(1,&shadowScissor);
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -797,11 +845,15 @@ static void drawShadowMaps() {
             Mesh &m=gMesh[order[p]];
             DrawParams draw=m.draw;
             if(p==3) draw.kind=3; // blue soldier CBV range 250..499
-            gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
+            draw.shadowPass=1;
+            draw.shadowOffset=li*INSTANCE_COUNT+
+                (p<2?0:(p==2?TREE_COUNT:TREE_COUNT+PER_ARMY));
+            gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
             gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
             gCmd->IASetVertexBuffers(0,1,&m.vbv);
             gCmd->IASetIndexBuffer(&m.ibv);
-            gCmd->DrawIndexedInstanced(m.indexCount,p<2?TREE_COUNT:PER_ARMY,0,0,0);
+            const UINT visible=gShadowVisibleCounts[li][p<2?0:(p==2?1:2)];
+            if(visible)gCmd->DrawIndexedInstanced(m.indexCount,visible,0,0,0);
         }
     }
     auto ready=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -826,6 +878,7 @@ static void renderFrame() {
     gFrameCB=gCameraBuffers[back];gSoldierCB=gSoldierBuffers[back];
     gLightsCB=gLightBuffers[back];gGridCB=gGridBuffers[back];
     gShadowCameraCB=gShadowCameraBuffers[back];
+    gShadowIndexCB=gShadowIndexBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
     float matrices[INSTANCE_COUNT*16]={};
@@ -846,7 +899,7 @@ static void renderFrame() {
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
-    updateLightsAndShadowCameras();
+    updateLightsAndShadowCameras(matrices);
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
         void *treeData=nullptr;
@@ -876,7 +929,13 @@ static void renderFrame() {
 
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
-    drawShadowMaps();
+    if(gEnableShadows)drawShadowMaps();
+    else {
+        // F5 now skips all shadow draw calls, not merely the final sampling.
+        auto readable=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        gCmd->ResourceBarrier(1,&readable);
+    }
     gCmd->SetPipelineState(gPSO.Get());
     auto toRT=transition(gTargets[back].Get(),
                          D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -896,6 +955,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
@@ -910,7 +970,7 @@ static void renderFrame() {
             draw.kind=3; // selects 250 blue soldiers in second army CBV range
             draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
         }
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
@@ -923,10 +983,10 @@ static void renderFrame() {
         gCmd->IASetVertexBuffers(0,1,&gDebugPathVBV);
         gCmd->SetGraphicsRootDescriptorTable(2,gMesh[1].srv);
         DrawParams overlay={4,1.0f,0.0f,0.0f,{1.f,0.68f,0.03f,1.f}};
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
         gCmd->DrawInstanced(gDebugRedVertices,1,0,0);
         overlay.tint[0]=0.05f;overlay.tint[1]=0.93f;overlay.tint[2]=1.0f;
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
         gCmd->DrawInstanced(gDebugBlueVertices,1,gDebugRedVertices,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
