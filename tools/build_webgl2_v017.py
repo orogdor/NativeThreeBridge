@@ -12,10 +12,12 @@ assert html.count(old)==1,'Light-selection function changed'
 # Actual Three.js spotlights are still reserved for the camera-near soldiers.
 replacement='''let soldierGlow=null;
 let glowEnabled=true;
-const glowPivot=new THREE.Object3D();
-const glowColors=[new THREE.Color(0xff694a),new THREE.Color(0x649dff)];
+let glowPivot=null;
+let glowColors=null;
 function prepareSoldierGlows(){
  if(soldierGlow)return;
+ glowPivot=new THREE.Object3D();
+ glowColors=[new THREE.Color(0xff694a),new THREE.Color(0x649dff)];
  const canvas=document.createElement('canvas');canvas.width=canvas.height=64;
  const ctx=canvas.getContext('2d');
  const grad=ctx.createRadialGradient(32,32,2,32,32,32);
