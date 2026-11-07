@@ -1,4 +1,26 @@
-# NativeThreeBridge v0.14.0 — juhuslikult paigutatud mets
+# NativeThreeBridge v0.15.0 — iga sõduri dünaamiline A* ja kokkupõrgete vältimine
+
+## 500 sõdurit ei saa enam üksteisest läbi kõndida
+
+Varasemates versioonides arvutati 500 A* marsruuti **ühekorraga stseeni alguses** ning sõdurid liikusid mööda neid sõltumata teiste üksuste asukohast. v0.15 eemaldab selle käitumise.
+
+- **Ükski sõdur ei alusta ettearvutatud marsruudiga.** Iga üksus teeb enda A* otsingu siis, kui ta hakkab liikuma või vajab ummikust ümbersõitu.
+- **A* arvestab ka teisi sõdureid**: puude hõivatud ruudud, teiste üksuste praegused ruudud ja nende reserveeritud järgmised ruudud on läbimatud. Otsitakse uus tee, kui järgmist ruutu ei saa kasutada.
+- **Ruutude reserveerimine:** enne liikumist peab sõdur saama ainuõiguse järgmisele ruudule. Lähteruut jääb tema kasutusse, kuni sõdur jõuab uude ruutu. Seega pole kaks sõdurit samas ruudus ning ei teki vastassuunalisi ruuduvahetusi.
+- **Ummikute lahendamine:** seisma jäänud üksus ootab lühidalt ja teeb seejärel uue A* otsingu. Otsingud jagatakse kaadrite vahel (kuni 12 otsingut kaadris), et 500 korraga arvutatavat marsruuti FPS-i ei blokeeriks.
+- **Reaalajas individuaalsed käsud:** `__nativeThreeSetDestination(id, gridX, gridZ)` muudab valitud sõduri sihtkohta. Ta planeerib marsruudi uuesti, kui jõuab ohutult järgmisse ruutu.
+- **500 sõdurit** (kaks 250-mehelist armeed), **1000 juhuslikku puud** ning **500 liikuvat Three.js-i SpotLight-valgustit** säilivad; 16 aktiivse DX12 varjukaardi piirang on sama.
+- Sõdurite algusruudud on kahe ruudu vahedega. See jätab liikumiskoridorid ja vähendab kohe tekkivaid ummikuid.
+
+Mänguakna pealkiri näitab nüüd näiteks `A* moving 500/500, planned 500, replans 36, waits 120`. See eristab uue raja otsimise ja teise sõduri järel ootamise.
+
+## Testid ja tegelikud piirangud
+
+JavaScripti automaattestid kontrollivad, et alguses on **0 planeeritud rada**, kõik 500 sõdurit teevad oma otsingu mängu ajal, lähte- ja sihtruutudel on eri omaniku vastu konfliktikaitse, dünaamilised liikumiskäsud põhjustavad uuesti planeerimise ning blokeeritud sihtruutu ei saa hõivata. Windowsi natiivne QuickJS-i test kontrollib samuti, et stseeni laadimisel radu ette ei arvutata.
+
+Tegemist on **ruudustikupõhise üksuste kokkupõrketõkkega**, mitte veel täisfüüsikalise mudelite/speade kokkupõrkesüsteemiga. Muutunud rajad kuvatakse F4 diagnostikas valitud sõdurite proovimarsruutidena. DX12 tegeliku varjupildi ja FPS-i kontrollimiseks on jätkuvalt vaja Windowsi masinat.
+
+## Eelnev v0.14 metsakatse
 
 ## Uus mets (1000 puud)
 

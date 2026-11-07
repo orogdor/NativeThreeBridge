@@ -1,4 +1,4 @@
-NativeThreeBridge v0.14.0 — VISIBLE A* ROUTES + CAMERA-NEAR SHADOWS
+NativeThreeBridge v0.15.0 — VISIBLE A* ROUTES + CAMERA-NEAR SHADOWS
 ============================================
 1000 original pine trees on a ~32x32 square forest placement grid.
 Two 250-soldier armies (500 moving real GLB models).
@@ -40,3 +40,13 @@ Minimum tree-trunk spacing ~6.15 world units, varied yaw and scale.
 Seeded random locations create the same forest on each start.
 Edit FOREST_SEED in game\scene.js to regenerate a new layout.
 Each tree still marks the corresponding A* obstacle cell.
+
+v0.15 DYNAMIC SOLDIER PATHFINDING AND COLLISION AVOIDANCE:
+- All 500 soldiers start WITHOUT precomputed routes.
+- Each soldier independently searches A* during the simulation.
+- Other soldiers' current and reserved next nav cells are BLOCKED.
+- A soldier claims the next cell before moving and only releases
+  the previous cell after reaching the destination.
+- Congested soldiers wait and recompute their path as needed.
+- Planning is spread across frames (12 A* searches per frame).
+- Window title shows planned paths, replans and blocked waits.
