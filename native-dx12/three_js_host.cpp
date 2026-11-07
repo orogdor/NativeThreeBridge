@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
+#include <vector>
 #include "quickjs.h"
 #include "three_js_host.h"
 
@@ -40,13 +41,40 @@ void dieWithJS(const char *phase) {
 }
 } // namespace
 
+// A separate scene.js is loaded relative to this EXE. No browser APIs.
+static std::string loadGameScene() {
+    wchar_t fullPath[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, fullPath, MAX_PATH);
+    if (!n || n >= MAX_PATH) die("Cannot find executable path.");
+    std::wstring filename(fullPath, n);
+    size_t slash = filename.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) die("Cannot locate executable folder.");
+    filename.resize(slash);
+    filename += L"\\game\\scene.js";
+    HANDLE f = CreateFileW(filename.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+        die("Missing game/scene.js. Extract the complete Windows ZIP beside the EXE.");
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(f, &size) || size.QuadPart < 32 || size.QuadPart > (8 * 1024 * 1024)) {
+        CloseHandle(f);
+        die("game/scene.js is empty, invalid or larger than 8 MB.");
+    }
+    std::string source(static_cast<size_t>(size.QuadPart), '\0');
+    DWORD received = 0;
+    BOOL ok = ReadFile(f, source.data(), static_cast<DWORD>(source.size()), &received, nullptr);
+    CloseHandle(f);
+    if (!ok || received != source.size()) die("Unable to read game/scene.js.");
+    return source;
+}
+
 void NativeThreeJS_Init() {
     HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(301), RT_RCDATA);
-    if (!res) die("Missing bundled official Three.js scene script (resource 301).");
+    if (!res) die("Missing bundled official Three.js core (resource 301).");
     const DWORD size = SizeofResource(nullptr, res);
     HGLOBAL bytes = LoadResource(nullptr, res);
     const char *script = bytes ? static_cast<const char *>(LockResource(bytes)) : nullptr;
-    if (!script || size < 32) die("Cannot read bundled Three.js script.");
+    if (!script || size < 32) die("Cannot read embedded official Three.js core.");
 
     runtime = JS_NewRuntime();
     if (!runtime) die("Cannot create QuickJS-NG runtime.");
@@ -55,8 +83,13 @@ void NativeThreeJS_Init() {
     context = JS_NewContext(runtime);
     if (!context) die("Cannot create QuickJS-NG context.");
 
-    JSValue result = JS_Eval(context, script, size, "three-scene.bundle.js", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(result)) dieWithJS("Three.js bundle evaluation failed");
+    JSValue result = JS_Eval(context, script, size, "three-runtime.bundle.js", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) dieWithJS("Three.js core evaluation failed");
+    JS_FreeValue(context, result);
+
+    const std::string gameScript = loadGameScene();
+    result = JS_Eval(context, gameScript.data(), gameScript.size(), "game/scene.js", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) dieWithJS("Game scene.js evaluation failed");
     JS_FreeValue(context, result);
 
     JSValue global = JS_GetGlobalObject(context);
