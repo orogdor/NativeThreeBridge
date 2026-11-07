@@ -34,6 +34,50 @@
   blue.name = 'Blue army: 10 spearmen';
   armies.add(red, blue);
 
+  // Twenty genuine Three.js spot lights (not decorative placeholders).
+  // The native DX12 renderer consumes their positions, colors and radii
+  // and renders a dedicated shadow map for every soldier each frame.
+  const soldierLights = [];
+  const LIGHT_HEIGHT = 9.5;
+  const LIGHT_RADIUS = 18.0;
+  for (let army = 0; army < 2; army++) {
+    for (let i = 0; i < PER_ARMY; i++) {
+      const lamp = new THREE.SpotLight(
+        army === 0 ? 0xffbc88 : 0x94c5ff, 3.4, LIGHT_RADIUS,
+        Math.PI / 3, 0.25, 1.5);
+      lamp.name = (army === 0 ? 'Red' : 'Blue') + ' soldier ' + (i + 1) + ' overhead light';
+      lamp.castShadow = true;
+      lamp.shadow.mapSize.set(256, 256);
+      lamp.shadow.bias = -0.0008;
+      lamp.position.y = LIGHT_HEIGHT;
+      lamp.target.name = lamp.name + ' target';
+      scene.add(lamp, lamp.target);
+      soldierLights.push(lamp);
+    }
+  }
+  const lightData = new Float32Array(SOLDIERS * 8);
+  const tempLightColor = new THREE.Color();
+  function refreshLights() {
+    for (let i = 0; i < SOLDIERS; i++) {
+      const lamp = soldierLights[i];
+      const unit = units[i];
+      // The light and its look-at target follow the same A* soldier.
+      lamp.position.set(unit.x, LIGHT_HEIGHT, unit.z);
+      lamp.target.position.set(unit.x, 0, unit.z);
+      const p = i * 8;
+      lamp.color.getRGB(tempLightColor);
+      lightData[p] = lamp.position.x;
+      lightData[p + 1] = lamp.position.y;
+      lightData[p + 2] = lamp.position.z;
+      lightData[p + 3] = lamp.distance;
+      lightData[p + 4] = tempLightColor.r;
+      lightData[p + 5] = tempLightColor.g;
+      lightData[p + 6] = tempLightColor.b;
+      lightData[p + 7] = lamp.intensity;
+    }
+  }
+
+
   const ground = new THREE.Mesh(new THREE.BufferGeometry(),
     new THREE.MeshStandardMaterial({ color: 0x405742 }));
   ground.name = 'Ground'; ground.userData.nativePrimitive = 'ground';
@@ -213,6 +257,7 @@
     }
     red.instanceMatrix.needsUpdate = true;
     blue.instanceMatrix.needsUpdate = true;
+    refreshLights();
   }
   updateSoldiers(0);
 
@@ -246,9 +291,14 @@
       arrived:arrivals, floats:matrices.length,
       moved:units.filter(u=>Math.abs(u.x-u.initialX)+Math.abs(u.z-u.initialZ)>0.2).length,
       treeCells:treeCells.length,
+      lights:soldierLights.length,
+      shadowLights:soldierLights.filter(l=>l.castShadow).length,
+      lightsAreSpotLights:soldierLights.every(l=>l.isSpotLight),
+      lightFloatCount:lightData.length,
     };
   }
   globalThis.__nativeThreeScene = scene;
+  globalThis.__nativeThreeLightFrame = () => lightData;
   globalThis.__nativeThreeFrame = frame;
   globalThis.__nativeThreeDiagnostics = diagnostics;
   globalThis.__nativeNavTest = () => ({
@@ -258,5 +308,6 @@
     goals:units.map(u=>u.destination.slice()),
     blocked:Array.from(blocked),
     cellSize:CELL,
+    lightPositions:Array.from(soldierLights, l=>[l.position.x,l.position.y,l.position.z]),
   });
 })();
