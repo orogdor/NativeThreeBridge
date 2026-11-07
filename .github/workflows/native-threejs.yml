@@ -4,7 +4,7 @@ on:
     branches: [main]
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build-threejs-native:
     runs-on: windows-2022
@@ -62,3 +62,45 @@ jobs:
         with:
           name: NativeThreeJS-DX12-prototype
           path: build/Release/NativeThree-Diagnostics.exe
+
+      - name: Package EXE with self-updating launcher
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Diagnostics.exe
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe
+          cl /nologo /O2 /W3 /TC launcher/NativeThree-Launcher.c /Fe:dist/NativeThree-Launcher.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Native updater compile failed" }
+          $v = (Get-Content version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
+          Set-Content dist/installed-version.txt -Value $v -Encoding ascii -NoNewline
+          $hash = (Get-FileHash dist/NativeThree-Diagnostics.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) "dist/update.txt"), ($v + [Environment]::NewLine + $hash + [Environment]::NewLine), [Text.Encoding]::ASCII)
+          Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
+          Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
+          Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
+          Compress-Archive -Path dist/NativeThree-Launcher.exe,dist/NativeThree-Diagnostics.exe,dist/NativeThree-DX12.exe,dist/installed-version.txt,dist/README-WINDOWS.txt,dist/LICENSE-QuickJS.txt,dist/LICENSE-ThreeJS.txt -DestinationPath dist/NativeThreeBridge-Windows-x64.zip -Force
+          if ((Get-Item dist/NativeThree-Diagnostics.exe).Length -lt 150000) { throw "Three.js DX12 EXE unexpectedly small" }
+          Write-Host "DX12 + embedded real Three.js: $v; sha256: $hash"
+      - name: Upload self-contained Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeBridge-Windows-x64
+          path: |
+            dist/NativeThreeBridge-Windows-x64.zip
+            dist/update.txt
+      - name: Release verified native Three.js runtime
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: $${{ github.token }}
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$v"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists. No file mutation."
+          } else {
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe dist/update.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag - real Three.js runtime" --notes "QuickJS-NG runs the OFFICIAL Three.js Scene, Group, Mesh, InstancedMesh and world matrix calculations inside a browser-free Windows EXE. Native DirectX12 renderer consumes real Three.js instance matrices. Kuningriigid house and pine GLBs embedded at build time (10 + 10). Windows JavaScript-runtime smoke test passed; physical GPU/window rendering still needs user validation. NOT general WebGLRenderer or GLTFLoader compatibility."
+            if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
+          }
