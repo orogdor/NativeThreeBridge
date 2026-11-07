@@ -93,7 +93,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
-          GH_TOKEN: $${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           $v = (Get-Content version.txt -Raw).Trim()
           $tag = "v$v"
