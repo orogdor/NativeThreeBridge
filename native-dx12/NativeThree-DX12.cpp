@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
+#include <vector>
 #include "three_js_host.h"
 
 #pragma comment(lib,"d3d12.lib")
@@ -31,7 +32,10 @@ static const UINT SHADOW_COUNT=16, SHADOW_SIZE=256;
 static const UINT TREE_COUNT=1000, LIGHT_COUNT=500, PER_ARMY=250, INSTANCE_COUNT=1500;
 static const UINT GRID_DIM=16, MAX_CELL_LIGHTS=16;
 static HWND gWindow=nullptr;
-static float gYaw=0.45f, gPitch=0.90f, gDistance=640.0f;
+static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
+static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
+static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
+static bool gShowDebugPaths=true;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
@@ -49,6 +53,9 @@ static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
 static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
 static bool gTreesUploaded=false;
+static ComPtr<ID3D12Resource> gDebugPathVB;
+static D3D12_VERTEX_BUFFER_VIEW gDebugPathVBV{};
+static UINT gDebugRedVertices=0,gDebugBlueVertices=0;
 static UINT gShadowSourceIndices[SHADOW_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
@@ -262,7 +269,7 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     Vout o;
     float3 p=v.p*gScale+float3(0,gYOffset,0);
     float3 n=v.n;
-    if(gKind!=2){
+    if(gKind!=2 && gKind!=4){
         float4x4 instanceTransform;
         if(gKind==0) instanceTransform=gTreeInstances[instance];
         else instanceTransform=gSoldierInstances[instance+(gKind==3?250:0)];
@@ -292,6 +299,8 @@ float shadowVisibility(float3 worldPos,uint li) {
     return (ndc.z-0.0015<=sampled)?1.0:0.20;
 }
 float4 PSMain(Vout v):SV_TARGET {
+    // A* route guides: emissive red/yellow and cyan ground stripes.
+    if(gKind==4) return float4(gTint.rgb,1);
     float4 albedo=gTexture.Sample(gSampler,v.uv)*gTint;
     if(gAlphaCut>0)clip(albedo.a-gAlphaCut);
     float3 normal=normalize(v.n);
@@ -581,28 +590,27 @@ static void updateLightsAndShadowCameras() {
         constants.colorsIntensity[li]={l[4],l[5],l[6],l[7]};
         constants.shadowSlots[li]={-1,0,0,0};
     }
-    // For the two armies, select eight nearest-to-forest lights each.
-    // All 500 lights contribute to illumination; 16 have up-to-date
-    // depth shadows (rather than a disastrous 500 depth passes/frame).
-    for(UINT army=0;army<2;army++) {
-        float bestD[SHADOW_COUNT/2];
-        UINT bestI[SHADOW_COUNT/2];
-        for(UINT k=0;k<SHADOW_COUNT/2;k++){bestD[k]=1.e30f;bestI[k]=army*PER_ARMY;}
-        for(UINT j=0;j<PER_ARMY;j++) {
-            UINT i=army*PER_ARMY+j;
-            float x=lights[i*8],z=lights[i*8+2],d=x*x+z*z;
-            if(d>=bestD[SHADOW_COUNT/2-1])continue;
-            UINT p=SHADOW_COUNT/2-1;
-            while(p>0 && d<bestD[p-1]) {
-                bestD[p]=bestD[p-1];bestI[p]=bestI[p-1];--p;
-            }
-            bestD[p]=d;bestI[p]=i;
+    // Render shadow maps for the 16 lights NEAREST THE CAMERA'S FOCUS,
+    // not the 16 nearest forest centre. The old approach selected offscreen
+    // lights during battle and appeared to have no shadows.
+    float bestD[SHADOW_COUNT]{};
+    UINT bestI[SHADOW_COUNT]{};
+    for(UINT k=0;k<SHADOW_COUNT;k++){bestD[k]=1.e30f;bestI[k]=k;}
+    for(UINT i=0;i<LIGHT_COUNT;i++) {
+        const float dx=lights[i*8]-gCameraFocusX;
+        const float dz=lights[i*8+2]-gCameraFocusZ;
+        const float d=dx*dx+dz*dz;
+        if(d>=bestD[SHADOW_COUNT-1])continue;
+        UINT p=SHADOW_COUNT-1;
+        while(p>0 && d<bestD[p-1]){
+            bestD[p]=bestD[p-1];bestI[p]=bestI[p-1];--p;
         }
-        for(UINT k=0;k<SHADOW_COUNT/2;k++){
-            const UINT slot=army*(SHADOW_COUNT/2)+k,li=bestI[k];
-            gShadowSourceIndices[slot]=li;
-            constants.shadowSlots[li].x=(float)slot;
-        }
+        bestD[p]=d;bestI[p]=i;
+    }
+    for(UINT k=0;k<SHADOW_COUNT;k++){
+        const UINT li=bestI[k];
+        gShadowSourceIndices[k]=li;
+        constants.shadowSlots[li].x=(float)k;
     }
 
     BYTE *shadowCameras=nullptr;
@@ -712,6 +720,12 @@ static void renderFrame() {
     const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
     gPreviousFrame=tick;
     NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
+    const UINT followIndex= gCameraMode==2 ? TREE_COUNT+PER_ARMY : TREE_COUNT;
+    gCameraFocusX=gCameraMode==0?0.f:matrices[followIndex*16+12];
+    gCameraFocusZ=gCameraMode==0?0.f:matrices[followIndex*16+14];
+    // Place the viewed soldier near the forest's edge for visible A* turns.
+    if(gCameraMode==1) gCameraFocusX+=16.0f;
+    if(gCameraMode==2) gCameraFocusX-=16.0f;
     updateLightsAndShadowCameras();
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
@@ -725,11 +739,11 @@ static void renderFrame() {
     check(gSoldierCB->Map(0,nullptr,&soldierData),"Map 500 moving soldier matrices");
     memcpy(soldierData,matrices+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
     gSoldierCB->Unmap(0,nullptr);
-    XMVECTOR eye=XMVectorSet(
+    XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
+    XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
         sinf(gYaw)*cosf(gPitch)*gDistance,
         sinf(gPitch)*gDistance,
-        -cosf(gYaw)*cosf(gPitch)*gDistance,1.0f);
-    XMVECTOR target=XMVectorSet(0,1.5f,0.0f,1);
+        -cosf(gYaw)*cosf(gPitch)*gDistance,0.0f));
     XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,1,0,0));
     XMMATRIX proj=XMMatrixPerspectiveFovLH(XMConvertToRadians(57.0f),
                  (float)WIDTH/HEIGHT,0.1f,2200.0f);
@@ -767,7 +781,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    // Four instanced draws for 600 logical objects: two tree parts,
+    // Instanced draws for 1500 objects: two tree parts,
     // 250 red soldiers, 250 blue soldiers; plus one ground draw.
     const UINT order[]={3,1,2,0,0};
     for(UINT p=0;p<5;p++) {
@@ -803,7 +817,7 @@ static void renderFrame() {
         NativeThreeJS_GetNavStatus(&navigation);
         wchar_t title[256];
         swprintf_s(title,
-            L"NativeThreeBridge v0.12 | FPS %d | A*: %d/500 moved, %d steps, %d failed | 1000 trees | 500 soldiers",
+            L"NativeThreeBridge v0.13 | FPS %d | A*: %d/500 moving, %d waypoints, %d failed | F1 overview F2 red F3 blue F4 routes",
             frames,navigation.moved,navigation.routeSteps,navigation.routeFailures);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
@@ -834,6 +848,10 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_KEYDOWN:
             if(wp==VK_ESCAPE)DestroyWindow(win);
             if(wp==VK_SPACE)gPause=!gPause;
+            if(wp==VK_F1){gCameraMode=0;gDistance=535.f;}
+            if(wp==VK_F2){gCameraMode=1;gDistance=92.f;}
+            if(wp==VK_F3){gCameraMode=2;gDistance=92.f;}
+            if(wp==VK_F4)gShowDebugPaths=!gShowDebugPaths;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -848,13 +866,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.12 | A* navigation diagnostics + 1000 trees",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.13 | F1 overview F2 red F3 blue F4 routes",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
     if(!gWindow)return 2;
     initializeDX12();
     NativeThreeJS_Init();
+    createDebugRouteGeometry();
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
     gStatStart=GetTickCount64();
