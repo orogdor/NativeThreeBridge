@@ -1,5 +1,5 @@
-// NativeThreeBridge DX12 prototype v0.5.0.
-// 10 original Kuningriigid Stone Age houses + 10 original Sapling pine trees.
+// NativeThreeBridge DX12 benchmark v0.8.0.
+// 1000 original Sapling pine trees + two 10-spearman A* armies in real Three.js.
 // Assets are generated from pinned GLBs and embedded as RCDATA by GitHub Actions.
 // No Chromium, WebView, Node, Deno or Python is used at runtime.
 #define WIN32_LEAN_AND_MEAN
@@ -28,10 +28,10 @@ using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
 static HWND gWindow=nullptr;
-static float gYaw=0.45f, gPitch=0.76f, gDistance=92.0f;
+static float gYaw=0.45f, gPitch=0.90f, gDistance=270.0f;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
-static ULONGLONG gStatStart=0;
+static ULONGLONG gStatStart=0, gPreviousFrame=0;
 static UINT gStatFrames=0;
 
 static ComPtr<ID3D12Device> gDevice;
@@ -205,8 +205,8 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
 }
 static void makeGround() {
     Vertex v[]={
-        {-45,0,-36,0,1,0,0,0},{45,0,-36,0,1,0,1,0},
-        {-45,0,42,0,1,0,0,1},{45,0,42,0,1,0,1,1}
+        {-104,0,-104,0,1,0,0,0},{104,0,-104,0,1,0,1,0},
+        {-104,0,104,0,1,0,0,1},{104,0,104,0,1,0,1,1}
     };
     uint32_t idx[]={0,2,1,1,2,3};
     Mesh &m=gMesh[3];
@@ -228,7 +228,7 @@ cbuffer Draw : register(b1) {
     float4 gTint;
 };
 cbuffer InstanceTransforms : register(b2) {
-    float4x4 gInstances[20];
+    float4x4 gInstances[1020];
 };
 Texture2D gTexture : register(t0);
 SamplerState gSampler : register(s0);
@@ -236,11 +236,12 @@ struct Vin {float3 p:POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
 struct Vout {float4 p:SV_POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
 Vout VSMain(Vin v,uint instance:SV_InstanceID) {
     Vout o;
-    float3 origin=float3(0,0,0);
     float3 p = v.p*gScale + float3(0,gYOffset,0);
     if (gKind != 2) {
-        uint offset = gKind == 1 ? 10 : 0;
-        p = mul(gInstances[instance + offset], float4(v.p*gScale, 1)).xyz + float3(0,gYOffset,0);
+        // 0=1000 pines, 1=red army, 3=blue army, 2=ground.
+        uint offset = gKind == 1 ? 1000 : (gKind == 3 ? 1010 : 0);
+        p = mul(gInstances[instance + offset], float4(v.p*gScale, 1)).xyz
+          + float3(0,gYOffset,0);
     }
     // XMMatrixTranspose(view*proj) is uploaded in row-major float order;
     // use row-vector mul to avoid the near-horizon camera projection bug.
@@ -393,13 +394,15 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     gFrameCB=uploadBuffer(nullptr,256);
-    gInstancesCB=uploadBuffer(nullptr,2048);
+    // 1020 x 64B matrices = 65,280B; last 256B are CBV alignment padding.
+    gInstancesCB=uploadBuffer(nullptr,65536);
     makePipeline();
 
-    DrawParams house={0,7.0f,2.08f,0,{1,1,1,1}};
-    DrawParams bark={1,0.37f,0,0,{0.22f,0.135f,0.075f,1.0f}};
-    DrawParams needles={1,0.37f,0,0.40f,{1,1,1,1}};
-    loadMesh(0,101,201,house);
+    // Original Kuningriigid odamees model is centered around y=0.
+    DrawParams soldier={1,3.5f,1.77f,0,{0.99f,0.46f,0.43f,1.0f}};
+    DrawParams bark={0,0.46f,0,0,{0.27f,0.20f,0.14f,1.0f}};
+    DrawParams needles={0,0.46f,0,0.40f,{1,1,1,1}};
+    loadMesh(0,101,201,soldier);
     loadMesh(1,102,202,bark);
     loadMesh(2,103,203,needles);
     makeGround();
@@ -407,8 +410,11 @@ static void initializeDX12() {
 static void renderFrame() {
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
-    float matrices[320]={};
-    NativeThreeJS_Frame(1.0f/60.0f,matrices,320);
+    float matrices[1020*16]={};
+    const ULONGLONG tick=GetTickCount64();
+    const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
+    gPreviousFrame=tick;
+    NativeThreeJS_Frame(dt,matrices,1020*16);
     void *instanceMapped=nullptr;
     check(gInstancesCB->Map(0,nullptr,&instanceMapped),"Map Three.js instance matrices");
     memcpy(instanceMapped,matrices,sizeof(matrices));
@@ -417,10 +423,10 @@ static void renderFrame() {
         sinf(gYaw)*cosf(gPitch)*gDistance,
         sinf(gPitch)*gDistance,
         -cosf(gYaw)*cosf(gPitch)*gDistance,1.0f);
-    XMVECTOR target=XMVectorSet(0,2.5f,0.0f,1);
+    XMVECTOR target=XMVectorSet(0,1.5f,0.0f,1);
     XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,1,0,0));
     XMMATRIX proj=XMMatrixPerspectiveFovLH(XMConvertToRadians(57.0f),
-                 (float)WIDTH/HEIGHT,0.1f,500.0f);
+                 (float)WIDTH/HEIGHT,0.1f,1200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
     void *cbptr=nullptr;
@@ -449,14 +455,21 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    const UINT order[]={3,0,1,2};
-    for(UINT p=0;p<4;p++) {
+    // Four model draws for 1020 logical objects: two tree parts,
+    // 10 red soldiers, 10 blue soldiers; plus one ground draw.
+    const UINT order[]={3,1,2,0,0};
+    for(UINT p=0;p<5;p++) {
         Mesh &m=gMesh[order[p]];
-        gCmd->SetGraphicsRoot32BitConstants(1,8,&m.draw,0);
+        DrawParams draw=m.draw;
+        if(p==4){
+            draw.kind=3; // selects blue soldiers [1010..1019]
+            draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
+        }
+        gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
-        gCmd->DrawIndexedInstanced(m.indexCount,order[p]==3?1:10,0,0,0);
+        gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?1000:10),0,0,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
                             D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
@@ -471,7 +484,7 @@ static void renderFrame() {
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         wchar_t title[256];
-        swprintf_s(title,L"NativeThreeBridge Three.js runtime v0.7 DX12 | FPS %d | 10 Stone Age houses + 10 pines | Chromium-free",frames);
+        swprintf_s(title,L"NativeThreeBridge v0.8 DX12 | FPS %d | 1000 pines | Red 10 vs Blue 10 | JS A* | Chromium-free",frames);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -515,7 +528,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.7 | Initializing DX12",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.8 | 1000 trees and 2 A* armies",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
