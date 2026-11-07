@@ -320,7 +320,7 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[6]={};
+    D3D12_ROOT_PARAMETER rp[7]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -348,6 +348,9 @@ static void makePipeline() {
     rp[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[5].Descriptor.ShaderRegister=3;
     rp[5].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[6].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[6].Descriptor.ShaderRegister=4;
+    rp[6].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -360,7 +363,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=6;rs.pParameters=rp;
+    rs.NumParameters=7;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -527,9 +530,12 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     gFrameCB=uploadBuffer(nullptr,256);
-    // 1020 x 64B matrices = 65,280B; last 256B are CBV alignment padding.
+    // 600 x 64B instance transforms = 38,400 bytes, fits one DX12 CBV.
     gInstancesCB=uploadBuffer(nullptr,65536);
-    gLightsCB=uploadBuffer(nullptr,2048);
+    // 16 shadow matrices + 500 lights (xyz/radius, rgb/intensity, slot).
+    gLightsCB=uploadBuffer(nullptr,32768);
+    // 16x16 world-space bins x up to 16 light indices, packed as uint4.
+    gGridCB=uploadBuffer(nullptr,17408);
     gShadowCameraCB=uploadBuffer(nullptr,SHADOW_COUNT*256);
     makePipeline();
 
@@ -607,7 +613,7 @@ static void drawShadowMaps() {
             gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
             gCmd->IASetVertexBuffers(0,1,&m.vbv);
             gCmd->IASetIndexBuffer(&m.ibv);
-            gCmd->DrawIndexedInstanced(m.indexCount,p<2?1000:10,0,0,0);
+            gCmd->DrawIndexedInstanced(m.indexCount,p<2?TREE_COUNT:PER_ARMY,0,0,0);
         }
     }
     auto ready=transition(gShadowDepth.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -618,11 +624,11 @@ static void drawShadowMaps() {
 static void renderFrame() {
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
-    float matrices[1020*16]={};
+    float matrices[INSTANCE_COUNT*16]={};
     const ULONGLONG tick=GetTickCount64();
     const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
     gPreviousFrame=tick;
-    NativeThreeJS_Frame(dt,matrices,1020*16);
+    NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
     updateLightsAndShadowCameras();
     void *instanceMapped=nullptr;
     check(gInstancesCB->Map(0,nullptr,&instanceMapped),"Map Three.js instance matrices");
@@ -667,9 +673,10 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    // Four model draws for 1020 logical objects: two tree parts,
-    // 10 red soldiers, 10 blue soldiers; plus one ground draw.
+    // Four instanced draws for 600 logical objects: two tree parts,
+    // 250 red soldiers, 250 blue soldiers; plus one ground draw.
     const UINT order[]={3,1,2,0,0};
     for(UINT p=0;p<5;p++) {
         Mesh &m=gMesh[order[p]];
@@ -682,7 +689,7 @@ static void renderFrame() {
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
-        gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?1000:10),0,0,0);
+        gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?TREE_COUNT:PER_ARMY),0,0,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
                             D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
