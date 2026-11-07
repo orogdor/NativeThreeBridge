@@ -23,7 +23,7 @@ s=s.replace(old,'''dst.angle=Math.PI/3;dst.penumbra=0.14;dst.decay=1.2;
    dst.shadow.needsUpdate=dst.castShadow;''',1)
 old="light.shadow.mapSize.set(256,256);light.shadow.bias=-.0008;"
 assert s.count(old)==1
-s=s.replace(old,'''light.shadow.mapSize.set(512,512);
+s=s.replace(old,'''light.shadow.mapSize.set(256,256);
     light.shadow.bias=-0.00028;light.shadow.normalBias=0.025;
     light.shadow.radius=1.2;''',1)
 # Real spotlight shadow contrast requires its light to dominate ambient + sun.
