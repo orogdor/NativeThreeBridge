@@ -63,3 +63,8 @@ test('camera can inspect either army close up and toggle real route overlays',()
   assert.match(dx,/gCmd->DrawInstanced\(gDebugBlueVertices/);
   assert.match(dx,/if\(gKind==4\) return float4\(gTint\.rgb,1\)/);
 });
+
+test('F5 toggles physical shadow contribution rather than fake projected decals',()=>{
+  assert.match(dx,/if\(wp==VK_F5\)gEnableShadows=!gEnableShadows/);
+  assert.match(dx,/constants\.shadowSlots\[li\]\.x=gEnableShadows\?\(float\)k:-1\.f/);
+});

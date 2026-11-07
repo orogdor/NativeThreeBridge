@@ -1,4 +1,19 @@
-# NativeThreeBridge v0.12.0 — A* movement fix
+# NativeThreeBridge v0.13.0 — nähtavad A* rajad ja kaameralähedased varjud
+
+## Mis v0.12 juures ei olnud nähtav
+
+Eelmises versioonis ei tõestanud 500 A* raja olemasolu, et sõdurid ekraanil selgelt puude vahel pööraksid. Puud paiknesid korrapäraselt, armeed alustasid metsast kaugel ja kaamera oli väga kõrgel. 500 liikuva valgusti hulgas arvutati vaid 16 varjukaarti, mis valiti **metsa keskpunkti**, mitte kaamera lähedusse jäävate sõdurite järgi.
+
+### Kontrollitavad parandused
+- 1000 männist väike osa moodustab keskmise puutõkke koos läbipääsuga. **Kõik 500 sõdurit kasutavad päris A* rada**; testid kontrollivad nüüd ka ümberpõikeid ja suunamuutusi, mitte ainult raja olemasolu.
+- Mõlemast armeest eksporditakse 6 päris A* teekonda JavaScriptist QuickJS-i kaudu DX12-sse. Need joonistatakse maapinnale **kollaste ja tsüaansete** heledate rajajoontena, mida saab F4-ga sisse/välja lülitada. Rajad ei ole C++-s väljamõeldud.
+- **F1**: kogu 1000 puuga mets; **F2**: punase armee lähedane kaamera; **F3**: sinise armee lähedane kaamera; **F4**: A* rajajooned; **F5**: tegeliku DX12 varjutuse sisse/välja lülitamise võrdlus.
+- 16 varjukaarti valitakse nüüd **kaamera sihtpunkti lähimate** liikuvate sõdurite valgusallikate järgi. Kõik 500 SpotLight-objekti jäävad alles; ainult 16-st arvutatakse samal kaadril sügavusvarjud.
+- Tugevam valgus ja lähivaade aitavad varjusid eristada. FPS-i ja A* edenemise näidud on akna pealkirjas.
+
+**Oluline:** GitHub Actions kontrollib endiselt Windowsi EXE koostamist, HLSL-i kompileerimist ja natiivset JavaScripti ning A* rajaandmete eksporti. See **ei tõesta füüsilise GPU valgustuspikslite tulemust**. Kui F5 sisse/välja ei muuda pilti ka F2 lähivaates, vajab DX12 varjude renderdus järgmise etapina GPU-pildikaadri analüüsi.
+
+## Varasem põhiarhitektuur
 
 ## Why soldiers appeared stuck in v0.11
 

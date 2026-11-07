@@ -1,4 +1,4 @@
-NativeThreeBridge v0.12.0 — A* NAVIGATION MOVEMENT FIX
+NativeThreeBridge v0.13.0 — VISIBLE A* ROUTES + CAMERA-NEAR SHADOWS
 ============================================
 1000 original pine trees on a ~32x32 square forest placement grid.
 Two 250-soldier armies (500 moving real GLB models).
@@ -24,3 +24,13 @@ v0.12 fixes v0.11's 0.06-second frame cap, which made soldiers
 move slowly when GPU FPS was low. The app title shows FPS, moved
 soldiers, waypoint progress and failed routes. 1000 trees, 500
 soldiers, 500 lights and the 16-shadow budget remain in place.
+
+TEST VISUALS IN v0.13:
+F1 = whole forest; F2 = near RED army; F3 = near BLUE army;
+F4 = toggle the REAL A* route lines (yellow/cyan);
+F5 = toggle depth-map shadows ON/OFF for a visual comparison.
+Newly placed trees form a navigable barrier; 500 soldiers must detour.
+Only 16 of the 500 SpotLights cast depth-map shadows per frame.
+The app title displays FPS and A* route progress.
+To be CERTAIN of the installed version, extract a fresh v0.13 ZIP
+and run NativeThree-Game.exe directly. Avoid mixing old scene.js files.
