@@ -870,8 +870,8 @@ static void renderFrame() {
         NativeThreeJS_GetNavStatus(&navigation);
         wchar_t title[256];
         swprintf_s(title,
-            L"NativeThree v0.13 | FPS %d | A* %d/500, %d steps, %d errors | shadows %s | F1 overview F2 red F3 blue F4 routes F5 shadow test",
-            frames,navigation.moved,navigation.routeSteps,navigation.routeFailures,
+            L"NativeThree v0.15 | FPS %d | A* moving %d/500, planned %d, replans %d, waits %d | shadows %s | F1-F5",
+            frames,navigation.moved,navigation.planned,navigation.replans,navigation.blockedMoves,
             gEnableShadows?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
@@ -921,7 +921,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.13 | F1 overview F2 red F3 blue F4 routes",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.15 | 500 dynamic A* soldiers avoiding each other",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);

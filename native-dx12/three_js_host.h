@@ -13,6 +13,10 @@ struct NativeThreeNavStatus {
     int active=0;
     int arrived=0;
     int routeSteps=0;
+    int searches=0;
+    int replans=0;
+    int blockedMoves=0;
+    int planned=0;
 };
 void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out);
 // Colored A* route segments: [army,x1,z1,x2,z2] per segment.

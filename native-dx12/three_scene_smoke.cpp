@@ -39,7 +39,8 @@ int main(){
     NativeThreeJS_Lights(lights,LIGHT_FLOATS);
     NativeThreeNavStatus nav{};
     NativeThreeJS_GetNavStatus(&nav);
-    if(nav.routeFailures!=0 || nav.moved!=500 || nav.routeSteps<1 || nav.active<1) {
+    if(nav.routeFailures!=0 || nav.moved!=500 || nav.routeSteps<1 ||
+       nav.active<1 || nav.planned!=500 || nav.searches<500) {
         std::fprintf(stderr,"A* failed: missing=%d moved=%d steps=%d active=%d\n",
             nav.routeFailures,nav.moved,nav.routeSteps,nav.active);
         return 8;
@@ -59,7 +60,8 @@ int main(){
     }
     std::puts("PASS: 1000 original pines with A* obstacle barrier");
     std::puts("PASS: genuine A* route guide segments exist for both armies");
-    std::puts("PASS: 500 real Three.js soldiers in two armies with A* paths");
+    std::puts("PASS: 500 individually requested A* searches during runtime");
+    std::puts("PASS: source/destination cell reservations prevent soldier intersections");
     std::puts("PASS: 500 moving Three.js SpotLight records follow soldiers");
     std::puts("PASS: real-time navigation status shows 500 moving soldiers and A* waypoint progress");
     NativeThreeJS_Shutdown();

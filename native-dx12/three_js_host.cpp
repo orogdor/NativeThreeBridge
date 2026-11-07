@@ -126,7 +126,20 @@ void NativeThreeJS_Init() {
     JS_FreeValue(context, diagnostics);
     JS_FreeValue(context, global);
     if (soldiers != 500 || armyCount != 2 || pines != 1000 || pathFailures != 0)
-        die("Unexpected JS scene or missing A* paths: expected 1000 pines and two 250-soldier armies");
+        die("Unexpected JS scene: expected 1000 pines and two 250-soldier armies");
+    // Starting the JS scene must NOT precompute all 500 soldiers' routes.
+    JSValue nav=JS_GetGlobalObject(context);
+    JSValue navFunction=JS_GetPropertyStr(context,nav,"__nativeThreeNavStats");
+    JSValue state=JS_Call(context,navFunction,JS_UNDEFINED,0,nullptr);
+    if(JS_IsException(state))dieWithJS("Initial dynamic pathfinding state");
+    JSValue searches=JS_GetPropertyStr(context,state,"searches");
+    int precomputed=0;
+    JS_ToInt32(context,&precomputed,searches);
+    JS_FreeValue(context,searches);
+    JS_FreeValue(context,state);
+    JS_FreeValue(context,navFunction);
+    JS_FreeValue(context,nav);
+    if(precomputed!=0)die("Navigation routes must be calculated on demand, not during scene init");
     ready = true;
 }
 void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t capacity) {
@@ -171,9 +184,11 @@ void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out) {
     if (!ready || !out) die("Navigation status: runtime not ready");
     JSValue stats = JS_Call(context,navStatusFunction,JS_UNDEFINED,0,nullptr);
     if (JS_IsException(stats)) dieWithJS("Read real-time A* movement status");
-    const char *keys[]={"routeFailures","moved","active","arrived","routeSteps"};
-    int *values[]={&out->routeFailures,&out->moved,&out->active,&out->arrived,&out->routeSteps};
-    for (int i=0;i<5;i++) {
+    const char *keys[]={"routeFailures","moved","active","arrived","routeSteps",
+                        "searches","replans","blockedMoves","planned"};
+    int *values[]={&out->routeFailures,&out->moved,&out->active,&out->arrived,&out->routeSteps,
+                   &out->searches,&out->replans,&out->blockedMoves,&out->planned};
+    for (int i=0;i<9;i++) {
         JSValue v=JS_GetPropertyStr(context,stats,keys[i]);
         if (JS_IsException(v) || JS_ToInt32(context,values[i],v)<0)
             dieWithJS("Invalid Three.js navigation status field");
