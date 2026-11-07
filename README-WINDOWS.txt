@@ -50,3 +50,14 @@ v0.15 DYNAMIC SOLDIER PATHFINDING AND COLLISION AVOIDANCE:
 - Congested soldiers wait and recompute their path as needed.
 - Planning is spread across frames (12 A* searches per frame).
 - Window title shows planned paths, replans and blocked waits.
+
+
+v0.16.0 PERFORMANCE TEST (DX12):
+- GPU-local DEFAULT memory for static vertex/index data instead of UPLOAD heap.
+- Two independent in-flight per-frame allocators and dynamic GPU buffers.
+- Only waits for the frame buffer being reused, not after each Present.
+- Per-spotlight visible-instance compaction for 1000 trees and 500 soldiers.
+- F5 OFF fully skips shadow rendering. F6 toggles VSync (OFF by default).
+- Window title displays GPU adapter, FPS and visible shadow instance count.
+- Run v0.15.0 vs v0.16.0 on the same GPU, camera and resolution.
+- Windows CI validates compilation, not GPU fps or visual shadow correctness.
