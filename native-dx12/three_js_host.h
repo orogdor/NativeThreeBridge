@@ -15,4 +15,6 @@ struct NativeThreeNavStatus {
     int routeSteps=0;
 };
 void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out);
+// Colored A* route segments: [army,x1,z1,x2,z2] per segment.
+std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t floatCapacity);
 void NativeThreeJS_Shutdown();

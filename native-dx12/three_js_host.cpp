@@ -16,6 +16,7 @@ JSContext *context = nullptr;
 JSValue frameFunction = JS_UNDEFINED;
 JSValue lightFunction = JS_UNDEFINED;
 JSValue navStatusFunction = JS_UNDEFINED;
+JSValue pathSegmentsFunction = JS_UNDEFINED;
 bool ready = false;
 
 [[noreturn]] void die(const char *msg) {
@@ -98,10 +99,12 @@ void NativeThreeJS_Init() {
     frameFunction = JS_GetPropertyStr(context, global, "__nativeThreeFrame");
     lightFunction = JS_GetPropertyStr(context, global, "__nativeThreeLightFrame");
     navStatusFunction = JS_GetPropertyStr(context, global, "__nativeThreeNavStats");
+    pathSegmentsFunction = JS_GetPropertyStr(context, global, "__nativeThreeDebugSegments");
     JSValue diagnostics = JS_GetPropertyStr(context, global, "__nativeThreeDiagnostics");
     if (!JS_IsFunction(context, frameFunction) ||
         !JS_IsFunction(context, lightFunction) ||
         !JS_IsFunction(context, navStatusFunction) ||
+        !JS_IsFunction(context, pathSegmentsFunction) ||
         !JS_IsFunction(context, diagnostics))
         die("Real Three.js scene or dynamic light bridge API missing");
     JSValue check = JS_Call(context, diagnostics, JS_UNDEFINED, 0, nullptr);
@@ -178,8 +181,27 @@ void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out) {
     }
     JS_FreeValue(context,stats);
 }
+std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t capacity) {
+    if (!ready || !outSegments) die("A* visual route buffer unavailable");
+    JSValue value=JS_Call(context,pathSegmentsFunction,JS_UNDEFINED,0,nullptr);
+    if(JS_IsException(value))dieWithJS("Read Three.js A* path visualization");
+    size_t offset=0,bytes=0,itemBytes=0;
+    JSValue buffer=JS_GetTypedArrayBuffer(context,value,&offset,&bytes,&itemBytes);
+    if(JS_IsException(buffer) || itemBytes!=sizeof(float) ||
+       bytes%sizeof(float) || (bytes/sizeof(float))%5 ||
+       bytes>capacity*sizeof(float))
+        die("Invalid/oversized Three.js A* path debug segment array");
+    size_t bufferBytes=0;
+    uint8_t *ptr=JS_GetArrayBuffer(context,&bufferBytes,buffer);
+    if(!ptr || offset+bytes>bufferBytes)die("A* route buffer bounds error");
+    std::memcpy(outSegments,ptr+offset,bytes);
+    JS_FreeValue(context,buffer);
+    JS_FreeValue(context,value);
+    return bytes/sizeof(float);
+}
 void NativeThreeJS_Shutdown() {
     if (!ready) return;
+    JS_FreeValue(context,pathSegmentsFunction);
     JS_FreeValue(context,navStatusFunction);
     JS_FreeValue(context,lightFunction);
     JS_FreeValue(context,frameFunction);
@@ -188,6 +210,7 @@ void NativeThreeJS_Shutdown() {
     frameFunction=JS_UNDEFINED;
     lightFunction=JS_UNDEFINED;
     navStatusFunction=JS_UNDEFINED;
+    pathSegmentsFunction=JS_UNDEFINED;
     context=nullptr;
     runtime=nullptr;
     ready=false;
