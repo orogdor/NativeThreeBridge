@@ -217,6 +217,45 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
     m.draw=draw;
     makeTexture(meshIndex,texRes);
 }
+
+static void createDebugRouteGeometry() {
+    // Exactly the A* routes produced by game/scene.js, not hand-authored lines.
+    // Each record is [team,x1,z1,x2,z2]. Build static emissive triangle strips.
+    std::vector<float> segments(60000);
+    const size_t used=NativeThreeJS_DebugSegments(segments.data(),segments.size());
+    std::vector<Vertex> red,blue;
+    red.reserve(used/5*3);blue.reserve(used/5*3);
+    for(size_t i=0;i+4<used;i+=5){
+        const int team=(int)segments[i];
+        const float x1=segments[i+1],z1=segments[i+2];
+        const float x2=segments[i+3],z2=segments[i+4];
+        if((team!=0 && team!=1) || !std::isfinite(x1) || !std::isfinite(z1) ||
+           !std::isfinite(x2) || !std::isfinite(z2))
+            fatal("A* path overlay contains invalid coordinates",E_INVALIDARG);
+        const float dx=x2-x1,dz=z2-z1;
+        const float len=sqrtf(dx*dx+dz*dz);
+        if(len<0.001f)continue;
+        const float halfWidth=0.30f;
+        const float px=-dz/len*halfWidth,pz=dx/len*halfWidth;
+        const Vertex a={x1+px,0.12f,z1+pz,0,1,0,0,0};
+        const Vertex b={x1-px,0.12f,z1-pz,0,1,0,0,0};
+        const Vertex c={x2+px,0.12f,z2+pz,0,1,0,0,0};
+        const Vertex d={x2-px,0.12f,z2-pz,0,1,0,0,0};
+        auto &v=team==0?red:blue;
+        v.push_back(a);v.push_back(b);v.push_back(c);
+        v.push_back(c);v.push_back(b);v.push_back(d);
+    }
+    if(red.empty()||blue.empty())fatal("A* route overlay missing one army",E_INVALIDARG);
+    gDebugRedVertices=(UINT)red.size();
+    gDebugBlueVertices=(UINT)blue.size();
+    red.insert(red.end(),blue.begin(),blue.end());
+    const UINT64 bytes=(UINT64)red.size()*sizeof(Vertex);
+    gDebugPathVB=uploadBuffer(red.data(),bytes);
+    gDebugPathVBV.BufferLocation=gDebugPathVB->GetGPUVirtualAddress();
+    gDebugPathVBV.StrideInBytes=sizeof(Vertex);
+    gDebugPathVBV.SizeInBytes=(UINT)bytes;
+}
+
 static void makeGround() {
     Vertex v[]={
         {-250,0,-250,0,1,0,0,0},{250,0,-250,0,1,0,1,0},
@@ -796,6 +835,19 @@ static void renderFrame() {
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
         gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?TREE_COUNT:PER_ARMY),0,0,0);
+    }
+    // Overlay 12 representative REAL A* routes over ground. F4 toggles them.
+    // Warm yellow = red army; cyan = blue army. A bright diagnostic even
+    // with zero visible sunlight/shadows, so movement is verifiable.
+    if(gShowDebugPaths && gDebugPathVB) {
+        gCmd->IASetVertexBuffers(0,1,&gDebugPathVBV);
+        gCmd->SetGraphicsRootDescriptorTable(2,gMesh[1].srv);
+        DrawParams overlay={4,1.0f,0.0f,0.0f,{1.f,0.68f,0.03f,1.f}};
+        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->DrawInstanced(gDebugRedVertices,1,0,0);
+        overlay.tint[0]=0.05f;overlay.tint[1]=0.93f;overlay.tint[2]=1.0f;
+        gCmd->SetGraphicsRoot32BitConstants(1,8,&overlay,0);
+        gCmd->DrawInstanced(gDebugBlueVertices,1,gDebugRedVertices,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
                             D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
