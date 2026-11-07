@@ -722,6 +722,17 @@ static void updateLightsAndShadowCameras() {
 }
 
 static void drawShadowMaps() {
+    // Last frame leaves the depth array in shader-resource state.
+    // Transition it back before binding DSVs or clearing/writing depth.
+    // The first frame starts in DEPTH_WRITE from CreateCommittedResource.
+    static bool shadowMapsWereSampled=false;
+    if(shadowMapsWereSampled) {
+        auto toDepth=transition(gShadowDepth.Get(),
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        gCmd->ResourceBarrier(1,&toDepth);
+    }
+    shadowMapsWereSampled=true;
     const D3D12_VIEWPORT shadowViewport={0,0,(float)SHADOW_SIZE,(float)SHADOW_SIZE,0,1};
     const D3D12_RECT shadowScissor={0,0,(LONG)SHADOW_SIZE,(LONG)SHADOW_SIZE};
     gCmd->SetPipelineState(gShadowPSO.Get());
