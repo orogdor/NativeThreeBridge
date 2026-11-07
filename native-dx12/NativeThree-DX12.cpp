@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <vector>
+#include <algorithm>
 #include "three_js_host.h"
 
 #pragma comment(lib,"d3d12.lib")
@@ -38,6 +39,7 @@ static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
 static bool gShowDebugPaths=true;
 static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
+static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
@@ -61,6 +63,12 @@ static UINT gDebugRedVertices=0,gDebugBlueVertices=0;
 static UINT gShadowSourceIndices[SHADOW_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
+struct RetiredResource { UINT64 fenceValue; ComPtr<ID3D12Resource> resource; };
+static std::vector<RetiredResource> gRetiredResources;
+static ComPtr<ID3D12CommandAllocator> gFrameAllocators[FRAME_COUNT];
+static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_COUNT],
+    gLightBuffers[FRAME_COUNT],gGridBuffers[FRAME_COUNT],gShadowCameraBuffers[FRAME_COUNT];
+static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{};
@@ -128,6 +136,27 @@ static void waitGPU() {
         check(gFence->SetEventOnCompletion(value,gFenceEvent),"Fence event");
         WaitForSingleObject(gFenceEvent,INFINITE);
     }
+}
+// Static geometry lives in GPU-local DEFAULT memory; upload heaps are staging only.
+static ComPtr<ID3D12Resource> staticGpuBuffer(const void *bytes,UINT64 length,
+                                              D3D12_RESOURCE_STATES finalState) {
+    ComPtr<ID3D12Resource> gpu;
+    auto heap=heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc=bufferDescription(length);
+    check(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+          D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&gpu)),
+          "Create GPU-local mesh buffer");
+    auto staging=uploadBuffer(bytes,length);
+    check(gAllocator->Reset(),"Reset static mesh upload allocator");
+    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset static mesh upload commands");
+    gCmd->CopyBufferRegion(gpu.Get(),0,staging.Get(),0,length);
+    auto barrier=transition(gpu.Get(),D3D12_RESOURCE_STATE_COPY_DEST,finalState);
+    gCmd->ResourceBarrier(1,&barrier);
+    check(gCmd->Close(),"Close static mesh upload commands");
+    ID3D12CommandList *lists[]={gCmd.Get()};
+    gQueue->ExecuteCommandLists(1,lists);
+    waitGPU(); // Initialization only: GPU must complete copy before releasing staging.
+    return gpu;
 }
 static const BYTE *resourceBytes(int id,DWORD *size) {
     HRSRC res=FindResourceW(NULL,MAKEINTRESOURCEW(id),RT_RCDATA);
@@ -207,8 +236,10 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
        sizeof(h)+vertexBytes+indexBytes!=size)
         fatal("Packed mesh invalid",E_INVALIDARG);
     Mesh &m=gMesh[meshIndex];
-    m.vertices=uploadBuffer(raw+sizeof(h),vertexBytes);
-    m.indices=uploadBuffer(raw+sizeof(h)+vertexBytes,indexBytes);
+    m.vertices=staticGpuBuffer(raw+sizeof(h),vertexBytes,
+                               D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m.indices=staticGpuBuffer(raw+sizeof(h)+vertexBytes,indexBytes,
+                              D3D12_RESOURCE_STATE_INDEX_BUFFER);
     m.vbv.BufferLocation=m.vertices->GetGPUVirtualAddress();
     m.vbv.SizeInBytes=(UINT)vertexBytes;
     m.vbv.StrideInBytes=sizeof(Vertex);
@@ -250,6 +281,7 @@ static void createDebugRouteGeometry() {
     // Some units may reach their goal; one army having no remaining route
     // is normal and must not crash the renderer.
     if(red.empty()&&blue.empty()){
+        if(gDebugPathVB)gRetiredResources.push_back({gFenceValue,gDebugPathVB});
         gDebugPathVB.Reset();
         gDebugRedVertices=0;gDebugBlueVertices=0;
         return;
@@ -258,6 +290,7 @@ static void createDebugRouteGeometry() {
     gDebugBlueVertices=(UINT)blue.size();
     red.insert(red.end(),blue.begin(),blue.end());
     const UINT64 bytes=(UINT64)red.size()*sizeof(Vertex);
+    if(gDebugPathVB)gRetiredResources.push_back({gFenceValue,gDebugPathVB});
     gDebugPathVB=uploadBuffer(red.data(),bytes);
     gDebugPathVBV.BufferLocation=gDebugPathVB->GetGPUVirtualAddress();
     gDebugPathVBV.StrideInBytes=sizeof(Vertex);
@@ -271,7 +304,8 @@ static void makeGround() {
     };
     uint32_t idx[]={0,2,1,1,2,3};
     Mesh &m=gMesh[3];
-    m.vertices=uploadBuffer(v,sizeof(v));m.indices=uploadBuffer(idx,sizeof(idx));
+    m.vertices=staticGpuBuffer(v,sizeof(v),D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    m.indices=staticGpuBuffer(idx,sizeof(idx),D3D12_RESOURCE_STATE_INDEX_BUFFER);
     m.vbv={m.vertices->GetGPUVirtualAddress(),sizeof(v),sizeof(Vertex)};
     m.ibv={m.indices->GetGPUVirtualAddress(),sizeof(idx),DXGI_FORMAT_R32_UINT};
     m.indexCount=6;
@@ -593,16 +627,21 @@ static void initializeDX12() {
     gFenceEvent=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
-    gFrameCB=uploadBuffer(nullptr,256);
-    // A DX12 CBV must not exceed 65536 bytes. Split 1500 Matrix4 transforms:
-    // 1000 static trees = 64000B, 500 moving soldiers = 32000B.
-    gInstancesCB=uploadBuffer(nullptr,65536);
-    gSoldierCB=uploadBuffer(nullptr,32768);
-    // 16 shadow matrices + 500 lights (xyz/radius, rgb/intensity, slot).
-    gLightsCB=uploadBuffer(nullptr,32768);
-    // 16x16 world-space bins x up to 16 light indices, packed as uint4.
-    gGridCB=uploadBuffer(nullptr,17408);
-    gShadowCameraCB=uploadBuffer(nullptr,SHADOW_COUNT*256);
+    // Each in-flight backbuffer has dedicated upload buffers and allocator.
+    gInstancesCB=uploadBuffer(nullptr,65536); // 1000 static tree transforms
+    for(UINT frame=0;frame<FRAME_COUNT;frame++) {
+        if(frame==0)gFrameAllocators[frame]=gAllocator;
+        else check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                   IID_PPV_ARGS(&gFrameAllocators[frame])),"Create frame allocator");
+        gCameraBuffers[frame]=uploadBuffer(nullptr,256);
+        gSoldierBuffers[frame]=uploadBuffer(nullptr,32768);
+        gLightBuffers[frame]=uploadBuffer(nullptr,32768);
+        gGridBuffers[frame]=uploadBuffer(nullptr,17408);
+        gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
+    }
+    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];
+    gLightsCB=gLightBuffers[0];gGridCB=gGridBuffers[0];
+    gShadowCameraCB=gShadowCameraBuffers[0];
     makePipeline();
 
     // Original Kuningriigid odamees model is centered around y=0.
@@ -771,6 +810,22 @@ static void drawShadowMaps() {
 }
 
 static void renderFrame() {
+    const UINT back=gSwap->GetCurrentBackBufferIndex();
+    // Do not block after Present; wait only when reusing a busy buffer.
+    const UINT64 reuseFence=gFrameFenceValues[back];
+    if(reuseFence && gFence->GetCompletedValue()<reuseFence) {
+        check(gFence->SetEventOnCompletion(reuseFence,gFenceEvent),"Frame reuse event");
+        WaitForSingleObject(gFenceEvent,INFINITE);
+    }
+    const UINT64 completed=gFence->GetCompletedValue();
+    gRetiredResources.erase(std::remove_if(gRetiredResources.begin(),
+        gRetiredResources.end(),[completed](const RetiredResource &r){
+            return r.fenceValue<=completed;
+        }),gRetiredResources.end());
+    gAllocator=gFrameAllocators[back];
+    gFrameCB=gCameraBuffers[back];gSoldierCB=gSoldierBuffers[back];
+    gLightsCB=gLightBuffers[back];gGridCB=gGridBuffers[back];
+    gShadowCameraCB=gShadowCameraBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
     float matrices[INSTANCE_COUNT*16]={};
@@ -819,7 +874,6 @@ static void renderFrame() {
     memcpy(cbptr,&vp,sizeof(vp));
     gFrameCB->Unmap(0,nullptr);
 
-    const UINT back=gSwap->GetCurrentBackBufferIndex();
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
     drawShadowMaps();
@@ -885,8 +939,10 @@ static void renderFrame() {
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    check(gSwap->Present(1,0),"Present frame");
-    waitGPU(); // simple safe prototype; future versions will use multi-frame buffering
+    check(gSwap->Present(gVSync?1:0,0),"Present frame");
+    const UINT64 submitted=++gFenceValue;
+    check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
+    gFrameFenceValues[back]=submitted;
     ++gStatFrames;
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
@@ -895,7 +951,7 @@ static void renderFrame() {
         NativeThreeJS_GetNavStatus(&navigation);
         wchar_t title[256];
         swprintf_s(title,
-            L"NativeThree v0.15 | FPS %d | A* moving %d/500, planned %d, replans %d, waits %d | shadows %s | F1-F5",
+            L"NativeThree PERF | FPS %d | A* moving %d/500, planned %d, replans %d, waits %d | shadows %s | F5 shadows F6 VSync",
             frames,navigation.moved,navigation.planned,navigation.replans,navigation.blockedMoves,
             gEnableShadows?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
@@ -935,6 +991,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
                 if(gShowDebugPaths)gLastPathRefresh=0;
             }
             if(wp==VK_F5)gEnableShadows=!gEnableShadows;
+            if(wp==VK_F6)gVSync=!gVSync;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
