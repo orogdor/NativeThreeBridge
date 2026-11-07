@@ -138,8 +138,8 @@ def main():
         rc += f'{201+i} RCDATA "generated/tex{i}.bin"\n'
     bundle = work/"three-runtime.bundle.js"
     if not bundle.is_file() or bundle.stat().st_size < 256:
-        raise ValueError("Missing real bundled Three.js scene script; run esbuild first")
-    rc += '301 RCDATA "generated/three-runtime.bundle.js"\\n'
+        raise ValueError("Missing official Three.js runtime core; run esbuild first")
+    rc += '301 RCDATA "generated/three-runtime.bundle.js"' + chr(10)
     (work/"model_assets.rc").write_text(rc,encoding="utf-8")
     (work/"parts.json").write_text(json.dumps(allparts,indent=2),encoding="utf-8")
     print(json.dumps(allparts,indent=2))
