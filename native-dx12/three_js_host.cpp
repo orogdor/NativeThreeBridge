@@ -10,7 +10,7 @@
 #include "three_js_host.h"
 
 namespace {
-constexpr std::size_t MATRIX_FLOATS = 20 * 16;
+constexpr std::size_t MATRIX_FLOATS = 1020 * 16;
 JSRuntime *runtime = nullptr;
 JSContext *context = nullptr;
 JSValue frameFunction = JS_UNDEFINED;
@@ -99,18 +99,24 @@ void NativeThreeJS_Init() {
         die("Real Three.js scene bridge API missing");
     JSValue check = JS_Call(context, diagnostics, JS_UNDEFINED, 0, nullptr);
     if (JS_IsException(check)) dieWithJS("Three.js scene diagnostics failed");
-    JSValue count = JS_GetPropertyStr(context, check, "houseCount");
+    JSValue count = JS_GetPropertyStr(context, check, "unitCount");
     JSValue trees = JS_GetPropertyStr(context, check, "treeCount");
-    int houses=0,pines=0;
-    JS_ToInt32(context,&houses,count);
+    JSValue armies = JS_GetPropertyStr(context, check, "armyCount");
+    JSValue failures = JS_GetPropertyStr(context, check, "routeFailures");
+    int soldiers=0,pines=0,armyCount=0,pathFailures=0;
+    JS_ToInt32(context,&soldiers,count);
     JS_ToInt32(context,&pines,trees);
+    JS_ToInt32(context,&armyCount,armies);
+    JS_ToInt32(context,&pathFailures,failures);
     JS_FreeValue(context, count);
     JS_FreeValue(context, trees);
+    JS_FreeValue(context, armies);
+    JS_FreeValue(context, failures);
     JS_FreeValue(context, check);
     JS_FreeValue(context, diagnostics);
     JS_FreeValue(context, global);
-    if (houses != 10 || pines != 10)
-        die("Unexpected Three.js scene: 10 houses and 10 pines expected");
+    if (soldiers != 20 || armyCount != 2 || pines != 1000 || pathFailures != 0)
+        die("Unexpected JS scene or missing A* paths: expected 1000 trees + two 10-soldier armies");
     ready = true;
 }
 void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t capacity) {
@@ -125,7 +131,7 @@ void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t cap
     JSValue arrayBuffer = JS_GetTypedArrayBuffer(context, transforms, &offset, &length, &elementBytes);
     if (JS_IsException(arrayBuffer) || elementBytes != sizeof(float) ||
         length != MATRIX_FLOATS * sizeof(float)) {
-        die("Three.js frame must produce Float32Array(320)");
+        die("Three.js frame must produce Float32Array(16320): 1000 trees + 20 soldiers");
     }
     size_t arrayBytes = 0;
     uint8_t *bytes = JS_GetArrayBuffer(context, &arrayBytes, arrayBuffer);
