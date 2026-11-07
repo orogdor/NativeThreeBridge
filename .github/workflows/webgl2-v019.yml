@@ -39,7 +39,7 @@ jobs:
           from pathlib import Path
           d=Path('/tmp/v019-dom.html').read_text()
           import re
-          print('DOM bytes:',len(d),'Status:',re.findall(r'data-(?:ready|error|fallback|visible-pixels)="[^"]*"',d)[-15:])
+          print('DOM bytes:',len(d),'Status:',re.findall(r'data-(?:ready|error|fallback|visible-pixels)="[^"]*"',d)[-15:]); print('STATUS ELEMENT:',re.findall(r'<[^>]*id="(?:message|status|start)"[^>]*>.{0,300}',d)[-10:]); print('DOM suffix:',d[-1100:])
           print('Chrome:',Path('/tmp/v019-browser.log').read_text()[-1800:])
           assert 'data-ready="true"' in d,'WebGL2 app did not start'
           assert 'data-fallback="true"' not in d,'3D fallback active'
