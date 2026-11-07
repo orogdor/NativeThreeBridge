@@ -50,6 +50,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
           cmake --build build --config Release --target ThreeSceneSmoke NativeThreeJS --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
+      - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
+        shell: pwsh
+        run: |
+          cl /nologo /O2 /W3 /EHsc /std:c++17 tools/shader_smoke.cpp /Fe:build/shader_smoke.exe /link d3dcompiler.lib
+          if ($LASTEXITCODE -ne 0) { throw "Shader compiler smoke executable failed to build" }
+          & .\build\shader_smoke.exe native-dx12/NativeThree-DX12.cpp
+          if ($LASTEXITCODE -ne 0) { throw "DX12 lighting/shadow HLSL failed to compile" }
       - name: Execute actual Three.js runtime smoke test in Windows
         shell: pwsh
         env:
