@@ -28,10 +28,10 @@ using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
 static const UINT SHADOW_COUNT=16, SHADOW_SIZE=256;
-static const UINT TREE_COUNT=100, LIGHT_COUNT=500, PER_ARMY=250, INSTANCE_COUNT=600;
+static const UINT TREE_COUNT=1000, LIGHT_COUNT=500, PER_ARMY=250, INSTANCE_COUNT=1500;
 static const UINT GRID_DIM=16, MAX_CELL_LIGHTS=16;
 static HWND gWindow=nullptr;
-static float gYaw=0.45f, gPitch=0.90f, gDistance=270.0f;
+static float gYaw=0.45f, gPitch=0.90f, gDistance=640.0f;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
@@ -47,7 +47,8 @@ static ComPtr<ID3D12GraphicsCommandList> gCmd;
 static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
-static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static bool gTreesUploaded=false;
 static UINT gShadowSourceIndices[SHADOW_COUNT]{};
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
@@ -211,8 +212,8 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
 }
 static void makeGround() {
     Vertex v[]={
-        {-104,0,-104,0,1,0,0,0},{104,0,-104,0,1,0,1,0},
-        {-104,0,104,0,1,0,0,1},{104,0,104,0,1,0,1,1}
+        {-250,0,-250,0,1,0,0,0},{250,0,-250,0,1,0,1,0},
+        {-250,0,250,0,1,0,0,1},{250,0,250,0,1,0,1,1}
     };
     uint32_t idx[]={0,2,1,1,2,3};
     Mesh &m=gMesh[3];
@@ -233,7 +234,9 @@ cbuffer Draw : register(b1) {
     float gAlphaCut;
     float4 gTint;
 };
-cbuffer InstanceTransforms : register(b2) { float4x4 gInstances[600]; };
+// Two CBVs: one 64000-byte buffer for 1000 static pines and one for 500 soldiers.
+cbuffer TreeTransforms : register(b2) { float4x4 gTreeInstances[1000]; };
+cbuffer SoldierTransforms : register(b5) { float4x4 gSoldierInstances[500]; };
 cbuffer Lights : register(b3) {
     float4x4 gLightVP[16];
     float4 gLightPosRadius[500];
@@ -260,10 +263,12 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     float3 p=v.p*gScale+float3(0,gYOffset,0);
     float3 n=v.n;
     if(gKind!=2){
-        uint offset=gKind==1?100:(gKind==3?350:0);
-        p=mul(gInstances[instance+offset],float4(v.p*gScale,1)).xyz+
+        float4x4 instanceTransform;
+        if(gKind==0) instanceTransform=gTreeInstances[instance];
+        else instanceTransform=gSoldierInstances[instance+(gKind==3?250:0)];
+        p=mul(instanceTransform,float4(v.p*gScale,1)).xyz+
           float3(0,gYOffset,0);
-        n=mul((float3x3)gInstances[instance+offset],v.n);
+        n=mul((float3x3)instanceTransform,v.n);
     }
     o.p=mul(float4(p,1),gViewProjection);
     o.n=normalize(n);
@@ -292,10 +297,10 @@ float4 PSMain(Vout v):SV_TARGET {
     float3 normal=normalize(v.n);
     float day=0.20+0.34*abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
     float3 illumination=day.xxx;
-    // CPU bins all 500 moving lights into 16x16 world-space tiles.
+    // CPU bins all 500 moving lights into 16x16 tiles across the expanded forest.
     // Only the nearest 16 in this tile are evaluated per pixel.
-    int gx=clamp((int)floor((v.worldPos.x+96.0)/12.0),0,15);
-    int gz=clamp((int)floor((v.worldPos.z+96.0)/12.0),0,15);
+    int gx=clamp((int)floor((v.worldPos.x+240.0)/30.0),0,15);
+    int gz=clamp((int)floor((v.worldPos.z+240.0)/30.0),0,15);
     uint cell=(uint)(gz*16+gx);
     uint count=gGridCounts[cell/4][cell%4];
     [loop] for(uint k=0;k<count;k++){
@@ -320,7 +325,7 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[7]={};
+    D3D12_ROOT_PARAMETER rp[8]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -351,6 +356,9 @@ static void makePipeline() {
     rp[6].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[6].Descriptor.ShaderRegister=4;
     rp[6].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[7].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[7].Descriptor.ShaderRegister=5;
+    rp[7].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -363,7 +371,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=7;rs.pParameters=rp;
+    rs.NumParameters=8;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -530,8 +538,10 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     gFrameCB=uploadBuffer(nullptr,256);
-    // 600 x 64B instance transforms = 38,400 bytes, fits one DX12 CBV.
+    // A DX12 CBV must not exceed 65536 bytes. Split 1500 Matrix4 transforms:
+    // 1000 static trees = 64000B, 500 moving soldiers = 32000B.
     gInstancesCB=uploadBuffer(nullptr,65536);
+    gSoldierCB=uploadBuffer(nullptr,32768);
     // 16 shadow matrices + 500 lights (xyz/radius, rgb/intensity, slot).
     gLightsCB=uploadBuffer(nullptr,32768);
     // 16x16 world-space bins x up to 16 light indices, packed as uint4.
@@ -613,12 +623,12 @@ static void updateLightsAndShadowCameras() {
     gShadowCameraCB->Unmap(0,nullptr);
 
     LightGridConstants grid{};
-    // Fixed world-space 16x16 tiles, 12 world units per cell, [-96,+96].
+    // 16x16 tiles, 30 world units each, spanning the 480-unit-wide world.
     // Each pixel evaluates at most 16 nearby lights, instead of all 500.
     for(UINT cell=0;cell<GRID_DIM*GRID_DIM;cell++) {
         const UINT cx=cell%GRID_DIM,cz=cell/GRID_DIM;
-        const float worldX=-96.0f+((float)cx+0.5f)*12.0f;
-        const float worldZ=-96.0f+((float)cz+0.5f)*12.0f;
+        const float worldX=-240.0f+((float)cx+0.5f)*30.0f;
+        const float worldZ=-240.0f+((float)cz+0.5f)*30.0f;
         float bestDist[MAX_CELL_LIGHTS];
         UINT bestIndex[MAX_CELL_LIGHTS];
         for(UINT k=0;k<MAX_CELL_LIGHTS;k++) {
@@ -629,7 +639,7 @@ static void updateLightsAndShadowCameras() {
             const float *l=lights+li*8;
             const float dx=l[0]-worldX,dz=l[2]-worldZ;
             const float d2=dx*dx+dz*dz;
-            const float radius=l[3]+8.5f; // include entire 12x12 tile
+            const float radius=l[3]+22.0f; // include diagonal of 30x30 tile
             if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
                 continue;
             UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
@@ -667,6 +677,7 @@ static void drawShadowMaps() {
     gCmd->RSSetScissorRects(1,&shadowScissor);
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
     // and the two distinct army instance ranges. The depth texture is shared
     // as a 20-layer texture array and sampled by the forward lighting pass.
@@ -680,7 +691,7 @@ static void drawShadowMaps() {
         for(UINT p=0;p<4;p++){
             Mesh &m=gMesh[order[p]];
             DrawParams draw=m.draw;
-            if(p==3) draw.kind=3; // blue army matrix offset 1010
+            if(p==3) draw.kind=3; // blue soldier CBV range 250..499
             gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
             gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
             gCmd->IASetVertexBuffers(0,1,&m.vbv);
@@ -702,10 +713,18 @@ static void renderFrame() {
     gPreviousFrame=tick;
     NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
     updateLightsAndShadowCameras();
-    void *instanceMapped=nullptr;
-    check(gInstancesCB->Map(0,nullptr,&instanceMapped),"Map Three.js instance matrices");
-    memcpy(instanceMapped,matrices,sizeof(matrices));
-    gInstancesCB->Unmap(0,nullptr);
+    // Tree geometry is static; write its 1000 matrices once, not every frame.
+    if(!gTreesUploaded){
+        void *treeData=nullptr;
+        check(gInstancesCB->Map(0,nullptr,&treeData),"Map static 1000-tree matrices");
+        memcpy(treeData,matrices,TREE_COUNT*16*sizeof(float));
+        gInstancesCB->Unmap(0,nullptr);
+        gTreesUploaded=true;
+    }
+    void *soldierData=nullptr;
+    check(gSoldierCB->Map(0,nullptr,&soldierData),"Map 500 moving soldier matrices");
+    memcpy(soldierData,matrices+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
+    gSoldierCB->Unmap(0,nullptr);
     XMVECTOR eye=XMVectorSet(
         sinf(gYaw)*cosf(gPitch)*gDistance,
         sinf(gPitch)*gDistance,
@@ -713,7 +732,7 @@ static void renderFrame() {
     XMVECTOR target=XMVectorSet(0,1.5f,0.0f,1);
     XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,1,0,0));
     XMMATRIX proj=XMMatrixPerspectiveFovLH(XMConvertToRadians(57.0f),
-                 (float)WIDTH/HEIGHT,0.1f,1200.0f);
+                 (float)WIDTH/HEIGHT,0.1f,2200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
     void *cbptr=nullptr;
@@ -743,6 +762,7 @@ static void renderFrame() {
     gCmd->SetDescriptorHeaps(1,heaps);
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
@@ -754,7 +774,7 @@ static void renderFrame() {
         Mesh &m=gMesh[order[p]];
         DrawParams draw=m.draw;
         if(p==4){
-            draw.kind=3; // selects blue soldiers [1010..1019]
+            draw.kind=3; // selects 250 blue soldiers in second army CBV range
             draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
         }
         gCmd->SetGraphicsRoot32BitConstants(1,8,&draw,0);
@@ -805,7 +825,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_MOUSEWHEEL:
             gDistance*=GET_WHEEL_DELTA_WPARAM(wp)>0?0.9f:1.1f;
             if(gDistance<20)gDistance=20;
-            if(gDistance>190)gDistance=190;
+            if(gDistance>950)gDistance=950;
             return 0;
         case WM_KEYDOWN:
             if(wp==VK_ESCAPE)DestroyWindow(win);
