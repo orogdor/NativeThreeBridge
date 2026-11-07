@@ -2,8 +2,8 @@
 #include <cmath>
 #include <cstdio>
 int main(){
-    constexpr int TREES=100, PER_ARMY=250, SOLDIERS=500, INSTANCE_FLOATS=600*16, LIGHT_FLOATS=500*8;
-    NativeThreeJS_Init();  // Validates all 500 A* routes, 100 trees and two armies
+    constexpr int TREES=1000, PER_ARMY=250, SOLDIERS=500, INSTANCE_FLOATS=1500*16, LIGHT_FLOATS=500*8;
+    NativeThreeJS_Init();  // Validates 1000-tree forest, 500 A* routes and two armies
     float matrices[INSTANCE_FLOATS]{};
     float lights[LIGHT_FLOATS]{};
     NativeThreeJS_Frame(0.f,matrices,INSTANCE_FLOATS);
@@ -35,7 +35,7 @@ int main(){
             return 7;
         }
     }
-    std::puts("PASS: 10x10 (100) pine forest with original GLB");
+    std::puts("PASS: 1000 original pines on 10x enlarged forest footprint");
     std::puts("PASS: 500 real Three.js soldiers in two armies with A* paths");
     std::puts("PASS: 500 moving Three.js SpotLight records follow soldiers");
     NativeThreeJS_Shutdown();

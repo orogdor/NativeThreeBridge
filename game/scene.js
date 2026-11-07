@@ -52,6 +52,7 @@
     put(treeBark,n,tx,tz,yaw,scale);
     put(treeNeedles,n,tx,tz,yaw,scale);
   }
+  if(treeCells.length!==TREES) throw new Error('Forest tree count must be exactly 1000');
   treeBark.instanceMatrix.needsUpdate=true;
   treeNeedles.instanceMatrix.needsUpdate=true;
 
@@ -97,7 +98,7 @@
       for(const next of adj){
         if(next<0||closed[next]||blocked[next])continue;
         const d=cost[n]+1;
-        if(d<cost[next]){cost[next]=d;prev[next]=n;push(next,d+heuristic(next));}
+        if(d<cost[next]){cost[next]=d;prev[next]=n;push(next,d+heuristic(next)*1.0001);}
       }
     }
     return [];
