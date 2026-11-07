@@ -2,7 +2,11 @@
 
 A separate **native Windows** game-engine experiment, independent from [Kuningriigid](https://github.com/orogdor/Kuningriigid).
 
-**Status v0.4.0:** the Win32 GDI diagnostic EXE and WinHTTP updater are real native Windows executables. **This is not yet a working DirectX 12 + embedded JavaScript runtime.** Three.js is currently used only in the scene exporter (Node.js at build time), not inside the Windows EXE.
+**Status v0.4.1:** the Win32 GDI diagnostic EXE and WinHTTP updater are real native Windows executables. **This is not yet a working DirectX 12 + embedded JavaScript runtime.** Three.js is currently used only in the scene exporter (Node.js at build time), not inside the Windows EXE.
+
+## v0.4.1 diagnostic rendering fix
+
+The native GDI diagnostic now uses a persistent offscreen bitmap and copies each completed frame to the window with one `BitBlt`. It suppresses `WM_ERASEBKGND` and painter-sorts trees and houses by camera depth. This addresses flicker and inconsistent house overlap; it is **not** yet DirectX 12 or a fully compatible Three.js engine.
 
 ## Download / auto update
 
