@@ -27,6 +27,7 @@ using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
+static const UINT SHADOW_COUNT=20, SHADOW_SIZE=256;
 static HWND gWindow=nullptr;
 static float gYaw=0.45f, gPitch=0.90f, gDistance=270.0f;
 static bool gDrag=false,gPause=false;
@@ -43,11 +44,13 @@ static ComPtr<ID3D12CommandAllocator> gAllocator;
 static ComPtr<ID3D12GraphicsCommandList> gCmd;
 static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
-static ComPtr<ID3D12PipelineState> gPSO;
-static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB;
+static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
+static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gLightsCB,gShadowCameraCB,gShadowDepth;
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
 static UINT gRTVStep=0,gSRVStep=0;
+static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{};
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
 static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
@@ -302,7 +305,7 @@ float4 PSMain(Vout i):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[4]={};
+    D3D12_ROOT_PARAMETER rp[6]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -310,26 +313,40 @@ static void makePipeline() {
     rp[1].Constants.ShaderRegister=1;
     rp[1].Constants.Num32BitValues=8;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE range={};
-    range.RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors=1;range.BaseShaderRegister=0;
+    D3D12_DESCRIPTOR_RANGE ranges[2]={};
+    for(UINT i=0;i<2;i++){
+        ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[i].NumDescriptors=1;
+        ranges[i].BaseShaderRegister=i;
+    }
     rp[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[2].DescriptorTable.NumDescriptorRanges=1;
-    rp[2].DescriptorTable.pDescriptorRanges=&range;
+    rp[2].DescriptorTable.pDescriptorRanges=&ranges[0];
     rp[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     rp[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[3].Descriptor.ShaderRegister=2;
     rp[3].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
-    D3D12_STATIC_SAMPLER_DESC samp={};
-    samp.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    samp.AddressU=samp.AddressV=samp.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    samp.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
-    samp.MaxLOD=D3D12_FLOAT32_MAX;
-    samp.ShaderRegister=0;
-    samp.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[4].DescriptorTable.NumDescriptorRanges=1;
+    rp[4].DescriptorTable.pDescriptorRanges=&ranges[1];
+    rp[4].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[5].Descriptor.ShaderRegister=3;
+    rp[5].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2]={};
+    samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    samplers[0].ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+    samplers[0].MaxLOD=D3D12_FLOAT32_MAX;
+    samplers[0].ShaderRegister=0;
+    samplers[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    samplers[1]=samplers[0];
+    samplers[1].Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+    samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=4;rs.pParameters=rp;
-    rs.NumStaticSamplers=1;rs.pStaticSamplers=&samp;
+    rs.NumParameters=6;rs.pParameters=rp;
+    rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
     HRESULT hr=D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1,&signature,&error);
@@ -340,7 +357,7 @@ static void makePipeline() {
     check(gDevice->CreateRootSignature(0,signature->GetBufferPointer(),
           signature->GetBufferSize(),IID_PPV_ARGS(&gRoot)),"Create root signature");
 
-    ComPtr<ID3DBlob> vs,ps;
+    ComPtr<ID3DBlob> vs,ps,shadowPS;
     hr=D3DCompile(SHADER,strlen(SHADER),"shader",nullptr,nullptr,"VSMain","vs_5_0",
                   D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&vs,&error);
     if(FAILED(hr)){
@@ -353,6 +370,14 @@ static void makePipeline() {
     if(FAILED(hr)){
         if(error)MessageBoxA(gWindow,(char*)error->GetBufferPointer(),"Pixel Shader",MB_OK);
         fatal("Compile pixel shader",hr);
+    }
+    error.Reset();
+    hr=D3DCompile(SHADER,strlen(SHADER),"shader",nullptr,nullptr,"PSShadow","ps_5_0",
+                  D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL3,0,
+                  &shadowPS,&error);
+    if(FAILED(hr)){
+        if(error)MessageBoxA(gWindow,(char*)error->GetBufferPointer(),"Shadow Shader",MB_OK);
+        fatal("Compile shadow map pixel shader",hr);
     }
     D3D12_INPUT_ELEMENT_DESC input[]={
         {"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
@@ -377,6 +402,14 @@ static void makePipeline() {
     p.DSVFormat=DXGI_FORMAT_D32_FLOAT;p.SampleDesc.Count=1;
     check(gDevice->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&gPSO)),
           "Create pipeline state");
+    p.PS={shadowPS->GetBufferPointer(),shadowPS->GetBufferSize()};
+    p.NumRenderTargets=0;
+    p.RTVFormats[0]=DXGI_FORMAT_UNKNOWN;
+    p.RasterizerState.DepthBias=1250;
+    p.RasterizerState.SlopeScaledDepthBias=1.4f;
+    p.RasterizerState.DepthBiasClamp=0.005f;
+    check(gDevice->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&gShadowPSO)),
+          "Create shadow-map pipeline state");
 }
 static void initializeDX12() {
     ComPtr<IDXGIFactory4> factory;
