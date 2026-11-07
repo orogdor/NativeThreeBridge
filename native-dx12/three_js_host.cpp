@@ -15,6 +15,7 @@ JSRuntime *runtime = nullptr;
 JSContext *context = nullptr;
 JSValue frameFunction = JS_UNDEFINED;
 JSValue lightFunction = JS_UNDEFINED;
+JSValue navStatusFunction = JS_UNDEFINED;
 bool ready = false;
 
 [[noreturn]] void die(const char *msg) {
@@ -96,9 +97,12 @@ void NativeThreeJS_Init() {
     JSValue global = JS_GetGlobalObject(context);
     frameFunction = JS_GetPropertyStr(context, global, "__nativeThreeFrame");
     lightFunction = JS_GetPropertyStr(context, global, "__nativeThreeLightFrame");
+    navStatusFunction = JS_GetPropertyStr(context, global, "__nativeThreeNavStats");
     JSValue diagnostics = JS_GetPropertyStr(context, global, "__nativeThreeDiagnostics");
     if (!JS_IsFunction(context, frameFunction) ||
-        !JS_IsFunction(context, lightFunction) || !JS_IsFunction(context, diagnostics))
+        !JS_IsFunction(context, lightFunction) ||
+        !JS_IsFunction(context, navStatusFunction) ||
+        !JS_IsFunction(context, diagnostics))
         die("Real Three.js scene or dynamic light bridge API missing");
     JSValue check = JS_Call(context, diagnostics, JS_UNDEFINED, 0, nullptr);
     if (JS_IsException(check)) dieWithJS("Three.js scene diagnostics failed");
@@ -160,14 +164,30 @@ void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
     JS_FreeValue(context, buffer);
     JS_FreeValue(context, result);
 }
+void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out) {
+    if (!ready || !out) die("Navigation status: runtime not ready");
+    JSValue stats = JS_Call(context,navStatusFunction,JS_UNDEFINED,0,nullptr);
+    if (JS_IsException(stats)) dieWithJS("Read real-time A* movement status");
+    const char *keys[]={"routeFailures","moved","active","arrived","routeSteps"};
+    int *values[]={&out->routeFailures,&out->moved,&out->active,&out->arrived,&out->routeSteps};
+    for (int i=0;i<5;i++) {
+        JSValue v=JS_GetPropertyStr(context,stats,keys[i]);
+        if (JS_IsException(v) || JS_ToInt32(context,values[i],v)<0)
+            dieWithJS("Invalid Three.js navigation status field");
+        JS_FreeValue(context,v);
+    }
+    JS_FreeValue(context,stats);
+}
 void NativeThreeJS_Shutdown() {
     if (!ready) return;
+    JS_FreeValue(context,navStatusFunction);
     JS_FreeValue(context,lightFunction);
     JS_FreeValue(context,frameFunction);
     JS_FreeContext(context);
     JS_FreeRuntime(runtime);
     frameFunction=JS_UNDEFINED;
     lightFunction=JS_UNDEFINED;
+    navStatusFunction=JS_UNDEFINED;
     context=nullptr;
     runtime=nullptr;
     ready=false;
