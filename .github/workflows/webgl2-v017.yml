@@ -38,6 +38,9 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           d=Path('/tmp/v017-dom.html').read_text()
+          import re
+          print('DOM bytes:',len(d),'Status:',re.findall(r'data-(?:ready|error|fallback|visible-pixels)="[^"]*"',d)[-15:])
+          print('Chrome:',Path('/tmp/v017-browser.log').read_text()[-1800:])
           assert 'data-ready="true"' in d,'WebGL2 app did not start'
           assert 'data-fallback="true"' not in d,'3D fallback active'
           assert '500 sõduri valgused: SEES' in d,'500-glow UI was not created'
