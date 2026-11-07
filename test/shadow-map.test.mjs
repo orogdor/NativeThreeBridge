@@ -33,7 +33,9 @@ test('real DX12 shadow depth array captures tree and soldier silhouettes',()=>{
   assert.match(dx,/D3D12_DSV_DIMENSION_TEXTURE2DARRAY/);
   assert.match(dx,/DXGI_FORMAT_R32_TYPELESS/);
   assert.match(dx,/DXGI_FORMAT_R32_FLOAT/);
-  assert.match(dx,/p<2\?TREE_COUNT:PER_ARMY/);
+  assert.match(dx,/gShadowVisibleCounts\[li\]\[p<2\?0/);
+  assert.match(dx,/gShadowInstanceIDs\[gShadowOffset\+instance\]/);
+  assert.match(dx,/gShadowIndexSRV\[FRAME_COUNT\]/);
   assert.match(dx,/gShadowDepthTexture\.SampleLevel/);
   assert.match(dx,/SetGraphicsRootDescriptorTable\(4,gShadowSRV\)/);
   assert.match(dx,/SetGraphicsRootConstantBufferView\(5,gLightsCB/);
