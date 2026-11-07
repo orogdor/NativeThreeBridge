@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main]
+    branches: [main, perf/dx12-frame-pipeline-and-shadows]
   workflow_dispatch:
 permissions:
   contents: write
