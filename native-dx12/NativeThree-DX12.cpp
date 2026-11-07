@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
+#include "three_js_host.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -43,7 +44,7 @@ static ComPtr<ID3D12GraphicsCommandList> gCmd;
 static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO;
-static ComPtr<ID3D12Resource> gFrameCB;
+static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB;
 static HANDLE gFenceEvent=NULL;
 static UINT64 gFenceValue=0;
 static UINT gRTVStep=0,gSRVStep=0;
@@ -226,6 +227,9 @@ cbuffer Draw : register(b1) {
     float gAlphaCut;
     float4 gTint;
 };
+cbuffer InstanceTransforms : register(b2) {
+    float4x4 gInstances[20];
+};
 Texture2D gTexture : register(t0);
 SamplerState gSampler : register(s0);
 struct Vin {float3 p:POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
@@ -233,12 +237,11 @@ struct Vout {float4 p:SV_POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
 Vout VSMain(Vin v,uint instance:SV_InstanceID) {
     Vout o;
     float3 origin=float3(0,0,0);
-    if(gKind==0) {
-        origin=float3(((int)(instance%5)-2)*6.8,0,((int)(instance/5))*6.5-14);
-    } else if(gKind==1) {
-        origin=float3(((int)(instance%5)-2)*9.0,0,((int)(instance/5))*9+13);
+    float3 p = v.p*gScale + float3(0,gYOffset,0);
+    if (gKind != 2) {
+        uint offset = gKind == 1 ? 10 : 0;
+        p = mul(gInstances[instance + offset], float4(v.p*gScale, 1)).xyz + float3(0,gYOffset,0);
     }
-    float3 p=v.p*gScale + origin + float3(0,gYOffset,0);
     o.p=mul(gViewProjection,float4(p,1));
     o.n=v.n; o.uv=v.uv;
     return o;
@@ -251,7 +254,7 @@ float4 PSMain(Vout i):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[3]={};
+    D3D12_ROOT_PARAMETER rp[4]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -266,6 +269,9 @@ static void makePipeline() {
     rp[2].DescriptorTable.NumDescriptorRanges=1;
     rp[2].DescriptorTable.pDescriptorRanges=&range;
     rp[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[3].Descriptor.ShaderRegister=2;
+    rp[3].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samp={};
     samp.Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samp.AddressU=samp.AddressV=samp.AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -274,7 +280,7 @@ static void makePipeline() {
     samp.ShaderRegister=0;
     samp.ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=3;rs.pParameters=rp;
+    rs.NumParameters=4;rs.pParameters=rp;
     rs.NumStaticSamplers=1;rs.pStaticSamplers=&samp;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -385,6 +391,7 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     gFrameCB=uploadBuffer(nullptr,256);
+    gInstancesCB=uploadBuffer(nullptr,2048);
     makePipeline();
 
     DrawParams house={0,7.0f,2.08f,0,{1,1,1,1}};
@@ -396,6 +403,14 @@ static void initializeDX12() {
     makeGround();
 }
 static void renderFrame() {
+    // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
+    // objects in QuickJS, not hardcoded into C++ instance positioning.
+    float matrices[320]={};
+    NativeThreeJS_Frame(1.0f/60.0f,matrices,320);
+    void *instanceMapped=nullptr;
+    check(gInstancesCB->Map(0,nullptr,&instanceMapped),"Map Three.js instance matrices");
+    memcpy(instanceMapped,matrices,sizeof(matrices));
+    gInstancesCB->Unmap(0,nullptr);
     XMVECTOR eye=XMVectorSet(
         sinf(gYaw)*cosf(gPitch)*gDistance,
         sinf(gPitch)*gDistance,
@@ -430,6 +445,7 @@ static void renderFrame() {
     ID3D12DescriptorHeap *heaps[]={gSRVHeap.Get()};
     gCmd->SetDescriptorHeaps(1,heaps);
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const UINT order[]={3,0,1,2};
     for(UINT p=0;p<4;p++) {
@@ -453,7 +469,7 @@ static void renderFrame() {
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         wchar_t title[256];
-        swprintf_s(title,L"NativeThreeBridge v0.5 DX12 | FPS %d | 10 Stone Age houses + 10 pines | Chromium-free",frames);
+        swprintf_s(title,L"NativeThreeBridge Three.js runtime v0.6 DX12 | FPS %d | 10 Stone Age houses + 10 pines | Chromium-free",frames);
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gStatStart=t;
@@ -503,6 +519,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
        nullptr,nullptr,instance,nullptr);
     if(!gWindow)return 2;
     initializeDX12();
+    NativeThreeJS_Init();
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
     gStatStart=GetTickCount64();
@@ -518,6 +535,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
         else Sleep(50);
     }
     waitGPU();
+    NativeThreeJS_Shutdown();
     if(gFenceEvent)CloseHandle(gFenceEvent);
     return 0;
 }
