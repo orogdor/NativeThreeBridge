@@ -42,3 +42,24 @@ test('CI builds the three HLSL entry points without a physical GPU',()=>{
   assert.match(workflow,/Compile HLSL main lighting and per-soldier shadow shaders/);
   assert.match(workflow,/shader_smoke\.exe/);
 });
+
+
+test('shadow slots are selected from lights nearest the visible camera focus',()=>{
+  assert.match(dx,/gCameraFocusX/);
+  assert.match(dx,/gCameraFocusZ/);
+  assert.match(dx,/const float dx=lights\[i\*8\]-gCameraFocusX/);
+  assert.match(dx,/gShadowSourceIndices\[k\]=li/);
+  assert.match(dx,/constants\.shadowSlots\[li\]\.x=\(float\)k/);
+});
+test('camera can inspect either army close up and toggle real route overlays',()=>{
+  assert.match(dx,/gCameraMode=1/);
+  assert.match(dx,/wp==VK_F1/);
+  assert.match(dx,/wp==VK_F2/);
+  assert.match(dx,/wp==VK_F3/);
+  assert.match(dx,/wp==VK_F4/);
+  assert.match(dx,/createDebugRouteGeometry\(\)/);
+  assert.match(dx,/NativeThreeJS_DebugSegments/);
+  assert.match(dx,/gCmd->DrawInstanced\(gDebugRedVertices/);
+  assert.match(dx,/gCmd->DrawInstanced\(gDebugBlueVertices/);
+  assert.match(dx,/if\(gKind==4\) return float4\(gTint\.rgb,1\)/);
+});
