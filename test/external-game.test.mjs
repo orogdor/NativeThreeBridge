@@ -5,33 +5,33 @@ import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
 const src=readFileSync(new URL('../game/scene.js',import.meta.url),'utf8');
 function create(){const box={THREE};vm.runInNewContext(src,box,{filename:'scene.js'});return box;}
-test('exactly 10x10 pine forest, 500 soldiers and 500 moving spotlights',()=>{
+test('forest 10 times larger with 1000 pines, 500 soldiers and 500 moving spotlights',()=>{
   const box=create(),d=box.__nativeThreeDiagnostics();
-  assert.equal(d.treeCount,100);
-  assert.equal(d.forestSide,10);
+  assert.equal(d.treeCount,1000);
+  assert.equal(d.forestSide,32);
   assert.deepEqual(Array.from(d.soldierCounts),[250,250]);
   assert.equal(d.unitCount,500);
   assert.equal(d.lights,500);
   assert.equal(d.shadowLights,500);
   assert.equal(d.lightsAreSpotLights,true);
   assert.equal(d.lightFloatCount,500*8);
-  assert.equal(d.floats,600*16);
+  assert.equal(d.floats,1500*16);
   assert.equal(d.routes,500);
   assert.equal(d.routeFailures,0);
 });
-test('100 distinct trees form exactly 10x10 square and paths avoid tree cells',()=>{
+test('1000 distinct trees cover an approximately 32x32 square and paths avoid tree cells',()=>{
   const box=create(),nav=box.__nativeNavTest();
-  const trees=new Set(nav.trees.map(([x,z])=>z*64+x));
-  assert.equal(trees.size,100);
+  const trees=new Set(nav.trees.map(([x,z])=>z*160+x));
+  assert.equal(trees.size,1000);
   const xs=[...new Set(nav.trees.map(x=>x[0]))],zs=[...new Set(nav.trees.map(x=>x[1]))];
-  assert.equal(xs.length,10);assert.equal(zs.length,10);
+  assert.equal(xs.length,32);assert.equal(zs.length,32);
   for(const path of nav.paths){
     assert.ok(path.length>1);
     for(let i=0;i<path.length;i++){
       assert.equal(nav.blocked[path[i]],0,'A* traversed blocked tree cell');
       if(i){const diff=Math.abs(path[i]-path[i-1]);
-        assert.ok(diff===1||diff===64,'nonadjacent A* step');
-        if(diff===1)assert.equal(Math.floor(path[i]/64),Math.floor(path[i-1]/64));
+        assert.ok(diff===1||diff===160,'nonadjacent A* step');
+        if(diff===1)assert.equal(Math.floor(path[i]/160),Math.floor(path[i-1]/160));
       }
     }
   }

@@ -11,9 +11,11 @@ test('real JS code is interpreted by QuickJS without Chromium',()=>{
   assert.match(host,/memcpy\(outMatrices/);
   assert.match(cmake,/target_link_libraries\(NativeThreeJS PRIVATE qjs d3d12/);
 });
-test('DX12 consumes 600 official THREE.InstancedMesh world matrices',()=>{
+test('DX12 consumes 1500 THREE.InstancedMesh transforms over split DirectX12 buffers',()=>{
   assert.match(dx,/NativeThreeJS_Frame\(/);
   assert.match(dx,/SetGraphicsRootConstantBufferView\(3,gInstancesCB/);
-  assert.match(dx,/float4x4 gInstances\[600\]/);
-  assert.match(host,/MATRIX_FLOATS = 600 \* 16/);
+  assert.match(dx,/float4x4 gTreeInstances\[1000\]/);
+  assert.match(dx,/float4x4 gSoldierInstances\[500\]/);
+  assert.match(dx,/SetGraphicsRootConstantBufferView\(7,gSoldierCB/);
+  assert.match(host,/MATRIX_FLOATS = 1500 \* 16/);
 });
