@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include "quickjs.h"
 #include "three_js_host.h"
@@ -15,7 +16,9 @@ JSValue frameFunction = JS_UNDEFINED;
 bool ready = false;
 
 [[noreturn]] void die(const char *msg) {
-    MessageBoxA(nullptr, msg, "NativeThreeBridge: Three.js runtime failure", MB_OK | MB_ICONERROR);
+    if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
+        MessageBoxA(nullptr, msg, "NativeThreeBridge: Three.js runtime failure", MB_OK | MB_ICONERROR);
+    std::fprintf(stderr, "%s\\n", msg);
     ExitProcess(41);
 }
 std::string errorString() {
