@@ -1,35 +1,35 @@
-# NativeThreeBridge v0.10.0 — 10×10 forest + 500 soldiers/lights
+# NativeThreeBridge v0.11.0 — 10× larger forest
 
-Windows-only native DirectX 12 prototype with official Three.js r181 inside embedded QuickJS-NG, no Chromium, Electron, WebView, browser, Node or Deno at runtime.
+Native Windows DirectX 12 prototype using official Three.js within QuickJS-NG, without a browser, Chromium or WebView.
 
-## Stress-test scene
+## New forest benchmark
 
-- 10×10 forest: 100 original Kuningriigid Sapling pine GLBs on 100 distinct navigation tiles.
-- Two opposing armies with 250 spearmen each: 500 real Kuningriigid odamees GLB instances.
-- 500 real THREE.SpotLight objects, one moving above each soldier, with warm/red or cool/blue color.
-- 500 individually calculated A* paths on a 64×64 navigation grid. Paths avoid tree obstacles; no combat or unit collision avoidance.
-- 600 actual Three.js Matrix4 instance transforms go to DirectX 12 per frame. The static 100 tree transforms are cached.
-- DX12 keeps all 500 dynamic lights but evaluates at most 16 nearest lights per 16×16 world-space illumination tile, preventing a 500-iteration pixel-shader loop.
-- 16 active 256×256 shadow-map slices (eight selected lights per army), rather than 500 full depth passes per frame. All 500 lights are present in the JS scene but only the 16 selected lights cast real-time depth-map shadows that frame.
-- Trees and armies use GPU instancing; pine foliage shadows retain the alpha cutout.
+- **1000 original Sapling pines**, ten times the 100-tree population in v0.10. The forest expands to an approximately 32×32 tree-placement lattice (1024 candidate locations, 24 omitted to leave exactly 1000), retaining the previous 3-cell tree spacing. The visible forest footprint is roughly ten times larger.
+- **Two armies of 250 Kuningriigid spearmen**, for 500 moving units. All 500 still have independent A* paths through the forest.
+- **500 real moving Three.js spotlights**, one per soldier, with warm/cool army colors.
+- **16 real-time shadow maps** chosen from the 500 lights each frame; other nearby lights illuminate without a depth shadow.
+- Navigation expanded from **64×64 to 160×160 cells**. Tree-occupied cells are blocked; soldiers move on passable routes.
+- GPU instancing still draws pine bark, pine foliage, red soldiers, and blue soldiers in four draw batches plus the ground.
+- DX12 world, camera and 16×16 tiled-light coverage enlarged to match the forest.
+
+### Windows/DX12 memory change
+
+1000 trees + 500 soldiers require **1500 Matrix4 transforms** (96,000 bytes). This is larger than one DirectX12 constant-buffer-view limit of 64 KiB, so the engine uses **two GPU CBVs**: 1000 static tree transforms (64,000 bytes) and 500 dynamic soldier transforms (32,000 bytes). Tree transforms are uploaded once; soldier matrices are updated per frame. This preserves real Three.js Scene/InstancedMesh transforms, rather than replacing them with hardcoded C++ positions.
 
 ## Download and update
 
-[Windows release ZIP](https://github.com/orogdor/NativeThreeBridge/releases/latest). Extract the entire ZIP keeping the game subdirectory:
+Use the latest [NativeThreeBridge Windows GitHub Release](https://github.com/orogdor/NativeThreeBridge/releases/latest). Keep the ZIP layout:
 
-    NativeThree-Updater.exe    independent SHA-256 GitHub updater
-    NativeThree-Game.exe       separate native Three.js / QuickJS-NG / DX12 executable
-    game/scene.js              editable 10×10 forest and 500-unit JS code
-    installed-version.txt
+    NativeThree-Updater.exe  – separate SHA-256 verified updater
+    NativeThree-Game.exe     – standalone native DX12 + QuickJS-NG + Three.js
+    game/scene.js            – independently editable forest/army pathfinding
 
-Launch NativeThree-Game.exe without checking GitHub, or NativeThree-Updater.exe for independent per-file updates. NO-UPDATE.txt disables checking; PRESERVE-SCENE.txt protects locally modified scene.js. Close the game before updating. v0.7+ updater is compatible with this two-file layout.
+Close the game and open the updater to check for changed EXE and scene.js files, or run the game EXE directly. If PRESERVE-SCENE.txt exists, it protects local game script changes; remove it to install the new forest scene. NO-UPDATE.txt disables update checks.
 
-Mouse drag rotates the camera; wheel zooms; Space pauses; Escape closes. FPS is in the title.
+Mouse drag rotates the camera, mouse wheel zooms, Space pauses, Esc closes. FPS appears in the window title.
 
-## Testing and limitations
+## Verification boundary
 
-GitHub Actions verifies JavaScript Three.js structure, 100 distinct tree tiles, 500 A* routes, 500 moving SpotLights, native QuickJS matrices, the MSVC Windows EXE build and the three HLSL shader entries.
+GitHub Actions checks actual Three.js instancing, 1000 tree placements, 500 A* routes, native QuickJS matrix export, C++/DX12 compilation and HLSL shader compilation. Graphical rendering, GPU FPS and shadow appearance still need testing on Windows hardware. This remains a limited Three.js-to-DX12 adapter, not a complete WebGLRenderer/GLTFLoader replacement.
 
-Real GPU shadow appearance and FPS still require a Windows test. General Three.js WebGLRenderer, GLTFLoader, generic geometry uploads, all materials, full animations, HTML/DOM and UI remain unsupported.
-
-Original pinned GLBs in the unchanged [Kuningriigid repository](https://github.com/orogdor/Kuningriigid): models-trellis-v262/odamees.glb and assets/sapling-trees/pine_01/mid.glb.
+Original unchanged source assets: Kuningriigid `models-trellis-v262/odamees.glb`, `assets/sapling-trees/pine_01/mid.glb`.
