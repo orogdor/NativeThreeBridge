@@ -1,0 +1,64 @@
+name: Build offline WebGL2 v0.18 real depth shadows
+on:
+  push:
+    paths:
+      - "tools/build_webgl2_v018.py"
+      - ".github/workflows/webgl2-v018.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate self-contained v0.18 HTML
+        run: python tools/build_webgl2_v018.py
+      - name: Syntax check extracted application module
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          s=Path('benchmarks/NativeThreeBridge-v018-REAL-SHADOWS.html').read_text()
+          module=s.rsplit('<script type="module">',1)[1].split('</script>',1)[0]
+          Path('/tmp/v018.mjs').write_text(module)
+          assert 'Actual tree and soldier shadows' in s
+          assert 'sun.castShadow=shadows' in s
+          PY
+          node --check /tmp/v018.mjs
+      - name: Headless WebGL2 geometry and spotlight test
+        shell: bash
+        run: |
+          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser)
+          FILE="$(pwd)/benchmarks/NativeThreeBridge-v018-REAL-SHADOWS.html"
+          timeout 100s "$CHROME" --headless=new --no-sandbox --disable-dev-shm-usage \
+            --enable-unsafe-swiftshader --use-gl=angle --use-angle=swiftshader \
+            --disable-background-networking --no-first-run --virtual-time-budget=20000 \
+            --dump-dom "file://$FILE?autotest=1" >/tmp/v018-dom.html 2>/tmp/v018-browser.log || true
+          python - <<'PY'
+          from pathlib import Path
+          d=Path('/tmp/v018-dom.html').read_text()
+          import re
+          print('DOM bytes:',len(d),'Status:',re.findall(r'data-(?:ready|error|fallback|visible-pixels)="[^"]*"',d)[-15:])
+          print('Chrome:',Path('/tmp/v018-browser.log').read_text()[-1800:])
+          assert 'data-ready="true"' in d,'WebGL2 app did not start'
+          assert 'data-fallback="true"' not in d,'3D fallback active'
+          assert 'data-sunlight-shadow="true"' in d,'Directional shadow not enabled'\n          assert 'data-shadow-receiving-ground="true"' in d,'Ground cannot receive shadows'\n          assert 'data-shadow-casting-meshes="4"' in d,'Trees or soldiers do not cast shadows'
+          import re
+          m=re.search(r'data-visible-pixels="(\d+)"',d)
+          assert m and int(m.group(1))>=200,'No rendered 3D geometry'
+          print('PASS: 500 soldier glow instances initialized; WebGL2 visible pixels:',m.group(1))
+          PY
+      - name: Publish generated HTML to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add benchmarks/NativeThreeBridge-v018-REAL-SHADOWS.html
+          git commit -m "Publish WebGL2 v0.18 with visible lights for 500 soldiers"
+          git push origin HEAD:main
+      - name: Upload standalone HTML to v0.15 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v0.15.0 benchmarks/NativeThreeBridge-v018-REAL-SHADOWS.html --clobber
