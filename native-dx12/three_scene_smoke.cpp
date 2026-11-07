@@ -4,6 +4,21 @@
 int main(){
     constexpr int TREES=1000, PER_ARMY=250, SOLDIERS=500, INSTANCE_FLOATS=1500*16, LIGHT_FLOATS=500*8;
     NativeThreeJS_Init();  // Validates 1000-tree forest, 500 A* routes and two armies
+    float debugSegments[60000]{};
+    const size_t debugFloats=NativeThreeJS_DebugSegments(debugSegments,60000);
+    if(debugFloats<5000 || debugFloats%5!=0){
+        std::fprintf(stderr,"A* visualization contains no usable route segments: %zu\n",debugFloats);
+        return 9;
+    }
+    bool redPath=false,bluePath=false;
+    for(size_t j=0;j<debugFloats;j+=5){
+        if(debugSegments[j]==0.f)redPath=true;
+        if(debugSegments[j]==1.f)bluePath=true;
+    }
+    if(!redPath||!bluePath){
+        std::fprintf(stderr,"Missing red or blue army A* debug paths\n");
+        return 10;
+    }
     float matrices[INSTANCE_FLOATS]{};
     float lights[LIGHT_FLOATS]{};
     NativeThreeJS_Frame(0.f,matrices,INSTANCE_FLOATS);
@@ -42,7 +57,8 @@ int main(){
             return 7;
         }
     }
-    std::puts("PASS: 1000 original pines on 10x enlarged forest footprint");
+    std::puts("PASS: 1000 original pines with A* obstacle barrier");
+    std::puts("PASS: genuine A* route guide segments exist for both armies");
     std::puts("PASS: 500 real Three.js soldiers in two armies with A* paths");
     std::puts("PASS: 500 moving Three.js SpotLight records follow soldiers");
     std::puts("PASS: real-time navigation status shows 500 moving soldiers and A* waypoint progress");
