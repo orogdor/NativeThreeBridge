@@ -3,7 +3,7 @@
 (() => {
   'use strict';
   const GRID=160, CELL=3, FOREST_SIDE=32, TREES=1000, PER_ARMY=250;
-  const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=9.5, LIGHT_RADIUS=18;
+  const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=9.5, LIGHT_RADIUS=32;
   const scene=new THREE.Scene();
   scene.name='1000-tree expanded forest + 500 moving soldiers with spotlights';
   scene.background=new THREE.Color(0x1c2a3c);
@@ -51,6 +51,31 @@
     const yaw=rand()*Math.PI*2,scale=0.83+rand()*0.34;
     put(treeBark,n,tx,tz,yaw,scale);
     put(treeNeedles,n,tx,tz,yaw,scale);
+  }
+  // A visibly navigable obstacle: shift a small subset of trees from the
+  // regular grid into a continuous cross-forest barrier. The opening forces
+  // A* units to turn, rather than mostly walking in visually straight lanes.
+  const BARRIER_X=79, BARRIER_Z0=36, BARRIER_Z1=121;
+  const barrierCells=[];
+  for(let z=BARRIER_Z0;z<=BARRIER_Z1;z++){
+    if(z>=77 && z<=85)continue; // nine-cell gap for the armies
+    if(blocked[gridIndex(BARRIER_X,z)])continue;
+    barrierCells.push([BARRIER_X,z]);
+  }
+  // Retire the last N original tree locations, then reuse their instances
+  // for the barrier. This preserves exactly 1000 source GLB instances.
+  for(let j=0;j<barrierCells.length;j++){
+    const i=TREES-barrierCells.length+j;
+    const [oldX,oldZ]=treeCells[i];
+    blocked[gridIndex(oldX,oldZ)]=0;
+  }
+  for(let j=0;j<barrierCells.length;j++){
+    const i=TREES-barrierCells.length+j;
+    const [gx,gz]=barrierCells[j];
+    treeCells[i]=[gx,gz];blocked[gridIndex(gx,gz)]=1;
+    const x=toWorld(gx),z=toWorld(gz),yaw=rand()*Math.PI*2;
+    put(treeBark,i,x,z,yaw,0.87);
+    put(treeNeedles,i,x,z,yaw,0.87);
   }
   if(treeCells.length!==TREES) throw new Error('Forest tree count must be exactly 1000');
   treeBark.instanceMatrix.needsUpdate=true;
@@ -112,9 +137,9 @@
   for(let team=0;team<2;team++)for(let i=0;i<PER_ARMY;i++){
     // 10 columns by 25 rows on each side (250 separate starting tiles).
     const column=i%10,row=(i/10)|0;
-    const sx=team===0?4+column:155-column;
+    const sx=team===0?20+column:139-column;
     const sz=68+row;
-    const tx=team===0?155-column:4+column;
+    const tx=team===0?139-column:20+column;
     const tz=92-row;
     const path=findPath(sx,sz,tx,tz);
     if(path.length===0)pathFailures++;
@@ -125,7 +150,7 @@
       // A faster walking speed keeps long routes visibly progressing.
       speed:10.5+(i%5)*0.35,arrived:false};
     units.push(unit);
-    const lamp=new THREE.SpotLight(lightColors[team],2.0,LIGHT_RADIUS,Math.PI/3,0.25,1.5);
+    const lamp=new THREE.SpotLight(lightColors[team],4.0,LIGHT_RADIUS,Math.PI/3,0.25,1.5);
     lamp.name=(team===0?'Red':'Blue')+' spotlight '+i;
     lamp.castShadow=true; // DX12 selectively budgets 16 shadow-map updates/frame.
     lamp.shadow.mapSize.set(256,256);lamp.shadow.bias=-0.0008;
@@ -200,6 +225,7 @@
       routes:units.length,routeFailures:pathFailures,totalRouteCells:totalPathCells,
       moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
       arrived:arrivals,treeCells:treeCells.length,
+      debugSegments:debugPathData.length/5,
       active:units.filter(u=>u.path.length>1 && !u.arrived).length,
       routeSteps:units.reduce((n,u)=>n+u.at,0),
       scene:scene.isScene,group:forest.isGroup,mesh:ground.isMesh,
@@ -212,6 +238,22 @@
     arrived:arrivals,
     routeSteps:units.reduce((n,u)=>n+u.at,0)
   });
+  // Visual diagnostics: six selected A* routes per army. Each record:
+  // [army, world-x1, world-z1, world-x2, world-z2]. This is real A* output,
+  // not native-generated decorative curves. The DX12 renderer draws these
+  // as emissive colored ground lines that can be toggled with F4.
+  const debugSegments=[];
+  const sampleUnits=[0,29,79,129,179,229];
+  for(let team=0;team<2;team++)for(const unitIndex of sampleUnits){
+    const path=units[team*PER_ARMY+unitIndex].path;
+    for(let j=1;j<path.length;j++){
+      const [aX,aZ]=fromIndex(path[j-1]);
+      const [bX,bZ]=fromIndex(path[j]);
+      debugSegments.push(team,toWorld(aX),toWorld(aZ),toWorld(bX),toWorld(bZ));
+    }
+  }
+  const debugPathData=new Float32Array(debugSegments);
+  globalThis.__nativeThreeDebugSegments=()=>debugPathData;
   globalThis.__nativeThreeScene=scene;
   globalThis.__nativeThreeFrame=frame;
   globalThis.__nativeThreeLightFrame=()=>lightData;
