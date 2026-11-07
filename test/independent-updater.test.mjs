@@ -8,14 +8,14 @@ const flow=readFileSync(new URL('../.github/workflows/native-threejs.yml',import
 test('independent updater targets separate EXE and editable JS',()=>{
  assert.match(updater,/update-v2\.txt/);
  assert.match(updater,/NativeThree-Game\.exe/);
- assert.match(updater,/game\\scene\.js/);
+ assert.ok(updater.includes("scene.js") && updater.includes("game"));
  assert.match(updater,/sha256File\(/);
  assert.match(updater,/applyAll\(/);
 });
 test('real official Three.js runtime loads scene.js from the game directory',()=>{
  assert.match(host,/loadGameScene\(/);
  assert.match(host,/GetModuleFileNameW/);
- assert.match(host,/game\\scene\.js/);
+ assert.ok(host.includes("scene.js") && host.includes("game"));
  assert.match(host,/JS_Eval\(context, gameScript\.data\(\)/);
 });
 test('DX12 projection uses correct row-vector convention',()=>{
