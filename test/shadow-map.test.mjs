@@ -49,7 +49,7 @@ test('shadow slots are selected from lights nearest the visible camera focus',()
   assert.match(dx,/gCameraFocusZ/);
   assert.match(dx,/const float dx=lights\[i\*8\]-gCameraFocusX/);
   assert.match(dx,/gShadowSourceIndices\[k\]=li/);
-  assert.match(dx,/constants\.shadowSlots\[li\]\.x=\(float\)k/);
+  assert.match(dx,/constants\.shadowSlots\[li\]\.x=gEnableShadows\?\(float\)k:-1\.f/);
 });
 test('camera can inspect either army close up and toggle real route overlays',()=>{
   assert.match(dx,/gCameraMode=1/);
