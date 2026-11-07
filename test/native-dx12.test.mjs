@@ -7,10 +7,10 @@ const yml=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.
 test('actual native DX12 backend and GPU instancing',()=>{
   assert.match(cpp,/#include <d3d12\.h>/);
   assert.match(cpp,/D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL/);
-  assert.match(cpp,/DrawIndexedInstanced\(m\.indexCount,order\[p\]==3\?1:10/);
+  assert.match(cpp,/p==1\|\|p==2\?1000:10/);
 });
-test('original pinned Stone Age house and pine GLB assets',()=>{
-  assert.match(py,/models-stone-lod-v244\/house_far\.glb/);
+test('original pinned Stone Age spearman and pine GLB assets',()=>{
+  assert.match(py,/models-trellis-v262\/odamees\.glb/);
   assert.match(py,/assets\/sapling-trees\/pine_01\/mid\.glb/);
   assert.match(py,/SOURCE_COMMIT = "[0-9a-f]{40}"/);
   assert.match(py,/computed != digest/);

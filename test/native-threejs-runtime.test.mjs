@@ -14,6 +14,6 @@ test('official Three.js bundle evaluated in embedded QuickJS not browser',()=>{
 test('DX12 reads native JS instance matrices per frame',()=>{
   assert.match(dx12,/NativeThreeJS_Frame\(/);
   assert.match(dx12,/SetGraphicsRootConstantBufferView\(3,gInstancesCB/);
-  assert.match(dx12,/float4x4 gInstances\[20\]/);
+  assert.match(dx12,/float4x4 gInstances\[1020\]/);
   assert.match(dx12,/gInstances\[instance \+ offset\]/);
 });
