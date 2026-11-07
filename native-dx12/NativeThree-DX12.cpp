@@ -227,33 +227,78 @@ cbuffer Draw : register(b1) {
     float gAlphaCut;
     float4 gTint;
 };
-cbuffer InstanceTransforms : register(b2) {
-    float4x4 gInstances[1020];
+cbuffer InstanceTransforms : register(b2) { float4x4 gInstances[1020]; };
+cbuffer Lights : register(b3) {
+    float4x4 gLightVP[20];
+    float4 gLightPosRadius[20];
+    float4 gLightColorIntensity[20];
 };
 Texture2D gTexture : register(t0);
+Texture2DArray gShadowDepthTexture : register(t1);
 SamplerState gSampler : register(s0);
+SamplerState gShadowSampler : register(s1);
 struct Vin {float3 p:POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
-struct Vout {float4 p:SV_POSITION;float3 n:NORMAL;float2 uv:TEXCOORD0;};
+struct Vout {
+    float4 p:SV_POSITION;
+    float3 n:NORMAL;
+    float2 uv:TEXCOORD0;
+    float3 worldPos:TEXCOORD1;
+};
 Vout VSMain(Vin v,uint instance:SV_InstanceID) {
     Vout o;
     float3 p = v.p*gScale + float3(0,gYOffset,0);
-    if (gKind != 2) {
-        // 0=1000 pines, 1=red army, 3=blue army, 2=ground.
+    float3 normal = v.n;
+    if(gKind != 2) {
         uint offset = gKind == 1 ? 1000 : (gKind == 3 ? 1010 : 0);
-        p = mul(gInstances[instance + offset], float4(v.p*gScale, 1)).xyz
+        p = mul(gInstances[instance + offset], float4(v.p*gScale,1)).xyz
           + float3(0,gYOffset,0);
+        normal = mul((float3x3)gInstances[instance + offset],v.n);
     }
-    // XMMatrixTranspose(view*proj) is uploaded in row-major float order;
-    // use row-vector mul to avoid the near-horizon camera projection bug.
     o.p=mul(float4(p,1),gViewProjection);
-    o.n=v.n; o.uv=v.uv;
+    o.n=normalize(normal);
+    o.uv=v.uv;
+    o.worldPos=p;
     return o;
+}
+// This depth-only pixel shader discards holes in the pine foliage cards,
+// so foliage casts silhouette shadows, not solid rectangular shadows.
+void PSShadow(Vout i) {
+    if(gAlphaCut>0) clip(gTexture.Sample(gSampler,i.uv).a-gAlphaCut);
+}
+float visibilityFromShadowMap(float3 pos,uint lightIndex) {
+    float4 projected = mul(float4(pos,1),gLightVP[lightIndex]);
+    if(projected.w < 0.001) return 1.0;
+    float3 ndc = projected.xyz/projected.w;
+    float2 uv=float2(ndc.x*0.5+0.5,0.5-ndc.y*0.5);
+    if(any(uv<0.0) || any(uv>1.0) || ndc.z<0.0 || ndc.z>1.0) return 1.0;
+    float depth=gShadowDepthTexture.SampleLevel(
+        gShadowSampler,float3(uv,(float)lightIndex),0).r;
+    return (ndc.z-0.0015<=depth)?1.0:0.16;
 }
 float4 PSMain(Vout i):SV_TARGET {
     float4 albedo=gTexture.Sample(gSampler,i.uv)*gTint;
     if(gAlphaCut>0) clip(albedo.a-gAlphaCut);
-    float illumination=0.48+0.52*abs(dot(normalize(i.n),normalize(float3(0.32,0.84,0.41))));
-    return float4(albedo.rgb*illumination,1);
+    float3 n=normalize(i.n);
+    float daylight=0.30+0.40*abs(dot(n,normalize(float3(0.32,0.84,0.41))));
+    float3 illumination=daylight.xxx;
+    [loop] for(uint li=0;li<20;li++) {
+        float3 toLight=gLightPosRadius[li].xyz-i.worldPos;
+        float radius=gLightPosRadius[li].w;
+        float dist=length(toLight);
+        if(dist>radius || dist<0.01) continue;
+        // Each Three.js SpotLight points straight down from above the soldier.
+        float cone=toLight.y/dist;
+        if(cone<0.51)continue;
+        float coneFade=smoothstep(0.51,0.72,cone);
+        float diffuse=saturate(dot(n,toLight/dist));
+        if(diffuse<=0)continue;
+        float attenuation=saturate(1.0-dist/radius);
+        float visible=visibilityFromShadowMap(i.worldPos,li);
+        illumination+=gLightColorIntensity[li].rgb
+            *gLightColorIntensity[li].a*(attenuation*attenuation)
+            *coneFade*diffuse*visible*0.62;
+    }
+    return float4(saturate(albedo.rgb*illumination),1);
 }
 )";
 static void makePipeline() {
