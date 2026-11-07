@@ -75,8 +75,8 @@ test('long GPU frames are not limited to old 60ms movement cap',()=>{
   const a=create(),b=create();
   a.__nativeThreeFrame(0.2);
   b.__nativeThreeFrame(0.06);
-  const ax=a.__nativeThreeNavTest().positions;
-  const bx=b.__nativeThreeNavTest().positions;
+  const ax=a.__nativeNavTest().positions;
+  const bx=b.__nativeNavTest().positions;
   for(const i of [0,250]){
     const init=i<250?[(4-(160-1)/2)*3, (68-(160-1)/2)*3]:[(155-(160-1)/2)*3,(68-(160-1)/2)*3];
     const da=Math.hypot(ax[i][0]-init[0],ax[i][1]-init[1]);
