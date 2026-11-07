@@ -1,72 +1,10 @@
-name: Build Windows EXE and publish release
+name: Legacy build (retired - use native-threejs.yml)
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
-
 permissions:
-  contents: write
-
+  contents: read
 jobs:
-  windows:
-    runs-on: windows-2022
+  notice:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Pack original Kuningriigid GLB model resources
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check Pillow
-          if ($LASTEXITCODE -ne 0) { throw "Pillow install failed" }
-          python tools/pack_kuningriigid.py
-          if ($LASTEXITCODE -ne 0) { throw "GLB extraction and validation failed" }
-          python -c "import json; a=json.load(open('generated/parts.json')); assert [x['source'] for x in a] == ['house','pine','pine']; assert sum(x['triangles'] for x in a)>0; print('Original 3D model verification OK')"
-          if ($LASTEXITCODE -ne 0) { throw "Model verification failed" }
-      - name: Configure MSVC x64
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-      - name: Build DX12 renderer and self-updating launcher
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          rc /nologo /fo generated/model_assets.res generated/model_assets.rc
-          if ($LASTEXITCODE -ne 0) { throw "Model resource compilation failed" }
-          cl /nologo /O2 /W3 /EHsc /std:c++17 /DUNICODE /D_UNICODE native-dx12/NativeThree-DX12.cpp generated/model_assets.res /Fe:dist/NativeThree-Diagnostics.exe /link /SUBSYSTEM:WINDOWS user32.lib d3d12.lib dxgi.lib d3dcompiler.lib
-          if ($LASTEXITCODE -ne 0) { throw "Native DX12 build failed" }
-          Copy-Item dist/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe
-          cl /nologo /O2 /W3 /TC launcher/NativeThree-Launcher.c /Fe:dist/NativeThree-Launcher.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
-          if ($LASTEXITCODE -ne 0) { throw "Launcher build failed" }
-          $v = (Get-Content version.txt -Raw).Trim()
-          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
-          Set-Content -Path dist/installed-version.txt -Value $v -Encoding ascii -NoNewline
-          $hash = (Get-FileHash dist/NativeThree-Diagnostics.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          $data = $v + [Environment]::NewLine + $hash + [Environment]::NewLine
-          [IO.File]::WriteAllText((Join-Path (Get-Location) 'dist/update.txt'), $data, [Text.Encoding]::ASCII)
-          Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
-          Compress-Archive -Path dist/NativeThree-Launcher.exe,dist/NativeThree-Diagnostics.exe,dist/NativeThree-DX12.exe,dist/installed-version.txt,dist/README-WINDOWS.txt -DestinationPath dist/NativeThreeBridge-Windows-x64.zip -Force
-          if ((Get-Item dist/NativeThree-Diagnostics.exe).Length -lt 100000) { throw "DX12 EXE unexpectedly small" }
-          Write-Host "Version $v; SHA256 $hash"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: NativeThreeBridge-Windows-x64
-          path: |
-            dist/NativeThreeBridge-Windows-x64.zip
-            dist/update.txt
-      - name: Publish new stable GitHub Release
-        if: github.ref == 'refs/heads/main'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $v = (Get-Content version.txt -Raw).Trim()
-          $tag = "v$v"
-          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $tag already exists; no update to installed users"
-          } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe dist/update.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag" --notes "First actual Direct3D 12 test renderer: 10 original Stone Age house GLBs and 10 original Sapling pine GLBs; assets embedded in Windows EXE. No Chromium or browser. This is a DX12 prototype, NOT a full Three.js runtime. GPU runtime behavior must be verified on a Windows PC."
-            if ($LASTEXITCODE -ne 0) { throw "Release failed" }
-          }
+      - run: echo "Old v0.5 builder retired. NativeThreeJS DX12 build and releases use native-threejs.yml."

@@ -1,32 +1,37 @@
-# NativeThreeBridge
+# NativeThreeBridge v0.6.0
 
-An experimental native Windows DirectX 12 renderer, independent of Kuningriigid.
+Native Windows DirectX 12 prototype with a real **Three.js scene graph running in an embedded JavaScript engine**. This is a separate project from Kuningriigid; the original game repository is unchanged.
 
-## v0.5.0: 10 original Stone Age houses and 10 original pines
+## What is real in v0.6
 
-- Native DirectX 12 renderer, depth buffer, textured 3D models, GPU instancing.
-- Exactly 10 houses from Kuningriigid/models-stone-lod-v244/house_far.glb.
-- Exactly 10 trees from Kuningriigid/assets/sapling-trees/pine_01/mid.glb.
-- House JPEG and pine PNG alpha-mask textures embedded in the EXE.
-- No Chromium, Electron, WebView, Deno, Node, Python or web browser at Windows runtime.
-- Windows EXE includes models. GitHub Actions downloads pinned original GLBs, verifies checksums and packs them as Windows resources.
-- Orbit camera via left mouse drag, wheel zoom, pause with Space, exit with Esc, FPS in window title.
-- SHA-256 verified GitHub Releases updater is retained.
+- Three.js r181 is bundled into the executable and executed by embedded QuickJS-NG.
+- JavaScript builds actual THREE.Scene, THREE.Group, THREE.Mesh, THREE.InstancedMesh, THREE.Object3D, THREE.Matrix4 and THREE.PerspectiveCamera objects.
+- The C++ DX12 renderer reads twenty genuine world matrices from the Three.js objects **every frame**, not hardcoded native placement.
+- The test renders 10 original Stone Age houses and 10 original Sapling pines from the Kuningriigid GLBs, with a GPU depth buffer, texturing, simple shading, and GPU instancing.
+- The meshes and textures are converted and embedded at **build time**. No browser, WebGL, Chromium, WebView, Electron, Node.js or Deno is required on Windows to run the EXE.
+- The Windows GitHub Actions build compiles MSVC + QuickJS-NG and runs a real embedded-JavaScript smoke test that validates world matrices before publishing.
 
-**Current limitations:** This is a static render benchmark and is NOT yet a full Three.js JavaScript game runtime. Real runtime output and FPS need verification on a Windows PC; GitHub CI validates building and model packaging but cannot test the 3D window.
+## Download and run
 
-## Downloads
+Download NativeThreeBridge-Windows-x64.zip from [Releases](https://github.com/orogdor/NativeThreeBridge/releases/latest), extract it, open NativeThree-Launcher.exe for an update check, or NativeThree-DX12.exe directly.
 
-[Get Windows v0.5.0 from Releases](https://github.com/orogdor/NativeThreeBridge/releases/latest). Download NativeThreeBridge-Windows-x64.zip, extract and run NativeThree-Launcher.exe for automatic updates. Or open NativeThree-DX12.exe directly without an update check. For compatibility with the existing launcher, NativeThree-Diagnostics.exe now contains the new DX12 renderer rather than GDI.
+Left mouse drag rotates the camera, mouse wheel zooms, Space pauses, Escape closes. FPS is displayed in the window title.
 
-## Windows development build
+## How it is structured
 
-Run BUILD-WINDOWS.bat inside a Visual Studio x64 Native Tools Command Prompt with Python installed. The script uses Pillow at build time for embedded GLB textures, Microsoft C++ compiler and Windows SDK resource compiler.
+Game JavaScript -> official Three.js scene graph -> embedded QuickJS-NG -> native C++ scene adapter -> Direct3D 12 GPU rendering.
 
-The JavaScript Three.js data adapter remains in js/ as experimental conversion code, but it does NOT run inside this EXE.
+- threejs-native/scene.mjs — source Three.js scene graph
+- native-dx12/three_js_host.cpp — embedded JavaScript runtime and typed-array bridge
+- native-dx12/NativeThree-DX12.cpp — Direct3D 12 renderer
+- native-dx12/three_scene_smoke.cpp — runtime verification without the GPU
+- tools/pack_kuningriigid.py — original GLB asset verification and resource packaging
+- .github/workflows/native-threejs.yml — Windows build and release with smoke test
 
-Original models and provenance:
-- [Kuningriigid Stone Age house](https://github.com/orogdor/Kuningriigid/blob/main/models-stone-lod-v244/house_far.glb)
-- [Kuningriigid Sapling pine](https://github.com/orogdor/Kuningriigid/blob/main/assets/sapling-trees/pine_01/mid.glb)
+## Current limitations
 
-The Kuningriigid repository is not modified by the experiment.
+**Not yet a drop-in engine for arbitrary Three.js games.** Scene graph transforms are genuine Three.js, but the BufferGeometry objects carry native IDs while vertex data/textures come from the pre-packed models in DX12. Dynamic user-provided BufferGeometry uploads, arbitrary materials/shaders, WebGLRenderer, WebGPURenderer, GLTFLoader, TextureLoader, browser DOM, advanced lights/shadows, skeletal animation, and UI event bridges are **not** supported yet.
+
+Windows native JavaScript execution is verified by CI. The actual DX12 graphics output/FPS on your GPU is **not yet verified**.
+
+To build locally, run BUILD-WINDOWS.bat from a Visual Studio x64 Native Tools Command Prompt with Python and Node/npm available for development only. The Windows game EXE needs neither.
