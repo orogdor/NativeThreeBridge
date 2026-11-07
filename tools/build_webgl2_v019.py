@@ -38,7 +38,7 @@ old="map:tex,transparent:true,opacity:.22,depthWrite:false,"
 assert s.count(old)==1
 s=s.replace(old,"map:tex,transparent:true,opacity:.075,depthWrite:false,",1)
 # Explicit diagnostic of actual spotlight shadow instances, not merely JS lights.
-old="renderer.shadowMap.enabled=shadows;\n }"
+old="renderer.shadowMap.enabled=shadows;"
 assert s.count(old)==1
 s=s.replace(old,'''renderer.shadowMap.enabled=shadows;
   document.body.dataset.soldierShadowLights=String(pool.filter(l=>l.visible&&l.castShadow).length);
