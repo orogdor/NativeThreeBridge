@@ -1,3 +1,17 @@
+# NativeThreeBridge v0.16.0 — DX12 performance fixes
+
+DX12 performance pass (Windows):
+- Replaced the unconditional per-frame GPU fence stall with backbuffer-specific fences, command allocators and per-frame dynamic upload buffers. CPU can prepare the next frame while the GPU is rendering the previous one.
+- Moved static model vertex/index buffers to GPU-local DEFAULT memory using startup-only copy uploads.
+- Compact per-light visible instance lists replace the original unconditional 1000 trees + 500 soldiers for *every* one of the 16 shadow maps. Conservative light-radius culling keeps local trees and soldiers casting shadows.
+- F5 now stops rendering the shadow-map passes (it is no longer just a shader contribution toggle). F6 toggles VSync, OFF by default for uncapped benchmark comparisons.
+- Device selection explicitly prefers the high-performance hardware adapter; title shows GPU, FPS, how many shadow instances are submitted, and VSync state.
+- Dynamic A* routing, 1000 random trees, 500 moving soldiers and 500 dynamic lights remain in place.
+
+**Benchmark protocol:** Run the [v0.15.0 release](https://github.com/orogdor/NativeThreeBridge/releases/tag/v0.15.0) and v0.16.0 on the same computer. Compare F2 and F3 close views, shadows F5 ON/OFF and VSync F6 OFF; allow the scene to settle before comparing FPS. The latest standalone [HTML WebGL2 v0.19](benchmarks/NativeThreeBridge-v019-SOLDIER-SHADOWS.html) uses a different lighting implementation and is not yet a perfectly equal GPU workload. GitHub Actions validates compilation and CPU tests; hardware FPS and real shadows require a physical Windows GPU test.
+
+---
+
 # NativeThreeBridge v0.15.0 — iga sõduri dünaamiline A* ja kokkupõrgete vältimine
 
 ## 500 sõdurit ei saa enam üksteisest läbi kõndida
