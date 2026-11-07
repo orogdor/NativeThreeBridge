@@ -109,7 +109,7 @@ test('tree barrier forces real A* detours and exports visible route geometry',()
   assert.ok(forcedDetours>=30, 'at least 30 soldiers must avoid barrier with nontrivial A* detours');
   assert.ok(turned>=300, 'hundreds of soldiers must visibly change direction');
   const segments=x.__nativeThreeDebugSegments();
-  assert.ok(segments instanceof Float32Array);
+  assert.ok(ArrayBuffer.isView(segments),'cross-realm Float32Array should remain a typed array');
   assert.equal(segments.length%5,0);
   assert.ok(segments.length>5000,'draw enough segments for visible paths');
   assert.equal(x.__nativeThreeDiagnostics().debugSegments,segments.length/5);
