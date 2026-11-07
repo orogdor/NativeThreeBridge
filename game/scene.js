@@ -5,10 +5,10 @@
   const GRID=160, CELL=3, FOREST_SIDE=32, TREES=1000, PER_ARMY=250;
   const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=9.5, LIGHT_RADIUS=32;
   const scene=new THREE.Scene();
-  scene.name='1000-tree expanded forest + 500 moving soldiers with spotlights';
+  scene.name='1000 randomly placed pines + 500 moving soldiers';
   scene.background=new THREE.Color(0x1c2a3c);
   const forest=new THREE.Group(), armies=new THREE.Group();
-  forest.name='1000 pine forest (~32x32 grid)'; armies.name='Two armies of 250';
+  forest.name='1000 randomly scattered pines'; armies.name='Two armies of 250';
   scene.add(forest,armies);
   const pineGeo=new THREE.BufferGeometry();
   pineGeo.userData.nativeMesh='assets/sapling-trees/pine_01/mid.glb';
@@ -39,45 +39,51 @@
   let seed=173019;
   function rand(){seed=(Math.imul(seed,1664525)+1013904223)>>>0;return seed/4294967296;}
   const treeCells=[];
-  // 32x32 positions cover 10.24x the original forest footprint.
-  // Omit every 43rd grid position: 1024 - 24 = exactly 1000 trees.
-  // Preserve 3 nav cells spacing so soldiers can find routes between trunks.
-  for(let z=0;z<FOREST_SIDE;z++)for(let x=0;x<FOREST_SIDE;x++){
-    if((z*FOREST_SIDE+x)%43===0)continue;
-    const gx=32+x*3, gz=32+z*3, n=treeCells.length;
-    treeCells.push([gx,gz]);blocked[gridIndex(gx,gz)]=1;
-    const tx=toWorld(gx)+(rand()-0.5)*0.55;
-    const tz=toWorld(gz)+(rand()-0.5)*0.55;
-    const yaw=rand()*Math.PI*2,scale=0.83+rand()*0.34;
-    put(treeBark,n,tx,tz,yaw,scale);
-    put(treeNeedles,n,tx,tz,yaw,scale);
+  const treePositions=[]; // sub-cell coordinates; prevents visible grid rows
+  // Seeded pseudo-random blue-noise placement. Keep approximately the same
+  // forest footprint but discard the rigid 32x32 planting lattice.
+  // Each accepted tree occupies a navigation cell so A* routes avoid trunks.
+  const FOREST_MIN=32, FOREST_MAX=127, MIN_TREE_SPACING=2.05;
+  const MIN_TREE_SPACING_SQ=MIN_TREE_SPACING*MIN_TREE_SPACING;
+  const treeCellOwner=new Int32Array(GRID*GRID);
+  treeCellOwner.fill(-1);
+  let attempts=0;
+  while(treeCells.length<TREES && attempts<250000){
+    attempts++;
+    const gxFloat=FOREST_MIN+rand()*(FOREST_MAX-FOREST_MIN);
+    const gzFloat=FOREST_MIN+rand()*(FOREST_MAX-FOREST_MIN);
+    // Vary local density to create denser pockets and natural clearings.
+    const density=0.62+0.23*Math.sin(gxFloat*0.17+1.4)*
+                           Math.cos(gzFloat*0.13-0.8);
+    if(rand()>density)continue;
+    const gx=Math.round(gxFloat),gz=Math.round(gzFloat);
+    const index=gridIndex(gx,gz);
+    if(blocked[index])continue;
+    // Check only neighbouring cells: O(1) instead of testing all 1000 trees.
+    // Trunks are kept apart, while their canopies may naturally overlap.
+    let collision=false;
+    for(let z=Math.max(0,gz-3);z<=Math.min(GRID-1,gz+3)&&!collision;z++){
+      for(let x=Math.max(0,gx-3);x<=Math.min(GRID-1,gx+3);x++){
+        const previous=treeCellOwner[gridIndex(x,z)];
+        if(previous<0)continue;
+        const [px,pz]=treePositions[previous];
+        const dx=px-gxFloat,dz=pz-gzFloat;
+        if(dx*dx+dz*dz<MIN_TREE_SPACING_SQ){collision=true;break;}
+      }
+    }
+    if(collision)continue;
+    const n=treeCells.length;
+    treeCells.push([gx,gz]);
+    treePositions.push([gxFloat,gzFloat]);
+    blocked[index]=1;
+    treeCellOwner[index]=n;
+    const worldX=toWorld(gxFloat),worldZ=toWorld(gzFloat);
+    const yaw=rand()*Math.PI*2,scale=0.75+rand()*0.55;
+    put(treeBark,n,worldX,worldZ,yaw,scale);
+    put(treeNeedles,n,worldX,worldZ,yaw,scale);
   }
-  // A visibly navigable obstacle: shift a small subset of trees from the
-  // regular grid into a continuous cross-forest barrier. The opening forces
-  // A* units to turn, rather than mostly walking in visually straight lanes.
-  const BARRIER_X=79, BARRIER_Z0=36, BARRIER_Z1=121;
-  const barrierCells=[];
-  for(let z=BARRIER_Z0;z<=BARRIER_Z1;z++){
-    if(z>=77 && z<=85)continue; // nine-cell gap for the armies
-    if(blocked[gridIndex(BARRIER_X,z)])continue;
-    barrierCells.push([BARRIER_X,z]);
-  }
-  // Retire the last N original tree locations, then reuse their instances
-  // for the barrier. This preserves exactly 1000 source GLB instances.
-  for(let j=0;j<barrierCells.length;j++){
-    const i=TREES-barrierCells.length+j;
-    const [oldX,oldZ]=treeCells[i];
-    blocked[gridIndex(oldX,oldZ)]=0;
-  }
-  for(let j=0;j<barrierCells.length;j++){
-    const i=TREES-barrierCells.length+j;
-    const [gx,gz]=barrierCells[j];
-    treeCells[i]=[gx,gz];blocked[gridIndex(gx,gz)]=1;
-    const x=toWorld(gx),z=toWorld(gz),yaw=rand()*Math.PI*2;
-    put(treeBark,i,x,z,yaw,0.87);
-    put(treeNeedles,i,x,z,yaw,0.87);
-  }
-  if(treeCells.length!==TREES) throw new Error('Forest tree count must be exactly 1000');
+  if(treeCells.length!==TREES)
+    throw new Error('Random forest placed '+treeCells.length+' of '+TREES+' trees');
   treeBark.instanceMatrix.needsUpdate=true;
   treeNeedles.instanceMatrix.needsUpdate=true;
 
@@ -227,6 +233,7 @@
       routes:units.length,routeFailures:pathFailures,totalRouteCells:totalPathCells,
       moved:units.filter(u=>Math.hypot(u.x-u.startX,u.z-u.startZ)>0.2).length,
       arrived:arrivals,treeCells:treeCells.length,
+      placementMode:'seeded-random',forestAttempts:attempts,
       debugSegments:debugPathData.length/5,
       active:units.filter(u=>u.path.length>1 && !u.arrived).length,
       routeSteps:units.reduce((n,u)=>n+u.at,0),
@@ -262,6 +269,8 @@
   globalThis.__nativeThreeDiagnostics=diagnostics;
   globalThis.__nativeNavTest=()=>({
     size:GRID,blocked:Array.from(blocked),trees:treeCells.map(t=>t.slice()),
+    worldTreePositions:treePositions.map(([x,z])=>[toWorld(x),toWorld(z)]),
+    forestAttempts:attempts,
     paths:units.map(u=>u.path.slice()),
     positions:units.map(u=>[u.x,u.z]),
     lights:soldierLights.map(l=>[l.position.x,l.position.y,l.position.z])
