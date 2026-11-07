@@ -1,0 +1,64 @@
+name: Native Three.js runtime smoke and DX12 build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-threejs-native:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build official Three.js module without DOM or browser
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm dependencies failed" }
+          npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
+          if ($LASTEXITCODE -ne 0) { throw "esbuild dependency failed" }
+          New-Item -ItemType Directory -Force generated,third_party | Out-Null
+          npx esbuild threejs-native/scene.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-scene.bundle.js
+          if ($LASTEXITCODE -ne 0) { throw "Three.js bundle build failed" }
+          node --test test/native-scene.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Real Three.js structure tests failed" }
+      - name: Convert pinned Kuningriigid GLBs into native resources
+        shell: pwsh
+        run: |
+          python -m pip install Pillow
+          if ($LASTEXITCODE -ne 0) { throw "Pillow install failed" }
+          python tools/pack_kuningriigid.py
+          if ($LASTEXITCODE -ne 0) { throw "GLB packer failed" }
+      - name: Download pinned QuickJS-NG C runtime
+        shell: pwsh
+        run: |
+          git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS-NG checkout failed" }
+      - name: Compile native Three.js runtime and DX12 renderer with MSVC
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build build --config Release --target ThreeSceneSmoke NativeThreeJS --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "CMake/MSVC build failed" }
+      - name: Execute actual JS interpreter smoke test inside Windows
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build\Release\ThreeSceneSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Real Three.js embedded smoke test failed" }
+      - name: Save prototype EXE for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeJS-DX12-prototype
+          path: build/Release/NativeThree-Diagnostics.exe
