@@ -1,0 +1,11 @@
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.log
+*.exe
+*.dll
+node_modules/
+dist/
+.DS_Store

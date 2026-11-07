@@ -1,0 +1,56 @@
+name: Build Windows EXE and publish release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build native Windows binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          cl /nologo /O2 /W3 /TC diagnostic/NativeThree-Diagnostics.c /Fe:dist/NativeThree-Diagnostics.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Diagnostic build failed" }
+          cl /nologo /O2 /W3 /TC launcher/NativeThree-Launcher.c /Fe:dist/NativeThree-Launcher.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Launcher build failed" }
+          $v = (Get-Content version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
+          Set-Content -Path dist/installed-version.txt -Value $v -Encoding ascii -NoNewline
+          $hash = (Get-FileHash dist/NativeThree-Diagnostics.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'dist/update.txt'), "$v`n$hash`n", [Text.Encoding]::ASCII)
+          Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
+          Compress-Archive -Path dist/NativeThree-Launcher.exe,dist/NativeThree-Diagnostics.exe,dist/installed-version.txt,dist/README-WINDOWS.txt -DestinationPath dist/NativeThreeBridge-Windows-x64.zip -Force
+          if ((Get-Item dist/NativeThree-Launcher.exe).Length -lt 2048) { throw "Launcher too small" }
+          Write-Host "Version $v; SHA256 $hash"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeBridge-Windows-x64
+          path: |
+            dist/NativeThreeBridge-Windows-x64.zip
+            dist/update.txt
+      - name: Publish new stable GitHub Release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$v"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; no update to installed users"
+          } else {
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Diagnostics.exe dist/update.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag" --notes "Native Windows diagnostic engine and GitHub auto-updating launcher. GDI test only; DX12 is not yet production-ready."
+            if ($LASTEXITCODE -ne 0) { throw "Release failed" }
+          }

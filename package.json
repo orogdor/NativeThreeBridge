@@ -1,0 +1,13 @@
+{
+  "name": "native-three-bridge",
+  "version": "0.4.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "export": "node js/export-demo.mjs"
+  },
+  "dependencies": {
+    "three": "0.181.0"
+  }
+}
