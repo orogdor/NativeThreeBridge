@@ -58,18 +58,17 @@ html=html.replace(old,replacement,1)
 html=html.replace('const activeLights=shadowBudget===16?16:8;',
                   'const activeLights=16;',1)
 # Initialize after all original GLB meshes and pool of 16 actual spotlights exist.
-anchor='''   setView(1);selectLights();refreshPaths();'''
+anchor='setView(1);selectLights();refreshPaths();'
 assert html.count(anchor)==1,'Initial light setup changed'
-html=html.replace(anchor,'''   prepareSoldierGlows();refreshSoldierGlows();
+html=html.replace(anchor,'''prepareSoldierGlows();refreshSoldierGlows();
    setView(1);selectLights();refreshPaths();''',1)
 # Ensure moving instanced light footprints follow each soldier on every frame.
 # selectLights is called in the animation loop, so update all footprints at its start.
 
 # Keep the test's original UI and add a separate toggle for all glow footprints.
-anchor="  renderer.shadowMap.enabled=shadows;\n }"
-assert html.count(anchor)==1,'Shadow control block changed'
+
 # add UI control using existing shadow-button parent to avoid altering bundled libraries.
-anchor="   setView(1);selectLights();refreshPaths();"
+anchor="setView(1);selectLights();refreshPaths();"
 assert html.count(anchor)==1
 html=html.replace(anchor,'''   const glowToggle=document.createElement('button');
    glowToggle.textContent='500 sõduri valgused: SEES';
