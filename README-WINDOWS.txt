@@ -1,17 +1,22 @@
-NativeThreeBridge v0.7 – independent Windows EXE and updater
-==========================================================
-NativeThree-Game.exe      : run game directly without checking GitHub
-NativeThree-Updater.exe   : update Game EXE + game/scene.js and start game
-game\scene.js            : editable official THREE.Scene / THREE.InstancedMesh script
+NativeThreeBridge v0.8 - 1000 trees + TWO A* pathfinding armies
+===============================================================
+NativeThree-Game.exe       DirectX12 renderer + embedded official Three.js
+NativeThree-Updater.exe    independent GitHub update checker
+game\scene.js             editable forest generation + A* pathfinding
 
-Extract the whole ZIP keeping game/scene.js in its subfolder.
-Open NativeThree-Updater.exe for GitHub updates or NativeThree-Game.exe directly.
-Command NativeThree-Updater.exe --check-only checks/updates without launching.
-Create NO-UPDATE.txt alongside updater to disable updates.
-Create PRESERVE-SCENE.txt alongside updater to protect your locally edited scene.js.
-Use updater.log to investigate failures. Running EXE files cannot be replaced.
+Test contents:
+ - 1000 original Kuningriigid Sapling pine trees
+ - Red army: 10 original spearmen; blue army: 10 original spearmen
+ - Every soldier calculates an A* path around tree obstacles on a 64x64 grid
+ - Both armies move continuously; GPU instancing and FPS title enabled
 
-v0.6 and older launchers cannot migrate automatically: extract v0.7 ZIP once.
-Updater EXE itself currently needs manual replacement via ZIP.
-Game supports a limited genuine Three.js scene graph, not all WebGLRenderer APIs.
-No Chromium, browser, Electron, WebView, Deno or Node at runtime.
+Unpack the complete ZIP preserving game\scene.js.
+Run NativeThree-Game.exe for direct offline gameplay; updater is optional.
+Run NativeThree-Updater.exe to download EXE and JS independently if changed.
+NO-UPDATE.txt disables updates; PRESERVE-SCENE.txt preserves edited JS.
+Mouse drag to orbit; mouse wheel zoom; Space pauses; Esc quits.
+
+This is NOT a general drop-in WebGLRenderer/GLTFLoader compatibility layer.
+Models are embedded during the Windows build. Soldiers have no skeletal walk cycle.
+GitHub validates Windows compilation and JS pathfinding, but real DX12 output
+must still be verified on the user's GPU.
