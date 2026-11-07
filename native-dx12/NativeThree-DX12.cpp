@@ -36,6 +36,7 @@ static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
 static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
 static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
 static bool gShowDebugPaths=true;
+static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
@@ -246,7 +247,13 @@ static void createDebugRouteGeometry() {
         v.push_back(a);v.push_back(b);v.push_back(c);
         v.push_back(c);v.push_back(b);v.push_back(d);
     }
-    if(red.empty()||blue.empty())fatal("A* route overlay missing one army",E_INVALIDARG);
+    // Some units may reach their goal; one army having no remaining route
+    // is normal and must not crash the renderer.
+    if(red.empty()&&blue.empty()){
+        gDebugPathVB.Reset();
+        gDebugRedVertices=0;gDebugBlueVertices=0;
+        return;
+    }
     gDebugRedVertices=(UINT)red.size();
     gDebugBlueVertices=(UINT)blue.size();
     red.insert(red.end(),blue.begin(),blue.end());
@@ -760,6 +767,13 @@ static void renderFrame() {
     const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
     gPreviousFrame=tick;
     NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
+    // F4 route visualization tracks live replanning instead of showing
+    // stale paths from launch time. The previous frame's waitGPU() fence
+    // guarantees that replacing the upload resource is safe.
+    if(gShowDebugPaths && (gLastPathRefresh==0 || tick-gLastPathRefresh>=2000)){
+        createDebugRouteGeometry();
+        gLastPathRefresh=tick;
+    }
     const UINT followIndex= gCameraMode==2 ? TREE_COUNT+PER_ARMY : TREE_COUNT;
     gCameraFocusX=gCameraMode==0?0.f:matrices[followIndex*16+12];
     gCameraFocusZ=gCameraMode==0?0.f:matrices[followIndex*16+14];
@@ -905,7 +919,10 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F1){gCameraMode=0;gDistance=535.f;}
             if(wp==VK_F2){gCameraMode=1;gDistance=92.f;}
             if(wp==VK_F3){gCameraMode=2;gDistance=92.f;}
-            if(wp==VK_F4)gShowDebugPaths=!gShowDebugPaths;
+            if(wp==VK_F4){
+                gShowDebugPaths=!gShowDebugPaths;
+                if(gShowDebugPaths)gLastPathRefresh=0;
+            }
             if(wp==VK_F5)gEnableShadows=!gEnableShadows;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
