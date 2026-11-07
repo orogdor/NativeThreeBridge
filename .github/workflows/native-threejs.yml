@@ -1,4 +1,4 @@
-name: Native Three.js runtime smoke and DX12 build
+name: Build native Three.js Windows Game and separate Updater
 on:
   push:
     branches: [main]
@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 jobs:
-  build-threejs-native:
+  native-windows:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -19,88 +19,89 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-      - name: Build official Three.js module without DOM or browser
+      - name: Build official Three.js core separately from game/scene.js
         shell: pwsh
         run: |
           npm install --no-audit --no-fund
-          if ($LASTEXITCODE -ne 0) { throw "npm dependencies failed" }
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
           npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
-          if ($LASTEXITCODE -ne 0) { throw "esbuild dependency failed" }
+          if ($LASTEXITCODE -ne 0) { throw "esbuild install failed" }
           New-Item -ItemType Directory -Force generated,third_party | Out-Null
-          npx esbuild threejs-native/scene.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-scene.bundle.js
-          if ($LASTEXITCODE -ne 0) { throw "Three.js bundle build failed" }
-          node --test test/native-scene.test.mjs
-          if ($LASTEXITCODE -ne 0) { throw "Real Three.js structure tests failed" }
-      - name: Convert pinned Kuningriigid GLBs into native resources
+          npx esbuild threejs-native/three-runtime-entry.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-runtime.bundle.js
+          if ($LASTEXITCODE -ne 0) { throw "Three.js runtime bundle failed" }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw "JavaScript tests failed" }
+      - name: Convert original Kuningriigid house and pine GLBs
         shell: pwsh
         run: |
-          python -m pip install Pillow
+          python -m pip install --disable-pip-version-check Pillow
           if ($LASTEXITCODE -ne 0) { throw "Pillow install failed" }
           python tools/pack_kuningriigid.py
-          if ($LASTEXITCODE -ne 0) { throw "GLB packer failed" }
-      - name: Download pinned QuickJS-NG C runtime
+          if ($LASTEXITCODE -ne 0) { throw "GLB conversion failed" }
+      - name: Acquire pinned QuickJS-NG native JavaScript engine
         shell: pwsh
         run: |
           git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
           if ($LASTEXITCODE -ne 0) { throw "QuickJS-NG checkout failed" }
-      - name: Compile native Three.js runtime and DX12 renderer with MSVC
+      - name: Compile native game engine and runtime smoke test
         shell: pwsh
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
           cmake --build build --config Release --target ThreeSceneSmoke NativeThreeJS --parallel 4
-          if ($LASTEXITCODE -ne 0) { throw "CMake/MSVC build failed" }
-      - name: Execute actual JS interpreter smoke test inside Windows
+          if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
+      - name: Execute actual Three.js runtime smoke test in Windows
         shell: pwsh
         env:
           CI: '1'
         run: |
+          if (!(Test-Path build/Release/game/scene.js)) { throw "External scene.js missing" }
           & .\build\Release\ThreeSceneSmoke.exe
-          if ($LASTEXITCODE -ne 0) { throw "Real Three.js embedded smoke test failed" }
-      - name: Save prototype EXE for review
-        uses: actions/upload-artifact@v4
-        with:
-          name: NativeThreeJS-DX12-prototype
-          path: build/Release/NativeThree-Diagnostics.exe
-
-      - name: Package EXE with self-updating launcher
+          if ($LASTEXITCODE -ne 0) { throw "Embedded Three.js JavaScript execution failed" }
+      - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Diagnostics.exe
-          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe
-          cl /nologo /O2 /W3 /TC launcher/NativeThree-Launcher.c /Fe:dist/NativeThree-Launcher.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
-          if ($LASTEXITCODE -ne 0) { throw "Native updater compile failed" }
+          New-Item -ItemType Directory -Force dist/game | Out-Null
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Game.exe
+          Copy-Item game/scene.js dist/game/scene.js
+          cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
+          & .\dist\NativeThree-Updater.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Offline independent updater self-test failed" }
           $v = (Get-Content version.txt -Raw).Trim()
           if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
           Set-Content dist/installed-version.txt -Value $v -Encoding ascii -NoNewline
-          $hash = (Get-FileHash dist/NativeThree-Diagnostics.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          [IO.File]::WriteAllText((Join-Path (Get-Location) "dist/update.txt"), ($v + [Environment]::NewLine + $hash + [Environment]::NewLine), [Text.Encoding]::ASCII)
           Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
           Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
           Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
-          Compress-Archive -Path dist/NativeThree-Launcher.exe,dist/NativeThree-Diagnostics.exe,dist/NativeThree-DX12.exe,dist/installed-version.txt,dist/README-WINDOWS.txt,dist/LICENSE-QuickJS.txt,dist/LICENSE-ThreeJS.txt -DestinationPath dist/NativeThreeBridge-Windows-x64.zip -Force
-          if ((Get-Item dist/NativeThree-Diagnostics.exe).Length -lt 150000) { throw "Three.js DX12 EXE unexpectedly small" }
-          Write-Host "DX12 + embedded real Three.js: $v; sha256: $hash"
-      - name: Upload self-contained Windows package
+          $gameHash=(Get-FileHash dist/NativeThree-Game.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sceneHash=(Get-FileHash dist/game/scene.js -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) "dist/update-v2.txt"), ("NTB2`n" + $v + "`n" + $gameHash + "`n" + $sceneHash + "`n"), [Text.Encoding]::ASCII)
+          Compress-Archive -Path dist/* -DestinationPath NativeThreeBridge-Windows-x64.zip -Force
+          Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
+          New-Item -ItemType Directory -Force verify | Out-Null
+          Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js)) { throw "Incomplete ZIP structure" }
+          Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
+      - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
         with:
           name: NativeThreeBridge-Windows-x64
           path: |
             dist/NativeThreeBridge-Windows-x64.zip
-            dist/update.txt
-      - name: Release verified native Three.js runtime
+            dist/update-v2.txt
+      - name: Publish stable release (only after Windows tests succeed)
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $v = (Get-Content version.txt -Raw).Trim()
-          $tag = "v$v"
+          $tag="v$v"
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $tag already exists. No file mutation."
+            Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Diagnostics.exe dist/NativeThree-DX12.exe dist/update.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag - real Three.js runtime" --notes "QuickJS-NG runs the OFFICIAL Three.js Scene, Group, Mesh, InstancedMesh and world matrix calculations inside a browser-free Windows EXE. Native DirectX12 renderer consumes real Three.js instance matrices. Kuningriigid house and pine GLBs embedded at build time (10 + 10). Windows JavaScript-runtime smoke test passed; physical GPU/window rendering still needs user validation. NOT general WebGLRenderer or GLTFLoader compatibility."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "Independent NativeThree-Updater.exe and NativeThree-Game.exe plus editable game/scene.js. Official Three.js runs inside embedded QuickJS-NG and DX12 draws 10 original Kuningriigid houses + 10 pines. The updater SHA-256 checks and updates EXE/script independently. Shader view-projection order fixed; actual Windows GPU output should still be verified. WARNING: older v0.6 launchers cannot migrate automatically; extract this new ZIP once."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
