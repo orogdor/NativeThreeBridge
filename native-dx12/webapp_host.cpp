@@ -2,6 +2,8 @@
 #include "webapp_host.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -189,6 +191,9 @@ struct WebappHost::Impl {
     WebappRenderSink* sink = nullptr;
     std::string title;
     bool started = false;
+    bool timedOut = false;
+    std::uint32_t executionTimeoutMs = 45000; // configurable for stress/diagnostic runs
+    std::chrono::steady_clock::time_point jsDeadline = std::chrono::steady_clock::time_point::max();
 
     static Impl* from(JSContext* c) { return static_cast<Impl*>(JS_GetContextOpaque(c)); }
 
@@ -213,14 +218,22 @@ struct WebappHost::Impl {
         JS_FreeValue(ctx, exception);
         return out;
     }
+    // A large page may enqueue thousands of promises, including self-scheduling
+    // microtasks. Never let that queue monopolize the entire Win32 UI thread.
+    // Remaining jobs are consumed on subsequent displayed frames.
     void drainJobs() {
-        for (int i = 0; i < 1000000; i++) {
+        constexpr int kJobQuota = 2048;
+        const auto softDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(12);
+        for (int i = 0; i < kJobQuota && !timedOut; i++) {
+            if (i > 0 && std::chrono::steady_clock::now() >= softDeadline) return;
             JSContext* jobContext = nullptr;
             const int r = JS_ExecutePendingJob(rt, &jobContext);
             if (r == 0) return;
-            if (r < 0) log("error", "Uncaught (in promise job): " + exceptionText());
+            if (r < 0) {
+                log("error", "Uncaught (in promise job): " + exceptionText());
+                if (timedOut) return;
+            }
         }
-        log("error", "Promise job queue did not settle (1,000,000 jobs in one step)");
     }
     bool readGameFile(const std::string& rel, std::string& out, std::string& error) {
         const std::string clean = webappNormalizeGamePath(rel);
@@ -238,22 +251,45 @@ struct WebappHost::Impl {
         if (size > 0 && !file.read(out.data(), size)) { error = "Read failed: " + clean; return false; }
         return true;
     }
-    // Calls __ntHost[name](...args); errors are logged, never fatal.
+    // Each synchronous VM call gets its own wall-clock budget; JS interrupt
+    // callbacks stop runaway loops without a separate unsafe watchdog thread.
     void callHost(const char* name, int argc, JSValue* argv) {
-        if (!started) return;
+        if (!started || timedOut) {
+            for (int i=0; i<argc; i++) if (ctx) JS_FreeValue(ctx, argv[i]);
+            return;
+        }
+        jsDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(executionTimeoutMs);
         JSValue fn = JS_GetPropertyStr(ctx, hostObject, name);
         JSValue result = JS_Call(ctx, fn, hostObject, argc, argv);
-        if (JS_IsException(result)) log("error", std::string("__ntHost.") + name + ": " + exceptionText());
+        if (JS_IsException(result))
+            log("error", std::string("__ntHost.") + name + ": " + exceptionText());
         JS_FreeValue(ctx, result);
         JS_FreeValue(ctx, fn);
         for (int i = 0; i < argc; i++) JS_FreeValue(ctx, argv[i]);
-        drainJobs();
+        if (!timedOut) drainJobs();
+        jsDeadline = std::chrono::steady_clock::time_point::max();
+        if (timedOut)
+            log("error", std::string("QuickJS watchdog stopped long-running ") + name +
+                " (more than " + std::to_string(executionTimeoutMs) +
+                " ms; check the last module in the log)");
     }
+
 };
 
 namespace {
 
 using Impl = WebappHost::Impl;
+
+// Called by QuickJS-NG on the JS execution thread while interpreting bytecode.
+// No JS, log file or Win32 calls are made from the interrupt callback.
+int webappInterrupt(JSRuntime*, void* opaque) {
+    auto* s = static_cast<Impl*>(opaque);
+    if (std::chrono::steady_clock::now() >= s->jsDeadline) {
+        s->timedOut = true;
+        return 1;
+    }
+    return 0;
+}
 
 std::string argString(JSContext* ctx, JSValueConst v) {
     std::size_t len = 0;
@@ -337,7 +373,12 @@ JSValue jsEvalScript(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     if (argc < 2) return JS_ThrowTypeError(ctx, "evalScript(source, name)");
     const std::string source = argString(ctx, argv[0]);
     const std::string name = argString(ctx, argv[1]);
-    return JS_Eval(ctx, source.c_str(), source.size(), name.c_str(), JS_EVAL_TYPE_GLOBAL);
+    Impl* self = Impl::from(ctx);
+    self->log("info", "QuickJS evaluating classic script: " + name +
+                       " (" + std::to_string(source.size()) + " bytes)");
+    JSValue result=JS_Eval(ctx, source.c_str(), source.size(), name.c_str(), JS_EVAL_TYPE_GLOBAL);
+    if(!JS_IsException(result)) self->log("info", "QuickJS classic script completed: " + name);
+    return result;
 }
 int setImportMeta(JSContext* ctx, JSValueConst moduleValue, const std::string& name) {
     JSModuleDef* m = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(moduleValue));
@@ -360,6 +401,7 @@ JSValue jsEvalModule(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     if (argc < 2) return JS_ThrowTypeError(ctx, "evalModule(source, name)");
     const std::string source = argString(ctx, argv[0]);
     const std::string name = argString(ctx, argv[1]);
+    Impl::from(ctx)->log("info", "QuickJS executing module entry: " + name);
     JSValue compiled = JS_Eval(ctx, source.c_str(), source.size(), name.c_str(),
                                JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(compiled)) return compiled;
@@ -467,6 +509,7 @@ JSModuleDef* moduleLoader(JSContext* ctx, const char* nameIn, void*) {
         }
         source = it->second;
     } else {
+        self->log("info", "QuickJS module requested: " + name);
         if (endsWith(toLower(name), ".json")) {
             JS_ThrowTypeError(ctx, "JSON modules are not supported yet: %s (use fetch)", name.c_str());
             return nullptr;
@@ -475,6 +518,8 @@ JSModuleDef* moduleLoader(JSContext* ctx, const char* nameIn, void*) {
             JS_ThrowReferenceError(ctx, "%s", error.c_str());
             return nullptr;
         }
+        self->log("info", "QuickJS compiling " + name +
+                            " (" + std::to_string(source.size()) + " bytes)");
     }
     JSValue compiled = JS_Eval(ctx, source.c_str(), source.size(), name.c_str(),
                                JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
@@ -484,6 +529,7 @@ JSModuleDef* moduleLoader(JSContext* ctx, const char* nameIn, void*) {
         return nullptr;
     }
     JSModuleDef* m = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(compiled));
+    if (!startsWith(name, "nt:")) self->log("info", "QuickJS compiled: " + name);
     JS_FreeValue(ctx, compiled); // the runtime keeps its own reference
     return m;
 }
@@ -534,6 +580,15 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
 
     s.rt = JS_NewRuntime();
     if (!s.rt) { error = "Cannot create QuickJS runtime"; return false; }
+    s.timedOut = false;
+    // For CI or diagnosis: NTB_JS_WATCHDOG_MS=200; normal apps get 45 s
+    // per synchronously running JS call. Never allow a disabled watchdog.
+    if (const char* timeout = std::getenv("NTB_JS_WATCHDOG_MS")) {
+        const long parsed = std::strtol(timeout, nullptr, 10);
+        if (parsed >= 100 && parsed <= 180000) s.executionTimeoutMs = static_cast<std::uint32_t>(parsed);
+    }
+    JS_SetInterruptHandler(s.rt, webappInterrupt, &s);
+    s.log("info", "QuickJS watchdog: " + std::to_string(s.executionTimeoutMs) + " ms per JS invocation");
     JS_SetMemoryLimit(s.rt, 1024ULL * 1024ULL * 1024ULL);
     // The game/smoke EXEs reserve a 64 MB main-thread stack (CMake /STACK);
     // QuickJS throws a catchable RangeError well before that is exhausted.
@@ -560,6 +615,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         JS_SetPropertyStr(s.ctx, api, f.name, JS_NewCFunction(s.ctx, f.fn, f.name, f.length));
     JS_SetPropertyStr(s.ctx, global, "__nt", api);
 
+    s.log("info", "QuickJS preparing browser compatibility shim");
     JSValue result = JS_Eval(s.ctx, shimSource.c_str(), shimSource.size(), "nt:webapp-shim.js",
                              JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(result)) {
@@ -575,8 +631,17 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     s.started = true;
 
     resize(width, height, 1.0);
+    s.log("info", "QuickJS parsing index.html (" + std::to_string(html.size()) + " bytes)");
     JSValue arg = JS_NewStringLen(s.ctx, html.data(), html.size());
     s.callHost("boot", 1, &arg);
+    if (s.timedOut) {
+        error = "QuickJS startup watchdog exceeded " + std::to_string(s.executionTimeoutMs) +
+                " ms. See the last script/module name in NativeThreeBridge-webapp-log.txt";
+        s.log("error", error);
+        shutdown();
+        return false;
+    }
+    s.log("info", "QuickJS returned from initial HTML boot; module jobs may continue on frames");
     return true;
 }
 
@@ -607,6 +672,7 @@ void WebappHost::frame(double timeMs) {
     if (!running()) return;
     JSValue arg = JS_NewFloat64(impl_->ctx, timeMs);
     impl_->callHost("frame", 1, &arg);
+    if (impl_->timedOut) impl_->started = false; // native window exits cleanly with an error
 }
 void WebappHost::key(bool down, const std::string& key, const std::string& code, bool repeat,
                      bool alt, bool ctrl, bool shift, bool meta) {
