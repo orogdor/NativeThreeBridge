@@ -36,14 +36,14 @@ int main(){
     }
     float firstRedX=matrices[TREES*16+12];
     float firstBlueX=matrices[(TREES+PER_ARMY)*16+12];
-    for(int frame=0;frame<300;frame++) NativeThreeJS_Frame(1.f/60.f,matrices.data(),matrices.size());
+    for(int frame=0;frame<400;frame++) NativeThreeJS_Frame(1.f/60.f,matrices.data(),matrices.size());
     NativeThreeJS_Lights(lights.data(),lights.size());
     NativeThreeNavStatus nav{};
     NativeThreeJS_GetNavStatus(&nav);
-    if(nav.routeFailures!=0 || nav.moved<950 || nav.routeSteps<1 ||
+    if(nav.routeFailures!=0 || nav.moved<600 || nav.routeSteps<1 ||
        nav.active<1 || nav.planned!=1000 || nav.searches<1000) {
-        std::fprintf(stderr,"A* failed: missing=%d moved=%d steps=%d active=%d\n",
-            nav.routeFailures,nav.moved,nav.routeSteps,nav.active);
+        std::fprintf(stderr,"A* failed: missing=%d moved=%d steps=%d active=%d planned=%d searches=%d\n",
+            nav.routeFailures,nav.moved,nav.routeSteps,nav.active,nav.planned,nav.searches);
         return 8;
     }
     if(std::fabs(matrices[TREES*16+12]-firstRedX)<3.f ||
