@@ -38,8 +38,11 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check Pillow
           if ($LASTEXITCODE -ne 0) { throw "Pillow install failed" }
+          python tools/test_spearman_rig.py
+          if ($LASTEXITCODE -ne 0) { throw "Eight-bone GLB skin unit tests failed" }
           python tools/pack_kuningriigid.py
           if ($LASTEXITCODE -ne 0) { throw "GLB conversion failed" }
+          if (!(Test-Path generated/soldier-rigged.glb) -or !(Test-Path generated/skin0.bin)) { throw "Skeleton asset packing failed" }
       - name: Acquire pinned QuickJS-NG native JavaScript engine
         shell: pwsh
         run: |
@@ -78,6 +81,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/game | Out-Null
           Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Game.exe
           Copy-Item game/scene.js dist/game/scene.js
+          Copy-Item generated/soldier-rigged.glb dist/game/odamees-rigged.glb
           cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
           if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
           & .\dist\NativeThree-Updater.exe --self-test
@@ -95,7 +99,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/odamees-rigged.glb)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
@@ -116,6 +120,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.21.0 walking animation test: each moving soldier has independent distance-driven leg motion and a subtle body bob, with idle fading and F8 walking toggle. GPU vertex deformation is also used for the 16 real shadow maps, with the v0.20 continuous soldier-lighting fix retained. This uses the existing unrigged odamees GLB, not skeletal animation. Windows CI compiles DX12 and HLSL, executes navigation/simulation checks and builds a complete ZIP. Appearance and FPS require physical GPU validation."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.22.0: Red-army 500 spearmen now use an authentic 8-bone glTF 2.0 skeleton with hierarchy, inverse bind matrices, normalized per-vertex JOINTS_0 and WEIGHTS_0 and DX12 weighted bone deformation in both the color and real shadow passes. Blue army 500 remains on unrigged v0.21 gait for visual/FPS A/B testing. F8 toggles animation on both armies. The build exports the rigged odamees GLB in the ZIP. This is a first-pass automatic envelope rig with a procedural walk cycle, not artist-painted animation. Performance and visuals require Windows GPU verification."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
