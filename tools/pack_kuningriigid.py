@@ -118,15 +118,17 @@ def build_mesh(doc, buf, primitive, out_mesh, out_tex):
     mipmaps=[]
     original_coverage=sum(a>=102 for a in rgba[3::4])/(w*h)
     while True:
-        level=texture_image
+        level=texture_image.copy()
         if mat.get("alphaMode") == "MASK" and len(mipmaps)>0 and original_coverage>0:
-            # Preserve alpha-test silhouette density after downsampling.
+            # Histogram-based binary search avoids rescanning millions of pixels
+            # on each of the 12 alpha-coverage iterations.
             alpha=level.getchannel("A")
-            pixels=list(alpha.getdata())
+            hist=alpha.histogram()
             lo,hi=0.0,8.0
             for _ in range(12):
                 scale=(lo+hi)*0.5
-                coverage=sum(min(255,round(v*scale))>=102 for v in pixels)/len(pixels)
+                coverage=sum(hist[v] for v in range(256)
+                             if min(255,round(v*scale))>=102)/(level.width*level.height)
                 if coverage<original_coverage:lo=scale
                 else:hi=scale
             level.putalpha(alpha.point(lambda v:min(255,round(v*hi))))
