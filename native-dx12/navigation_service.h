@@ -87,7 +87,6 @@ private:
         std::shared_ptr<const Grid> map;
         std::shared_ptr<std::atomic<bool>> canceled;
     };
-    std::mutex mutableMutexDummy_; // reserved for future instrumentation
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Request> pending_;
@@ -161,7 +160,7 @@ private:
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock,[&]{return stop_||!pending_.empty();});
-                if(stop_&&pending_.empty())return;
+                if(stop_)return; // shutdown does not drain an unbounded game queue
                 request=std::move(pending_.front());pending_.pop_front();
             }
             RouteResult result=request.canceled->load()?RouteResult{request.token,RouteStatus::Canceled,{}}:route(request);
