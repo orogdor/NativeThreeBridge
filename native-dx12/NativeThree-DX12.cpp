@@ -22,6 +22,7 @@
 #include "spatial_index.h"
 #include "fixed_stepper.h"
 #include "scene_registry.h"
+#include "frame_profiler.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -46,10 +47,17 @@ static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
 static bool gNightMode=true; // Night default; F7 toggles day/night
 static double gPreviousFrameSeconds=0;
 static double gJsCpuMsTotal=0,gLightCpuMsTotal=0,gRecordCpuMsTotal=0,gPresentCpuMsTotal=0;
+static double gLastJSms=0,gLastLightMs=0,gLastRecordMs=0,gLastPresentMs=0,gLastFenceMs=0;
+static UINT64 gTotalFrames=0;
+static native_three::AsyncCsvLogger gPerfLog("NativeThreeBridge-frames.csv");
 static double cpuSeconds() {
     LARGE_INTEGER ticks{},frequency{};
-    QueryPerformanceCounter(&ticks);QueryPerformanceFrequency(&frequency);
-    return (double)ticks.QuadPart/(double)frequency.QuadPart;
+    QueryPerformanceCounter(&ticks);
+    static const double inverseFrequency=[](){
+        LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
+        return 1.0/(double)freq.QuadPart;
+    }();
+    return (double)ticks.QuadPart*inverseFrequency;
 }
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
@@ -69,6 +77,13 @@ static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
 static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static ComPtr<ID3D12QueryHeap> gGpuTimingQueries;
+static ComPtr<ID3D12Resource> gGpuTimingReadback;
+static UINT64 gGpuTimingFrequency=0;
+static double gGpuShadowTotal=0,gGpuMainTotal=0;
+static double gLastGpuShadowMs=0,gLastGpuMainMs=0;
+static UINT gGpuTimingSamples=0;
+static const UINT GPU_TIMESTAMPS_PER_FRAME=3;
 static bool gTreesUploaded=false;
 static ComPtr<ID3D12Resource> gDebugPathVB;
 static D3D12_VERTEX_BUFFER_VIEW gDebugPathVBV{};
@@ -612,6 +627,23 @@ static void initializeDX12() {
     }
     D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(gDevice->CreateCommandQueue(&q,IID_PPV_ARGS(&gQueue)),"Create GPU queue");
+    // Optional hardware GPU timestamps. No GPU timing is ever inferred from CPU
+    // command-recording duration; failed query support only disables this metric.
+    if(SUCCEEDED(gQueue->GetTimestampFrequency(&gGpuTimingFrequency)) &&
+       gGpuTimingFrequency>0){
+        D3D12_QUERY_HEAP_DESC desc{};
+        desc.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        desc.Count=FRAME_COUNT*GPU_TIMESTAMPS_PER_FRAME;
+        if(SUCCEEDED(gDevice->CreateQueryHeap(&desc,IID_PPV_ARGS(&gGpuTimingQueries)))){
+            auto heap=heapProperties(D3D12_HEAP_TYPE_READBACK);
+            auto data=bufferDescription(desc.Count*sizeof(UINT64));
+            if(FAILED(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,
+                  &data,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,
+                  IID_PPV_ARGS(&gGpuTimingReadback)))){
+                gGpuTimingQueries.Reset();gGpuTimingFrequency=0;
+            }
+        }
+    }
     DXGI_SWAP_CHAIN_DESC1 sd={};
     sd.Width=WIDTH;sd.Height=HEIGHT;sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count=1;sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -990,11 +1022,33 @@ static void renderFrame() {
     const UINT back=gSwap->GetCurrentBackBufferIndex();
     // Do not block after Present; wait only when reusing a busy buffer.
     const UINT64 reuseFence=gFrameFenceValues[back];
+    gLastFenceMs=0;
     if(reuseFence && gFence->GetCompletedValue()<reuseFence) {
         const double waitBegin=cpuSeconds();
         check(gFence->SetEventOnCompletion(reuseFence,gFenceEvent),"Frame reuse event");
         WaitForSingleObject(gFenceEvent,INFINITE);
-        gFenceWaitTotal+=(cpuSeconds()-waitBegin)*1000.0;
+        gLastFenceMs=(cpuSeconds()-waitBegin)*1000.0;
+        gFenceWaitTotal+=gLastFenceMs;
+    }
+    // Read last use of this buffer only after its GPU fence has completed.
+    if(reuseFence && gGpuTimingReadback && gGpuTimingFrequency){
+        const UINT64 byteOffset=(UINT64)back*GPU_TIMESTAMPS_PER_FRAME*sizeof(UINT64);
+        const D3D12_RANGE range={(SIZE_T)byteOffset,
+                       (SIZE_T)(byteOffset+GPU_TIMESTAMPS_PER_FRAME*sizeof(UINT64))};
+        UINT8* bytes=nullptr;
+        if(SUCCEEDED(gGpuTimingReadback->Map(0,&range,(void**)&bytes)) && bytes){
+            const UINT64* stamps=(const UINT64*)(bytes+byteOffset);
+            if(stamps[0]<=stamps[1] && stamps[1]<=stamps[2]){
+                const double scale=1000.0/(double)gGpuTimingFrequency;
+                gLastGpuShadowMs=(double)(stamps[1]-stamps[0])*scale;
+                gLastGpuMainMs=(double)(stamps[2]-stamps[1])*scale;
+                gGpuShadowTotal+=gLastGpuShadowMs;
+                gGpuMainTotal+=gLastGpuMainMs;
+                ++gGpuTimingSamples;
+            }
+            const D3D12_RANGE noCpuWrites={0,0};
+            gGpuTimingReadback->Unmap(0,&noCpuWrites);
+        }
     }
     const UINT64 completed=gFence->GetCompletedValue();
     gRetiredResources.erase(std::remove_if(gRetiredResources.begin(),
@@ -1056,7 +1110,8 @@ static void renderFrame() {
             renderMatrices[off+k]=previous[off+k]+
                                   (matrices[off+k]-previous[off+k])*alpha;
     }
-    gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
+    gLastJSms=(cpuSeconds()-jsStart)*1000.0;
+    gJsCpuMsTotal+=gLastJSms;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
     // guarantees that replacing the upload resource is safe.
@@ -1097,7 +1152,8 @@ static void renderFrame() {
                        const native_three::SceneRecord&){++gDirtySceneObjects;});
     const double lightsStart=cpuSeconds();
     updateLightsAndShadowCameras(renderMatrices.data(),renderedLights.data());
-    gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
+    gLastLightMs=(cpuSeconds()-lightsStart)*1000.0;
+    gLightCpuMsTotal+=gLastLightMs;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
         // 1000 tree matrices = 64000 bytes, exactly within a DX12 root CBV.
@@ -1142,6 +1198,9 @@ static void renderFrame() {
     const double recordStart=cpuSeconds();
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
+    const UINT queryBase=back*GPU_TIMESTAMPS_PER_FRAME;
+    if(gGpuTimingQueries)
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase);
     if(gEnableShadows)drawShadowMaps();
     else {
         // F5 now skips all shadow draw calls, not merely the final sampling.
@@ -1149,6 +1208,8 @@ static void renderFrame() {
                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gCmd->ResourceBarrier(1,&readable);
     }
+    if(gGpuTimingQueries)
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase+1);
     gCmd->SetPipelineState(gPSO.Get());
     auto toRT=transition(gTargets[back].Get(),
                          D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1215,22 +1276,40 @@ static void renderFrame() {
     auto shadowWritable=transition(gShadowDepth.Get(),
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE);
     gCmd->ResourceBarrier(1,&shadowWritable);
+    if(gGpuTimingQueries){
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase+2);
+        gCmd->ResolveQueryData(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,
+            queryBase,GPU_TIMESTAMPS_PER_FRAME,gGpuTimingReadback.Get(),
+            (UINT64)queryBase*sizeof(UINT64));
+    }
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    gRecordCpuMsTotal+=(cpuSeconds()-recordStart)*1000.0;
+    gLastRecordMs=(cpuSeconds()-recordStart)*1000.0;
+    gRecordCpuMsTotal+=gLastRecordMs;
     const double presentStart=cpuSeconds();
     check(gSwap->Present(gVSync?1:0,0),"Present frame");
-    gPresentCpuMsTotal+=(cpuSeconds()-presentStart)*1000.0;
+    gLastPresentMs=(cpuSeconds()-presentStart)*1000.0;
+    gPresentCpuMsTotal+=gLastPresentMs;
     const UINT64 submitted=++gFenceValue;
     check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
     gFrameFenceValues[back]=submitted;
-    ++gStatFrames;
+    ++gStatFrames;++gTotalFrames;
     const double endFrame=cpuSeconds();
-    if(gLastFrameEndSeconds){
-        gWorstFrameMs=std::max(gWorstFrameMs,(endFrame-gLastFrameEndSeconds)*1000.0);
-    }
+    const double fullFrameMs=gLastFrameEndSeconds ?
+        (endFrame-gLastFrameEndSeconds)*1000.0:0.0;
+    if(gLastFrameEndSeconds)
+        gWorstFrameMs=std::max(gWorstFrameMs,fullFrameMs);
     gLastFrameEndSeconds=endFrame;
+    if(fullFrameMs>40.0){
+        char csv[512];
+        sprintf_s(csv,"spike,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
+            (unsigned long long)gTotalFrames,fullFrameMs,
+            gLastJSms,gLastLightMs,gLastRecordMs,gLastPresentMs,
+            gLastFenceMs,gLastGpuShadowMs,gLastGpuMainMs,gMainVisibleTrees,
+            gDirtySceneObjects,gLightCandidateChecks,gShadowTreeCandidateChecks);
+        gPerfLog.enqueue(csv);
+    }
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
@@ -1240,19 +1319,34 @@ static void renderFrame() {
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
                              gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
-        wchar_t title[620];
+        wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
+            gGpuTimingSamples?gGpuShadowTotal/gGpuTimingSamples:0.0,
+            gGpuTimingSamples?gGpuMainTotal/gGpuTimingSamples:0.0,
             gMainVisibleTrees,gDirtySceneObjects,
             gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
+        char summary[512];
+        sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
+            (unsigned long long)gTotalFrames,gWorstFrameMs,
+            gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,
+            gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
+            gFenceWaitTotal*inv,
+            gGpuTimingSamples?gGpuShadowTotal/gGpuTimingSamples:0.0,
+            gGpuTimingSamples?gGpuMainTotal/gGpuTimingSamples:0.0,
+            gMainVisibleTrees,gDirtySceneObjects,
+            gLightCandidateChecks,gShadowTreeCandidateChecks);
+        gPerfLog.enqueue(summary);
         gStatFrames=0;
+        gGpuShadowTotal=gGpuMainTotal=0;
+        gGpuTimingSamples=0;
         gJsCpuMsTotal=gLightCpuMsTotal=gRecordCpuMsTotal=gPresentCpuMsTotal=0;
         gFenceWaitTotal=gWorstFrameMs=0;
         gStatStart=t;
