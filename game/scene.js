@@ -204,6 +204,13 @@ function protectedFormationCell(x,z) {
   const lightData=new Float32Array(SOLDIERS*8);
   const lightColors=[new THREE.Color(0xffbc88),new THREE.Color(0x94c5ff)];
   let arrivals=0,planningCursor=0,simFrames=0;
+  const urgentPlans=[],queuedUrgent=new Uint8Array(SOLDIERS);
+  function requestUrgentPlan(unit) {
+    if(!queuedUrgent[unit.id]){
+      queuedUrgent[unit.id]=1;
+      urgentPlans.push(unit.id);
+    }
+  }
   for(let team=0;team<2;team++)for(let i=0;i<PER_ARMY;i++){
     // Two-spaced formations leave a free cell between soldiers: physically
     // viable queues that can get around one another without spawning overlaps.
@@ -240,13 +247,25 @@ function protectedFormationCell(x,z) {
   }
 
   function planPending(dt) {
-    // Fair round-robin, max four independent A* searches per frame. Solders
-    // request a route only when needed; a stuck unit can request a new one.
+    // New movement orders and released collisions cannot wait behind 1000
+    // first-time route requests. Defer busy units without losing their ticket.
     let budget=MAX_PLANS_PER_FRAME;
+    for(let attempts=urgentPlans.length;attempts>0 && budget>0;attempts--){
+      const id=urgentPlans.shift(),unit=units[id];
+      if(unit.next!==-1||unit.retry>0){
+        urgentPlans.push(id);
+        continue;
+      }
+      queuedUrgent[id]=0;
+      if(unit.arrived||unit.path.length>1)continue;
+      planFor(unit);budget--;
+    }
+    // The remaining slots are fair round-robin requests from all soldiers.
     for(let checked=0;checked<SOLDIERS && budget>0;checked++){
       const unit=units[planningCursor];
       planningCursor=(planningCursor+1)%SOLDIERS;
-      if(unit.arrived||unit.next!==-1||unit.path.length>1||unit.retry>0)continue;
+      if(unit.arrived||unit.next!==-1||unit.path.length>1||unit.retry>0||
+         queuedUrgent[unit.id])continue;
       planFor(unit);budget--;
     }
   }
@@ -254,7 +273,11 @@ function protectedFormationCell(x,z) {
     dt=Math.min(0.5,Math.max(0,Number(dt)||0));
     simFrames++;
     // Retry clocks progress even for soldiers who cannot currently find a route.
-    for(const unit of units)if(unit.retry>0)unit.retry=Math.max(0,unit.retry-dt);
+    for(const unit of units)if(unit.retry>0){
+      unit.retry=Math.max(0,unit.retry-dt);
+      if(unit.retry===0 && unit.path.length<2 && !unit.arrived)
+        requestUrgentPlan(unit);
+    }
     if(dt>0)planPending(dt);
     // Rotate priority every frame to avoid permanent starvation.
     const first=simFrames%SOLDIERS;
@@ -381,6 +404,7 @@ function protectedFormationCell(x,z) {
     const unit=units[id];
     unit.goal=target;unit.arrived=false;unit.path=[];unit.at=0;
     unit.wait=0;unit.retry=0;
+    requestUrgentPlan(unit);
     return true;
   };
   globalThis.__nativeThreeScene=scene;
