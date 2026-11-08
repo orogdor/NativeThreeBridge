@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 namespace native_three {
 struct PoseQuat { float x=0,y=0,z=0,w=1; };
