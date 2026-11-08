@@ -44,6 +44,7 @@ add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
   native-dx12/three_js_host.cpp
   native-dx12/webapp_dx12.cpp
+  native-dx12/v8_webapp_host.cpp
   ${WEBAPP_RUNTIME}
   ${ASSETS}
 )
@@ -60,6 +61,11 @@ target_include_directories(WebappSmoke PRIVATE native-dx12)
 target_link_libraries(WebappSmoke PRIVATE qjs d3dcompiler user32)
 target_compile_definitions(WebappSmoke PRIVATE UNICODE _UNICODE)
 target_link_options(WebappSmoke PRIVATE /STACK:67108864)
+
+# Experimental V8 bridge smoke (same WebappRenderSink, no GPU required).
+add_executable(WebappV8Smoke native-dx12/v8_bridge_smoke.cpp native-dx12/v8_webapp_host.cpp)
+target_include_directories(WebappV8Smoke PRIVATE native-dx12)
+target_compile_definitions(WebappV8Smoke PRIVATE UNICODE _UNICODE)
 
 add_executable(ThreeSceneSmoke
   native-dx12/three_scene_smoke.cpp
