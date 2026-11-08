@@ -19,6 +19,10 @@
 #include <vector>
 #include <algorithm>
 #include "three_js_host.h"
+#include "spatial_index.h"
+#include "fixed_stepper.h"
+#include "scene_registry.h"
+#include "frame_profiler.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -43,10 +47,17 @@ static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
 static bool gNightMode=true; // Night default; F7 toggles day/night
 static double gPreviousFrameSeconds=0;
 static double gJsCpuMsTotal=0,gLightCpuMsTotal=0,gRecordCpuMsTotal=0,gPresentCpuMsTotal=0;
+static double gLastJSms=0,gLastLightMs=0,gLastRecordMs=0,gLastPresentMs=0,gLastFenceMs=0;
+static UINT64 gTotalFrames=0;
+static native_three::AsyncCsvLogger gPerfLog("NativeThreeBridge-frames.csv");
 static double cpuSeconds() {
     LARGE_INTEGER ticks{},frequency{};
-    QueryPerformanceCounter(&ticks);QueryPerformanceFrequency(&frequency);
-    return (double)ticks.QuadPart/(double)frequency.QuadPart;
+    QueryPerformanceCounter(&ticks);
+    static const double inverseFrequency=[](){
+        LARGE_INTEGER freq{};QueryPerformanceFrequency(&freq);
+        return 1.0/(double)freq.QuadPart;
+    }();
+    return (double)ticks.QuadPart*inverseFrequency;
 }
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
@@ -66,6 +77,13 @@ static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
 static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static ComPtr<ID3D12QueryHeap> gGpuTimingQueries;
+static ComPtr<ID3D12Resource> gGpuTimingReadback;
+static UINT64 gGpuTimingFrequency=0;
+static double gGpuShadowTotal=0,gGpuMainTotal=0;
+static double gLastGpuShadowMs=0,gLastGpuMainMs=0;
+static UINT gGpuTimingSamples=0;
+static const UINT GPU_TIMESTAMPS_PER_FRAME=3;
 static bool gTreesUploaded=false;
 static ComPtr<ID3D12Resource> gDebugPathVB;
 static D3D12_VERTEX_BUFFER_VIEW gDebugPathVBV{};
@@ -86,6 +104,19 @@ static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
 static UINT gMainVisibleTrees=0;
+static XMFLOAT4X4 gLastVisibilityMatrix{};
+static bool gHaveVisibilityCache=false;
+static std::vector<UINT> gCachedVisibleTreeIds;
+static UINT64 gVisibilityRevision=0;
+static UINT64 gUploadedVisibilityRevisions[FRAME_COUNT]={};
+// Shared engine spatial lookups. Object classes do not affect the index.
+static native_three::SpatialIndex2D gStaticObjects(36.f);
+static native_three::SpatialIndex2D gDynamicLights(36.f);
+static bool gStaticObjectsRegistered=false;
+static native_three::SceneRegistry gSceneRegistry;
+static std::vector<native_three::ObjectHandle> gMovingObjectHandles;
+static UINT gDirtySceneObjects=0;
+static UINT gLightCandidateChecks=0,gShadowTreeCandidateChecks=0,gVisibleTreeCandidateChecks=0;
 static double gFenceWaitTotal=0,gWorstFrameMs=0,gLastFrameEndSeconds=0;
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
 static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
@@ -187,53 +218,74 @@ static void makeTexture(UINT meshIndex,int resourceID) {
     DWORD size=0;
     const BYTE *raw=resourceBytes(resourceID,&size);
     if(size<8)fatal("Invalid packed RGBA header",E_INVALIDARG);
-    UINT width=0,height=0;
-    memcpy(&width,raw,4);memcpy(&height,raw+4,4);
-    if(!width||!height||width>4096||height>4096||(UINT64)width*height*4+8!=size)
-        fatal("Invalid packed RGBA pixels",E_INVALIDARG);
-
+    // NTX2 has offline-generated complete mipmaps. Legacy <width,height,RGBA>
+    // is also accepted to avoid breaking third-party packed assets.
+    const bool version2=size>=16 && memcmp(raw,"NTX2",4)==0;
+    UINT width=0,height=0,levels=1;
+    const UINT headerBytes=version2?16:8;
+    memcpy(&width,raw+(version2?4:0),4);
+    memcpy(&height,raw+(version2?8:4),4);
+    if(version2)memcpy(&levels,raw+12,4);
+    if(!width||!height||width>4096||height>4096||levels<1||levels>13)
+        fatal("Invalid packed mipmap header",E_INVALIDARG);
+    UINT64 expected=headerBytes;
+    UINT tw=width,th=height;
+    for(UINT i=0;i<levels;i++){
+        expected+=(UINT64)tw*th*4;
+        tw=std::max(1u,tw/2);th=std::max(1u,th/2);
+    }
+    if(expected!=size)fatal("RGBA/mipmap payload size mismatch",E_INVALIDARG);
     D3D12_RESOURCE_DESC desc={};
     desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width=width;desc.Height=height;desc.DepthOrArraySize=1;
-    desc.MipLevels=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.MipLevels=(UINT16)levels;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
     auto heap=heapProperties(D3D12_HEAP_TYPE_DEFAULT);
     check(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
           D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&gMesh[meshIndex].texture)),
-          "Create model texture");
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp={};
-    UINT rows=0;UINT64 rowSize=0,totalBytes=0;
-    gDevice->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&rowSize,&totalBytes);
+          "Create model texture with mipmaps");
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[13]{};
+    UINT rows[13]{};UINT64 rowSizes[13]{},totalBytes=0;
+    gDevice->GetCopyableFootprints(&desc,0,levels,0,footprints,rows,rowSizes,&totalBytes);
     auto staging=uploadBuffer(nullptr,totalBytes);
     BYTE *dst=nullptr;
-    check(staging->Map(0,nullptr,(void**)&dst),"Map texture staging");
-    for(UINT y=0;y<height;y++)
-        memcpy(dst+fp.Offset+(UINT64)y*fp.Footprint.RowPitch,
-               raw+8+(UINT64)y*width*4,(size_t)width*4);
+    check(staging->Map(0,nullptr,(void**)&dst),"Map texture mip staging");
+    const BYTE *pixels=raw+headerBytes;
+    tw=width;th=height;
+    for(UINT mip=0;mip<levels;mip++){
+        for(UINT y=0;y<th;y++)
+            memcpy(dst+footprints[mip].Offset+
+                   (UINT64)y*footprints[mip].Footprint.RowPitch,
+                   pixels+(UINT64)y*tw*4,(size_t)tw*4);
+        pixels+=(UINT64)tw*th*4;
+        tw=std::max(1u,tw/2);th=std::max(1u,th/2);
+    }
     staging->Unmap(0,nullptr);
 
-    check(gAllocator->Reset(),"Reset allocator for texture");
-    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset command list for texture");
-    D3D12_TEXTURE_COPY_LOCATION src={},tgt={};
-    src.pResource=staging.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint=fp;
-    tgt.pResource=gMesh[meshIndex].texture.Get();
-    tgt.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    tgt.SubresourceIndex=0;
-    gCmd->CopyTextureRegion(&tgt,0,0,0,&src,nullptr);
-    auto b=transition(gMesh[meshIndex].texture.Get(),
-                      D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    gCmd->ResourceBarrier(1,&b);
-    check(gCmd->Close(),"Close upload command list");
+    check(gAllocator->Reset(),"Reset allocator for texture mips");
+    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset command list for texture mips");
+    for(UINT mip=0;mip<levels;mip++){
+        D3D12_TEXTURE_COPY_LOCATION src{},tgt{};
+        src.pResource=staging.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint=footprints[mip];
+        tgt.pResource=gMesh[meshIndex].texture.Get();
+        tgt.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        tgt.SubresourceIndex=mip;
+        gCmd->CopyTextureRegion(&tgt,0,0,0,&src,nullptr);
+    }
+    auto barrier=transition(gMesh[meshIndex].texture.Get(),
+                   D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    gCmd->ResourceBarrier(1,&barrier);
+    check(gCmd->Close(),"Close texture mip commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    waitGPU();
+    waitGPU(); // startup only, no per-frame GPU stall
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC view={};
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels=1;
+    view.Texture2D.MipLevels=levels;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr+=(SIZE_T)meshIndex*gSRVStep;
     gDevice->CreateShaderResourceView(gMesh[meshIndex].texture.Get(),&view,cpu);
@@ -601,6 +653,23 @@ static void initializeDX12() {
     }
     D3D12_COMMAND_QUEUE_DESC q={};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(gDevice->CreateCommandQueue(&q,IID_PPV_ARGS(&gQueue)),"Create GPU queue");
+    // Optional hardware GPU timestamps. No GPU timing is ever inferred from CPU
+    // command-recording duration; failed query support only disables this metric.
+    if(SUCCEEDED(gQueue->GetTimestampFrequency(&gGpuTimingFrequency)) &&
+       gGpuTimingFrequency>0){
+        D3D12_QUERY_HEAP_DESC desc{};
+        desc.Type=D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        desc.Count=FRAME_COUNT*GPU_TIMESTAMPS_PER_FRAME;
+        if(SUCCEEDED(gDevice->CreateQueryHeap(&desc,IID_PPV_ARGS(&gGpuTimingQueries)))){
+            auto heap=heapProperties(D3D12_HEAP_TYPE_READBACK);
+            auto data=bufferDescription(desc.Count*sizeof(UINT64));
+            if(FAILED(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,
+                  &data,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,
+                  IID_PPV_ARGS(&gGpuTimingReadback)))){
+                gGpuTimingQueries.Reset();gGpuTimingFrequency=0;
+            }
+        }
+    }
     DXGI_SWAP_CHAIN_DESC1 sd={};
     sd.Width=WIDTH;sd.Height=HEIGHT;sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count=1;sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -743,10 +812,16 @@ struct LightGridConstants {
 static_assert(sizeof(LightConstants)==49024,"1000-light CB layout mismatch");
 static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
-static void updateLightsAndShadowCameras(const float *matrices) {
-    float lights[LIGHT_COUNT*8]{};
-    NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
+static void updateLightsAndShadowCameras(const float *matrices,const float *lights) {
     LightConstants constants{};
+    gDynamicLights.beginFrame();
+    float maximumLightRange=0.f;
+    for(UINT li=0;li<LIGHT_COUNT;li++) {
+        const float *l=lights+li*8;
+        gDynamicLights.insert(li,l[0],l[2]);
+        maximumLightRange=std::max(maximumLightRange,l[3]);
+    }
+    gLightCandidateChecks=gShadowTreeCandidateChecks=0;
     for(UINT li=0;li<LIGHT_COUNT;li++) {
         const float *l=lights+li*8;
         constants.positionsRadius[li]={l[0],l[1],l[2],l[3]};
@@ -789,10 +864,11 @@ static void updateLightsAndShadowCameras(const float *matrices) {
             const float treeDist2=treeRange*treeRange,unitDist2=unitRange*unitRange;
             const UINT base=slot*INSTANCE_COUNT;
             UINT trees=0,reds=0,blues=0;
-            for(UINT i=0;i<TREE_COUNT;i++){
-                const float dx=matrices[i*16+12]-lx,dz=matrices[i*16+14]-lz;
-                if(dx*dx+dz*dz<=treeDist2)ids[base+trees++]=i;
-            }
+            // Query nearby static chunks once, not all 10,000 trees per light.
+            gStaticObjects.queryRadius(lx,lz,treeRange,[&](const native_three::SpatialItem& entry){
+                ++gShadowTreeCandidateChecks;
+                ids[base+trees++]=entry.id;
+            });
             for(UINT i=0;i<PER_ARMY;i++){
                 const UINT red=TREE_COUNT+i,blue=TREE_COUNT+PER_ARMY+i;
                 const float rx=matrices[red*16+12]-lx,rz=matrices[red*16+14]-lz;
@@ -836,13 +912,17 @@ static void updateLightsAndShadowCameras(const float *matrices) {
             bestDist[k]=1.e30f;bestIndex[k]=0;
         }
         UINT count=0;
-        for(UINT li=0;li<LIGHT_COUNT;li++) {
+        // Search only light chunks whose influence can touch this tile.
+        gDynamicLights.queryRadius(worldX,worldZ,maximumLightRange+48.f,
+          [&](const native_three::SpatialItem& lightItem) {
+            ++gLightCandidateChecks;
+            const UINT li=lightItem.id;
             const float *l=lights+li*8;
             const float dx=l[0]-worldX,dz=l[2]-worldZ;
             const float d2=dx*dx+dz*dz;
-            const float radius=l[3]+48.0f; // covers diagonal of 67.5x67.5 tile
+            const float radius=l[3]+48.0f; // conservative tile-diagonal margin
             if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
-                continue;
+                return;
             UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
             if(count<MAX_CELL_LIGHTS)++count;
             while(pos>0 && d2<bestDist[pos-1]) {
@@ -851,7 +931,7 @@ static void updateLightsAndShadowCameras(const float *matrices) {
                 --pos;
             }
             bestDist[pos]=d2;bestIndex[pos]=li;
-        }
+        });
         reinterpret_cast<UINT*>(&grid.counts[cell/4])[cell%4]=count;
         for(UINT k=0;k<count;k++) {
             UINT word=cell*MAX_CELL_LIGHTS/4+k/4;
@@ -919,24 +999,71 @@ static void drawShadowMaps() {
 // The shadow passes maintain their own separate, per-light visibility lists.
 static void updateMainTreeVisibility(const float *matrices,
                                      FXMMATRIX viewProjection,FXMMATRIX projection) {
+    XMFLOAT4X4 cameraMatrix{};
+    XMStoreFloat4x4(&cameraMatrix,viewProjection);
+    const UINT offset=SHADOW_COUNT*INSTANCE_COUNT;
+    const UINT frame=gSwap->GetCurrentBackBufferIndex();
+    if(gHaveVisibilityCache && memcmp(&cameraMatrix,&gLastVisibilityMatrix,
+                                      sizeof(cameraMatrix))==0){
+        // A stationary camera sees the same static meshes. Each backbuffer
+        // needs its index table uploaded once, not a 10k frustum traversal.
+        gVisibleTreeCandidateChecks=0;
+        if(gUploadedVisibilityRevisions[frame]!=gVisibilityRevision){
+            UINT* ids=nullptr;
+            check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map cached tree IDs");
+            memcpy(ids+offset,gCachedVisibleTreeIds.data(),
+                   gCachedVisibleTreeIds.size()*sizeof(UINT));
+            gShadowIndexCB->Unmap(0,nullptr);
+            gUploadedVisibilityRevisions[frame]=gVisibilityRevision;
+        }
+        return;
+    }
     UINT *ids=nullptr;
     check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map camera-visible tree IDs");
-    const UINT offset=SHADOW_COUNT*INSTANCE_COUNT;
     const float padX=XMVectorGetX(projection.r[0])*14.f;
     const float padY=XMVectorGetY(projection.r[1])*20.f;
     UINT visible=0;
-    for(UINT i=0;i<TREE_COUNT;i++){
-        const float *m=matrices+i*16;
-        const XMVECTOR at=XMVectorSet(m[12],8.f,m[14],1.f);
-        const XMVECTOR clip=XMVector4Transform(at,viewProjection);
-        const float w=XMVectorGetW(clip);
-        if(w<=-18.f)continue;
-        const float x=XMVectorGetX(clip),y=XMVectorGetY(clip);
-        if(x < -w-padX || x > w+padX ||
-           y < -w-padY || y > w+padY)continue;
-        ids[offset+visible++]=i;
-    }
+    gVisibleTreeCandidateChecks=0;
+    gStaticObjects.forEachChunk([&](int cx,int cz,
+                           const std::vector<native_three::SpatialItem>& entries){
+        // Reject an entire spatial chunk only if all eight corners of its
+        // conservative 3D bounds are outside the SAME clip-space plane.
+        // Unknown trees/methods remain visible rather than risk false culls.
+        const float size=gStaticObjects.chunkSize();
+        const float x0=cx*size-18.f,x1=(cx+1)*size+18.f;
+        const float z0=cz*size-18.f,z1=(cz+1)*size+18.f;
+        int rejectedLeft=0,rejectedRight=0,rejectedBelow=0,rejectedAbove=0;
+        for(int corner=0;corner<8;corner++){
+            const float x=(corner&1)?x1:x0,z=(corner&2)?z1:z0;
+            const float y=(corner&4)?36.f:-2.f;
+            const XMVECTOR clip=XMVector4Transform(XMVectorSet(x,y,z,1.f),viewProjection);
+            const float w=XMVectorGetW(clip),px=XMVectorGetX(clip),py=XMVectorGetY(clip);
+            rejectedLeft+=(px < -w-padX);
+            rejectedRight+=(px > w+padX);
+            rejectedBelow+=(py < -w-padY);
+            rejectedAbove+=(py > w+padY);
+        }
+        if(rejectedLeft==8 || rejectedRight==8 || rejectedBelow==8 || rejectedAbove==8)
+            return;
+        for(const auto& entry:entries){
+            ++gVisibleTreeCandidateChecks;
+            const UINT i=entry.id;
+            const XMVECTOR at=XMVectorSet(entry.x,8.f,entry.z,1.f);
+            const XMVECTOR clip=XMVector4Transform(at,viewProjection);
+            const float w=XMVectorGetW(clip);
+            if(w<=-18.f)continue;
+            const float x=XMVectorGetX(clip),y=XMVectorGetY(clip);
+            if(x < -w-padX || x > w+padX ||
+               y < -w-padY || y > w+padY)continue;
+            ids[offset+visible++]=i;
+        }
+    });
     gMainVisibleTrees=visible;
+    gCachedVisibleTreeIds.assign(ids+offset,ids+offset+visible);
+    gLastVisibilityMatrix=cameraMatrix;
+    gHaveVisibilityCache=true;
+    ++gVisibilityRevision;
+    gUploadedVisibilityRevisions[frame]=gVisibilityRevision;
     gShadowIndexCB->Unmap(0,nullptr);
 }
 
@@ -944,11 +1071,33 @@ static void renderFrame() {
     const UINT back=gSwap->GetCurrentBackBufferIndex();
     // Do not block after Present; wait only when reusing a busy buffer.
     const UINT64 reuseFence=gFrameFenceValues[back];
+    gLastFenceMs=0;
     if(reuseFence && gFence->GetCompletedValue()<reuseFence) {
         const double waitBegin=cpuSeconds();
         check(gFence->SetEventOnCompletion(reuseFence,gFenceEvent),"Frame reuse event");
         WaitForSingleObject(gFenceEvent,INFINITE);
-        gFenceWaitTotal+=(cpuSeconds()-waitBegin)*1000.0;
+        gLastFenceMs=(cpuSeconds()-waitBegin)*1000.0;
+        gFenceWaitTotal+=gLastFenceMs;
+    }
+    // Read last use of this buffer only after its GPU fence has completed.
+    if(reuseFence && gGpuTimingReadback && gGpuTimingFrequency){
+        const UINT64 byteOffset=(UINT64)back*GPU_TIMESTAMPS_PER_FRAME*sizeof(UINT64);
+        const D3D12_RANGE range={(SIZE_T)byteOffset,
+                       (SIZE_T)(byteOffset+GPU_TIMESTAMPS_PER_FRAME*sizeof(UINT64))};
+        UINT8* bytes=nullptr;
+        if(SUCCEEDED(gGpuTimingReadback->Map(0,&range,(void**)&bytes)) && bytes){
+            const UINT64* stamps=(const UINT64*)(bytes+byteOffset);
+            if(stamps[0]<=stamps[1] && stamps[1]<=stamps[2]){
+                const double scale=1000.0/(double)gGpuTimingFrequency;
+                gLastGpuShadowMs=(double)(stamps[1]-stamps[0])*scale;
+                gLastGpuMainMs=(double)(stamps[2]-stamps[1])*scale;
+                gGpuShadowTotal+=gLastGpuShadowMs;
+                gGpuMainTotal+=gLastGpuMainMs;
+                ++gGpuTimingSamples;
+            }
+            const D3D12_RANGE noCpuWrites={0,0};
+            gGpuTimingReadback->Unmap(0,&noCpuWrites);
+        }
     }
     const UINT64 completed=gFence->GetCompletedValue();
     gRetiredResources.erase(std::remove_if(gRetiredResources.begin(),
@@ -962,15 +1111,56 @@ static void renderFrame() {
     gShadowIndexCB=gShadowIndexBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
-    static std::vector<float> matrices(INSTANCE_COUNT*16,0.f); // 704KB stays off the 1MB Windows stack
+    static std::vector<float> matrices(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> previous(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> renderMatrices(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> currentLights(LIGHT_COUNT*8,0.f);
+    static std::vector<float> previousLights(LIGHT_COUNT*8,0.f);
+    static std::vector<float> renderedLights(LIGHT_COUNT*8,0.f);
+    static native_three::FixedStepper simulation(1.0/60.0,4);
+    static bool firstSceneFrame=true;
     const ULONGLONG tick=GetTickCount64();
     const double now=cpuSeconds();
-    const float dt=gPreviousFrameSeconds ?
-        (float)std::min(0.25,std::max(0.0,now-gPreviousFrameSeconds)) : (1.f/60.f);
+    const double dt=gPreviousFrameSeconds ?
+        std::min(0.20,std::max(0.0,now-gPreviousFrameSeconds)) : (1.0/60.0);
     gPreviousFrameSeconds=now;
     const double jsStart=cpuSeconds();
-    NativeThreeJS_Frame(dt,matrices.data(),INSTANCE_COUNT*16);
-    gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
+    if(firstSceneFrame){
+        // A fresh scene exposes all static and dynamic transforms exactly once.
+        NativeThreeJS_FrameFrom(0.f,matrices.data(),INSTANCE_COUNT*16,0);
+        previous=matrices;renderMatrices=matrices;
+        NativeThreeJS_Lights(currentLights.data(),currentLights.size());
+        previousLights=currentLights;
+        firstSceneFrame=false;
+    }
+    const float alpha=simulation.advance(dt,[&](double step){
+        std::copy(matrices.begin()+TREE_COUNT*16,matrices.end(),
+                  previous.begin()+TREE_COUNT*16);
+        previousLights=currentLights;
+        NativeThreeJS_FrameFrom((float)step,matrices.data(),INSTANCE_COUNT*16,
+                                gTreesUploaded ? TREE_COUNT : 0);
+        NativeThreeJS_Lights(currentLights.data(),currentLights.size());
+    });
+    // Interpolate independently moving light objects, not assuming they are
+    // attached to a soldier or occupy the same index as a mesh.
+    for(UINT i=0;i<LIGHT_COUNT;i++){
+        const size_t k=(size_t)i*8;
+        memcpy(renderedLights.data()+k,currentLights.data()+k,8*sizeof(float));
+        for(size_t c=0;c<3;c++)
+            renderedLights[k+c]=previousLights[k+c]+
+                                 (currentLights[k+c]-previousLights[k+c])*alpha;
+    }
+    // Native interpolator works on the generic transform matrix layout.
+    // Only changed/animated instances are copied; static tree matrices stay.
+    for(UINT i=TREE_COUNT;i<INSTANCE_COUNT;i++){
+        const size_t off=(size_t)i*16;
+        memcpy(renderMatrices.data()+off,matrices.data()+off,16*sizeof(float));
+        for(size_t k=12;k<=14;k++)
+            renderMatrices[off+k]=previous[off+k]+
+                                  (matrices[off+k]-previous[off+k])*alpha;
+    }
+    gLastJSms=(cpuSeconds()-jsStart)*1000.0;
+    gJsCpuMsTotal+=gLastJSms;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
     // guarantees that replacing the upload resource is safe.
@@ -984,9 +1174,35 @@ static void renderFrame() {
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
+    // Static scene objects register once; moving objects use their own grid.
+    if(!gStaticObjectsRegistered){
+        gStaticObjects.reserve(1024);
+        for(UINT i=0;i<TREE_COUNT;i++){
+            const float x=matrices[i*16+12],z=matrices[i*16+14];
+            const auto h=gSceneRegistry.create(native_three::ObjectKind::Mesh,x,0,z);
+            gStaticObjects.insert(h.slot,x,z);
+        }
+        gMovingObjectHandles.reserve(LIGHT_COUNT);
+        for(UINT i=0;i<LIGHT_COUNT;i++){
+            const UINT index=TREE_COUNT+i;
+            gMovingObjectHandles.push_back(gSceneRegistry.create(
+                native_three::ObjectKind::Agent,
+                matrices[index*16+12],0,matrices[index*16+14]));
+        }
+        gStaticObjectsRegistered=true;
+    }
+    for(UINT i=0;i<LIGHT_COUNT;i++){
+        const UINT index=TREE_COUNT+i;
+        gSceneRegistry.setPosition(gMovingObjectHandles[i],
+            renderMatrices[index*16+12],0,renderMatrices[index*16+14]);
+    }
+    gDirtySceneObjects=0;
+    gSceneRegistry.consumeChanges([&](native_three::ObjectHandle,
+                       const native_three::SceneRecord&){++gDirtySceneObjects;});
     const double lightsStart=cpuSeconds();
-    updateLightsAndShadowCameras(matrices.data());
-    gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
+    updateLightsAndShadowCameras(renderMatrices.data(),renderedLights.data());
+    gLastLightMs=(cpuSeconds()-lightsStart)*1000.0;
+    gLightCpuMsTotal+=gLastLightMs;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
         // 1000 tree matrices = 64000 bytes, exactly within a DX12 root CBV.
@@ -1009,7 +1225,8 @@ static void renderFrame() {
     }
     void *soldierData=nullptr;
     check(gSoldierCB->Map(0,nullptr,&soldierData),"Map 500 moving soldier matrices");
-    memcpy(soldierData,matrices.data()+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
+    memcpy(soldierData,renderMatrices.data()+TREE_COUNT*16,
+           LIGHT_COUNT*16*sizeof(float));
     gSoldierCB->Unmap(0,nullptr);
     XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
     XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
@@ -1021,7 +1238,7 @@ static void renderFrame() {
                  (float)WIDTH/HEIGHT,0.1f,2200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
-    updateMainTreeVisibility(matrices.data(),view*proj,proj);
+    updateMainTreeVisibility(renderMatrices.data(),view*proj,proj);
     void *cbptr=nullptr;
     check(gFrameCB->Map(0,nullptr,&cbptr),"Map view projection buffer");
     memcpy(cbptr,&vp,sizeof(vp));
@@ -1030,6 +1247,9 @@ static void renderFrame() {
     const double recordStart=cpuSeconds();
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
+    const UINT queryBase=back*GPU_TIMESTAMPS_PER_FRAME;
+    if(gGpuTimingQueries)
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase);
     if(gEnableShadows)drawShadowMaps();
     else {
         // F5 now skips all shadow draw calls, not merely the final sampling.
@@ -1037,6 +1257,8 @@ static void renderFrame() {
                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gCmd->ResourceBarrier(1,&readable);
     }
+    if(gGpuTimingQueries)
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase+1);
     gCmd->SetPipelineState(gPSO.Get());
     auto toRT=transition(gTargets[back].Get(),
                          D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1103,22 +1325,40 @@ static void renderFrame() {
     auto shadowWritable=transition(gShadowDepth.Get(),
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_DEPTH_WRITE);
     gCmd->ResourceBarrier(1,&shadowWritable);
+    if(gGpuTimingQueries){
+        gCmd->EndQuery(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,queryBase+2);
+        gCmd->ResolveQueryData(gGpuTimingQueries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,
+            queryBase,GPU_TIMESTAMPS_PER_FRAME,gGpuTimingReadback.Get(),
+            (UINT64)queryBase*sizeof(UINT64));
+    }
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    gRecordCpuMsTotal+=(cpuSeconds()-recordStart)*1000.0;
+    gLastRecordMs=(cpuSeconds()-recordStart)*1000.0;
+    gRecordCpuMsTotal+=gLastRecordMs;
     const double presentStart=cpuSeconds();
     check(gSwap->Present(gVSync?1:0,0),"Present frame");
-    gPresentCpuMsTotal+=(cpuSeconds()-presentStart)*1000.0;
+    gLastPresentMs=(cpuSeconds()-presentStart)*1000.0;
+    gPresentCpuMsTotal+=gLastPresentMs;
     const UINT64 submitted=++gFenceValue;
     check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
     gFrameFenceValues[back]=submitted;
-    ++gStatFrames;
+    ++gStatFrames;++gTotalFrames;
     const double endFrame=cpuSeconds();
-    if(gLastFrameEndSeconds){
-        gWorstFrameMs=std::max(gWorstFrameMs,(endFrame-gLastFrameEndSeconds)*1000.0);
-    }
+    const double fullFrameMs=gLastFrameEndSeconds ?
+        (endFrame-gLastFrameEndSeconds)*1000.0:0.0;
+    if(gLastFrameEndSeconds)
+        gWorstFrameMs=std::max(gWorstFrameMs,fullFrameMs);
     gLastFrameEndSeconds=endFrame;
+    if(fullFrameMs>40.0){
+        char csv[512];
+        sprintf_s(csv,"spike,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
+            (unsigned long long)gTotalFrames,fullFrameMs,
+            gLastJSms,gLastLightMs,gLastRecordMs,gLastPresentMs,
+            gLastFenceMs,gLastGpuShadowMs,gLastGpuMainMs,gMainVisibleTrees,
+            gDirtySceneObjects,gLightCandidateChecks,gShadowTreeCandidateChecks);
+        gPerfLog.enqueue(csv);
+    }
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
@@ -1128,17 +1368,34 @@ static void renderFrame() {
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
                              gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
-        wchar_t title[620];
+        wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f ms FENCE %.2f | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | A* %d/1000 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
-            gMainVisibleTrees,navigation.moved,navigation.planned,shadowInstances,
+            gGpuTimingSamples?gGpuShadowTotal/gGpuTimingSamples:0.0,
+            gGpuTimingSamples?gGpuMainTotal/gGpuTimingSamples:0.0,
+            gMainVisibleTrees,gDirtySceneObjects,
+            gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
+            navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
+        char summary[512];
+        sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
+            (unsigned long long)gTotalFrames,gWorstFrameMs,
+            gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,
+            gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
+            gFenceWaitTotal*inv,
+            gGpuTimingSamples?gGpuShadowTotal/gGpuTimingSamples:0.0,
+            gGpuTimingSamples?gGpuMainTotal/gGpuTimingSamples:0.0,
+            gMainVisibleTrees,gDirtySceneObjects,
+            gLightCandidateChecks,gShadowTreeCandidateChecks);
+        gPerfLog.enqueue(summary);
         gStatFrames=0;
+        gGpuShadowTotal=gGpuMainTotal=0;
+        gGpuTimingSamples=0;
         gJsCpuMsTotal=gLightCpuMsTotal=gRecordCpuMsTotal=gPresentCpuMsTotal=0;
         gFenceWaitTotal=gWorstFrameMs=0;
         gStatStart=t;

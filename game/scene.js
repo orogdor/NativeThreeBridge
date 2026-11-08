@@ -96,6 +96,14 @@ function protectedFormationCell(x,z) {
     throw new Error('Random forest placed '+treeCells.length+' of '+TREES+' trees');
   treeBark.instanceMatrix.needsUpdate=true;
   treeNeedles.instanceMatrix.needsUpdate=true;
+  // Generic native asynchronous navigation is preferred in Windows.
+  // Browser/Node Three.js tests keep the identical synchronous JS fallback.
+  const nativeNavigation=globalThis.NativeThreeNavigation??null;
+  if(nativeNavigation)nativeNavigation.configure(GRID,GRID,blocked);
+  const nativeTickets=new Map();
+  const nativeOccupied=new Int32Array(SOLDIERS);
+  const nativeReserved=new Int32Array(SOLDIERS);
+  let occupancyRevision=1,lastNativeOccupancyRevision=-1;
 
   // Each unit plans on demand while the simulation is running.
   // Live cell occupancy AND in-transit reservations are A* obstacles.
@@ -185,10 +193,8 @@ function protectedFormationCell(x,z) {
     }
     return [];
   }
-  function planFor(unit) {
-    if(unit.next!==-1 || unit.arrived)return false;
+  function acceptPath(unit,path) {
     const oldPlans=unit.plans;
-    const path=findPath(unit);
     searches++; if(oldPlans>0)replans++;
     else initialRoutesRemaining--;
     unit.plans++;unit.wait=0;unit.path=path;unit.at=0;
@@ -198,6 +204,20 @@ function protectedFormationCell(x,z) {
       return false;
     }
     unit.retry=0;
+    return true;
+  }
+  function planForImmediate(unit) {
+    if(unit.next!==-1 || unit.arrived)return false;
+    return acceptPath(unit,findPath(unit));
+  }
+  function planFor(unit) {
+    if(!nativeNavigation)return planForImmediate(unit);
+    if(unit.next!==-1 || unit.arrived || unit.navTicket)return false;
+    // Worker captures an immutable navigation snapshot; route application
+    // checks that the unit is still at the request's start and target.
+    const token=nativeNavigation.request(unit.cell,unit.goal,unit.plans>0);
+    unit.navTicket=token;
+    nativeTickets.set(token,{id:unit.id,start:unit.cell,goal:unit.goal});
     return true;
   }
   const units=[],soldierLights=[];
@@ -225,7 +245,7 @@ function protectedFormationCell(x,z) {
       throw new Error('Invalid soldier start/goal '+id);
     occupants[cell]=id;
     const unit={id,team,index:i,cell,goal,next:-1,progress:0,
-      path:[],at:0,plans:0,wait:0,retry:0,arrived:false,
+      path:[],at:0,plans:0,wait:0,retry:0,arrived:false,navTicket:0,
       x:toWorld(sx),z:toWorld(sz),startX:toWorld(sx),startZ:toWorld(sz),
       yaw:team===0?1.57:-1.57,speed:10.5+(i%5)*0.35};
     units.push(unit);
@@ -247,7 +267,34 @@ function protectedFormationCell(x,z) {
     put(team===0?red:blue,i,unit.x,unit.z,unit.yaw);
   }
 
+  function pollNativeNavigation() {
+    if(!nativeNavigation)return;
+    if(occupancyRevision!==lastNativeOccupancyRevision){
+      for(const unit of units){
+        nativeOccupied[unit.id]=unit.cell;
+        nativeReserved[unit.id]=unit.next;
+      }
+      nativeNavigation.updateAgents(nativeOccupied,nativeReserved);
+      lastNativeOccupancyRevision=occupancyRevision;
+    }
+    for(const response of nativeNavigation.poll(32)){
+      const request=nativeTickets.get(response.token);
+      if(!request)continue;
+      nativeTickets.delete(response.token);
+      const unit=units[request.id];
+      if(unit.navTicket!==response.token)continue;
+      unit.navTicket=0;
+      if(unit.cell!==request.start || unit.goal!==request.goal ||
+         unit.next!==-1 || unit.arrived){
+        requestUrgentPlan(unit);
+        continue;
+      }
+      const path=response.status===0 ? response.cells : [];
+      acceptPath(unit,path);
+    }
+  }
   function planPending(dt) {
+    pollNativeNavigation();
     // New movement orders and released collisions cannot wait behind 1000
     // first-time route requests. Defer busy units without losing their ticket.
     let budget=MAX_PLANS_PER_FRAME;
@@ -258,7 +305,7 @@ function protectedFormationCell(x,z) {
     for(let attempts=urgentPlans.length;attempts>0 &&
         budget>0 && urgentUsed<urgentQuota;attempts--){
       const id=urgentPlans.shift(),unit=units[id];
-      if(unit.next!==-1||unit.retry>0){
+      if(unit.next!==-1||unit.retry>0||unit.navTicket){
         urgentPlans.push(id);
         continue;
       }
@@ -271,7 +318,7 @@ function protectedFormationCell(x,z) {
       const unit=units[planningCursor];
       planningCursor=(planningCursor+1)%SOLDIERS;
       if(unit.arrived||unit.next!==-1||unit.path.length>1||unit.retry>0||
-         queuedUrgent[unit.id])continue;
+         unit.navTicket||queuedUrgent[unit.id])continue;
       planFor(unit);budget--;
     }
   }
@@ -307,6 +354,7 @@ function protectedFormationCell(x,z) {
             break;
           }
           reservations[next]=unit.id;
+          ++occupancyRevision;
           unit.next=next;unit.progress=0;unit.wait=0;
         }
         const remaining=CELL-unit.progress;
@@ -328,6 +376,7 @@ function protectedFormationCell(x,z) {
           occupants[unit.cell]=-1;
           occupants[unit.next]=unit.id;
           reservations[unit.next]=-1;
+          ++occupancyRevision;
           unit.cell=unit.next;unit.next=-1;unit.progress=0;
           unit.at++;segments++;
           if(unit.cell===unit.goal){unit.arrived=true;arrivals++;break;}
@@ -388,7 +437,14 @@ function protectedFormationCell(x,z) {
     const output=[];
     for(let team=0;team<2;team++)for(const index of sampleUnits){
       const unit=units[team*PER_ARMY+index];
-      if(!unit.plans)planFor(unit); // on-demand render inspection, not a bulk preload
+      if(!unit.plans){
+        if(nativeNavigation && unit.navTicket){
+          nativeNavigation.cancel(unit.navTicket);
+          nativeTickets.delete(unit.navTicket);
+          unit.navTicket=0;
+        }
+        planForImmediate(unit); // F4 route preview is a synchronous diagnostic only
+      }
       const path=unit.path;
       for(let j=unit.at+1;j<path.length;j++){
         const [ax,az]=fromIndex(path[j-1]);
@@ -408,6 +464,10 @@ function protectedFormationCell(x,z) {
     const target=gridIndex(gx,gz);
     if(blocked[target])return false;
     const unit=units[id];
+    if(nativeNavigation && unit.navTicket){
+      nativeNavigation.cancel(unit.navTicket);
+      nativeTickets.delete(unit.navTicket);unit.navTicket=0;
+    }
     unit.goal=target;unit.arrived=false;unit.path=[];unit.at=0;
     unit.wait=0;unit.retry=0;
     requestUrgentPlan(unit);

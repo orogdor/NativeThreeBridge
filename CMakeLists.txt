@@ -46,3 +46,7 @@ add_executable(ThreeSceneSmoke
 target_include_directories(ThreeSceneSmoke PRIVATE native-dx12)
 target_link_libraries(ThreeSceneSmoke PRIVATE qjs user32)
 target_compile_definitions(ThreeSceneSmoke PRIVATE UNICODE _UNICODE)
+
+# Pure C++ reusable engine subsystems; no Three.js, assets, or DX12 dependency.
+add_executable(NativeCoreSmoke native-dx12/core_smoke.cpp)
+target_include_directories(NativeCoreSmoke PRIVATE native-dx12)

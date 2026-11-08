@@ -13,7 +13,7 @@ test('1000 native Three.js spotlights each follow a soldier; only 16 depth maps'
   assert.match(js,/lamp\.position\.x=unit\.x/);
   assert.match(js,/__nativeThreeLightFrame/);
   assert.match(host,/constexpr size_t FLOATS = 1000 \* 8/);
-  assert.match(dx,/NativeThreeJS_Lights\(lights,LIGHT_COUNT\*8\)/);
+  assert.match(dx,/NativeThreeJS_Lights\(currentLights\.data\(\),currentLights\.size\(\)\)/);
   assert.match(dx,/SHADOW_COUNT=16/);
   assert.match(dx,/LIGHT_COUNT=1000/);
 });

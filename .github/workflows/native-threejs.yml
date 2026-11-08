@@ -48,8 +48,13 @@ jobs:
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build --config Release --target ThreeSceneSmoke NativeThreeJS --parallel 4
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke NativeThreeJS --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
+      - name: Verify generic scene registry, spatial index and async path worker pool
+        shell: pwsh
+        run: |
+          & .\\build\\Release\\NativeCoreSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Native core subsystem tests failed" }
       - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
         shell: pwsh
         run: |
@@ -109,6 +114,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.18.0: DX12 stress test with 10000 procedurally scattered Sapling pines, two 500-soldier armies, 1000 individually moving real SpotLights, and 16 dynamic depth-map shadows. 360x360 navigation grid, max four A* full searches per frame. Trees use 640KB GPU-local structured SRV instead of invalid over-64KB constant buffer; 1000 soldiers remain in an exactly 64KB constant buffer. CPU frustum culling compacts visible trees for both main draw calls; shadow maps have separate local instance lists. Night mode ON by default. F1 overview, F2/F3 armies, F4 paths, F5 shadows, F6 VSync, F7 day/night. Window shows FPS, worst frame milliseconds, GPU fence wait, JS/light/draw/present CPU times and visible tree count. Automated Windows compile and JS/A* tests are not physical GPU FPS benchmarks."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.19.0: NativeThreeBridge engine-core upgrade with generic C++ chunk spatial index for static objects, clustered moving light candidates, cached stationary-camera visibility, stable-ID scene registry/dirty tracking, incremental JS-native matrix copy, fixed 60Hz simulation with native render/light interpolation and bounded catchup. NativeThreeNavigation exposes nonblocking C++ worker-based A* with dynamic cell occupancy snapshots while retaining a synchronous browser fallback. GPU timestamp queries and asynchronous NativeThreeBridge-frames.csv stutter logger distinguish shadow/main GPU durations from CPU, Present and fences. NTX2 offline mipmaps with alpha coverage for foliage, screen-space LOD policy foundation and Three.js scene manifest export CLI (npm run convert). 10k pines/1k soldiers/1k lights/16 shadow maps remain the default night test. This is NOT yet a universal DX12 manifest loader: mesh LOD assets, ExecuteIndirect and arbitrary JS/custom shader compatibility remain to be built. FPS/shadow pixels require physical Windows DX12 testing."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }

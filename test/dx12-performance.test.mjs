@@ -26,5 +26,5 @@ test('shadow rendering culls per light, and shadow-off actually skips the pass',
 test('GPU selection, VSync toggle, diagnostics are visible',()=>{
   assert.match(dx,/DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE/);
   assert.match(dx,/wp==VK_F6/);
-  assert.match(dx,/shadow instances %u/);
+  assert.match(dx,/shadows %u/);
 });

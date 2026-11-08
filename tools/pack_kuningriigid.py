@@ -112,7 +112,32 @@ def build_mesh(doc, buf, primitive, out_mesh, out_tex):
     out_mesh.write_bytes(struct.pack("<4sIII",b"NTM1",len(pos),len(idx),0) + vertices + indices)
     mat = doc.get("materials",[{}])[primitive.get("material",0)]
     w,h,rgba = texture_rgba(doc,buf,mat)
-    out_tex.write_bytes(struct.pack("<II",w,h)+rgba)
+    # Precompute the entire mip pyramid offline instead of regenerating it
+    # while loading the game. Keep a single resource with a versioned header.
+    texture_image=Image.frombytes("RGBA",(w,h),rgba)
+    mipmaps=[]
+    original_coverage=sum(a>=102 for a in rgba[3::4])/(w*h)
+    while True:
+        level=texture_image.copy()
+        if mat.get("alphaMode") == "MASK" and len(mipmaps)>0 and original_coverage>0:
+            # Histogram-based binary search avoids rescanning millions of pixels
+            # on each of the 12 alpha-coverage iterations.
+            alpha=level.getchannel("A")
+            hist=alpha.histogram()
+            lo,hi=0.0,8.0
+            for _ in range(12):
+                scale=(lo+hi)*0.5
+                coverage=sum(hist[v] for v in range(256)
+                             if min(255,round(v*scale))>=102)/(level.width*level.height)
+                if coverage<original_coverage:lo=scale
+                else:hi=scale
+            level.putalpha(alpha.point(lambda v:min(255,round(v*hi))))
+        mipmaps.append(level.tobytes())
+        if texture_image.width==1 and texture_image.height==1:break
+        texture_image=texture_image.resize(
+            (max(1,texture_image.width//2),max(1,texture_image.height//2)),
+            Image.Resampling.BOX)
+    out_tex.write_bytes(struct.pack("<4sIII",b"NTX2",w,h,len(mipmaps))+b"".join(mipmaps))
     return {"vertices":len(pos),"triangles":len(idx)//3,
             "texture":f"{w}x{h}","material":mat.get("name",""),
             "alpha_mask":mat.get("alphaMode") == "MASK",
@@ -146,7 +171,7 @@ def main():
     (work/"model_assets.rc").write_text(rc,encoding="utf-8")
     (work/"parts.json").write_text(json.dumps(allparts,indent=2),encoding="utf-8")
     print(json.dumps(allparts,indent=2))
-    print("Packaged 1 spearman model and 1000 tree instances; 20 army soldiers at runtime.")
+    print("Packed mipmapped textures for the universal native renderer; model assets are instance-count independent.")
 
 if __name__ == "__main__":
     main()

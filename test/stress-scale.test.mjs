@@ -23,7 +23,7 @@ test('10k tree transforms live in structured GPU SRV, not invalid >64KB CBV',()=
   assert.match(dx,/gLightBuffers\[frame\]=uploadBuffer\(nullptr,49152\)/);
 });
 test('CPU frustum compaction preserves 10k trees, only draws visible instances',()=>{
-  assert.match(dx,/updateMainTreeVisibility\(matrices\.data\(\),view\*proj,proj\)/);
+  assert.match(dx,/updateMainTreeVisibility\(renderMatrices\.data\(\),view\*proj,proj\)/);
   assert.match(dx,/gMainVisibleTrees/);
   assert.match(dx,/SHADOW_COUNT\*INSTANCE_COUNT\+TREE_COUNT/);
   assert.match(dx,/draw\.shadowOffset=SHADOW_COUNT\*INSTANCE_COUNT/);
