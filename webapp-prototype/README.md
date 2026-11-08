@@ -23,7 +23,7 @@ drive a native GPU scene without Chromium, not general WebApp compatibility.
 
 Download the Actions artifact `NativeThreeWebApp-v026-Windows-x64` from
 the workflow for branch `experiments/v026-webapp-cube`. Extract the whole
-ZIP, then run `NativeThree-WebApp.exe` on Windows 10/11 with a DX12 GPU.
+ZIP, then run `Run-WebApp.cmd` (or `NativeThree-WebApp.exe`) on Windows 10/11 with a DX12 GPU.
 You should see a rotating blue cube; Escape closes it.
 
 For the browser comparison open `webapp/index.html` using a local HTTP
@@ -35,3 +35,18 @@ Windows CI compiles the DX12 EXE and runs `ThreeWebAppSmoke.exe`, which
 checks real QuickJS / Three.js initialization and animated matrices
 **without requiring a GPU**. The visual DX12 result still requires
 interactive testing on a Windows machine.
+
+
+## Startup troubleshooting
+
+The EXE writes a fresh `webapp-startup.log` alongside itself on each launch.
+If the window fails to open or immediately closes, run `Run-WebApp.cmd`
+from the extracted ZIP folder. It will show the log and keep the console
+visible on nonzero exits. If you want to test the software fallback instead,
+run `NativeThree-WebApp.exe --warp` from a terminal.
+
+The native EXE uses the MSVC static runtime to avoid missing VC++ DLLs.
+Windows CI tests actual D3D12 creation, shader compilation, swapchain
+initialization and three presented frames on the WARP software adapter.
+That is stronger than the JS-only smoke, but does not replace a visual test
+on physical hardware.
