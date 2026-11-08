@@ -52,6 +52,27 @@ JSValue jsNavigationConfigure(JSContext* ctx,JSValueConst,int argc,JSValueConst*
     navService->setMap(width,height,std::move(blocked));
     return JS_NewBool(ctx,true);
 }
+JSValue jsNavigationUpdateAgents(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
+    if(!navService)return JS_ThrowTypeError(ctx,"Call configure before updateAgents");
+    if(argc<2)return JS_ThrowTypeError(ctx,"updateAgents(Int32Array occupied,Int32Array reserved)");
+    std::vector<std::int32_t> lists[2];
+    for(int i=0;i<2;i++){
+        size_t off=0,bytes=0,width=0,total=0;
+        JSValue buffer=JS_GetTypedArrayBuffer(ctx,argv[i],&off,&bytes,&width);
+        if(JS_IsException(buffer))return buffer;
+        const std::uint8_t* ptr=JS_GetArrayBuffer(ctx,&total,buffer);
+        if(!ptr||width!=sizeof(std::int32_t)||off+bytes>total||
+           bytes%sizeof(std::int32_t)){
+            JS_FreeValue(ctx,buffer);
+            return JS_ThrowTypeError(ctx,"Expected Int32Array cell indices");
+        }
+        lists[i].resize(bytes/sizeof(std::int32_t));
+        std::memcpy(lists[i].data(),ptr+off,bytes);
+        JS_FreeValue(ctx,buffer);
+    }
+    navService->updateAgents(lists[0],lists[1]);
+    return JS_UNDEFINED;
+}
 JSValue jsNavigationRequest(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
     if(!navService)return JS_ThrowTypeError(ctx,"Call NativeThreeNavigation.configure first");
     if(argc<2)return JS_ThrowTypeError(ctx,"request(startCell,goalCell,urgent=false)");
@@ -95,6 +116,8 @@ JSValue jsNavigationPending(JSContext* ctx,JSValueConst,int,JSValueConst*) {
 void installNativeNavigation(JSContext* ctx) {
     JSValue global=JS_GetGlobalObject(ctx),api=JS_NewObject(ctx);
     JS_SetPropertyStr(ctx,api,"configure",JS_NewCFunction(ctx,jsNavigationConfigure,"configure",3));
+    JS_SetPropertyStr(ctx,api,"updateAgents",
+                      JS_NewCFunction(ctx,jsNavigationUpdateAgents,"updateAgents",2));
     JS_SetPropertyStr(ctx,api,"request",JS_NewCFunction(ctx,jsNavigationRequest,"request",3));
     JS_SetPropertyStr(ctx,api,"poll",JS_NewCFunction(ctx,jsNavigationPoll,"poll",1));
     JS_SetPropertyStr(ctx,api,"cancel",JS_NewCFunction(ctx,jsNavigationCancel,"cancel",1));
