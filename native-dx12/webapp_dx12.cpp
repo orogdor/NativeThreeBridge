@@ -784,6 +784,15 @@ int WebappWindow::run(HINSTANCE instance) {
     height_ = std::max<LONG>(1, client.bottom);
     initDevice();
 
+    // Display the native window BEFORE executing the user's JavaScript.
+    // Otherwise a large or stuck synchronous module looks like an invisible
+    // background process. Only the startup order changes, not the DX12 draws.
+    SetWindowTextW(window_, L"NativeThreeBridge — loading game/index.html...");
+    ShowWindow(window_, SW_SHOW);
+    UpdateWindow(window_);
+    SetForegroundWindow(window_);
+    log("info", "Native DX12 window shown before QuickJS startup");
+
     gCrashPhase = "loading index.html and the game's JavaScript";
     log("info", "Starting JavaScript (QuickJS)");
     if (!host_.start(root_, shim, std::move(builtins), this, int(width_), int(height_), error)) {
@@ -792,8 +801,7 @@ int WebappWindow::run(HINSTANCE instance) {
         return 45;
     }
     log("info", "index.html parsed, scripts started");
-    ShowWindow(window_, SW_SHOW);
-    SetForegroundWindow(window_);
+    // Keep this window alive while deferred module jobs continue on frames.
 
     const auto start = std::chrono::steady_clock::now();
     auto statStart = start;
@@ -817,6 +825,18 @@ int WebappWindow::run(HINSTANCE instance) {
         pendingPasses_.clear();
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
         host_.frame(ms);
+        if (!host_.running()) {
+            const char* message = "Game JavaScript was stopped by the QuickJS watchdog. "
+                                  "See NativeThreeBridge-webapp-log.txt for the last module.";
+            log("error", message);
+            if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
+                MessageBoxA(window_, message, "NativeThreeBridge webapp", MB_OK | MB_ICONWARNING);
+            waitForGpu();
+            host_.shutdown();
+            gActive = nullptr;
+            if (log_) { std::fclose(log_); log_ = nullptr; gCrashLog = nullptr; }
+            return 46;
+        }
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
         renderFrame();
