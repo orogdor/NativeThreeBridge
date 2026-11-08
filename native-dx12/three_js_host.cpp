@@ -192,31 +192,56 @@ void dieWithJS(const char *phase) {
 }
 } // namespace
 
-// A separate scene.js is loaded relative to this EXE. No browser APIs.
-static std::string loadGameScene() {
-    wchar_t fullPath[MAX_PATH] = {};
-    DWORD n = GetModuleFileNameW(nullptr, fullPath, MAX_PATH);
-    if (!n || n >= MAX_PATH) die("Cannot find executable path.");
-    std::wstring filename(fullPath, n);
-    size_t slash = filename.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) die("Cannot locate executable folder.");
-    filename.resize(slash);
-    filename += L"\\game\\scene.js";
+// The ONLY v0.26.0 engine change: resolve game JS from a local webapp
+// index.html manifest. The actual scene bytes, JS runtime, scene ABI, DX12
+// renderer, memory allocations, GPU paths and simulation remain unchanged.
+static std::string readGameFile(const std::wstring& filename, DWORD maxBytes,
+                                const char* missingFile) {
     HANDLE f = CreateFileW(filename.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE)
-        die("Missing game/scene.js. Extract the complete Windows ZIP beside the EXE.");
+    if (f == INVALID_HANDLE_VALUE) die(missingFile);
     LARGE_INTEGER size = {};
-    if (!GetFileSizeEx(f, &size) || size.QuadPart < 32 || size.QuadPart > (8 * 1024 * 1024)) {
+    if (!GetFileSizeEx(f, &size) || size.QuadPart < 32 || size.QuadPart > maxBytes) {
         CloseHandle(f);
-        die("game/scene.js is empty, invalid or larger than 8 MB.");
+        die("Webapp entry or game script is empty, invalid or too large.");
     }
     std::string source(static_cast<size_t>(size.QuadPart), '\0');
     DWORD received = 0;
     BOOL ok = ReadFile(f, source.data(), static_cast<DWORD>(source.size()), &received, nullptr);
     CloseHandle(f);
-    if (!ok || received != source.size()) die("Unable to read game/scene.js.");
+    if (!ok || received != source.size()) die("Unable to read webapp entry or game script.");
     return source;
+}
+static std::string loadGameScene() {
+    wchar_t fullPath[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(nullptr, fullPath, MAX_PATH);
+    if (!n || n >= MAX_PATH) die("Cannot find executable path.");
+    std::wstring root(fullPath, n);
+    size_t slash = root.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) die("Cannot locate executable folder.");
+    root.resize(slash);
+    root += L"\\game\\";
+    // A small, explicit entry point: do not introduce DOM, a browser,
+    // WebGLRenderer adapter or a second scene-rendering implementation.
+    const std::string html = readGameFile(root + L"index.html", 64 * 1024,
+        "Missing game/index.html. Extract the complete webapp ZIP beside the EXE.");
+    constexpr const char* tag = "<meta name=\"native-three-entry\" content=\"";
+    const size_t start = html.find(tag);
+    if (start == std::string::npos)
+        die("game/index.html must declare <meta name=\"native-three-entry\" content=\"scene.js\">.");
+    const size_t from = start + std::strlen(tag);
+    const size_t to = html.find('"', from);
+    if (to == std::string::npos || to == from || to - from > 120)
+        die("Invalid native-three-entry script name.");
+    const std::string entry = html.substr(from, to - from);
+    // Single JS asset in the webapp folder only; no traversal or remote URLs.
+    if (entry.size() < 4 || entry.substr(entry.size() - 3) != ".js" ||
+        entry.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-." ) != std::string::npos ||
+        entry == "." || entry == "..")
+        die("Webapp entry must be a local JS filename in game/.");
+    const std::wstring jsFile(entry.begin(), entry.end()); // validated ASCII
+    return readGameFile(root + jsFile, 8 * 1024 * 1024,
+        "Webapp JavaScript file is missing beside game/index.html.");
 }
 
 void NativeThreeJS_Init() {
