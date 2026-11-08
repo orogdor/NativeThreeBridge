@@ -1742,17 +1742,18 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
     // v0.28 webapp mode: an ordinary Three.js webapp folder (index.html + ES
     // modules) passed with --webapp <folder>, dropped on the EXE, or installed
-    // as game/index.html runs in its own window. Without one, the forest
-    // battle (game/scene.js) below stays the default engine scene.
-    if(!importedGame) {
+    // as game/index.html (also by the Kuningriigid installer, which leaves
+    // .native-three-game-manifest.json) runs in its own window. Without one,
+    // the forest battle (game/scene.js) below stays the default engine scene.
+    {
         std::filesystem::path webappRoot;
         if(NativeWebapp_FindRoot(commandLine,executable,webappRoot))
             return NativeWebapp_Run(instance,webappRoot);
     }
     if(importedGame || !battleScene) {
         const char* report=importedGame
-            ? "Kuningriigid source is installed in game/, but this DX12 engine cannot run it yet. "
-              "Browser DOM, HTML/CSS, module loading and WebGLRenderer are not implemented. "
+            ? "A browser game is installed in game/, but game/index.html is missing, so it cannot be opened. "
+              "Reinstall the game or open its folder with NativeThree-Game.exe --webapp <folder>. "
               "No downloaded game code was executed."
             : "No game/scene.js or game/index.html found. Install a game with its own updater, "
               "or open a Three.js webapp folder: NativeThree-Game.exe --webapp <folder>.";
