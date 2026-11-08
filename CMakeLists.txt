@@ -27,6 +27,11 @@ file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/generated/" DESTINATION "${CMAKE_BINARY_D
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/Release/game")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/game/scene.js"
                "${CMAKE_BINARY_DIR}/Release/game/scene.js" COPYONLY)
+# Only the webapp entry + browser viewer are new. The DX12 engine stays v0.26.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/game/index.html"
+               "${CMAKE_BINARY_DIR}/Release/game/index.html" COPYONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/game/browser.js"
+               "${CMAKE_BINARY_DIR}/Release/game/browser.js" COPYONLY)
 
 add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
