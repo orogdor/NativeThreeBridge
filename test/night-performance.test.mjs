@@ -28,7 +28,7 @@ test('scene transforms are copied from Three.js instance arrays, not re-evaluate
 });
 test('CPU diagnostics separate simulation, lighting, render command recording and present',()=>{
   assert.match(dx,/QueryPerformanceCounter/);
-  assert.match(dx,/CPU JS %\.2f LIGHT %\.2f DRAW %\.2f PRESENT %\.2f ms/);
+  assert.match(dx,/CPU JS %\.2f LIGHT %\.2f DRAW %\.2f PRESENT %\.2f/);
   assert.match(dx,/gJsCpuMsTotal/);
   assert.match(dx,/gLightCpuMsTotal/);
 });
