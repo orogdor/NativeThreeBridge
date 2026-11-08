@@ -56,12 +56,18 @@ jobs:
         run: |
           git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
           if ($LASTEXITCODE -ne 0) { throw "QuickJS-NG checkout failed" }
+      - name: Acquire prebuilt V8 13.0 for webapp JavaScript (pmed/v8-nuget)
+        shell: pwsh
+        run: |
+          nuget install v8-v143-x64 -Version 13.0.245.25 -OutputDirectory third_party/v8pkg -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "V8 NuGet download failed" }
+          Get-ChildItem third_party/v8pkg/v8.redist-v143-x64.13.0.245.25/lib/Release | Format-Table Name, Length
       - name: Compile native game engine and runtime smoke test
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DNTB_WEBAPP_V8=ON -DV8_PACKAGE_DIR="$PWD/third_party/v8pkg/v8-v143-x64.13.0.245.25" -DV8_REDIST_DIR="$PWD/third_party/v8pkg/v8.redist-v143-x64.13.0.245.25"
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke WebappSmoke NativeThreeJS --parallel 4
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke WebappSmoke WebappSmokeV8 NativeThreeJS --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
       - name: Verify generic scene registry, spatial index and async path worker pool
         shell: pwsh
@@ -94,6 +100,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed in the native webapp runtime" }
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-bad-import 0 expect-boot-error
           if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly" }
+          # Same folders on the V8 backend the game EXE now uses.
+          & .\build\Release\WebappSmokeV8.exe samples/hello-webapp 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "hello-webapp failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-edge 3
+          if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-bad-import 0 expect-boot-error
+          if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly on V8" }
       - name: Real game check - Kuningriigid through the embedded webapp runtime (informational)
         continue-on-error: true
         shell: pwsh
@@ -103,8 +116,8 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/orogdor/Kuningriigid.git kuningriigid-check
           if ($LASTEXITCODE -ne 0) { throw "Kuningriigid checkout failed" }
-          & .\build\Release\WebappSmoke.exe kuningriigid-check 1
-          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly in the webapp runtime (exit $LASTEXITCODE)" }
+          & .\build\Release\WebappSmokeV8.exe kuningriigid-check 1
+          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly on V8 (exit $LASTEXITCODE)" }
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |
@@ -119,6 +132,8 @@ jobs:
           New-Item -ItemType Directory -Force dist/webapps/hello-webapp | Out-Null
           Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
           Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
+          Copy-Item third_party/v8pkg/v8.redist-v143-x64.13.0.245.25/lib/Release/* dist/
+          Copy-Item third_party/v8pkg/v8-v143-x64.13.0.245.25/readme.md dist/README-V8-package.md -ErrorAction SilentlyContinue
           cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
           if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
           & .\dist\NativeThree-Updater.exe --self-test
@@ -138,7 +153,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav) -or !(Test-Path verify/webapps/hello-webapp/index.html) -or !(Test-Path verify/webapps/hello-webapp/main.js) -or !(Test-Path verify/webapps/hello-webapp/world.js) -or !(Test-Path verify/Run-Hello-Webapp.bat)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav) -or !(Test-Path verify/webapps/hello-webapp/index.html) -or !(Test-Path verify/webapps/hello-webapp/main.js) -or !(Test-Path verify/webapps/hello-webapp/world.js) -or !(Test-Path verify/Run-Hello-Webapp.bat) -or !(Test-Path verify/v8.dll) -or !(Test-Path verify/v8_libplatform.dll)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4

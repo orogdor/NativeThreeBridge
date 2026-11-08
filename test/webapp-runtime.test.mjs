@@ -126,14 +126,22 @@ test('module resolution rules (mirrored in webapp_host.cpp)', () => {
 });
 
 test('C++ host mirrors the resolver, packet layout and engine three module', () => {
-  const cpp = read('native-dx12/webapp_host.cpp'), h = read('native-dx12/webapp_host.h');
+  const cpp = read('native-dx12/webapp_common.cpp'), h = read('native-dx12/webapp_host.h');
+  const quick = read('native-dx12/webapp_host.cpp'), v8 = read('native-dx12/webapp_host_v8.cpp');
   assert.ok(cpp.includes(THREE_MODULE_SOURCE.split('\n').map((l) => l && `        "${l}\\n"`).filter(Boolean).join('\n')), 'virtual three module text is identical');
   for (const message of ['points to the internet', 'is not in the importmap of index.html', 'Module path leaves the game folder', 'nt:addons/', 'three/examples/jsm/']) assert.ok(cpp.includes(message), message);
   assert.match(h, new RegExp(`kWebappPassHeaderFloats = ${PASS_HEADER_FLOATS};`));
   assert.match(h, new RegExp(`kWebappLightFloats = ${LIGHT_FLOATS};`));
   assert.match(h, new RegExp(`kWebappDrawFloats = ${DRAW_FLOATS};`));
   assert.match(h, new RegExp(`kWebappMaxLights = ${MAX_LIGHTS};`));
-  assert.match(cpp, /JS_SetModuleLoaderFunc\(s\.rt, moduleNormalize, moduleLoader/);
+  assert.match(quick, /JS_SetModuleLoaderFunc\(s\.rt, moduleNormalize, moduleLoader/);
+  // Both JavaScript backends expose the same native bridge to the shim/renderer.
+  for (const fn of ['log', 'setTitle', 'readText', 'readBinary', 'setImportMap', 'evalScript', 'evalModule', 'uploadGeometry', 'releaseGeometry', 'uploadInstances', 'releaseInstances', 'submitPass']) {
+    assert.ok(quick.includes(`{"${fn}", js`), `QuickJS __nt.${fn}`);
+    assert.ok(v8.includes(`{"${fn}", nt`), `V8 __nt.${fn}`);
+  }
+  assert.match(v8, /SetHostImportModuleDynamicallyCallback/);
+  assert.match(v8, /webappResolveModule\(/, 'V8 uses the shared resolver');
 });
 
 test('webapp mode is a separate path: forest battle stays the default scene', () => {

@@ -73,109 +73,6 @@ std::string toLower(std::string s) {
 
 } // namespace
 
-std::string webappNormalizeGamePath(const std::string& path) {
-    if (path.empty() || path.size() > 1024) return {};
-    if (path.find('\\') != std::string::npos || path.find(':') != std::string::npos ||
-        path.find('\0') != std::string::npos)
-        return {};
-    std::string out;
-    if (!normalizeSegments(path, out) || out.empty()) return {};
-    return out;
-}
-
-std::string webappResolveModule(const std::string& base, const std::string& specifierIn,
-                                const std::vector<std::string>& importMap,
-                                const std::vector<std::string>& builtinNames,
-                                std::string& error) {
-    auto isBuiltin = [&](const std::string& name) {
-        return std::find(builtinNames.begin(), builtinNames.end(), name) != builtinNames.end();
-    };
-    std::string specifier = specifierIn;
-    std::string effectiveBase = base;
-
-    // 1. 'three' is always the engine's own Three.js + NativeRenderer.
-    if (specifier == "three") return "nt:three";
-    // 2. Addons the engine embeds (OrbitControls …) win over an importmap URL.
-    for (const char* prefix : {"three/addons/", "three/examples/jsm/"}) {
-        if (startsWith(specifier, prefix)) {
-            const std::string name = "nt:addons/" + specifier.substr(std::strlen(prefix));
-            if (isBuiltin(name)) return name;
-        }
-    }
-    // 3. Engine-internal modules import each other relatively.
-    if (startsWith(base, "nt:")) {
-        if (startsWith(specifier, "nt:")) return specifier;
-        if (startsWith(specifier, "./") || startsWith(specifier, "../")) {
-            std::string joined;
-            if (!normalizeSegments(dirOf(base.substr(3)) + specifier, joined)) {
-                error = "Engine module path escapes: " + specifier;
-                return {};
-            }
-            return "nt:" + joined;
-        }
-    }
-    // 4. Import map: exact key first, then the longest "prefix/" key.
-    const bool relative = startsWith(specifier, "/") || startsWith(specifier, "./") ||
-                          startsWith(specifier, "../");
-    if (!relative) {
-        std::string best, bestValue;
-        bool exact = false;
-        for (std::size_t i = 0; i + 1 < importMap.size(); i += 2) {
-            const std::string& key = importMap[i];
-            if (key == specifier) { bestValue = importMap[i + 1]; exact = true; break; }
-            if (!key.empty() && key.back() == '/' && startsWith(specifier, key.c_str()) &&
-                key.size() > best.size()) {
-                best = key;
-                bestValue = importMap[i + 1] + specifier.substr(key.size());
-            }
-        }
-        if (exact || !best.empty()) {
-            specifier = bestValue;
-            effectiveBase = "index.html"; // import map URLs are relative to the page
-        }
-    }
-    const std::string lower = toLower(specifier);
-    if (startsWith(lower, "http://") || startsWith(lower, "https://") || startsWith(lower, "//")) {
-        if (isThreeBuildFile(stripQueryAndHash(specifier))) return "nt:three";
-        error = "Module '" + specifierIn + "' points to the internet (" + specifier +
-                "). NativeThreeBridge runs offline: copy the file into the game folder "
-                "and point the importmap to it.";
-        return {};
-    }
-    if (startsWith(specifier, "nt:")) {
-        if (isBuiltin(specifier) || specifier == "nt:three") return specifier;
-        error = "Unknown engine module " + specifier;
-        return {};
-    }
-    if (!(startsWith(specifier, "/") || startsWith(specifier, "./") || startsWith(specifier, "../"))) {
-        error = "Bare module '" + specifierIn + "' is not in the importmap of index.html";
-        return {};
-    }
-    // 5. Paths inside the game folder.
-    const std::string pathPart = stripQueryAndHash(specifier);
-    std::string baseFile = effectiveBase;
-    const std::size_t hash = baseFile.find('#');
-    if (hash != std::string::npos) baseFile.resize(hash);
-    const std::string joined = pathPart[0] == '/' ? pathPart.substr(1) : dirOf(baseFile) + pathPart;
-    std::string normalized;
-    if (!normalizeSegments(joined, normalized) || normalized.empty()) {
-        error = "Module path leaves the game folder: " + specifierIn;
-        return {};
-    }
-    // A vendored copy of three.module.js would bring the WebGL renderer back.
-    if (isThreeBuildFile(normalized)) return "nt:three";
-    return normalized;
-}
-
-const char* webappThreeModuleSource() {
-    return
-        "export * from 'nt:three.module.min.js';\n"
-        "import * as THREE_CORE from 'nt:three.core.min.js';\n"
-        "import { createNativeRendererClasses } from 'nt:native-renderer.mjs';\n"
-        "const { NativeRenderer } = createNativeRendererClasses(THREE_CORE, globalThis.__nt, globalThis.__ntHost);\n"
-        "export { NativeRenderer, NativeRenderer as WebGLRenderer };\n";
-}
-
 // ---------------------------------------------------------------------------
 struct WebappHost::Impl {
     JSRuntime* rt = nullptr;
@@ -223,20 +120,7 @@ struct WebappHost::Impl {
         log("error", "Promise job queue did not settle (1,000,000 jobs in one step)");
     }
     bool readGameFile(const std::string& rel, std::string& out, std::string& error) {
-        const std::string clean = webappNormalizeGamePath(rel);
-        if (clean.empty()) { error = "Invalid game path: " + rel; return false; }
-        const std::filesystem::path full = root / std::filesystem::u8path(clean);
-        std::ifstream file(full, std::ios::binary);
-        if (!file) { error = "File not found in game folder: " + clean; return false; }
-        file.seekg(0, std::ios::end);
-        const std::streamoff size = file.tellg();
-        if (size < 0 || static_cast<std::uint64_t>(size) > kMaxGameFileBytes) {
-            error = "File too large or unreadable: " + clean; return false;
-        }
-        file.seekg(0, std::ios::beg);
-        out.resize(static_cast<std::size_t>(size));
-        if (size > 0 && !file.read(out.data(), size)) { error = "Read failed: " + clean; return false; }
-        return true;
+        return webappReadGameFile(root, rel, out, error);
     }
     // Calls __ntHost[name](...args); errors are logged, never fatal.
     void callHost(const char* name, int argc, JSValue* argv) {
@@ -528,7 +412,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
 
     std::string html;
     if (!s.readGameFile("index.html", html, error)) {
-        error = "No index.html in " + root.u8string() + " (" + error + ")";
+        error = "No index.html in " + webappPathUtf8(root) + " (" + error + ")";
         return false;
     }
 
@@ -648,5 +532,7 @@ std::string WebappHost::statusJson() {
     JS_FreeValue(s.ctx, result);
     return out;
 }
+
+const char* webappEngineName() { return "QuickJS-NG"; }
 
 } // namespace native_three

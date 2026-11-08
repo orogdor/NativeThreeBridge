@@ -16,6 +16,10 @@ Not yet (reported in NativeThreeBridge-webapp-log.txt): textures/images,
 GLTF models, shadows, fog, ShaderMaterial, post-processing, HTML/CSS
 overlays (DOM exists but is not drawn), audio, internet URLs.
 Without --webapp the forest battle starts exactly as before.
+WEBAPP JAVASCRIPT ENGINE: V8 13 (JIT, same engine as Chrome) runs the
+webapp's JavaScript; rendering is still NativeThreeBridge DX12. Keep the
+v8*.dll, icu*.dll and icudtl.dat files beside NativeThree-Game.exe.
+The forest battle still uses the embedded QuickJS-NG.
 
 NativeThreeBridge v0.27.1 - FOREST BATTLE ENGINE
 The forest battle is still the primary scenario and starts normally from

@@ -643,8 +643,8 @@ void WebappWindow::renderFrame() {
 
 void WebappWindow::updateTitle(double fps) {
     wchar_t text[512];
-    swprintf_s(text, L"%s — NativeThreeBridge webapp | %.0f FPS | %u draws | %s%s",
-               pageTitle_.c_str(), fps, lastDraws_, adapterName_.c_str(),
+    swprintf_s(text, L"%s — NativeThreeBridge webapp | %.0f FPS | %u draws | %s | %s%s",
+               pageTitle_.c_str(), fps, lastDraws_, widen(native_three::webappEngineName()).c_str(), adapterName_.c_str(),
                logErrors_ ? L" | JS errors: see NativeThreeBridge-webapp-log.txt" : L"");
     SetWindowTextW(window_, text);
 }

@@ -55,6 +55,14 @@ std::string webappResolveModule(const std::string& base, const std::string& spec
 // Source of the engine's virtual 'three' module.
 const char* webappThreeModuleSource();
 
+// Reads root/<rel> after webappNormalizeGamePath (no escaping the folder).
+bool webappReadGameFile(const std::filesystem::path& root, const std::string& rel,
+                        std::string& out, std::string& error);
+// UTF-8 form of a path (kept in a C++17 file: u8string changes type in C++20).
+std::string webappPathUtf8(const std::filesystem::path& path);
+// Name of the JavaScript engine this build uses ("QuickJS-NG" or "V8 <version>").
+const char* webappEngineName();
+
 class WebappHost {
 public:
     WebappHost();
