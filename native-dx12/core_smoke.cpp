@@ -4,6 +4,7 @@
 #include "fixed_stepper.h"
 #include "lod_policy.h"
 #include "native_css_style.h"
+#include "native_audio_core.h"
 #include "walk_animation.h"
 #include <algorithm>
 #include <cassert>
@@ -39,6 +40,40 @@ int main(){
     }
     const auto defaultButton=native_three::parseNativeButton("","bad CSS");
     if(defaultButton.width<120 || defaultButton.text!="Restart")return 56;
+
+    // Native sound is an independent engine service: safe WAV decoding,
+    // sound-ID sandboxing and spatial attenuation can be tested without a GPU.
+    assert(legalAudioAsset("battle_footstep-01"));
+    assert(!legalAudioAsset("../secrets"));
+    assert(!legalAudioAsset("bad.wav"));
+    std::vector<std::uint8_t> wav(48,0);
+    std::memcpy(wav.data(),"RIFF",4);
+    std::memcpy(wav.data()+8,"WAVEfmt ",8);
+    std::memcpy(wav.data()+36,"data",4);
+    auto put16=[&](std::size_t at,unsigned n){
+        wav[at]=(std::uint8_t)(n&255);
+        wav[at+1]=(std::uint8_t)((n>>8)&255);
+    };
+    auto put32=[&](std::size_t at,unsigned n){
+        put16(at,n&65535);put16(at+2,(n>>16)&65535);
+    };
+    put32(4,40);put32(16,16);put16(20,1);put16(22,1);
+    put32(24,48000);put32(28,96000);put16(32,2);put16(34,16);
+    put32(40,4);put16(44,1000);put16(46,2000);
+    const auto sound=decodePcmWave(wav.data(),wav.size());
+    assert(sound.valid()&&sound.channels==1 && sound.sampleRate==48000);
+    assert(sound.pcm.size()==4);
+    wav[20]=3; // format 3 is IEEE float, not PCM16; must be rejected
+    assert(!decodePcmWave(wav.data(),wav.size()).valid());
+    wav[20]=1;
+    put32(40,100000); // malicious/truncated chunk
+    assert(!decodePcmWave(wav.data(),wav.size()).valid());
+    const auto centered=spatialAudioMix(0,0,0,0,0,0.8f,true);
+    const auto right=spatialAudioMix(0,0,0,50,0,0.8f,true);
+    const auto far=spatialAudioMix(0,0,0,800,0,0.8f,true);
+    assert(std::abs(centered.left-centered.right)<0.0001f);
+    assert(right.right>right.left && right.attenuation>far.attenuation);
+    assert(spatialAudioMix(0,0,0,800,0,0.8f,false).attenuation==1.f);
 
     SceneRegistry scene;
     const auto mesh=scene.create(ObjectKind::Mesh,-10.f,0.f,3.f);
@@ -143,5 +178,6 @@ int main(){
     std::printf("PASS: native scene handles and dirty tracking\n");
     std::printf("PASS: 10000-object spatial index and exact proximity results\n");
     std::printf("PASS: 30 multithreaded non-blocking routes through narrow passage\n");
+    std::puts("PASS: WAV PCM16 decoder, path-safe asset IDs and positional audio mixing");
     return 0;
 }

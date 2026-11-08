@@ -24,6 +24,42 @@ JSValue navStatusFunction = JS_UNDEFINED;
 JSValue pathSegmentsFunction = JS_UNDEFINED;
 bool ready = false;
 std::unique_ptr<native_three::NavigationService> navService;
+std::vector<native_three::AudioCommand> audioQueue; // shared on the JS/main thread
+constexpr std::size_t kAudioMaxQueue=64;
+JSValue jsAudioPlay(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv){
+    if(argc<1)return JS_ThrowTypeError(ctx,
+        "NativeThreeAudio.play(name,x,y,z,volume,spatial=false,loop=false)");
+    const char* name=JS_ToCString(ctx,argv[0]);
+    if(!name)return JS_EXCEPTION;
+    const std::string id(name);
+    JS_FreeCString(ctx,name);
+    if(!native_three::legalAudioAsset(id))
+        return JS_ThrowTypeError(ctx,"Audio ID must be 1-63 ASCII letters, numbers, hyphens or underscores");
+    native_three::AudioCommand command{};
+    std::memcpy(command.asset,id.c_str(),id.size());
+    double* values[4];double x=0,y=0,z=0,volume=1;
+    values[0]=&x;values[1]=&y;values[2]=&z;values[3]=&volume;
+    for(int i=1;i<argc&&i<=4;i++){
+        if(JS_ToFloat64(ctx,values[i-1],argv[i])<0)return JS_EXCEPTION;
+    }
+    if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||
+       !std::isfinite(volume)||volume<0||volume>1)
+        return JS_ThrowRangeError(ctx,"Audio coordinates/volume must be finite; volume in 0..1");
+    command.x=(float)x;command.y=(float)y;command.z=(float)z;
+    command.volume=(float)volume;
+    if(argc>5)command.spatial=JS_ToBool(ctx,argv[5])>0;
+    if(argc>6)command.loop=JS_ToBool(ctx,argv[6])>0;
+    if(audioQueue.size()>=kAudioMaxQueue)return JS_NewBool(ctx,false);
+    audioQueue.push_back(command);
+    return JS_NewBool(ctx,true);
+}
+void installNativeAudio(JSContext* ctx){
+    JSValue global=JS_GetGlobalObject(ctx),api=JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx,api,"play",
+        JS_NewCFunction(ctx,jsAudioPlay,"play",7));
+    JS_SetPropertyStr(ctx,global,"NativeThreeAudio",api);
+    JS_FreeValue(ctx,global);
+}
 
 // Optional generic native-navigation API. Existing games need no migration:
 // callers that use it avoid A* searches on the JS/render thread.
@@ -199,6 +235,7 @@ void NativeThreeJS_Init() {
     if (JS_IsException(result)) dieWithJS("Three.js core evaluation failed");
     JS_FreeValue(context, result);
     installNativeNavigation(context);
+    installNativeAudio(context);
     const std::string gameScript = loadGameScene();
     result = JS_Eval(context, gameScript.data(), gameScript.size(), "game/scene.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(result)) dieWithJS("Game scene.js evaluation failed");
@@ -336,11 +373,35 @@ std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t capacity
     JS_FreeValue(context,value);
     return bytes/sizeof(float);
 }
+std::size_t NativeThreeJS_PopAudioCommands(native_three::AudioCommand* out,
+                                           std::size_t capacity){
+    if(!out||!capacity)return 0;
+    const auto count=std::min(capacity,audioQueue.size());
+    std::copy_n(audioQueue.begin(),count,out);
+    audioQueue.erase(audioQueue.begin(),audioQueue.begin()+count);
+    return count;
+}
+bool NativeThreeJS_TriggerAudioTest(){
+    if(!ready)return false;
+    JSValue global=JS_GetGlobalObject(context);
+    JSValue func=JS_GetPropertyStr(context,global,"__nativeThreeAudioTest");
+    bool success=false;
+    if(JS_IsFunction(context,func)){
+        JSValue result=JS_Call(context,func,JS_UNDEFINED,0,nullptr);
+        if(JS_IsException(result))dieWithJS("NativeThreeAudio test dispatch");
+        success=JS_ToBool(context,result)>0;
+        JS_FreeValue(context,result);
+    }
+    JS_FreeValue(context,func);
+    JS_FreeValue(context,global);
+    return success;
+}
 void NativeThreeJS_Restart() {
     NativeThreeJS_Shutdown();
     NativeThreeJS_Init();
 }
 void NativeThreeJS_Shutdown() {
+    audioQueue.clear(); // no sound from a previous game's lifetime leaks in
     // Worker pool may own in-flight navigation requests. Shutdown does not
     // wait for queued work to finish, and no worker touches the JS context.
     navService.reset();

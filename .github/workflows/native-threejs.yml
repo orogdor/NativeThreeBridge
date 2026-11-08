@@ -43,6 +43,14 @@ jobs:
           python tools/pack_kuningriigid.py
           if ($LASTEXITCODE -ne 0) { throw "GLB conversion failed" }
           if (!(Test-Path generated/soldier-rigged.glb) -or !(Test-Path generated/skin0.bin)) { throw "Skeleton asset packing failed" }
+      - name: Generate editable native PCM16 audio test samples
+        shell: pwsh
+        run: |
+          python tools/generate_native_audio_samples.py
+          if ($LASTEXITCODE -ne 0) { throw "Native audio WAV generation failed" }
+          foreach ($name in @('signal','step','restart')) {
+            if (!(Test-Path "game/audio/$name.wav")) { throw "Missing $name WAV" }
+          }
       - name: Acquire pinned QuickJS-NG native JavaScript engine
         shell: pwsh
         run: |
@@ -83,6 +91,8 @@ jobs:
           Copy-Item game/scene.js dist/game/scene.js
           Copy-Item game/ui.html dist/game/ui.html
           Copy-Item game/ui.css dist/game/ui.css
+          New-Item -ItemType Directory -Force dist/game/audio | Out-Null
+          Copy-Item game/audio/*.wav dist/game/audio/
           Copy-Item generated/soldier-rigged.glb dist/game/odamees-rigged.glb
           cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
           if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
@@ -101,7 +111,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
@@ -122,6 +132,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.23.0: First HTML/CSS to native C++ UI conversion test. game/ui.html and game/ui.css describe a single Restart button. C++ converts its CSS selector into a real owner-drawn Win32 button with native click handling (no Chromium or WebView). Restart re-initializes the Three.js/QuickJS scene and A* navigation workers while keeping cached 10k static trees in GPU memory; 1k soldiers and lights return to initial positions. F9 is the matching keyboard shortcut. Portable CSS parsing and Windows native restart are covered by CI. This intentionally implements a small CSS subset, not general HTML/CSS browser compatibility."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.24.0: Native Three.js/QuickJS audio event bridge to Windows XAudio2 2.9 (no WebAudio, WebView or browser). scene.js sends NativeThreeAudio.play(name,x,y,z,volume,spatial,loop), while C++ decodes user-editable PCM16 WAV, caches clips, mixes positional audio with distance attenuation and stereo panning, and caps at 24 simultaneous native voices. F10 emits a JavaScript-to-C++ audible test ping, F11 toggles sound, and two army footsteps demonstrate separate moving sound emitters. CSS Restart stops old voices and resets the JS audio event queue. Includes original generated signal, step and restart WAVs and an audio core/runtime smoke test. Only WAV PCM16 is supported for now; complete Three.js WebAudio API compatibility and streaming compressed music are future work."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
