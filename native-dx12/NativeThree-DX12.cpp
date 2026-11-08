@@ -213,53 +213,74 @@ static void makeTexture(UINT meshIndex,int resourceID) {
     DWORD size=0;
     const BYTE *raw=resourceBytes(resourceID,&size);
     if(size<8)fatal("Invalid packed RGBA header",E_INVALIDARG);
-    UINT width=0,height=0;
-    memcpy(&width,raw,4);memcpy(&height,raw+4,4);
-    if(!width||!height||width>4096||height>4096||(UINT64)width*height*4+8!=size)
-        fatal("Invalid packed RGBA pixels",E_INVALIDARG);
-
+    // NTX2 has offline-generated complete mipmaps. Legacy <width,height,RGBA>
+    // is also accepted to avoid breaking third-party packed assets.
+    const bool version2=size>=16 && memcmp(raw,"NTX2",4)==0;
+    UINT width=0,height=0,levels=1;
+    const UINT headerBytes=version2?16:8;
+    memcpy(&width,raw+(version2?4:0),4);
+    memcpy(&height,raw+(version2?8:4),4);
+    if(version2)memcpy(&levels,raw+12,4);
+    if(!width||!height||width>4096||height>4096||levels<1||levels>13)
+        fatal("Invalid packed mipmap header",E_INVALIDARG);
+    UINT64 expected=headerBytes;
+    UINT tw=width,th=height;
+    for(UINT i=0;i<levels;i++){
+        expected+=(UINT64)tw*th*4;
+        tw=std::max(1u,tw/2);th=std::max(1u,th/2);
+    }
+    if(expected!=size)fatal("RGBA/mipmap payload size mismatch",E_INVALIDARG);
     D3D12_RESOURCE_DESC desc={};
     desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width=width;desc.Height=height;desc.DepthOrArraySize=1;
-    desc.MipLevels=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.MipLevels=(UINT16)levels;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_UNKNOWN;
     auto heap=heapProperties(D3D12_HEAP_TYPE_DEFAULT);
     check(gDevice->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
           D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&gMesh[meshIndex].texture)),
-          "Create model texture");
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp={};
-    UINT rows=0;UINT64 rowSize=0,totalBytes=0;
-    gDevice->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&rowSize,&totalBytes);
+          "Create model texture with mipmaps");
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[13]{};
+    UINT rows[13]{};UINT64 rowSizes[13]{},totalBytes=0;
+    gDevice->GetCopyableFootprints(&desc,0,levels,0,footprints,rows,rowSizes,&totalBytes);
     auto staging=uploadBuffer(nullptr,totalBytes);
     BYTE *dst=nullptr;
-    check(staging->Map(0,nullptr,(void**)&dst),"Map texture staging");
-    for(UINT y=0;y<height;y++)
-        memcpy(dst+fp.Offset+(UINT64)y*fp.Footprint.RowPitch,
-               raw+8+(UINT64)y*width*4,(size_t)width*4);
+    check(staging->Map(0,nullptr,(void**)&dst),"Map texture mip staging");
+    const BYTE *pixels=raw+headerBytes;
+    tw=width;th=height;
+    for(UINT mip=0;mip<levels;mip++){
+        for(UINT y=0;y<th;y++)
+            memcpy(dst+footprints[mip].Offset+
+                   (UINT64)y*footprints[mip].Footprint.RowPitch,
+                   pixels+(UINT64)y*tw*4,(size_t)tw*4);
+        pixels+=(UINT64)tw*th*4;
+        tw=std::max(1u,tw/2);th=std::max(1u,th/2);
+    }
     staging->Unmap(0,nullptr);
 
-    check(gAllocator->Reset(),"Reset allocator for texture");
-    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset command list for texture");
-    D3D12_TEXTURE_COPY_LOCATION src={},tgt={};
-    src.pResource=staging.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint=fp;
-    tgt.pResource=gMesh[meshIndex].texture.Get();
-    tgt.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    tgt.SubresourceIndex=0;
-    gCmd->CopyTextureRegion(&tgt,0,0,0,&src,nullptr);
-    auto b=transition(gMesh[meshIndex].texture.Get(),
-                      D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    gCmd->ResourceBarrier(1,&b);
-    check(gCmd->Close(),"Close upload command list");
+    check(gAllocator->Reset(),"Reset allocator for texture mips");
+    check(gCmd->Reset(gAllocator.Get(),nullptr),"Reset command list for texture mips");
+    for(UINT mip=0;mip<levels;mip++){
+        D3D12_TEXTURE_COPY_LOCATION src{},tgt{};
+        src.pResource=staging.Get();src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint=footprints[mip];
+        tgt.pResource=gMesh[meshIndex].texture.Get();
+        tgt.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        tgt.SubresourceIndex=mip;
+        gCmd->CopyTextureRegion(&tgt,0,0,0,&src,nullptr);
+    }
+    auto barrier=transition(gMesh[meshIndex].texture.Get(),
+                   D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    gCmd->ResourceBarrier(1,&barrier);
+    check(gCmd->Close(),"Close texture mip commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
-    waitGPU();
+    waitGPU(); // startup only, no per-frame GPU stall
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC view={};
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
     view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    view.Texture2D.MipLevels=1;
+    view.Texture2D.MipLevels=levels;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr+=(SIZE_T)meshIndex*gSRVStep;
     gDevice->CreateShaderResourceView(gMesh[meshIndex].texture.Get(),&view,cpu);
