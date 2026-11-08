@@ -96,6 +96,32 @@ test('F12 quick skirmish relocates both detachments collision-free and attacks h
   assert.ok(stats.hits===stats.frontHits+stats.sideHits+stats.rearHits);
   assert.ok(ArrayBuffer.isView(w.__nativeThreeCombatFrame()));
   assert.equal(w.__nativeThreeCombatFrame().length,4000);
+  // End the skirmish artificially after actual combat took place, then
+  // verify living soldiers far from their spawn receive new A* home orders.
+  const killer=Array.from({length:500},(_,i)=>i)
+    .find(id=>!w.__nativeThreeBattleInspect(id).dead);
+  assert.notEqual(killer,undefined);
+  const attack=w.__nativeThreeBattleInspect(killer).position;
+  for(let id=500;id<1000;id++){
+    const victim=w.__nativeThreeBattleInspect(id);
+    if(victim.dead)continue;
+    // Facing away from the attacker makes this a deterministic rear strike.
+    const facing=Math.atan2(victim.position[0]-attack[0],
+                            victim.position[1]-attack[1]);
+    assert.ok(w.__nativeThreeBattleFace(id,facing));
+    assert.ok(w.__nativeThreeTestStrike(killer,id));
+  }
+  w.__nativeThreeFrame(1/30);
+  const victory=w.__nativeThreeBattleStatus();
+  assert.equal(victory.aliveBlue,0);
+  assert.equal(victory.winner,0);
+  assert.equal(victory.returned+victory.returning,victory.aliveRed);
+  assert.ok(victory.returning>0,'staged fighters did not receive return-to-spawn orders');
+  const home=w.__nativeNavTest();
+  for(let id=0;id<500;id++)
+    if(!w.__nativeThreeBattleInspect(id).dead)
+      assert.equal(home.goals[id],(90+Math.floor(id/20)*3)*360+
+        (10+(id%20)*2));
 });
 
 test('native battle test has visible scoreboard and the F12 battle shortcut',()=>{
