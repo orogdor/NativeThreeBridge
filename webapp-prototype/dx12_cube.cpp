@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <cstdio>
+#include <climits>
 #include <cstring>
 #include "app_host.h"
 using Microsoft::WRL::ComPtr;
@@ -151,7 +152,7 @@ struct Renderer {
     D3D12_ROOT_PARAMETER param{};
     param.ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     param.Descriptor.ShaderRegister=0;
-    param.ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    param.ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
     D3D12_ROOT_SIGNATURE_DESC sig{};
     sig.NumParameters=1;sig.pParameters=&param;
     sig.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
