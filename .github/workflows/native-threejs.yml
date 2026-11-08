@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main]
+    branches: [main, feat/v019-engine-core]
   workflow_dispatch:
 permissions:
   contents: write
@@ -48,8 +48,13 @@ jobs:
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build --config Release --target ThreeSceneSmoke NativeThreeJS --parallel 4
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke NativeThreeJS --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
+      - name: Verify generic scene registry, spatial index and async path worker pool
+        shell: pwsh
+        run: |
+          & .\\build\\Release\\NativeCoreSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Native core subsystem tests failed" }
       - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
         shell: pwsh
         run: |
