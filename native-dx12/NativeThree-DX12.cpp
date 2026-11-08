@@ -23,6 +23,7 @@
 #include "fixed_stepper.h"
 #include "scene_registry.h"
 #include "frame_profiler.h"
+#include "native_css_win32.h"
 #include "walk_animation.h"
 
 #pragma comment(lib,"d3d12.lib")
@@ -66,6 +67,9 @@ static double cpuSeconds() {
     return (double)ticks.QuadPart*inverseFrequency;
 }
 static bool gDrag=false,gPause=false;
+static bool gRestartRequested=false;
+static UINT gSceneEpoch=0;
+static native_three::NativeCssRestartButton gRestartButton;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
 static UINT gStatFrames=0;
@@ -1258,6 +1262,16 @@ static void renderFrame() {
     static std::array<float,LIGHT_COUNT*4> walkStates{};
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
+    static UINT seenSceneEpoch=~0u;
+    if(seenSceneEpoch!=gSceneEpoch) {
+        // First frame after a native UI-driven JS scene reboot must never
+        // interpolate toward old soldiers or reuse their old gait phases.
+        firstSceneFrame=true;
+        simulation=native_three::FixedStepper(1.0/60.0,4);
+        soldierWalk=native_three::WalkAnimation<LIGHT_COUNT>();
+        walkStates.fill(0.f);
+        seenSceneEpoch=gSceneEpoch;
+    }
     const ULONGLONG tick=GetTickCount64();
     const double now=cpuSeconds();
     const double dt=gPreviousFrameSeconds ?
@@ -1553,6 +1567,18 @@ static void renderFrame() {
 static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
     switch(msg) {
         case WM_ERASEBKGND:return 1;
+        case WM_SIZE:
+            gRestartButton.layout();
+            return 0;
+        case WM_DRAWITEM:
+            if(gRestartButton.draw((const DRAWITEMSTRUCT*)lp))return TRUE;
+            break;
+        case WM_COMMAND:
+            if(gRestartButton.isClick(wp)){
+                gRestartRequested=true;
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN:
             gDrag=true;gMouseX=GET_X_LPARAM(lp);gMouseY=GET_Y_LPARAM(lp);
             SetCapture(win);return 0;
@@ -1585,6 +1611,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F6)gVSync=!gVSync;
             if(wp==VK_F7)gNightMode=!gNightMode;
             if(wp==VK_F8)gWalkEnabled=!gWalkEnabled;
+            if(wp==VK_F9)gRestartRequested=true;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -1606,6 +1633,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!gWindow)return 2;
     initializeDX12();
     NativeThreeJS_Init();
+    // CSS is interpreted into a native owner-drawn child HWND. No browser.
+    if(!gRestartButton.create(gWindow))
+        fatal("Create native CSS Restart button",E_FAIL);
     // Debug route overlay is explicitly requested with F4, not precomputed at startup.
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
@@ -1618,6 +1648,21 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
             TranslateMessage(&message);DispatchMessageW(&message);
         }
         if(!running)break;
+        if(gRestartRequested) {
+            gRestartRequested=false;
+            // Explicit native command: discard old JS scene / worker pool,
+            // reload editable game/scene.js, and restore the initial game.
+            // Static 10k-tree GPU resources are deterministic and reusable.
+            NativeThreeJS_Restart();
+            ++gSceneEpoch;
+            gPreviousFrameSeconds=0;
+            gHaveVisibilityCache=false;
+            gLastPathRefresh=0;
+            gShowDebugPaths=false;
+            gPause=false;
+            gStatFrames=0;
+            gWorstFrameMs=0;
+        }
         if(!gPause&&!IsIconic(gWindow))renderFrame();
         else Sleep(50);
     }
