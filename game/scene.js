@@ -685,7 +685,15 @@ function protectedFormationCell(x,z) {
         const t=unit.progress/CELL;
         unit.x=toWorld(sx)+(toWorld(tx)-toWorld(sx))*t;
         unit.z=toWorld(sz)+(toWorld(tz)-toWorld(sz))*t;
-        unit.yaw=Math.atan2(tx-sx,tz-sz);
+        // A* grid waypoints may turn 90 degrees instantly. The collision
+        // path still follows exact cells, but the visual facing rotates at
+        // a bounded angular rate so the nearby model doesn't twitch at each
+        // waypoint. The native renderer additionally interpolates this pose.
+        const desiredYaw=Math.atan2(tx-sx,tz-sz);
+        const yawDelta=Math.atan2(Math.sin(desiredYaw-unit.yaw),
+                                  Math.cos(desiredYaw-unit.yaw));
+        const maxTurn=dt*9.0; // ~0.17 s for a 90 degree walking turn
+        unit.yaw+=Math.max(-maxTurn,Math.min(maxTurn,yawDelta));
         if(unit.progress>=CELL-0.00001){
           // The occupied and reserved tiles are updated atomically.
           if(occupants[unit.cell]!==unit.id ||
