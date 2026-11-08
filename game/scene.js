@@ -552,6 +552,10 @@ function protectedFormationCell(x,z) {
       if(unit.targetId<0)throw new Error('Fast battle lacks a nearby enemy');
       requestUrgentPlan(unit);
     }
+    // F12 relocates the simulation before the next fixed tick. Refresh actual
+    // THREE.InstancedMesh transforms NOW, so the native first-frame camera
+    // and interpolation do not see the old positions for one stale frame.
+    updateSoldiers(0);
     return true;
   }
   globalThis.__nativeThreeQuickBattle=quickBattle;
