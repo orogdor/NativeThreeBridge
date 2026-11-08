@@ -5,13 +5,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { runWebapp, decodePass, resolveModule, threeBuildDir, THREE_MODULE_SOURCE } from './helpers/webapp-node-host.mjs';
 import { DrawFlags, LightType, PASS_HEADER_FLOATS, DRAW_FLOATS, LIGHT_FLOATS, MAX_LIGHTS } from '../js/native-renderer.mjs';
 
-const read = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8');
-const sample = new URL('../samples/hello-webapp', import.meta.url).pathname;
-const edge = new URL('./fixtures/webapp-edge', import.meta.url).pathname;
-const badImport = new URL('./fixtures/webapp-bad-import', import.meta.url).pathname;
+// Windows checkouts use CRLF line endings.
+const read = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const sample = fileURLToPath(new URL('../samples/hello-webapp', import.meta.url));
+const edge = fileURLToPath(new URL('./fixtures/webapp-edge', import.meta.url));
+const badImport = fileURLToPath(new URL('./fixtures/webapp-bad-import', import.meta.url));
 const haveThree = !!threeBuildDir();
 const skip = haveThree ? false : 'three is not installed (npm install)';
 
