@@ -8,6 +8,10 @@
 #include <vector>
 #include "quickjs.h"
 #include "three_js_host.h"
+#include "navigation_service.h"
+#include <algorithm>
+#include <memory>
+#include <thread>
 
 namespace {
 constexpr std::size_t MATRIX_FLOATS = 11000 * 16;
@@ -18,6 +22,87 @@ JSValue lightFunction = JS_UNDEFINED;
 JSValue navStatusFunction = JS_UNDEFINED;
 JSValue pathSegmentsFunction = JS_UNDEFINED;
 bool ready = false;
+std::unique_ptr<native_three::NavigationService> navService;
+
+// Optional generic native-navigation API. Existing games need no migration:
+// callers that use it avoid A* searches on the JS/render thread.
+JSValue jsNavigationConfigure(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
+    if(argc<3)return JS_ThrowTypeError(ctx,"configure(width,height,Uint8Array obstacles)");
+    std::uint32_t width=0,height=0;
+    if(JS_ToUint32(ctx,&width,argv[0])<0||JS_ToUint32(ctx,&height,argv[1])<0)
+        return JS_EXCEPTION;
+    size_t offset=0,bytes=0,itemBytes=0;
+    JSValue buffer=JS_GetTypedArrayBuffer(ctx,argv[2],&offset,&bytes,&itemBytes);
+    if(JS_IsException(buffer))return buffer;
+    size_t bufferBytes=0;
+    const std::uint8_t* data=JS_GetArrayBuffer(ctx,&bufferBytes,buffer);
+    const bool valid=data && width>0&&height>0&&
+          std::uint64_t(width)*height==bytes&&itemBytes==1&&offset+bytes<=bufferBytes;
+    if(!valid){
+        JS_FreeValue(ctx,buffer);
+        return JS_ThrowRangeError(ctx,"Expected grid-sized Uint8Array of blocked cells");
+    }
+    std::vector<std::uint8_t> blocked(data+offset,data+offset+bytes);
+    JS_FreeValue(ctx,buffer);
+    if(!navService){
+        const unsigned hardware=std::thread::hardware_concurrency();
+        navService=std::make_unique<native_three::NavigationService>(
+            std::max(1u,std::min(4u,hardware>2?hardware-2:1u)));
+    }
+    navService->setMap(width,height,std::move(blocked));
+    return JS_NewBool(ctx,true);
+}
+JSValue jsNavigationRequest(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
+    if(!navService)return JS_ThrowTypeError(ctx,"Call NativeThreeNavigation.configure first");
+    if(argc<2)return JS_ThrowTypeError(ctx,"request(startCell,goalCell,urgent=false)");
+    std::uint32_t start=0,goal=0;
+    if(JS_ToUint32(ctx,&start,argv[0])<0||JS_ToUint32(ctx,&goal,argv[1])<0)
+        return JS_EXCEPTION;
+    const bool urgent=argc>2 && JS_ToBool(ctx,argv[2])>0;
+    return JS_NewInt64(ctx,(std::int64_t)navService->request(start,goal,urgent));
+}
+JSValue jsNavigationPoll(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
+    JSValue array=JS_NewArray(ctx);
+    if(!navService)return array;
+    std::uint32_t maxResults=32;
+    if(argc>0 && JS_ToUint32(ctx,&maxResults,argv[0])<0){
+        JS_FreeValue(ctx,array);return JS_EXCEPTION;
+    }
+    maxResults=std::min(maxResults,128u);
+    for(std::uint32_t i=0;i<maxResults;i++){
+        native_three::RouteResult route;
+        if(!navService->poll(route))break;
+        JSValue result=JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx,result,"token",JS_NewInt64(ctx,(std::int64_t)route.token));
+        JS_SetPropertyStr(ctx,result,"status",JS_NewInt32(ctx,(int)route.status));
+        JSValue cells=JS_NewArray(ctx);
+        for(std::uint32_t c=0;c<route.cells.size();c++)
+            JS_SetPropertyUint32(ctx,cells,c,JS_NewUint32(ctx,route.cells[c]));
+        JS_SetPropertyStr(ctx,result,"cells",cells);
+        JS_SetPropertyUint32(ctx,array,i,result);
+    }
+    return array;
+}
+JSValue jsNavigationCancel(JSContext* ctx,JSValueConst,int argc,JSValueConst* argv) {
+    if(!navService||argc<1)return JS_NewBool(ctx,false);
+    std::int64_t token=0;
+    if(JS_ToInt64(ctx,&token,argv[0])<0)return JS_EXCEPTION;
+    return JS_NewBool(ctx,navService->cancel((std::uint64_t)token));
+}
+JSValue jsNavigationPending(JSContext* ctx,JSValueConst,int,JSValueConst*) {
+    return JS_NewInt32(ctx,navService?(int)navService->pending():0);
+}
+void installNativeNavigation(JSContext* ctx) {
+    JSValue global=JS_GetGlobalObject(ctx),api=JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx,api,"configure",JS_NewCFunction(ctx,jsNavigationConfigure,"configure",3));
+    JS_SetPropertyStr(ctx,api,"request",JS_NewCFunction(ctx,jsNavigationRequest,"request",3));
+    JS_SetPropertyStr(ctx,api,"poll",JS_NewCFunction(ctx,jsNavigationPoll,"poll",1));
+    JS_SetPropertyStr(ctx,api,"cancel",JS_NewCFunction(ctx,jsNavigationCancel,"cancel",1));
+    JS_SetPropertyStr(ctx,api,"pending",JS_NewCFunction(ctx,jsNavigationPending,"pending",0));
+    JS_SetPropertyStr(ctx,global,"NativeThreeNavigation",api);
+    JS_FreeValue(ctx,global);
+}
+
 
 [[noreturn]] void die(const char *msg) {
     if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
@@ -89,7 +174,7 @@ void NativeThreeJS_Init() {
     JSValue result = JS_Eval(context, script, size, "three-runtime.bundle.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(result)) dieWithJS("Three.js core evaluation failed");
     JS_FreeValue(context, result);
-
+    installNativeNavigation(context);
     const std::string gameScript = loadGameScene();
     result = JS_Eval(context, gameScript.data(), gameScript.size(), "game/scene.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(result)) dieWithJS("Game scene.js evaluation failed");
@@ -228,6 +313,9 @@ std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t capacity
     return bytes/sizeof(float);
 }
 void NativeThreeJS_Shutdown() {
+    // Worker pool may own in-flight navigation requests. Shutdown does not
+    // wait for queued work to finish, and no worker touches the JS context.
+    navService.reset();
     if (!ready) return;
     JS_FreeValue(context,pathSegmentsFunction);
     JS_FreeValue(context,navStatusFunction);
