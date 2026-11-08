@@ -1,6 +1,7 @@
 #include "scene_registry.h"
 #include "spatial_index.h"
 #include "navigation_service.h"
+#include "fixed_stepper.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -47,6 +48,15 @@ int main(){
     trees.queryAabb(-482.f,-482.f,-470.f,-470.f,[&](const SpatialItem&){negative++;});
     assert(negative>0);
 
+    FixedStepper stepper(1.0/60.0,4);
+    unsigned simTicks=0;
+    for(int f=0;f<120;f++)stepper.advance(1.0/120.0,[&](double dt){
+        assert(std::abs(dt-1.0/60.0)<1.e-9);simTicks++;
+    });
+    assert(simTicks==60);
+    stepper.advance(4.0,[&](double){++simTicks;});
+    assert(simTicks<=64); // bound the catchup work after an extended stall
+
     // Generic asynchronous A* never needs DirectX or a Three.js game runtime.
     constexpr unsigned W=48,H=48;
     std::vector<std::uint8_t> obstacles(W*H,0);
@@ -72,6 +82,7 @@ int main(){
     }
     assert(expected.empty());
     assert(nav.pending()==0);
+    std::printf("PASS: deterministic fixed simulation scheduling and bounded catchup\\n");
     std::printf("PASS: native scene handles and dirty tracking\n");
     std::printf("PASS: 10000-object spatial index and exact proximity results\n");
     std::printf("PASS: 30 multithreaded non-blocking routes through narrow passage\n");
