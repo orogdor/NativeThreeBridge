@@ -3,10 +3,10 @@
 (() => {
   'use strict';
   const GRID=160, CELL=3, FOREST_SIDE=32, TREES=1000, PER_ARMY=250;
-  const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=9.5, LIGHT_RADIUS=32;
+  const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=12.5, LIGHT_RADIUS=32, LIGHT_OFFSET_X=6, LIGHT_OFFSET_Z=4;
   const scene=new THREE.Scene();
   scene.name='1000 randomly placed pines + 500 moving soldiers';
-  scene.background=new THREE.Color(0x1c2a3c);
+  scene.background=new THREE.Color(0x030611); // night benchmark by default
   const forest=new THREE.Group(), armies=new THREE.Group();
   forest.name='1000 randomly scattered pines'; armies.name='Two armies of 250';
   scene.add(forest,armies);
@@ -97,37 +97,45 @@
   const pathParents=new Int32Array(GRID*GRID);
   const seen=new Uint32Array(GRID*GRID), closed=new Uint32Array(GRID*GRID);
   let searchId=0,searches=0,replans=0,blockedMoves=0,routeFailures=0;
-  const MAX_PLANS_PER_FRAME=12; // budget planning to avoid JS frame spikes
-  const pathHeap=[];
+  const MAX_PLANS_PER_FRAME=8; // avoid 12 expensive searches in one frame
+  // Preallocated A* heap eliminates transient JS allocations per expanded node.
+  const HEAP_CAPACITY=GRID*GRID*4;
+  const heapNodes=new Int32Array(HEAP_CAPACITY);
+  const heapPriority=new Float64Array(HEAP_CAPACITY);
+  let heapSize=0;
   function findPath(unit) {
     const start=unit.cell,goal=unit.goal;
     if(blocked[start] || blocked[goal])return [];
     searchId++;
     if(searchId>=0xfffffffe){seen.fill(0);closed.fill(0);searchId=1;}
     const epoch=searchId;
-    pathHeap.length=0;
+    heapSize=0;
     const tx=goal%GRID,tz=(goal/GRID)|0;
     const heuristic=n=>Math.abs(n%GRID-tx)+Math.abs(((n/GRID)|0)-tz);
     function push(node,p) {
-      const entry={node,p};let i=pathHeap.length;
-      pathHeap.push(entry);
-      while(i>0){const parent=(i-1)>>1;
-        if(pathHeap[parent].p<=entry.p)break;
-        pathHeap[i]=pathHeap[parent];i=parent;
+      if(heapSize>=HEAP_CAPACITY)throw new Error('A* heap capacity exceeded');
+      let i=heapSize++;
+      while(i>0){
+        const parent=(i-1)>>1;
+        if(heapPriority[parent]<=p)break;
+        heapNodes[i]=heapNodes[parent];
+        heapPriority[i]=heapPriority[parent];
+        i=parent;
       }
-      pathHeap[i]=entry;
+      heapNodes[i]=node;heapPriority[i]=p;
     }
     function pop() {
-      const top=pathHeap[0].node,last=pathHeap.pop();
-      if(pathHeap.length){
+      const top=heapNodes[0];
+      const lastNode=heapNodes[--heapSize],lastPriority=heapPriority[heapSize];
+      if(heapSize){
         let i=0;
-        while(i*2+1<pathHeap.length){
+        while(i*2+1<heapSize){
           let child=i*2+1;
-          if(child+1<pathHeap.length && pathHeap[child+1].p<pathHeap[child].p)child++;
-          if(pathHeap[child].p>=last.p)break;
-          pathHeap[i]=pathHeap[child];i=child;
+          if(child+1<heapSize && heapPriority[child+1]<heapPriority[child])child++;
+          if(heapPriority[child]>=lastPriority)break;
+          heapNodes[i]=heapNodes[child];heapPriority[i]=heapPriority[child];i=child;
         }
-        pathHeap[i]=last;
+        heapNodes[i]=lastNode;heapPriority[i]=lastPriority;
       }
       return top;
     }
@@ -136,9 +144,19 @@
           (occupants[cell]===-1 || occupants[cell]===unit.id) &&
           (reservations[cell]===-1 || reservations[cell]===unit.id);
     }
+    // Visit helper is allocated once per search rather than per expanded cell.
+    function visit(next,from) {
+      if(closed[next]===epoch || !canVisit(next))return;
+      const candidate=pathCosts[from]+1;
+      if(seen[next]!==epoch || candidate<pathCosts[next]){
+        seen[next]=epoch;pathCosts[next]=candidate;
+        pathParents[next]=from;
+        push(next,candidate+heuristic(next)*1.0001);
+      }
+    }
     seen[start]=epoch;pathCosts[start]=0;pathParents[start]=-1;
     push(start,heuristic(start));
-    while(pathHeap.length){
+    while(heapSize){
       const n=pop();
       if(closed[n]===epoch)continue;
       if(n===goal){
@@ -151,16 +169,10 @@
       }
       closed[n]=epoch;
       const x=n%GRID,z=(n/GRID)|0;
-      const adj=[x>0?n-1:-1,x<GRID-1?n+1:-1,z>0?n-GRID:-1,z<GRID-1?n+GRID:-1];
-      for(const next of adj){
-        if(next<0 || closed[next]===epoch || !canVisit(next))continue;
-        const candidate=pathCosts[n]+1;
-        if(seen[next]!==epoch || candidate<pathCosts[next]){
-          seen[next]=epoch;pathCosts[next]=candidate;
-          pathParents[next]=n;
-          push(next,candidate+heuristic(next)*1.0001);
-        }
-      }
+      if(x>0)visit(n-1,n);
+      if(x<GRID-1)visit(n+1,n);
+      if(z>0)visit(n-GRID,n);
+      if(z<GRID-1)visit(n+GRID,n);
     }
     return [];
   }
@@ -204,7 +216,7 @@
     lamp.name=(team===0?'Red':'Blue')+' spotlight '+i;
     lamp.castShadow=true;
     lamp.shadow.mapSize.set(256,256);lamp.shadow.bias=-0.0008;
-    lamp.position.set(unit.x,LIGHT_HEIGHT,unit.z);
+    lamp.position.set(unit.x+LIGHT_OFFSET_X,LIGHT_HEIGHT,unit.z+LIGHT_OFFSET_Z);
     lamp.target.position.set(unit.x,0,unit.z);
     scene.add(lamp,lamp.target);
     soldierLights.push(lamp);
@@ -283,30 +295,24 @@
       }
       put(unit.team===0?red:blue,unit.index,unit.x,unit.z,unit.yaw);
       const base=unit.id*8,lamp=soldierLights[unit.id];
-      lamp.position.x=unit.x;lamp.position.z=unit.z;
+      lamp.position.x=unit.x+LIGHT_OFFSET_X;lamp.position.z=unit.z+LIGHT_OFFSET_Z;
       lamp.target.position.x=unit.x;lamp.target.position.z=unit.z;
-      lightData[base]=unit.x;lightData[base+2]=unit.z;
+      lightData[base]=lamp.position.x;lightData[base+2]=lamp.position.z;
     }
     red.instanceMatrix.needsUpdate=true;
     blue.instanceMatrix.needsUpdate=true;
   }
   updateSoldiers(0); // Creates no paths: planning only starts on actual frames.
 
-  const scratch=new THREE.Matrix4();
-  function writeMatrices(mesh,offset){
-    for(let i=0;i<mesh.count;i++){
-      mesh.getMatrixAt(i,scratch);
-      scratch.premultiply(mesh.matrixWorld);
-      matrices.set(scratch.elements,(offset+i)*16);
-    }
-  }
-  scene.updateMatrixWorld(true);
-  writeMatrices(treeBark,0); // static trees: once, no per-frame recalculation
+  // All instanced meshes and parent Groups have identity world transforms.
+  // Read the official Three.js instanceMatrix arrays directly, without 500
+  // getMatrixAt + premultiply operations or a forced full Scene traversal.
+  scene.updateMatrixWorld(true); // initialization only
+  matrices.set(treeBark.instanceMatrix.array,0); // static trees once
   function frame(dt=1/60){
     updateSoldiers(dt);
-    scene.updateMatrixWorld(true);
-    writeMatrices(red,TREES);
-    writeMatrices(blue,TREES+PER_ARMY);
+    matrices.set(red.instanceMatrix.array,TREES*16);
+    matrices.set(blue.instanceMatrix.array,(TREES+PER_ARMY)*16);
     return matrices;
   }
   function diagnostics(){
