@@ -814,7 +814,7 @@ static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout misma
 
 static void updateLightsAndShadowCameras(const float *matrices,const float *lights) {
     LightConstants constants{};
-    gDynamicLights.clear();
+    gDynamicLights.beginFrame();
     float maximumLightRange=0.f;
     for(UINT li=0;li<LIGHT_COUNT;li++) {
         const float *l=lights+li*8;
