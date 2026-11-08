@@ -24,6 +24,8 @@ test('CSS and markup define one Restart button without embedding a browser',()=>
   assert.doesNotMatch(win,/CreateCoreWebView2EnvironmentWithOptions|CreateWindowExA\(/);
 });
 test('click dispatches to native C++ reset, preserving GPU forest cache',()=>{
+  assert.match(dx,/WS_CLIPCHILDREN/);
+  assert.match(dx,/RESTARTS %u/);
   assert.match(dx,/case WM_DRAWITEM:/);
   assert.match(dx,/case WM_COMMAND:/);
   assert.match(dx,/gRestartButton\.isClick\(wp\)/);
