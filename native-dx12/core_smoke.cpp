@@ -2,6 +2,7 @@
 #include "spatial_index.h"
 #include "navigation_service.h"
 #include "fixed_stepper.h"
+#include "lod_policy.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -57,6 +58,13 @@ int main(){
     stepper.advance(4.0,[&](double){++simTicks;});
     assert(simTicks<=64); // bound the catchup work after an extended stall
 
+    LodPolicy lod;
+    assert(lod.choose(123,0.25f)==0);
+    assert(lod.choose(123,0.095f)==0); // hysteresis blocks flicker
+    assert(lod.choose(123,0.05f)==1);
+    assert(lod.choose(123,0.001f)==3);
+    lod.forget(123);
+    assert(lod.choose(123,0.03f)==2);
     // Generic asynchronous A* never needs DirectX or a Three.js game runtime.
     constexpr unsigned W=48,H=48;
     std::vector<std::uint8_t> obstacles(W*H,0);
@@ -83,6 +91,7 @@ int main(){
     assert(expected.empty());
     assert(nav.pending()==0);
     std::printf("PASS: deterministic fixed simulation scheduling and bounded catchup\\n");
+    std::printf("PASS: reusable LOD choice with threshold hysteresis\\n");
     std::printf("PASS: native scene handles and dirty tracking\n");
     std::printf("PASS: 10000-object spatial index and exact proximity results\n");
     std::printf("PASS: 30 multithreaded non-blocking routes through narrow passage\n");
