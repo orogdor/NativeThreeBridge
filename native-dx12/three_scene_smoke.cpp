@@ -84,6 +84,7 @@ int main(){
     if(NativeThreeJS_PopAudioCommands(initialAudio.data(),8)!=0)return 23;
     if(!NativeThreeJS_TriggerAudioTest() ||
        NativeThreeJS_PopAudioCommands(initialAudio.data(),8)!=1)return 24;
+    NativeThreeBattleStatus battle{};
     NativeThreeNavStatus reset{};
     NativeThreeJS_GetNavStatus(&reset);
     if(reset.moved!=0 || reset.planned!=0 || reset.searches!=0 ||
@@ -101,6 +102,24 @@ int main(){
         return 12;
     }
     std::puts("PASS: CSS Restart command recreates Three.js scene, A* state and initial army/light transforms");
+    // Same headless QuickJS backend that feeds the real DX12 renderer:
+    // verify F12 staging and real typed combat-pose transport end-to-end.
+    std::vector<float> combatPose(SOLDIERS*4);
+    NativeThreeJS_CombatStates(combatPose.data(),combatPose.size());
+    for(float value:combatPose)if(!std::isfinite(value))return 25;
+    if(!NativeThreeJS_QuickBattle())return 26;
+    NativeThreeJS_Frame(0.016f,matrices.data(),matrices.size());
+    NativeThreeJS_GetBattleStatus(&battle);
+    if(battle.aliveRed!=500||battle.aliveBlue!=500)return 27;
+    for(int n=0;n<150;n++)
+        NativeThreeJS_Frame(1.f/30.f,matrices.data(),matrices.size());
+    NativeThreeJS_GetBattleStatus(&battle);
+    NativeThreeJS_CombatStates(combatPose.data(),combatPose.size());
+    if(battle.attacks<=0||battle.hits<=0||battle.engaged<=0)
+        {std::fprintf(stderr,"Quick battle produced no melee attacks\\n");return 28;}
+    for(float value:combatPose)if(!std::isfinite(value))return 29;
+    std::printf("PASS: F12 quick battle: attacks %d hits %d casualties %d\\n",
+                battle.attacks,battle.hits,battle.deaths);
     std::puts("PASS: QuickJS emits typed native audio events, reset clears old sounds");
     NativeThreeJS_Shutdown();
     return 0;
