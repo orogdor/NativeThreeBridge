@@ -24,6 +24,7 @@
 #include "scene_registry.h"
 #include "frame_profiler.h"
 #include "native_css_win32.h"
+#include "native_audio_xaudio2.h"
 #include "walk_animation.h"
 
 #pragma comment(lib,"d3d12.lib")
@@ -70,6 +71,8 @@ static bool gDrag=false,gPause=false;
 static bool gRestartRequested=false;
 static UINT gSceneEpoch=0;
 static native_three::NativeCssRestartButton gRestartButton;
+static native_three::NativeAudioEngine gAudio;
+static bool gAudioEnabled=true; // F11 mutes native output without disabling JS events
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
 static UINT gStatFrames=0;
@@ -1389,6 +1392,15 @@ static void renderFrame() {
     check(gWalkCB->Map(0,nullptr,&walkData),"Map 1000 soldier walk states");
     memcpy(walkData,walkStates.data(),walkStates.size()*sizeof(float));
     gWalkCB->Unmap(0,nullptr);
+    // Game->native audio event dispatch is independent of DX12 draw calls.
+    // Scene.js sends events through QuickJS NativeThreeAudio.play(...), while
+    // XAudio2 mixes only the limited active sources on the native side.
+    gAudio.setListener(gCameraFocusX,gCameraFocusZ,gYaw);
+    gAudio.tick();
+    native_three::AudioCommand pending[64]{};
+    const auto pendingCount=NativeThreeJS_PopAudioCommands(pending,64);
+    if(gAudioEnabled)
+        for(std::size_t i=0;i<pendingCount;i++)gAudio.play(pending[i]);
     XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
     XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
         sinf(gYaw)*cosf(gPitch)*gDistance,
@@ -1534,7 +1546,7 @@ static void renderFrame() {
         wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u | AUDIO %u voices %u cues %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
@@ -1543,7 +1555,8 @@ static void renderFrame() {
             gMainVisibleTrees,gDirtySceneObjects,
             gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
-            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF",gSceneEpoch);
+            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF",gSceneEpoch,
+            gAudio.activeVoices(),gAudio.submitted(),gAudioEnabled&&gAudio.available()?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         char summary[512];
         sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
@@ -1612,6 +1625,11 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F7)gNightMode=!gNightMode;
             if(wp==VK_F8)gWalkEnabled=!gWalkEnabled;
             if(wp==VK_F9)gRestartRequested=true;
+            if(wp==VK_F10)NativeThreeJS_TriggerAudioTest();
+            if(wp==VK_F11){
+                gAudioEnabled=!gAudioEnabled;
+                if(!gAudioEnabled)gAudio.stopAll();
+            }
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -1633,6 +1651,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!gWindow)return 2;
     initializeDX12();
     NativeThreeJS_Init();
+    // Audio device is optional; CI runners and silent machines still render.
+    // NativeThreeAudio commands remain testable even without playback hardware.
+    gAudio.init();
     // CSS is interpreted into a native owner-drawn child HWND. No browser.
     if(!gRestartButton.create(gWindow))
         fatal("Create native CSS Restart button",E_FAIL);
@@ -1650,6 +1671,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
         if(!running)break;
         if(gRestartRequested) {
             gRestartRequested=false;
+            gAudio.stopAll(); // old spatial voices must not survive a new scene
+            if(gAudioEnabled){
+                native_three::AudioCommand restartCue{};
+                std::memcpy(restartCue.asset,"restart",8);
+                restartCue.volume=0.55f;
+                restartCue.spatial=false;
+                gAudio.play(restartCue);
+            }
             // Explicit native command: discard old JS scene / worker pool,
             // reload editable game/scene.js, and restore the initial game.
             // Static 10k-tree GPU resources are deterministic and reusable.
@@ -1669,6 +1698,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     }
     waitGPU();
     NativeThreeJS_Shutdown();
+    gAudio.shutdown();
     if(gFenceEvent)CloseHandle(gFenceEvent);
     return 0;
 }
