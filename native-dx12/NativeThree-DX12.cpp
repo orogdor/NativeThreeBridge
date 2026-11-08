@@ -1546,7 +1546,7 @@ static void renderFrame() {
         wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u | AUDIO %u voices %u cues %s",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u | AUDIO %u voices %u cues %s ERR 0x%08X",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
@@ -1556,7 +1556,8 @@ static void renderFrame() {
             gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF",gSceneEpoch,
-            gAudio.activeVoices(),gAudio.submitted(),gAudioEnabled&&gAudio.available()?L"ON":L"OFF");
+            gAudio.activeVoices(),gAudio.submitted(),gAudioEnabled&&gAudio.available()?L"ON":L"OFF",
+            gAudio.lastError());
         SetWindowTextW(gWindow,title);
         char summary[512];
         sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
