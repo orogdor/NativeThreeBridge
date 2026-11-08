@@ -72,6 +72,9 @@ static bool gRestartRequested=false;
 static bool gForceBattleCameraSnap=false;
 static UINT gSceneEpoch=0;
 static native_three::NativeCssRestartButton gRestartButton;
+static HWND gBattleHud=nullptr;
+static HBRUSH gBattleHudBrush=nullptr;
+static HFONT gBattleHudFont=nullptr;
 static native_three::NativeAudioEngine gAudio;
 static bool gAudioEnabled=true; // F11 mutes native output without disabling JS events
 static int gMouseX=0,gMouseY=0;
@@ -1575,6 +1578,18 @@ static void renderFrame() {
         NativeThreeJS_GetNavStatus(&navigation);
         NativeThreeBattleStatus battle{};
         NativeThreeJS_GetBattleStatus(&battle);
+        if(gBattleHud){
+            wchar_t line[180];
+            if(battle.winner>=0)
+                swprintf_s(line,L"VICTORY: %s | RED %d  BLUE %d | HITS %d | HOME %d",
+                    battle.winner==0?L"RED":L"BLUE",
+                    battle.aliveRed,battle.aliveBlue,battle.hits,battle.returned);
+            else
+                swprintf_s(line,L"RED %d  |  BLUE %d  |  FALLEN %d  |  HITS %d  |  FIGHTING %d",
+                    battle.aliveRed,battle.aliveBlue,battle.deaths,
+                    battle.hits,battle.engaged);
+            SetWindowTextW(gBattleHud,line);
+        }
         UINT shadowInstances=0;
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
@@ -1618,6 +1633,13 @@ static void renderFrame() {
 static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
     switch(msg) {
         case WM_ERASEBKGND:return 1;
+        case WM_CTLCOLORSTATIC:
+            if((HWND)lp==gBattleHud && gBattleHudBrush){
+                SetTextColor((HDC)wp,RGB(240,247,250));
+                SetBkColor((HDC)wp,RGB(14,27,39));
+                return (LRESULT)gBattleHudBrush;
+            }
+            break;
         case WM_SIZE:
             gRestartButton.layout();
             return 0;
@@ -1680,7 +1702,10 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
                 }
             }
             return 0;
-        case WM_DESTROY:PostQuitMessage(0);return 0;
+        case WM_DESTROY:
+            if(gBattleHudFont){DeleteObject(gBattleHudFont);gBattleHudFont=nullptr;}
+            if(gBattleHudBrush){DeleteObject(gBattleHudBrush);gBattleHudBrush=nullptr;}
+            PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(win,msg,wp,lp);
 }
@@ -1706,6 +1731,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     // CSS is interpreted into a native owner-drawn child HWND. No browser.
     if(!gRestartButton.create(gWindow))
         fatal("Create native CSS Restart button",E_FAIL);
+    // Always-visible native score panel; unlike the long DX12 title it is
+    // readable at 1152px and requires no HTML/WebView.
+    gBattleHudBrush=CreateSolidBrush(RGB(14,27,39));
+    gBattleHudFont=CreateFontW(-18,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
+        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    gBattleHud=CreateWindowExW(0,L"STATIC",L"RED 500 | BLUE 500 | HITS 0",
+        WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,12,12,540,32,
+        gWindow,(HMENU)2302,instance,nullptr);
+    if(!gBattleHud)fatal("Create native battle scoreboard",E_FAIL);
+    if(gBattleHudFont)SendMessageW(gBattleHud,WM_SETFONT,(WPARAM)gBattleHudFont,TRUE);
     // Debug route overlay is explicitly requested with F4, not precomputed at startup.
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
