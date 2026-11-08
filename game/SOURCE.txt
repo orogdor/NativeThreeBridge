@@ -1,0 +1,3 @@
+Default source: https://github.com/orogdor/Kuningriigid
+Run Game-Updater.exe to install its current main commit into this directory.
+This native DX12 test engine does not yet run the browser game; see README-WINDOWS.txt.

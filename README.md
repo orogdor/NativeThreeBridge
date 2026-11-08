@@ -1,3 +1,9 @@
+# NativeThreeBridge v0.27.0-test.1 — Kuningriigid source test
+
+This separate Windows test package has exactly three executables: `Game-Updater.exe`, `Engine-Updater.exe`, and `NativeThree-Game.exe`. The first downloads changed files from the pinned current commit of `orogdor/Kuningriigid` into `game/` with checksum verification and a previous-directory rollback snapshot. The second updates only the native engine EXE from a NativeThreeBridge release manifest. The third does no network work.
+
+**Compatibility limit:** Kuningriigid's browser DOM, HTML/CSS, ES modules, asset loading and Three.js `WebGLRenderer` are not implemented by this DX12 scene host. The new game EXE reports this before evaluating any downloaded JavaScript. This release tests acquisition, separation, rollback and clear failure, not native Kuningriigid gameplay. The forest battle is preserved as the complete [v0.26.0 release](https://github.com/orogdor/NativeThreeBridge/releases/tag/v0.26.0). See `README-WINDOWS.txt` for the Windows procedure.
+
 # NativeThreeBridge v0.25.0 — directional 500-vs-500 melee battle fixture
 
 This releases a real **autonomous combat test** on top of the existing 10,000 randomized trees and 1,000 individually navigating soldiers. Each living fighter searches for a nearby enemy, pursues via A* without passing occupied/reserved cells, turns toward its target and attacks on an individual cooldown. A 15-point durability pool implements **front 5 hits** (3 damage), **side 3 hits** (5 damage), and **rear 1 hit** (15 damage). A killer acquires the next living opponent. Bodies collapse and release occupied/reserved navigation slots. Once an army is defeated, every surviving fighter is assigned its individual original start cell for a return march. Combat status is visible in the DX12 window title.
