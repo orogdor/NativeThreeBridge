@@ -13,6 +13,7 @@ import struct
 import urllib.request
 
 from PIL import Image
+from spearman_rig import BONES, rig_geometry, write_glb, write_native_rig
 
 SOURCE_COMMIT = "e2bee672d626429d3f91b6158088eac23eee8c13"
 FILES = [
@@ -150,6 +151,17 @@ def main():
     allparts = []
     for name in ("soldier","pine"):
         doc,buf=read_glb(work/(name+".glb"))
+        if name=="soldier":
+            first_primitive=doc["meshes"][0]["primitives"][0]
+            positions=accessor_values(doc,buf,first_primitive["attributes"]["POSITION"])
+            doc,buf,influences=rig_geometry(doc,buf,positions)
+            write_glb(work/"soldier-rigged.glb",doc,buf)
+            write_native_rig(work/"skin0.bin",influences)
+            # Check that GLB exported to the ZIP contains the skin used by DX12.
+            check_doc,check_buf=read_glb(work/"soldier-rigged.glb")
+            assert len(check_doc["skins"][0]["joints"])==len(BONES)
+            assert len(accessor_values(check_doc,check_buf,
+                check_doc["meshes"][0]["primitives"][0]["attributes"]["JOINTS_0"]))==len(positions)
         for mesh in doc.get("meshes",[]):
             for primitive in mesh.get("primitives",[]):
                 i=len(allparts)
@@ -167,11 +179,12 @@ def main():
     bundle = work/"three-runtime.bundle.js"
     if not bundle.is_file() or bundle.stat().st_size < 256:
         raise ValueError("Missing official Three.js runtime core; run esbuild first")
+    rc += '104 RCDATA "generated/skin0.bin"' + chr(10)
     rc += '301 RCDATA "generated/three-runtime.bundle.js"' + chr(10)
     (work/"model_assets.rc").write_text(rc,encoding="utf-8")
     (work/"parts.json").write_text(json.dumps(allparts,indent=2),encoding="utf-8")
     print(json.dumps(allparts,indent=2))
-    print("Packed mipmapped textures for the universal native renderer; model assets are instance-count independent.")
+    print("Packed mipmapped textures and the red-army 8-bone skin; blue army still uses old gait.")
 
 if __name__ == "__main__":
     main()
