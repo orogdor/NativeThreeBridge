@@ -1668,6 +1668,10 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             }
             if(wp==VK_F12){
                 if(NativeThreeJS_QuickBattle()){
+                    // Present the clash immediately in close-up; F1 returns
+                    // to whole-map view and F2/F3 follow opposing detachments.
+                    gCameraMode=1;
+                    gDistance=72.f;
                     gHaveVisibilityCache=false;
                     gLastPathRefresh=0;
                 }
