@@ -1,5 +1,11 @@
-NativeThreeBridge v0.19.0 - ENGINE CORE + SMOOTH 10K/1K NIGHT TEST
+NativeThreeBridge v0.20.0 - CONTINUOUS SOLDIER LIGHTS / NO TILE SEAMS
 ================================================================
+New: all radius-overlapping lights contribute to each 16x16 spatial tile.
+The former nearest-16 light list created hard moving square boundaries.
+Light indices are now compact per-frame SRVs; 16 real shadow maps remain.
+Compare v0.19.0 and v0.20.0 on the same Windows DX12 camera and settings.
+A physical GPU is needed to check lighting pixels and FPS. FPS is not guaranteed.
+
 10,000 pines / two 500-unit armies / 1,000 lights / 16 shadow maps.
 C++ scene registry, spatial index, async A*, native fixed 60Hz simulation
 with render interpolation, GPU timing and offline texture mipmaps.
