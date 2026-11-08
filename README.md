@@ -1,3 +1,11 @@
+# NativeThreeBridge v0.24.0 — JavaScript sound events to native Windows XAudio2
+
+Native sound test: QuickJS exposes `NativeThreeAudio.play(name,x,y,z,volume=1,spatial=false,loop=false)` to game scripts. C++ consumes the bounded event queue and plays user-editable 16-bit PCM WAV files through Windows XAudio2 2.9, without Web Audio, Chromium or a browser. Files are loaded from `game/audio/<name>.wav` (mono/stereo, 8–96 kHz), cached by name, and played with at most 24 concurrent voices. Positional sounds have distance attenuation and stereo panning; each emitter keeps its own position and volume.
+
+Press **F10** to send a named `signal` sound from scene.js through the native bridge, **F11** to mute/unmute all native audio, and the CSS **Restart** button to discard old voices and play a reset tone. Two soldiers generate throttled positional `step` events. The ZIP contains three small, original synthesized WAV test files. The native audio device is optional in headless CI, where the C++ WAV parser, JavaScript event bridge and scene restart logic are tested independently.
+
+This is a transferable sound-command/WAV proof of concept, not a full implementation of Three.js `Audio`, `PositionalAudio`, WebAudio graph, MP3/OGG playback, streaming music, HRTF or occlusion. The v0.23.0 CSS test and 10,000-tree/1,000-soldier DX12 benchmark remain available.
+
 # NativeThreeBridge v0.23.0 — translating a CSS Restart button to native C++
 
 **First CSS→native UI experiment:** \`game/ui.html\` declares a single \`<button id="restart-button">Restart</button>\`, and \`game/ui.css\` styles it with \`#restart-button\`. A reusable, small C++ parser reads the markup and a deliberately restricted CSS subset (position by right/top pixels, width/height, colors, border, radius and font size/weight), then instantiates a native Win32 **owner-drawn BUTTON**. No browser, WebView or HTML/CSS renderer is included.
