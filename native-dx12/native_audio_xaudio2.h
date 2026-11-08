@@ -25,10 +25,21 @@ public:
     ~NativeAudioEngine(){shutdown();}
     bool init() {
         if(engine_)return true;
-        if(FAILED(XAudio2Create(&engine_,0,XAUDIO2_DEFAULT_PROCESSOR)))return false;
-        if(FAILED(engine_->CreateMasteringVoice(&master_))){
-            engine_->Release();engine_=nullptr;return false;
+        // XAudio2 requires COM initialization on the calling thread.
+        // The DX12 window thread previously skipped this, so CreateMasteringVoice
+        // could silently fail even when Windows audio services were available.
+        const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        if(SUCCEEDED(com))comInitialized_=true;
+        else if(com!=RPC_E_CHANGED_MODE){lastError_=com;return false;}
+        const HRESULT created=XAudio2Create(&engine_,0,XAUDIO2_DEFAULT_PROCESSOR);
+        if(FAILED(created)){lastError_=created;releaseCom();return false;}
+        const HRESULT mastered=engine_->CreateMasteringVoice(&master_);
+        if(FAILED(mastered)){
+            lastError_=mastered;
+            engine_->Release();engine_=nullptr;
+            releaseCom();return false;
         }
+        lastError_=S_OK;
         XAUDIO2_VOICE_DETAILS details{};
         master_->GetVoiceDetails(&details);
         outputChannels_=details.InputChannels;
@@ -45,6 +56,7 @@ public:
         if(master_){master_->DestroyVoice();master_=nullptr;}
         if(engine_){engine_->Release();engine_=nullptr;}
         outputChannels_=0;
+        releaseCom();
     }
     void stopAll() {
         for(auto &v:voices_){
@@ -113,7 +125,11 @@ public:
     unsigned activeVoices()const{return (unsigned)voices_.size();}
     unsigned submitted()const{return submitted_;}
     bool available()const{return engine_!=nullptr;}
+    unsigned lastError()const{return (unsigned)lastError_;}
 private:
+    void releaseCom(){
+        if(comInitialized_){CoUninitialize();comInitialized_=false;}
+    }
     struct Voice {
         IXAudio2SourceVoice* voice=nullptr;
         std::shared_ptr<PcmSound> clip;
@@ -169,6 +185,8 @@ private:
     }
     IXAudio2* engine_=nullptr;
     IXAudio2MasteringVoice* master_=nullptr;
+    bool comInitialized_=false;
+    HRESULT lastError_=S_OK;
     unsigned outputChannels_=0,submitted_=0;
     float listenerX_=0,listenerZ_=0,listenerYaw_=0;
     std::filesystem::path audioDirectory_;
