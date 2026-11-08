@@ -112,8 +112,8 @@ static std::vector<RetiredResource> gRetiredResources;
 static ComPtr<ID3D12CommandAllocator> gFrameAllocators[FRAME_COUNT];
 static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_COUNT],
     gLightBuffers[FRAME_COUNT],gGridBuffers[FRAME_COUNT],gShadowCameraBuffers[FRAME_COUNT],
-    gWalkBuffers[FRAME_COUNT];
-static ComPtr<ID3D12Resource> gWalkCB;
+    gWalkBuffers[FRAME_COUNT],gCombatBuffers[FRAME_COUNT];
+static ComPtr<ID3D12Resource> gWalkCB,gCombatCB;
 static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
@@ -439,6 +439,7 @@ StructuredBuffer<float4x4> gTreeInstances : register(t3);
 cbuffer SoldierTransforms : register(b5) { float4x4 gSoldierInstances[1000]; };
 // Per-instance walking, evaluated by the same shader in the main AND depth pass.
 cbuffer SoldierWalk : register(b6) { float4 gWalkStates[1000]; };
+cbuffer SoldierCombat : register(b7) { float4 gCombatStates[1000]; };
 cbuffer Lights : register(b3) {
     float4x4 gLightVP[16];
     float4 gLightPosRadius[1000];
@@ -481,8 +482,8 @@ void boneRotZ(inout float3 p,inout float3 n,float3 pivot,float angle){
     p=float3(cs*d.x-sn*d.y,sn*d.x+cs*d.y,d.z)+pivot;
     n=float3(cs*n.x-sn*n.y,sn*n.x+cs*n.y,n.z);
 }
-void skinOdameesBone(uint bone,float4 walk,inout float3 p,inout float3 n){
-    float stride=walk.x*walk.z;
+void skinOdameesBone(uint bone,float4 walk,float4 combat,inout float3 p,inout float3 n){
+    float stride=walk.x*walk.z*(1.0-combat.w)*(1.0-combat.z);
     // Main thighs counter-rotate; shins hinge around knees, then inherit
     // the parent's hip rotation. The pivots match exported glTF rest joints.
     if(bone==2 || bone==3){
@@ -495,10 +496,13 @@ void skinOdameesBone(uint bone,float4 walk,inout float3 p,inout float3 n){
         boneRotX(p,n,float3(0.07,-0.13,0),-stride*0.52);
     } else if(bone==6 || bone==7){
         float side=bone==6?-1.0:1.0;
-        boneRotX(p,n,float3(side*0.17,0.18,0),side*stride*0.19);
+        float striking=combat.x*(bone==7?1.0:0.35);
+        boneRotX(p,n,float3(side*0.17,0.18,0),
+                 side*stride*0.19-striking*1.05);
         boneRotZ(p,n,float3(0,-0.12,0),stride*0.025);
     } else if(bone==1){
         boneRotZ(p,n,float3(0,-0.12,0),stride*0.025);
+        boneRotX(p,n,float3(0,0.1,0),combat.x*0.15-combat.y*0.10);
     }
 }
 Vout VSMain(Vin v, uint instance:SV_InstanceID, uint vertexID:SV_VertexID) {
@@ -516,6 +520,8 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID, uint vertexID:SV_VertexID) {
             const uint soldierIndex=sourceInstance+(gKind==3?500:0);
             instanceTransform=gSoldierInstances[soldierIndex];
             float4 walk=gWalkStates[soldierIndex];
+            float4 combat=gCombatStates[soldierIndex];
+            walk.z*=1.0-combat.w;
             if(gKind==1) {
                 // RED army: 8 true glTF bones and vertex joint weights.
                 // A single instance of the rig resource is shared by 500 men.
@@ -525,7 +531,7 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID, uint vertexID:SV_VertexID) {
                 [unroll] for(uint ji=0;ji<4;ji++){
                     if(skin.weights[ji]>0.000001) {
                         float3 bp=v.p,bn=v.n;
-                        skinOdameesBone(skin.joints[ji],walk,bp,bn);
+                        skinOdameesBone(skin.joints[ji],walk,combat,bp,bn);
                         skinnedPos+=bp*skin.weights[ji];
                         skinnedNormal+=bn*skin.weights[ji];
                     }
@@ -549,8 +555,21 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID, uint vertexID:SV_VertexID) {
                     v.n.y*legSin+v.n.z*legCos);
                 localPos=lerp(v.p,swung,lowerBody);
                 localNormal=normalize(lerp(v.n,swungNormal,lowerBody));
+                // Unrigged blue-army comparison gets a visible forward thrust.
+                const float upper=saturate((v.p.y-0.03)*8);
+                localPos.z+=upper*combat.x*0.17-upper*combat.y*0.09;
             }
-            localPos.y+=walk.w;
+            // Corpses rotate down around the feet; renderer and shadow agree.
+            if(combat.z>0.001) {
+                const float angle=combat.z*1.45;
+                const float sn=sin(angle),cs=cos(angle);
+                const float3 tilt=localPos-float3(0,-0.45,0);
+                localPos=float3(tilt.x,tilt.y*cs-tilt.z*sn,
+                                tilt.y*sn+tilt.z*cs)+float3(0,-0.45,0);
+                const float3 nn=localNormal;
+                localNormal=float3(nn.x,nn.y*cs-nn.z*sn,nn.y*sn+nn.z*cs);
+            }
+            localPos.y+=walk.w*(1.0-combat.z);
         }
         p=mul(instanceTransform,float4(localPos*gScale,1)).xyz+
           float3(0,gYOffset,0);
@@ -618,7 +637,7 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[11]={};
+    D3D12_ROOT_PARAMETER rp[12]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -677,6 +696,9 @@ static void makePipeline() {
     rp[10].DescriptorTable.NumDescriptorRanges=1;
     rp[10].DescriptorTable.pDescriptorRanges=&ranges[5];
     rp[10].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[11].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[11].Descriptor.ShaderRegister=7;
+    rp[11].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -689,7 +711,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=11;rs.pParameters=rp;
+    rs.NumParameters=12;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -911,6 +933,7 @@ static void initializeDX12() {
         gCameraBuffers[frame]=uploadBuffer(nullptr,256);
         gSoldierBuffers[frame]=uploadBuffer(nullptr,65536); // 1000 matrices = 64000 bytes
         gWalkBuffers[frame]=uploadBuffer(nullptr,LIGHT_COUNT*4*sizeof(float)); // 1000 float4 gait states
+        gCombatBuffers[frame]=uploadBuffer(nullptr,LIGHT_COUNT*4*sizeof(float));
         gLightBuffers[frame]=uploadBuffer(nullptr,49152); // 1000 lights + 16 shadow matrices
         gGridBuffers[frame]=uploadBuffer(nullptr,(UINT64)GRID_BUFFER_UINT_COUNT*sizeof(UINT));
         gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
@@ -939,7 +962,7 @@ static void initializeDX12() {
         gGridSRV[frame].ptr+=(UINT64)(5+FRAME_COUNT+frame)*gSRVStep;
     }
     gShadowIndexCB=gShadowIndexBuffers[0];
-    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];gWalkCB=gWalkBuffers[0];
+    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];gWalkCB=gWalkBuffers[0];gCombatCB=gCombatBuffers[0];
     gLightsCB=gLightBuffers[0];gGridCB=gGridBuffers[0];
     gShadowCameraCB=gShadowCameraBuffers[0];
     makePipeline();
@@ -1105,6 +1128,7 @@ static void drawShadowMaps() {
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(11,gCombatCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(10,gRigSkinSRV);
     // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
     // and the two distinct army instance ranges. The depth texture is shared
@@ -1249,7 +1273,7 @@ static void renderFrame() {
         }),gRetiredResources.end());
     gAllocator=gFrameAllocators[back];
     gFrameCB=gCameraBuffers[back];gSoldierCB=gSoldierBuffers[back];
-    gWalkCB=gWalkBuffers[back];
+    gWalkCB=gWalkBuffers[back];gCombatCB=gCombatBuffers[back];
     gLightsCB=gLightBuffers[back];gGridCB=gGridBuffers[back];
     gShadowCameraCB=gShadowCameraBuffers[back];
     gShadowIndexCB=gShadowIndexBuffers[back];
@@ -1263,6 +1287,7 @@ static void renderFrame() {
     static std::vector<float> renderedLights(LIGHT_COUNT*8,0.f);
     static native_three::WalkAnimation<LIGHT_COUNT> soldierWalk;
     static std::array<float,LIGHT_COUNT*4> walkStates{};
+    static std::array<float,LIGHT_COUNT*4> combatStates{};
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
     static UINT seenSceneEpoch=~0u;
@@ -1273,6 +1298,7 @@ static void renderFrame() {
         simulation=native_three::FixedStepper(1.0/60.0,4);
         soldierWalk=native_three::WalkAnimation<LIGHT_COUNT>();
         walkStates.fill(0.f);
+        combatStates.fill(0.f);
         seenSceneEpoch=gSceneEpoch;
     }
     const ULONGLONG tick=GetTickCount64();
@@ -1392,6 +1418,11 @@ static void renderFrame() {
     check(gWalkCB->Map(0,nullptr,&walkData),"Map 1000 soldier walk states");
     memcpy(walkData,walkStates.data(),walkStates.size()*sizeof(float));
     gWalkCB->Unmap(0,nullptr);
+    NativeThreeJS_CombatStates(combatStates.data(),combatStates.size());
+    void* combatMapped=nullptr;
+    check(gCombatCB->Map(0,nullptr,&combatMapped),"Map 1000 combat poses");
+    memcpy(combatMapped,combatStates.data(),combatStates.size()*sizeof(float));
+    gCombatCB->Unmap(0,nullptr);
     // Game->native audio event dispatch is independent of DX12 draw calls.
     // Scene.js sends events through QuickJS NativeThreeAudio.play(...), while
     // XAudio2 mixes only the limited active sources on the native side.
@@ -1453,6 +1484,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(11,gCombatCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(10,gRigSkinSRV);
     gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
@@ -1539,6 +1571,8 @@ static void renderFrame() {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
         NativeThreeNavStatus navigation{};
         NativeThreeJS_GetNavStatus(&navigation);
+        NativeThreeBattleStatus battle{};
+        NativeThreeJS_GetBattleStatus(&battle);
         UINT shadowInstances=0;
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
@@ -1546,7 +1580,7 @@ static void renderFrame() {
         wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u | AUDIO %u voices %u cues %s ERR 0x%08X",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u | AUDIO %u voices %u cues %s ERR 0x%08X | BATTLE R%d B%d K%d H%d ENG%d W%d",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
@@ -1557,7 +1591,8 @@ static void renderFrame() {
             navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF",gSceneEpoch,
             gAudio.activeVoices(),gAudio.submitted(),gAudioEnabled&&gAudio.available()?L"ON":L"OFF",
-            gAudio.lastError());
+            gAudio.lastError(),battle.aliveRed,battle.aliveBlue,battle.deaths,
+            battle.hits,battle.engaged,battle.winner);
         SetWindowTextW(gWindow,title);
         char summary[512];
         sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
@@ -1630,6 +1665,12 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F11){
                 gAudioEnabled=!gAudioEnabled;
                 if(!gAudioEnabled)gAudio.stopAll();
+            }
+            if(wp==VK_F12){
+                if(NativeThreeJS_QuickBattle()){
+                    gHaveVisibilityCache=false;
+                    gLastPathRefresh=0;
+                }
             }
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
