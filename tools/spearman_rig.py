@@ -63,7 +63,7 @@ def influence(position):
     return tuple(indices),tuple(values)
 
 def _align(buffer: bytearray, alignment: int=4):
-    buffer.extend(b"\\x00"*((-len(buffer))%alignment))
+    buffer.extend(b"\x00"*((-len(buffer))%alignment))
 
 def _append_accessor(doc, blob, content, component_type, kind, count, target=None):
     _align(blob)
@@ -140,12 +140,12 @@ def rig_geometry(doc, original_bin: bytes, positions):
 def write_glb(path: Path, doc, binary: bytes):
     js=json.dumps(doc,separators=(",",":"),ensure_ascii=False).encode("utf-8")
     js+=b" "*((-len(js))%4)
-    binary+=b"\\x00"*((-len(binary))%4)
+    binary+=b"\x00"*((-len(binary))%4)
     total=12+8+len(js)+8+len(binary)
     path.write_bytes(
         struct.pack("<4sII",b"glTF",2,total)
         +struct.pack("<I4s",len(js),b"JSON")+js
-        +struct.pack("<I4s",len(binary),b"BIN\\x00")+binary
+        +struct.pack("<I4s",len(binary),b"BIN\x00")+binary
     )
 
 def write_native_rig(path: Path,influences):
