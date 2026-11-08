@@ -5,7 +5,7 @@ on:
       - experiments/v026-webapp-cube
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   windows-webapp:
     runs-on: windows-2022
@@ -72,3 +72,18 @@ jobs:
         with:
           name: NativeThreeWebApp-v026-Windows-x64
           path: NativeThreeWebApp-v026-Windows-x64.zip
+
+      - name: Publish isolated preview release after all tests pass
+        if: github.ref == 'refs/heads/experiments/v026-webapp-cube'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag='v0.26.1-webapp-test.1'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing preview release retained unchanged"
+          } else {
+            gh release create $tag NativeThreeWebApp-v026-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title 'NativeThreeBridge v0.26.1 WebApp cube test' --notes 'Isolated v0.26.0-based Three.js HTML+JS -> QuickJS -> DX12 spinning-cube proof of concept. Not the Kuningriigid game. Native support is intentionally restricted to one BoxGeometry mesh; Windows DX12 visual check required.'
+            if ($LASTEXITCODE -ne 0) { throw "Could not publish WebApp preview" }
+          }
