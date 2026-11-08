@@ -1,10 +1,16 @@
-NativeThreeBridge v0.20.0 - CONTINUOUS SOLDIER LIGHTS / NO TILE SEAMS
+NativeThreeBridge v0.21.0 - PER-SOLDIER PROCEDURAL WALK TEST
 ================================================================
 New: all radius-overlapping lights contribute to each 16x16 spatial tile.
 The former nearest-16 light list created hard moving square boundaries.
 Light indices are now compact per-frame SRVs; 16 real shadow maps remain.
 Compare v0.19.0 and v0.20.0 on the same Windows DX12 camera and settings.
 A physical GPU is needed to check lighting pixels and FPS. FPS is not guaranteed.
+
+Experimental: each moving spearman now walks with a distinct leg stride and
+light body bob; stationary soldiers gradually return to rest. The original
+unrigged GLB is unchanged: this is procedural vertex deformation, NOT a
+true skeletal/rigged animation clip. Shadows use the same deformed mesh.
+F8 toggles WALK ON/OFF for direct FPS and appearance comparison.
 
 10,000 pines / two 500-unit armies / 1,000 lights / 16 shadow maps.
 C++ scene registry, spatial index, async A*, native fixed 60Hz simulation
@@ -15,7 +21,8 @@ Run NativeThree-Game.exe directly to bypass updater checks.
 Run NativeThree-Updater.exe separately to check GitHub for deltas.
 
 Controls: F1 overview, F2/F3 army follow, F4 routes, F5 shadow toggle,
-F6 VSync, F7 day/night (night default). Mouse drag orbit, wheel zoom.
+F6 VSync, F7 day/night (night default), F8 walking on/off.
+Mouse drag orbit, wheel zoom; F2/F3 follow army to see legs close up.
 Space pause; Esc exit.
 
 Window title metrics: FPS, MAX longest frame ms, GPU FENCE wait ms, CPU

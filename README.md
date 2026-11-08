@@ -1,3 +1,11 @@
+# NativeThreeBridge v0.21.0 — per-soldier walking animation prototype
+
+The current original odamees GLB has no glTF skin or animation channels. This **first walk test** therefore procedurally deforms leg vertices around a hip pivot in the DX12 vertex shader, with a small individual body bounce. Each soldier uses its real interpolated movement distance to advance a separately randomized gait phase. Stationary and blocked units fade to idle. The deformation also runs during the **real shadow depth pass**, so cast silhouettes follow the walk cycle without separate shadow geometry. One 16-KB per-frame upload buffer holds 1,000 float4 gait states: **no extra draw calls or changed A* collision/path logic**.
+
+Use **F2/F3** and the mouse wheel for a close view of soldiers, and **F8** to compare walking ON/OFF. Keep F5 shadows ON to verify silhouettes. The prior v0.20.0 lighting fix is unchanged. This is a *procedural unrigged test*, not skeletal skinning and not a production walk animation. A rigged GLB and proper animation clips can be added once movement looks suitable.
+
+The Windows CI checks the C++ gait service, shader compilation, Three.js scene smoke, and packaging. GPU motion quality/FPS still requires a real DX12 machine.
+
 # NativeThreeBridge v0.20.0 — continuous DX12 night illumination
 
 This update fixes visibly moving square boundaries caused by selecting only the 16 lights nearest each 67.5-unit tile center. The 16×16 broad-phase grid remains for performance, but every moving light with a radius overlapping a tile is included in that tile's variable-length GPU index stream; the existing per-pixel distance, spotlight cone and shadow visibility remain continuous. There is **no per-tile nearest-N truncation**. This does **not** change the 16 available real-time shadow maps.

@@ -3,6 +3,7 @@
 #include "navigation_service.h"
 #include "fixed_stepper.h"
 #include "lod_policy.h"
+#include "walk_animation.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -57,6 +58,28 @@ int main(){
     assert(simTicks==60);
     stepper.advance(4.0,[&](double){++simTicks;});
     assert(simTicks<=64); // bound the catchup work after an extended stall
+
+    // Gait is distance driven: idle is still, each mover has its own
+    // phase, and stopping/turning animation off fades it out.
+    WalkAnimation<2> walk;
+    std::array<float,32> agentMatrices{};
+    std::array<float,8> gait{};
+    agentMatrices[16+12]=20.f; // two distinct world positions
+    walk.update(agentMatrices.data(),1.f/60.f,true,gait.data());
+    assert(gait[2]==0.f && gait[6]==0.f);
+    const float idleSin=gait[0];
+    agentMatrices[12]+=0.17f;
+    walk.update(agentMatrices.data(),1.f/60.f,true,gait.data());
+    assert(gait[2]>0.f && gait[2]<=1.f);
+    assert(gait[6]==0.f);
+    assert(gait[0]!=idleSin && gait[0]!=gait[4]);
+    for(int f=0;f<45;f++)walk.update(agentMatrices.data(),1.f/60.f,true,gait.data());
+    assert(gait[2]<0.001f);
+    agentMatrices[16+14]+=0.17f;
+    walk.update(agentMatrices.data(),1.f/60.f,true,gait.data());
+    assert(gait[6]>0.f);
+    for(int f=0;f<45;f++)walk.update(agentMatrices.data(),1.f/60.f,false,gait.data());
+    assert(gait[2]<0.001f && gait[6]<0.001f);
 
     LodPolicy lod;
     assert(lod.choose(123,0.25f)==0);
