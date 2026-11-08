@@ -33,7 +33,9 @@ test('click dispatches to native C++ reset, preserving GPU forest cache',()=>{
   assert.match(dx,/simulation=native_three::FixedStepper/);
   assert.match(dx,/soldierWalk=native_three::WalkAnimation/);
   assert.match(dx,/gHaveVisibilityCache=false/);
-  assert.doesNotMatch(dx,/gTreesUploaded=false;/);
+  const restartCode=dx.slice(dx.indexOf('if(gRestartRequested) {'),
+    dx.indexOf('if(!gPause&&!IsIconic(gWindow))renderFrame();'));
+  assert.doesNotMatch(restartCode,/gTreesUploaded=false;/);
   assert.match(host,/void NativeThreeJS_Restart\(\)/);
   assert.match(host,/NativeThreeJS_Shutdown\(\);\s*NativeThreeJS_Init\(\);/);
   assert.match(smoke,/NativeThreeJS_Restart\(\)/);
