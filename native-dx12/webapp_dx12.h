@@ -10,7 +10,7 @@
 
 // Opens an ordinary Three.js webapp folder (index.html + ES modules) in its
 // own resizable DX12 window. Returns the process exit code.
-int NativeWebapp_Run(HINSTANCE instance, const std::filesystem::path& webappRoot);
+int NativeWebapp_Run(HINSTANCE instance, const std::filesystem::path& webappRoot, bool useV8 = false);
 
 // Finds which webapp to open: "--webapp <folder>", a folder (or its
 // index.html) passed as the only argument / dropped on the EXE, or
