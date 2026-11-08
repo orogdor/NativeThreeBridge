@@ -6,7 +6,7 @@ const workflow=readFileSync(new URL('../.github/workflows/native-threejs.yml',im
 
 test('game/index.html is the default native Three.js webapp; no custom meta tag needed',()=>{
   assert.match(dx,/NativeWebapp_FindRoot\(commandLine,executable,webappRoot\)/);
-  assert.match(dx,/return NativeWebapp_Run\(instance,webappRoot\)/);
+  assert.match(dx,/return NativeWebapp_Run\(instance,webappRoot,useV8\)/);
   assert.doesNotMatch(dx,/if\(!importedGame\)\s*\{\s*std::filesystem::path webappRoot/);
   assert.match(workflow,/Copy-Item samples\/hello-webapp\/index\.html dist\/game\/index\.html/);
   assert.match(workflow,/Copy-Item samples\/hello-webapp\/main\.js dist\/game\/main\.js/);
