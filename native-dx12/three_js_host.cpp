@@ -142,7 +142,8 @@ void NativeThreeJS_Init() {
     if(precomputed!=0)die("Navigation routes must be calculated on demand, not during scene init");
     ready = true;
 }
-void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t capacity) {
+void NativeThreeJS_FrameFrom(float deltaSeconds, float *outMatrices,
+                             std::size_t capacity,std::size_t firstChangedInstance) {
     if (!ready || !outMatrices || capacity < MATRIX_FLOATS)
         die("NativeThreeJS_Frame invalid state");
     JSValue delta = JS_NewFloat64(context, deltaSeconds);
@@ -159,9 +160,21 @@ void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t cap
     size_t arrayBytes = 0;
     uint8_t *bytes = JS_GetArrayBuffer(context, &arrayBytes, arrayBuffer);
     if (!bytes || offset + length > arrayBytes) die("Three.js matrix array bounds error");
-    std::memcpy(outMatrices, bytes + offset, length);
+    const std::size_t firstFloat=firstChangedInstance*16;
+    if(firstChangedInstance>MATRIX_FLOATS/16)
+        die("NativeThreeJS_FrameFrom offset outside scene");
+    if(firstFloat==0) {
+        std::memcpy(outMatrices, bytes + offset, length);
+    } else {
+        // Static or unchanged prefix remains in the persistent native buffer.
+        std::memcpy(outMatrices+firstFloat,bytes+offset+firstFloat*sizeof(float),
+                    length-firstFloat*sizeof(float));
+    }
     JS_FreeValue(context, arrayBuffer);
     JS_FreeValue(context, transforms);
+}
+void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t capacity) {
+    NativeThreeJS_FrameFrom(deltaSeconds,outMatrices,capacity,0);
 }
 void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
     constexpr size_t FLOATS = 1000 * 8;
