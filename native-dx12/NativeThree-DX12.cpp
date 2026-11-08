@@ -962,14 +962,14 @@ static void renderFrame() {
     gShadowIndexCB=gShadowIndexBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
-    float matrices[INSTANCE_COUNT*16]={};
+    static std::vector<float> matrices(INSTANCE_COUNT*16,0.f); // 704KB stays off the 1MB Windows stack
     const ULONGLONG tick=GetTickCount64();
     const double now=cpuSeconds();
     const float dt=gPreviousFrameSeconds ?
         (float)std::min(0.25,std::max(0.0,now-gPreviousFrameSeconds)) : (1.f/60.f);
     gPreviousFrameSeconds=now;
     const double jsStart=cpuSeconds();
-    NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
+    NativeThreeJS_Frame(dt,matrices.data(),INSTANCE_COUNT*16);
     gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
@@ -985,14 +985,14 @@ static void renderFrame() {
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
     const double lightsStart=cpuSeconds();
-    updateLightsAndShadowCameras(matrices);
+    updateLightsAndShadowCameras(matrices.data());
     gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
         // 1000 tree matrices = 64000 bytes, exactly within a DX12 root CBV.
         // One-time GPU-local upload avoids 1000 repeated vertex shader reads
         // from PCIe-visible UPLOAD memory on discrete GPUs.
-        gInstancesCB=staticGpuBuffer(matrices,TREE_COUNT*16*sizeof(float),
+        gInstancesCB=staticGpuBuffer(matrices.data(),TREE_COUNT*16*sizeof(float),
                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         D3D12_SHADER_RESOURCE_VIEW_DESC treeView={};
         treeView.Format=DXGI_FORMAT_UNKNOWN;
@@ -1009,7 +1009,7 @@ static void renderFrame() {
     }
     void *soldierData=nullptr;
     check(gSoldierCB->Map(0,nullptr,&soldierData),"Map 500 moving soldier matrices");
-    memcpy(soldierData,matrices+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
+    memcpy(soldierData,matrices.data()+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
     gSoldierCB->Unmap(0,nullptr);
     XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
     XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
@@ -1021,7 +1021,7 @@ static void renderFrame() {
                  (float)WIDTH/HEIGHT,0.1f,2200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
-    updateMainTreeVisibility(matrices,view*proj,proj);
+    updateMainTreeVisibility(matrices.data(),view*proj,proj);
     void *cbptr=nullptr;
     check(gFrameCB->Map(0,nullptr,&cbptr),"Map view projection buffer");
     memcpy(cbptr,&vp,sizeof(vp));
