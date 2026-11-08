@@ -67,6 +67,26 @@ int main(){
     std::puts("PASS: reserved navigation cells protect against overlapping soldiers");
     std::puts("PASS: 1000 moving Three.js SpotLight records follow soldiers");
     std::puts("PASS: real-time navigation status reports moving soldiers, path plans and A* waypoint progress");
+    // Native restart is a real scene/navigation reset, not an OS process relaunch.
+    // Units and moving lights must return to the exact deterministic start.
+    NativeThreeJS_Restart();
+    NativeThreeNavStatus reset{};
+    NativeThreeJS_GetNavStatus(&reset);
+    if(reset.moved!=0 || reset.planned!=0 || reset.searches!=0 ||
+       reset.routeSteps!=0 || reset.arrived!=0){
+        std::fprintf(stderr,"Native restart left stale navigation: moved %d planned %d\\n",
+            reset.moved,reset.planned);
+        return 11;
+    }
+    NativeThreeJS_Frame(0.f,matrices.data(),matrices.size());
+    NativeThreeJS_Lights(lights.data(),lights.size());
+    if(std::fabs(matrices[TREES*16+12]-firstRedX)>0.001f ||
+       std::fabs(matrices[(TREES+PER_ARMY)*16+12]-firstBlueX)>0.001f ||
+       std::fabs(lights[0]-(matrices[TREES*16+12]+6.f))>0.005f){
+        std::fprintf(stderr,"Native scene restart did not restore army starting positions\\n");
+        return 12;
+    }
+    std::puts("PASS: CSS Restart command recreates Three.js scene, A* state and initial army/light transforms");
     NativeThreeJS_Shutdown();
     return 0;
 }
