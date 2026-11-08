@@ -8,4 +8,5 @@
 *.dll
 node_modules/
 dist/
+dist-web/
 .DS_Store
