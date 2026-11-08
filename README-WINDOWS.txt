@@ -1,3 +1,19 @@
+NativeThreeBridge 0.29.0 — V8 EXPERIMENT (Windows)
+=================================================
+V8 mode: double-click Run-V8.cmd or NativeThree-V8.exe.
+The exe automatically starts YOUR game/index.html without changing the game.
+To use any other webapp folder: NativeThree-V8.exe --webapp "C:\\my-app"
+This V8 backend uses a bundled Node.js 22/V8 subprocess (no Chromium).
+The C++ DirectX 12 renderer, shaders, and original v0.26 battle remain intact.
+QuickJS comparison: NativeThree-Game.exe (or .exe --battle for original forest).
+All files in v8-runtime/, js/, test/helpers/, and node_modules/three/ must stay
+in their relative folders next to NativeThree-V8.exe. Keep whole ZIP together.
+The same current renderer limitations on textures, GLB, custom GLSL, shadows,
+HTML/CSS overlays and incomplete Web APIs still apply to BOTH backends.
+The extra V8 process and IPC can cost memory and CPU: test FPS, don't assume
+faster GPU rendering. Compare the worldgen elapsed time and log errors.
+Logs: NativeThreeBridge-webapp-log.txt beside the EXE.
+
 NativeThreeBridge v0.28.2 - LARGE APP STARTUP DIAGNOSTICS
 =======================================================
 The native window is shown before the game JavaScript is evaluated, so large
