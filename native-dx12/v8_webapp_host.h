@@ -3,6 +3,12 @@
 // Uses exactly the same WebappRenderSink as QuickJS -> unchanged DX12 renderer.
 // No Chromium, no modifications to game JavaScript.
 #include "webapp_host.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <filesystem>
 #include <string>
