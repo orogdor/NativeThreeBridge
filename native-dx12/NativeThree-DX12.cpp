@@ -36,7 +36,7 @@ static HWND gWindow=nullptr;
 static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
 static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
 static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
-static bool gShowDebugPaths=true;
+static bool gShowDebugPaths=false; // avoid bright diagnostic overlay during night lighting tests
 static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
 static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
@@ -683,7 +683,8 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     // Each in-flight backbuffer has dedicated upload buffers and allocator.
-    gInstancesCB=uploadBuffer(nullptr,65536); // 1000 static tree transforms
+    // gInstancesCB is created on first real JS frame in GPU-local DEFAULT memory.
+    // Static tree transforms never need a per-frame UPLOAD heap.
     for(UINT frame=0;frame<FRAME_COUNT;frame++) {
         if(frame==0)gFrameAllocators[frame]=gAllocator;
         else check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -953,10 +954,11 @@ static void renderFrame() {
     gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
-        void *treeData=nullptr;
-        check(gInstancesCB->Map(0,nullptr,&treeData),"Map static 1000-tree matrices");
-        memcpy(treeData,matrices,TREE_COUNT*16*sizeof(float));
-        gInstancesCB->Unmap(0,nullptr);
+        // 1000 tree matrices = 64000 bytes, exactly within a DX12 root CBV.
+        // One-time GPU-local upload avoids 1000 repeated vertex shader reads
+        // from PCIe-visible UPLOAD memory on discrete GPUs.
+        gInstancesCB=staticGpuBuffer(matrices,TREE_COUNT*16*sizeof(float),
+                         D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         gTreesUploaded=true;
     }
     void *soldierData=nullptr;
@@ -1139,7 +1141,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!gWindow)return 2;
     initializeDX12();
     NativeThreeJS_Init();
-    createDebugRouteGeometry();
+    // Debug route overlay is explicitly requested with F4, not precomputed at startup.
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
     gStatStart=GetTickCount64();
