@@ -25,9 +25,9 @@ int main(){
     NativeThreeJS_Lights(lights,LIGHT_FLOATS);
     for(int i=0;i<SOLDIERS;i++){
         const int m=(TREES+i)*16,l=i*8;
-        if(std::fabs(lights[l]-matrices[m+12])>0.005f ||
-           std::fabs(lights[l+2]-matrices[m+14])>0.005f ||
-           std::fabs(lights[l+1]-9.5f)>0.01f ||
+        if(std::fabs(lights[l]-(matrices[m+12]+6.f))>0.005f ||
+           std::fabs(lights[l+2]-(matrices[m+14]+4.f))>0.005f ||
+           std::fabs(lights[l+1]-12.5f)>0.01f ||
            !(lights[l+3]>10 && lights[l+7]>0)) {
            std::fprintf(stderr,"Light %d failed follow/height check\n",i);
            return 5;
@@ -52,8 +52,8 @@ int main(){
     }
     for(int i=0;i<SOLDIERS;i++){
         const int m=(TREES+i)*16,l=i*8;
-        if(std::fabs(lights[l]-matrices[m+12])>0.005f ||
-           std::fabs(lights[l+2]-matrices[m+14])>0.005f) {
+        if(std::fabs(lights[l]-(matrices[m+12]+6.f))>0.005f ||
+           std::fabs(lights[l+2]-(matrices[m+14]+4.f))>0.005f) {
             std::fprintf(stderr,"Moving soldier %d light desynchronized\n",i);
             return 7;
         }
