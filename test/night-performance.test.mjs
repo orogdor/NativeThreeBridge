@@ -16,7 +16,7 @@ test('night DX12 benchmark is dark by default, with angled real shadow casting l
 test('A* uses bounded reusable arrays rather than allocating heap objects per node',()=>{
   assert.match(js,/const heapNodes=new Int32Array\(HEAP_CAPACITY\)/);
   assert.match(js,/const heapPriority=new Float64Array\(HEAP_CAPACITY\)/);
-  assert.match(js,/const MAX_PLANS_PER_FRAME=12/);
+  assert.match(js,/const MAX_PLANS_PER_FRAME=4/);
   assert.doesNotMatch(js,/const entry=\{node,p\}/);
   assert.doesNotMatch(js,/const adj=\[/);
 });
