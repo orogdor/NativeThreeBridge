@@ -20,6 +20,7 @@
 #include <algorithm>
 #include "three_js_host.h"
 #include "spatial_index.h"
+#include "fixed_stepper.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -1005,15 +1006,38 @@ static void renderFrame() {
     gShadowIndexCB=gShadowIndexBuffers[back];
     // The matrices are computed by real live THREE.InstancedMesh / Group / Scene
     // objects in QuickJS, not hardcoded into C++ instance positioning.
-    static std::vector<float> matrices(INSTANCE_COUNT*16,0.f); // 704KB stays off the 1MB Windows stack
+    static std::vector<float> matrices(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> previous(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> renderMatrices(INSTANCE_COUNT*16,0.f);
+    static native_three::FixedStepper simulation(1.0/60.0,4);
+    static bool firstSceneFrame=true;
     const ULONGLONG tick=GetTickCount64();
     const double now=cpuSeconds();
-    const float dt=gPreviousFrameSeconds ?
-        (float)std::min(0.25,std::max(0.0,now-gPreviousFrameSeconds)) : (1.f/60.f);
+    const double dt=gPreviousFrameSeconds ?
+        std::min(0.20,std::max(0.0,now-gPreviousFrameSeconds)) : (1.0/60.0);
     gPreviousFrameSeconds=now;
     const double jsStart=cpuSeconds();
-    NativeThreeJS_FrameFrom(dt,matrices.data(),INSTANCE_COUNT*16,
-                            gTreesUploaded ? TREE_COUNT : 0);
+    if(firstSceneFrame){
+        // A fresh scene exposes all static and dynamic transforms exactly once.
+        NativeThreeJS_FrameFrom(0.f,matrices.data(),INSTANCE_COUNT*16,0);
+        previous=matrices;renderMatrices=matrices;
+        firstSceneFrame=false;
+    }
+    const float alpha=simulation.advance(dt,[&](double step){
+        std::copy(matrices.begin()+TREE_COUNT*16,matrices.end(),
+                  previous.begin()+TREE_COUNT*16);
+        NativeThreeJS_FrameFrom((float)step,matrices.data(),INSTANCE_COUNT*16,
+                                gTreesUploaded ? TREE_COUNT : 0);
+    });
+    // Native interpolator works on the generic transform matrix layout.
+    // Only changed/animated instances are copied; static tree matrices stay.
+    for(UINT i=TREE_COUNT;i<INSTANCE_COUNT;i++){
+        const size_t off=(size_t)i*16;
+        memcpy(renderMatrices.data()+off,matrices.data()+off,16*sizeof(float));
+        for(size_t k=12;k<=14;k++)
+            renderMatrices[off+k]=previous[off+k]+
+                                  (matrices[off+k]-previous[off+k])*alpha;
+    }
     gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
@@ -1036,7 +1060,7 @@ static void renderFrame() {
         gStaticObjectsRegistered=true;
     }
     const double lightsStart=cpuSeconds();
-    updateLightsAndShadowCameras(matrices.data());
+    updateLightsAndShadowCameras(renderMatrices.data());
     gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
@@ -1060,7 +1084,8 @@ static void renderFrame() {
     }
     void *soldierData=nullptr;
     check(gSoldierCB->Map(0,nullptr,&soldierData),"Map 500 moving soldier matrices");
-    memcpy(soldierData,matrices.data()+TREE_COUNT*16,LIGHT_COUNT*16*sizeof(float));
+    memcpy(soldierData,renderMatrices.data()+TREE_COUNT*16,
+           LIGHT_COUNT*16*sizeof(float));
     gSoldierCB->Unmap(0,nullptr);
     XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
     XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
@@ -1072,7 +1097,7 @@ static void renderFrame() {
                  (float)WIDTH/HEIGHT,0.1f,2200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
-    updateMainTreeVisibility(matrices.data(),view*proj,proj);
+    updateMainTreeVisibility(renderMatrices.data(),view*proj,proj);
     void *cbptr=nullptr;
     check(gFrameCB->Map(0,nullptr,&cbptr),"Map view projection buffer");
     memcpy(cbptr,&vp,sizeof(vp));
