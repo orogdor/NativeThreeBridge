@@ -1,3 +1,10 @@
+NativeThreeBridge v0.26.0 - SMOOTH CLOSE-UP SOLDIER MOTION
+FIX: same fractional 60 Hz simulation time is used for character XYZ,
+rotation, battle animation and tracking camera at all DX12 frame rates.
+A* waypoint-facing rotates smoothly; F12 instantly refreshes instances.
+Compare with v0.25.0 by following soldiers using F2/F3 and zooming in.
+F8 still toggles gait, F7 day/night, F12 quick battle, CSS Restart resets.
+
 NativeThreeBridge v0.25.0 - 1000 SOLDIER DIRECTIONAL BATTLE TEST
 ================================================================
 NEW: 500 vs 500 soldiers now acquire an opponent, fight in melee,
