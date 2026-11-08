@@ -1,44 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-
-const source=path=>readFileSync(new URL(path,import.meta.url),'utf8');
-const game=source('../launcher/GameUpdater.cs');
-const engine=source('../launcher/EngineUpdater.cs');
-const common=source('../launcher/UpdaterCommon.cs');
-const dx=source('../native-dx12/NativeThree-DX12.cpp');
-const flow=source('../.github/workflows/native-threejs.yml');
-
-test('game updater pins a Git commit, checks blobs and swaps only game directory',()=>{
-  assert.match(game,/commits\/main/);
-  assert.match(game,/git\/trees\/\{commit\}\?recursive=1/);
-  assert.match(game,/raw\.githubusercontent\.com/);
-  assert.match(game,/GitBlobSha\(bytes\) != sha/);
-  assert.match(game,/Common\.Sha256File\(current\) != oldFile\.Sha256/);
-  assert.match(game,/Directory\.Move\(game, previous\)/);
-  assert.doesNotMatch(game,/Process\.Start|ShellExecute/);
+const updater=readFileSync(new URL('../launcher/NativeThree-Updater.c',import.meta.url),'utf8');
+const host=readFileSync(new URL('../native-dx12/three_js_host.cpp',import.meta.url),'utf8');
+const dx=readFileSync(new URL('../native-dx12/NativeThree-DX12.cpp',import.meta.url),'utf8');
+const flow=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.meta.url),'utf8');
+test('independent updater targets separate EXE and editable JS',()=>{
+ assert.match(updater,/update-v2\.txt/);
+ assert.match(updater,/NativeThree-Game\.exe/);
+ assert.ok(updater.includes("scene.js") && updater.includes("game"));
+ assert.match(updater,/sha256File\(/);
+ assert.match(updater,/applyAll\(/);
 });
-
-test('engine updater verifies release EXE and leaves game tree untouched',()=>{
-  assert.match(engine,/engine-update-v1\.json/);
-  assert.match(engine,/Common\.Sha256\(exe\) != manifest\.Sha256/);
-  assert.match(engine,/File\.Move\(gameExe, backup\)/);
-  assert.doesNotMatch(engine,/Path\.Combine\(Common\.Root, "game"\)/);
+test('real official Three.js runtime loads scene.js from the game directory',()=>{
+ assert.match(host,/loadGameScene\(/);
+ assert.match(host,/GetModuleFileNameW/);
+ assert.ok(host.includes("scene.js") && host.includes("game"));
+ assert.match(host,/JS_Eval\(context, gameScript\.data\(\)/);
 });
-
-test('downloaded browser game is refused before DX12 and JavaScript startup',()=>{
-  const check=dx.indexOf('const bool importedGame');
-  const start=dx.indexOf('initializeDX12();',check);
-  assert.ok(check>0 && start>check);
-  assert.match(dx,/No downloaded game code was executed/);
-  assert.match(dx,/return 42;/);
-  assert.match(common,/RejectLinks/);
+test('DX12 projection uses correct row-vector convention',()=>{
+ assert.match(dx,/XMMatrixTranspose\(view\*proj\)/);
+ assert.match(dx,/mul\(float4\(p,1\),gViewProjection\)/);
 });
-
-test('Windows package builds exactly three EXEs with Kuningriigid as source',()=>{
-  for(const exe of ['Game-Updater.exe','Engine-Updater.exe','NativeThree-Game.exe'])
-    assert.ok(flow.includes(exe));
-  assert.match(flow,/\$executables\.Count -ne 3/);
-  assert.match(flow,/Test-Path verify\/game\/scene\.js/);
-  assert.match(flow,/--prerelease/);
+test('release includes two distinct EXE files and separate JS',()=>{
+ assert.match(flow,/NativeThree-Updater\.exe/);
+ assert.match(flow,/NativeThree-Game\.exe/);
+ assert.match(flow,/game\/scene\.js/);
+ assert.match(flow,/update-v2\.txt/);
 });
