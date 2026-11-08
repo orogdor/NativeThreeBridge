@@ -10,6 +10,7 @@
 #include "quickjs.h"
 #include "three_js_host.h"
 #include "navigation_service.h"
+#include "game_folder.h"
 #include <algorithm>
 #include <memory>
 #include <thread>
@@ -201,11 +202,11 @@ static std::string loadGameScene() {
     size_t slash = filename.find_last_of(L"\\/");
     if (slash == std::wstring::npos) die("Cannot locate executable folder.");
     filename.resize(slash);
-    filename += L"\\game\\scene.js";
+    filename += L"\\" + NativeThree_SceneFolder() + L"\\scene.js";
     HANDLE f = CreateFileW(filename.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE)
-        die("Missing game/scene.js. Extract the complete Windows ZIP beside the EXE.");
+        die("Missing scene.js in the game folder (game/ or game1/). Extract the complete Windows ZIP beside the EXE.");
     LARGE_INTEGER size = {};
     if (!GetFileSizeEx(f, &size) || size.QuadPart < 32 || size.QuadPart > (8 * 1024 * 1024)) {
         CloseHandle(f);

@@ -1,3 +1,18 @@
+NativeThreeBridge v0.30.0 - KAKS MÄNGU, ÜKS ENGINE
+==================================================
+Game1.exe            metsalahingu test (kaust game1)
+Game2.exe            webapp kaustas game2 (alguses tühi)
+UpdateKuningriigid.exe  laeb Kuningriigid GitHubist kausta game2 või uuendab
+                     selle uusimale versioonile (ainult muutunud failid,
+                     eelmine versioon jääb kausta game2.previous)
+UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
+                     engine'i faile (NativeThree-Engine.exe, Game1/Game2,
+                     V8 DLL-id); game1 ja game2 kaustu ei puudutata.
+                     Eelmine engine jääb kausta engine.previous.
+Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
+Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
+Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
 NativeThreeBridge v0.28.0 - THREE.JS WEBAPPS IN THE ENGINE (TEST)
 =================================================================
 NEW: a whole Three.js webapp folder (index.html + ES modules) now runs in

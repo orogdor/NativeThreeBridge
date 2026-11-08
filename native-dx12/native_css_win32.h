@@ -1,4 +1,5 @@
 #pragma once
+#include "game_folder.h"
 // Win32 backend of the tiny HTML/CSS-to-native test. No browser/WebView.
 #include "native_css_style.h"
 #include <windows.h>
@@ -19,7 +20,7 @@ public:
         const DWORD length=GetModuleFileNameW(nullptr,module,MAX_PATH);
         if(length==0||length>=MAX_PATH)return false;
         const std::filesystem::path base=
-            std::filesystem::path(module).parent_path() / L"game";
+            std::filesystem::path(module).parent_path() / NativeThree_SceneFolder();
         const std::string html=read(base/L"ui.html");
         const std::string css=read(base/L"ui.css");
         style_=parseNativeButton(html,css,"restart-button");

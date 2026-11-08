@@ -1,4 +1,5 @@
 #pragma once
+#include "game_folder.h"
 // Windows XAudio2 2.9 backend for NativeThreeAudio events. No WebAudio engine,
 // browser process, sound-on-render-thread blocking, or 1000 voices at once.
 // Samples are shared across concurrent source voices and destroyed on restart.
@@ -47,7 +48,7 @@ public:
         const DWORD length=GetModuleFileNameW(nullptr,filename,MAX_PATH);
         if(length && length<MAX_PATH)
             audioDirectory_=std::filesystem::path(filename).parent_path()/
-                            L"game"/L"audio";
+                            NativeThree_SceneFolder()/L"audio";
         return true;
     }
     void shutdown() {

@@ -14,6 +14,8 @@ int NativeWebapp_Run(HINSTANCE instance, const std::filesystem::path& webappRoot
 
 // Finds which webapp to open: "--webapp <folder>", a folder (or its
 // index.html) passed as the only argument / dropped on the EXE, or
-// game/index.html beside the EXE. Returns false for the classic scene.js mode.
+// game/index.html beside the EXE. Returns false for the classic scene.js mode
+// (always when "--scene <folder>" is given). `missing` is set when
+// "--webapp <folder>" was given but the folder has no index.html.
 bool NativeWebapp_FindRoot(const wchar_t* commandLine, const std::filesystem::path& exeDir,
-                           std::filesystem::path& root);
+                           std::filesystem::path& root, std::filesystem::path* missing = nullptr);

@@ -18,6 +18,7 @@
 #include <cwchar>
 #include <vector>
 #include <algorithm>
+#include <cwctype>
 #include "three_js_host.h"
 #include "spatial_index.h"
 #include "fixed_stepper.h"
@@ -28,6 +29,8 @@
 #include "walk_animation.h"
 #include "transform_interpolation.h"
 #include "webapp_dx12.h"
+#include "game_folder.h"
+#include <shellapi.h>
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -1735,9 +1738,23 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     wchar_t* separator=wcsrchr(executable,L'\\');
     if(!separator)return 40;
     *separator=0;
+    // "--scene <folder>" selects the classic scene.js game folder (Game1.exe: game1).
+    {
+        int argc=0;
+        LPWSTR* argv=commandLine&&*commandLine?CommandLineToArgvW(commandLine,&argc):nullptr;
+        for(int i=0;argv&&i+1<argc;i++){
+            if(wcscmp(argv[i],L"--scene")!=0)continue;
+            const std::wstring folder=argv[i+1];
+            const bool simple=!folder.empty()&&folder.size()<64&&
+                std::all_of(folder.begin(),folder.end(),[](wchar_t c){return iswalnum(c)||c==L'-'||c==L'_';});
+            if(simple)NativeThree_SceneFolder()=folder;
+        }
+        if(argv)LocalFree(argv);
+    }
+    const std::wstring sceneFolder=NativeThree_SceneFolder();
     wchar_t sourceMarker[MAX_PATH]={},scenePath[MAX_PATH]={};
-    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",executable)<0 ||
-       swprintf_s(scenePath,L"%s\\game\\scene.js",executable)<0)return 40;
+    if(swprintf_s(sourceMarker,L"%s\\%s\\.native-three-game-manifest.json",executable,sceneFolder.c_str())<0 ||
+       swprintf_s(scenePath,L"%s\\%s\\scene.js",executable,sceneFolder.c_str())<0)return 40;
     const bool importedGame=GetFileAttributesW(sourceMarker)!=INVALID_FILE_ATTRIBUTES;
     const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
     // v0.28 webapp mode: an ordinary Three.js webapp folder (index.html + ES
@@ -1746,9 +1763,16 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     // .native-three-game-manifest.json) runs in its own window. Without one,
     // the forest battle (game/scene.js) below stays the default engine scene.
     {
-        std::filesystem::path webappRoot;
-        if(NativeWebapp_FindRoot(commandLine,executable,webappRoot))
+        std::filesystem::path webappRoot,missingWebapp;
+        if(NativeWebapp_FindRoot(commandLine,executable,webappRoot,&missingWebapp))
             return NativeWebapp_Run(instance,webappRoot);
+        if(!missingWebapp.empty()){
+            const std::wstring text=L"No index.html in "+missingWebapp.wstring()+
+                L"\nThe webapp folder is empty or incomplete. For game2 run UpdateKuningriigid.exe first.";
+            if(GetEnvironmentVariableA("CI",nullptr,0)==0)
+                MessageBoxW(nullptr,text.c_str(),L"NativeThreeBridge",MB_OK|MB_ICONWARNING);
+            return 43;
+        }
     }
     if(importedGame || !battleScene) {
         const char* report=importedGame

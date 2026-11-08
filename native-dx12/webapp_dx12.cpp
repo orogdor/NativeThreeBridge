@@ -851,7 +851,7 @@ int WebappWindow::run(HINSTANCE instance) {
 } // namespace
 
 bool NativeWebapp_FindRoot(const wchar_t* commandLine, const std::filesystem::path& exeDir,
-                           std::filesystem::path& root) {
+                           std::filesystem::path& root, std::filesystem::path* missing) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(commandLine && *commandLine ? commandLine : L"", &argc);
     std::vector<std::wstring> args;
@@ -860,6 +860,8 @@ bool NativeWebapp_FindRoot(const wchar_t* commandLine, const std::filesystem::pa
         for (int i = 0; i < argc; i++) args.emplace_back(argv[i]);
     if (argv) LocalFree(argv);
     std::error_code ec;
+    for (const std::wstring& a : args)
+        if (a == L"--scene") return false; // classic scene.js game requested explicitly
     for (size_t i = 0; i < args.size(); i++) {
         std::filesystem::path candidate;
         if (args[i] == L"--webapp" && i + 1 < args.size()) candidate = args[++i];
@@ -872,7 +874,9 @@ bool NativeWebapp_FindRoot(const wchar_t* commandLine, const std::filesystem::pa
             if (ec) root = candidate;
             return true;
         }
+        if (missing && i > 0 && args[i - 1] == L"--webapp") *missing = candidate;
     }
+    if (missing && !missing->empty()) return false;
     if (std::filesystem::exists(exeDir / L"game" / L"index.html", ec)) {
         root = exeDir / L"game";
         return true;
