@@ -353,10 +353,14 @@ function protectedFormationCell(x,z) {
   const bucketHead=new Int32Array(FIGHT_BUCKETS*FIGHT_BUCKETS);
   const bucketNext=new Int16Array(SOLDIERS);
   let bucketTimer=0;
+  let redFront=-1e9,blueFront=1e9;
   function rebuildOpponentIndex() {
     bucketHead.fill(-1);
+    redFront=-1e9;blueFront=1e9;
     for(const u of units){
       if(u.dead)continue;
+      if(u.team===0)redFront=Math.max(redFront,u.x);
+      else blueFront=Math.min(blueFront,u.x);
       const gx=u.cell%GRID,gz=(u.cell/GRID)|0;
       const index=((gz/FIGHT_BUCKET_CELLS)|0)*FIGHT_BUCKETS+
                     ((gx/FIGHT_BUCKET_CELLS)|0);
@@ -420,6 +424,12 @@ function protectedFormationCell(x,z) {
     battleSeconds+=dt;
     bucketTimer+=dt;
     if(bucketTimer>=0.22)rebuildOpponentIndex();
+    // When the opposing army fronts are farther apart than acquisition
+    // range, there cannot be a strike or target in this frame. No reason to
+    // scan 1000 fighters or write the same zero animation data 60x/second.
+    // F12 staging updates the bounds immediately, so combat still starts.
+    if(!battleStarted && !battleFinished &&
+       blueFront-redFront>ACQUIRE_RANGE)return;
     combatSoundBudget=Math.min(3,combatSoundBudget+dt*6);
     // Offset work across frames; one search/candidate update per soldier
     // roughly every 16 frames, even with 1000 agents.
