@@ -17,6 +17,12 @@ class SpatialIndex2D {
 public:
     explicit SpatialIndex2D(float chunkSize=36.f):chunkSize_(chunkSize>0?chunkSize:36.f) {}
     void clear() { chunks_.clear(); itemCount_=0; }
+    // Reuse previously allocated chunk vectors for moving objects instead
+    // of allocating/freeing hundreds of per-frame STL vectors.
+    void beginFrame(){
+        for(auto& kv:chunks_)kv.second.clear();
+        itemCount_=0;
+    }
     void reserve(std::size_t chunks) { chunks_.reserve(chunks); }
     void insert(std::uint32_t id,float x,float z) {
         if(!std::isfinite(x)||!std::isfinite(z))return;
