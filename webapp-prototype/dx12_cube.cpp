@@ -187,21 +187,39 @@ struct Renderer {
           rootBlob->GetBufferSize(),IID_PPV_ARGS(&root)),"CreateRootSignature");
 
     const char* shader=R"HLSL(
-cbuffer C : register(b0) { row_major float4x4 mvp; float4 tint; };
-struct In { float3 xyz:POSITION; float3 face:COLOR; };
-struct Out { float4 pos:SV_POSITION; float3 face:COLOR; };
-Out VS(In i) { Out o; o.pos=mul(float4(i.xyz,1),mvp); o.face=i.face; return o; }
-float4 PS(Out i):SV_TARGET {
-  float3 linear = saturate(tint.rgb*i.face);
-  return float4(pow(linear,float3(1.0/2.2,1.0/2.2,1.0/2.2)),1);
+cbuffer CubeConstants : register(b0) { row_major float4x4 mvp; float4 tint; };
+struct CubeVertexInput { float3 position:POSITION; float3 shading:COLOR0; };
+struct CubePixelInput { float4 clipPosition:SV_POSITION; float3 shading:COLOR0; };
+CubePixelInput CubeVS(CubeVertexInput inputVertex) {
+  CubePixelInput result;
+  result.clipPosition=mul(float4(inputVertex.position,1.0),mvp);
+  result.shading=inputVertex.shading;
+  return result;
+}
+float4 CubePS(CubePixelInput inputPixel):SV_Target {
+  float3 shadedColor=saturate(tint.rgb*inputPixel.shading);
+  float3 gammaColor=pow(shadedColor,float3(0.454545,0.454545,0.454545));
+  return float4(gammaColor,1.0);
 }
 )HLSL";
     ComPtr<ID3DBlob> vs,ps;
-    check(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"VS",
-          "vs_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&vs,&errors),"Compile vertex shader");
+    HRESULT compileResult=D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,
+          "CubeVS","vs_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&vs,&errors);
+    if(FAILED(compileResult)) {
+      if(errors) logLine(std::string("HLSL vertex compiler: ") +
+                        std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                    errors->GetBufferSize()));
+      check(compileResult,"Compile vertex shader");
+    }
     errors.Reset();
-    check(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"PS",
-          "ps_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&ps,&errors),"Compile pixel shader");
+    compileResult=D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,
+          "CubePS","ps_5_0",D3DCOMPILE_ENABLE_STRICTNESS,0,&ps,&errors);
+    if(FAILED(compileResult)) {
+      if(errors) logLine(std::string("HLSL pixel compiler: ") +
+                        std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                    errors->GetBufferSize()));
+      check(compileResult,"Compile pixel shader");
+    }
     D3D12_INPUT_ELEMENT_DESC layout[]={
       {"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
       {"COLOR",0,DXGI_FORMAT_R32G32B32_FLOAT,0,12,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}
