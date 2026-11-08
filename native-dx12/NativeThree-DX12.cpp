@@ -82,7 +82,7 @@ static ComPtr<ID3D12GraphicsCommandList> gCmd;
 static ComPtr<ID3D12Fence> gFence;
 static ComPtr<ID3D12RootSignature> gRoot;
 static ComPtr<ID3D12PipelineState> gPSO,gShadowPSO;
-static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth;
+static ComPtr<ID3D12Resource> gFrameCB,gInstancesCB,gSoldierCB,gLightsCB,gGridCB,gShadowCameraCB,gShadowDepth,gRigSkinGPU;
 static ComPtr<ID3D12QueryHeap> gGpuTimingQueries;
 static ComPtr<ID3D12Resource> gGpuTimingReadback;
 static UINT64 gGpuTimingFrequency=0;
@@ -110,7 +110,7 @@ static ComPtr<ID3D12Resource> gWalkCB;
 static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
-static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{},gGridSRV[FRAME_COUNT]{};
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{},gGridSRV[FRAME_COUNT]{},gRigSkinSRV{};
 static UINT gMainVisibleTrees=0;
 static XMFLOAT4X4 gLastVisibilityMatrix{};
 static bool gHaveVisibilityCache=false;
@@ -326,6 +326,33 @@ static void loadMesh(UINT meshIndex,int meshRes,int texRes,DrawParams draw) {
     makeTexture(meshIndex,texRes);
 }
 
+static void loadRigSkin() {
+    DWORD size=0;
+    const BYTE *raw=resourceBytes(104,&size);
+    if(size<16 || memcmp(raw,"NTS1",4)!=0)
+        fatal("Rigged spearman weights missing",E_INVALIDARG);
+    UINT vertices=0,bones=0,stride=0;
+    memcpy(&vertices,raw+4,4);
+    memcpy(&bones,raw+8,4);
+    memcpy(&stride,raw+12,4);
+    if(bones!=8 || stride!=32 || vertices!=gMesh[0].vbv.SizeInBytes/sizeof(Vertex) ||
+       (UINT64)size!=16ull+(UINT64)vertices*stride)
+        fatal("Rigged spearman weights invalid",E_INVALIDARG);
+    gRigSkinGPU=staticGpuBuffer(raw+16,(UINT64)vertices*stride,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Format=DXGI_FORMAT_UNKNOWN;
+    view.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+    view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.Buffer.NumElements=vertices;
+    view.Buffer.StructureByteStride=stride;
+    const UINT slot=5+FRAME_COUNT*2; // textures0-2, shadow3, indices4-5, tree6, grid7-8
+    auto cpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr+=(SIZE_T)slot*gSRVStep;
+    gDevice->CreateShaderResourceView(gRigSkinGPU.Get(),&view,cpu);
+    gRigSkinSRV=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+    gRigSkinSRV.ptr+=(UINT64)slot*gSRVStep;
+}
 static void createDebugRouteGeometry() {
     // Exactly the A* routes produced by game/scene.js, not hand-authored lines.
     // Each record is [team,x1,z1,x2,z2]. Build static emissive triangle strips.
@@ -419,6 +446,10 @@ Texture2DArray gShadowDepthTexture : register(t1);
 Buffer<uint> gShadowInstanceIDs : register(t2);
 SamplerState gSampler : register(s0);
 SamplerState gShadowSampler : register(s1);
+// Generated from the JOINTS_0 / WEIGHTS_0 attributes of the actual
+// 8-bone glTF skin. The original 32-byte mesh VBO remains unchanged.
+struct SkinInfluence { uint4 joints; float4 weights; };
+StructuredBuffer<SkinInfluence> gRigVertices : register(t5);
 struct Vin { float3 p:POSITION; float3 n:NORMAL; float2 uv:TEXCOORD0; };
 struct Vout {
     float4 p:SV_POSITION;
@@ -426,7 +457,44 @@ struct Vout {
     float2 uv:TEXCOORD0;
     float3 worldPos:TEXCOORD1;
 };
-Vout VSMain(Vin v, uint instance:SV_InstanceID) {
+// Bone hierarchy (local mesh coordinates, original GLB bounds +-0.5):
+// Pelvis0 -> Spine1 -> Arms6/7; Pelvis0 -> ThighL2/ShinL3,
+//                                  Pelvis0 -> ThighR4/ShinR5.
+// The exported GLB stores the same pivots, joints, and inverse bind matrices.
+// Each vertex is linearly blended between up to four actual assigned joints.
+void boneRotX(inout float3 p,inout float3 n,float3 pivot,float angle){
+    float sn=sin(angle),cs=cos(angle);
+    float3 d=p-pivot;
+    p=float3(d.x,cs*d.y-sn*d.z,sn*d.y+cs*d.z)+pivot;
+    n=float3(n.x,cs*n.y-sn*n.z,sn*n.y+cs*n.z);
+}
+void boneRotZ(inout float3 p,inout float3 n,float3 pivot,float angle){
+    float sn=sin(angle),cs=cos(angle);
+    float3 d=p-pivot;
+    p=float3(cs*d.x-sn*d.y,sn*d.x+cs*d.y,d.z)+pivot;
+    n=float3(cs*n.x-sn*n.y,sn*n.x+cs*n.y,n.z);
+}
+void skinOdameesBone(uint bone,float4 walk,inout float3 p,inout float3 n){
+    float stride=walk.x*walk.z;
+    // Main thighs counter-rotate; shins hinge around knees, then inherit
+    // the parent's hip rotation. The pivots match exported glTF rest joints.
+    if(bone==2 || bone==3){
+        if(bone==3)
+            boneRotX(p,n,float3(-0.07,-0.31,0),max(0.0,-stride)*0.56);
+        boneRotX(p,n,float3(-0.07,-0.13,0),stride*0.52);
+    } else if(bone==4 || bone==5){
+        if(bone==5)
+            boneRotX(p,n,float3(0.07,-0.31,0),max(0.0,stride)*0.56);
+        boneRotX(p,n,float3(0.07,-0.13,0),-stride*0.52);
+    } else if(bone==6 || bone==7){
+        float side=bone==6?-1.0:1.0;
+        boneRotX(p,n,float3(side*0.17,0.18,0),side*stride*0.19);
+        boneRotZ(p,n,float3(0,-0.12,0),stride*0.025);
+    } else if(bone==1){
+        boneRotZ(p,n,float3(0,-0.12,0),stride*0.025);
+    }
+}
+Vout VSMain(Vin v, uint instance:SV_InstanceID, uint vertexID:SV_VertexID) {
     Vout o;
     uint sourceInstance=gShadowPass!=0 ? gShadowInstanceIDs[gShadowOffset+instance] : instance;
     float3 p=v.p*gScale+float3(0,gYOffset,0);
@@ -440,27 +508,42 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID) {
         } else {
             const uint soldierIndex=sourceInstance+(gKind==3?500:0);
             instanceTransform=gSoldierInstances[soldierIndex];
-            // First walk test for the unrigged odamees GLB. Its local Y
-            // extents are approximately [-0.5,+0.5]; lower legs are below
-            // -0.13 and separated by local X. No bone asset is invented.
             float4 walk=gWalkStates[soldierIndex];
-            float lowerBody=saturate((-0.12-v.p.y)*7.5);
-            float legSide=v.p.x<0.0?-1.0:1.0;
-            // Avoid moving spear tips or other wide lower accessories.
-            lowerBody*=1.0-saturate((abs(v.p.x)-0.17)*18.0);
-            float legSin=legSide*walk.x*walk.z*0.48;
-            float legCos=sqrt(saturate(1.0-legSin*legSin));
-            float dy=v.p.y+0.13;
-            float3 swung=float3(v.p.x,
-                -0.13+dy*legCos-v.p.z*legSin,
-                dy*legSin+v.p.z*legCos);
-            swung.y+=max(0.0,legSide*walk.x)*0.045*walk.z;
-            float3 swungNormal=float3(v.n.x,
-                v.n.y*legCos-v.n.z*legSin,
-                v.n.y*legSin+v.n.z*legCos);
-            localPos=lerp(v.p,swung,lowerBody);
+            if(gKind==1) {
+                // RED army: 8 true glTF bones and vertex joint weights.
+                // A single instance of the rig resource is shared by 500 men.
+                SkinInfluence skin=gRigVertices[vertexID];
+                float3 skinnedPos=0;
+                float3 skinnedNormal=0;
+                [unroll] for(uint ji=0;ji<4;ji++){
+                    if(skin.weights[ji]>0.000001) {
+                        float3 bp=v.p,bn=v.n;
+                        skinOdameesBone(skin.joints[ji],walk,bp,bn);
+                        skinnedPos+=bp*skin.weights[ji];
+                        skinnedNormal+=bn*skin.weights[ji];
+                    }
+                }
+                localPos=skinnedPos;
+                localNormal=normalize(skinnedNormal);
+            } else {
+                // BLUE army: original v0.21 unrigged shader gait as control.
+                float lowerBody=saturate((-0.12-v.p.y)*7.5);
+                float legSide=v.p.x<0.0?-1.0:1.0;
+                lowerBody*=1.0-saturate((abs(v.p.x)-0.17)*18.0);
+                float legSin=legSide*walk.x*walk.z*0.48;
+                float legCos=sqrt(saturate(1.0-legSin*legSin));
+                float dy=v.p.y+0.13;
+                float3 swung=float3(v.p.x,
+                    -0.13+dy*legCos-v.p.z*legSin,
+                    dy*legSin+v.p.z*legCos);
+                swung.y+=max(0.0,legSide*walk.x)*0.045*walk.z;
+                float3 swungNormal=float3(v.n.x,
+                    v.n.y*legCos-v.n.z*legSin,
+                    v.n.y*legSin+v.n.z*legCos);
+                localPos=lerp(v.p,swung,lowerBody);
+                localNormal=normalize(lerp(v.n,swungNormal,lowerBody));
+            }
             localPos.y+=walk.w;
-            localNormal=normalize(lerp(v.n,swungNormal,lowerBody));
         }
         p=mul(instanceTransform,float4(localPos*gScale,1)).xyz+
           float3(0,gYOffset,0);
@@ -528,7 +611,7 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[10]={};
+    D3D12_ROOT_PARAMETER rp[11]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -536,7 +619,7 @@ static void makePipeline() {
     rp[1].Constants.ShaderRegister=1;
     rp[1].Constants.Num32BitValues=11;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[5]={};
+    D3D12_DESCRIPTOR_RANGE ranges[6]={};
     for(UINT i=0;i<3;i++){
         ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors=1;
@@ -579,6 +662,14 @@ static void makePipeline() {
     rp[9].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[9].Descriptor.ShaderRegister=6;
     rp[9].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    // Rig influences are read by the vertex shader in both main + shadow passes.
+    ranges[5].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[5].NumDescriptors=1;
+    ranges[5].BaseShaderRegister=5;
+    rp[10].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[10].DescriptorTable.NumDescriptorRanges=1;
+    rp[10].DescriptorTable.pDescriptorRanges=&ranges[5];
+    rp[10].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -591,7 +682,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=10;rs.pParameters=rp;
+    rs.NumParameters=11;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -731,7 +822,7 @@ static void initializeDX12() {
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=4+FRAME_COUNT+1+FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4+FRAME_COUNT+1+FRAME_COUNT+1;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -851,6 +942,7 @@ static void initializeDX12() {
     DrawParams bark={0,0.46f,0,0,{0.27f,0.20f,0.14f,1.0f}};
     DrawParams needles={0,0.46f,0,0.40f,{1,1,1,1}};
     loadMesh(0,101,201,soldier);
+    loadRigSkin();
     loadMesh(1,102,202,bark);
     loadMesh(2,103,203,needles);
     makeGround();
@@ -1006,6 +1098,7 @@ static void drawShadowMaps() {
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(10,gRigSkinSRV);
     // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
     // and the two distinct army instance ranges. The depth texture is shared
     // as a 20-layer texture array and sampled by the forward lighting pass.
@@ -1334,6 +1427,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(10,gRigSkinSRV);
     gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
