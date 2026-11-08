@@ -51,12 +51,15 @@ set_target_properties(NativeThreeJS PROPERTIES OUTPUT_NAME "NativeThree-Diagnost
 target_include_directories(NativeThreeJS PRIVATE native-dx12)
 target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32 shell32)
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
+# Webapp JavaScript can recurse deeply; Windows' default 1 MB stack crashed silently.
+target_link_options(NativeThreeJS PRIVATE /STACK:67108864)
 
 # Headless CI check of the webapp runtime with the same embedded resources.
 add_executable(WebappSmoke native-dx12/webapp_smoke.cpp ${WEBAPP_RUNTIME})
 target_include_directories(WebappSmoke PRIVATE native-dx12)
 target_link_libraries(WebappSmoke PRIVATE qjs d3dcompiler user32)
 target_compile_definitions(WebappSmoke PRIVATE UNICODE _UNICODE)
+target_link_options(WebappSmoke PRIVATE /STACK:67108864)
 
 add_executable(ThreeSceneSmoke
   native-dx12/three_scene_smoke.cpp

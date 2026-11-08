@@ -74,7 +74,19 @@ bool compileShaders() {
 }
 } // namespace
 
+LONG WINAPI smokeCrashFilter(EXCEPTION_POINTERS* info) {
+    std::printf("CRASH: native exception 0x%08lX at %p\n",
+                info && info->ExceptionRecord ? (unsigned long)info->ExceptionRecord->ExceptionCode : 0ul,
+                info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr);
+    std::fflush(stdout);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 int wmain(int argc, wchar_t** argv) {
+    ULONG guarantee = 128 * 1024;
+    SetThreadStackGuarantee(&guarantee);
+    SetUnhandledExceptionFilter(smokeCrashFilter);
+    setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) {
         std::printf("Usage: WebappSmoke <webapp folder> <min draws> [expect-boot-error|expect-resize]\n");
         return 2;
@@ -100,6 +112,7 @@ int wmain(int argc, wchar_t** argv) {
     std::size_t maxDraws = 0;
     for (int frame = 0; frame < 300; frame++) {
         sink.framePasses.clear();
+        if (frame < 3 || frame % 50 == 0) std::printf("frame %d\n", frame);
         host.frame(t);
         if (!sink.framePasses.empty()) sink.lastPasses = sink.framePasses;
         for (const auto& p : sink.framePasses) maxDraws = std::max<std::size_t>(maxDraws, std::size_t(p[43]));

@@ -535,7 +535,9 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     s.rt = JS_NewRuntime();
     if (!s.rt) { error = "Cannot create QuickJS runtime"; return false; }
     JS_SetMemoryLimit(s.rt, 1024ULL * 1024ULL * 1024ULL);
-    JS_SetMaxStackSize(s.rt, 8ULL * 1024ULL * 1024ULL);
+    // The game/smoke EXEs reserve a 64 MB main-thread stack (CMake /STACK);
+    // QuickJS throws a catchable RangeError well before that is exhausted.
+    JS_SetMaxStackSize(s.rt, 48ULL * 1024ULL * 1024ULL);
     JS_SetModuleLoaderFunc(s.rt, moduleNormalize, moduleLoader, nullptr);
     JS_SetHostPromiseRejectionTracker(s.rt, rejectionTracker, nullptr);
     s.ctx = JS_NewContext(s.rt);

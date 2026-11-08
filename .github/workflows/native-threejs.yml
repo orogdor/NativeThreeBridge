@@ -94,6 +94,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed in the native webapp runtime" }
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-bad-import 0 expect-boot-error
           if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly" }
+      - name: Real game check - Kuningriigid through the embedded webapp runtime (informational)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CI: '1'
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git clone --depth 1 https://github.com/orogdor/Kuningriigid.git kuningriigid-check
+          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid checkout failed" }
+          & .\build\Release\WebappSmoke.exe kuningriigid-check 1
+          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly in the webapp runtime (exit $LASTEXITCODE)" }
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |

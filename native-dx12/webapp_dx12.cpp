@@ -168,6 +168,25 @@ private:
 };
 
 WebappWindow* gActive = nullptr;
+std::FILE* gCrashLog = nullptr;
+std::string gCrashPhase = "startup";
+
+// Native crashes (access violation, stack overflow) must not just close the
+// window silently: write what happened to the log and tell the user.
+LONG WINAPI webappCrashFilter(EXCEPTION_POINTERS* info) {
+    char text[512];
+    const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    const void* address = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+    const char* name = code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
+                     : code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
+                     : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer divide by zero" : "native exception";
+    std::snprintf(text, sizeof text, "NativeThreeBridge crashed: %s (0x%08lX at %p) during %s.",
+                  name, (unsigned long)code, address, gCrashPhase.c_str());
+    if (gCrashLog) { std::fprintf(gCrashLog, "[crash] %s\n", text); std::fflush(gCrashLog); }
+    if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
+        MessageBoxA(nullptr, text, "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 LRESULT CALLBACK webappWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (gActive) return gActive->handle(hwnd, msg, wp, lp);
@@ -725,6 +744,10 @@ int WebappWindow::run(HINSTANCE instance) {
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     const std::filesystem::path logPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-log.txt";
     _wfopen_s(&log_, logPath.c_str(), L"wb");
+    gCrashLog = log_;
+    ULONG guarantee = 128 * 1024; // room for the crash handler after a stack overflow
+    SetThreadStackGuarantee(&guarantee);
+    SetUnhandledExceptionFilter(webappCrashFilter);
     log("info", "Opening webapp: " + root_.u8string());
 
     std::string shim, error;
@@ -761,11 +784,14 @@ int WebappWindow::run(HINSTANCE instance) {
     height_ = std::max<LONG>(1, client.bottom);
     initDevice();
 
+    gCrashPhase = "loading index.html and the game's JavaScript";
+    log("info", "Starting JavaScript (QuickJS)");
     if (!host_.start(root_, shim, std::move(builtins), this, int(width_), int(height_), error)) {
         log("error", error);
         MessageBoxA(window_, error.c_str(), "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
         return 45;
     }
+    log("info", "index.html parsed, scripts started");
     ShowWindow(window_, SW_SHOW);
     SetForegroundWindow(window_);
 
@@ -789,7 +815,9 @@ int WebappWindow::run(HINSTANCE instance) {
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - start).count();
         pendingPasses_.clear();
+        gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
         host_.frame(ms);
+        gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
         renderFrame();
         frameNumber++;
@@ -799,6 +827,12 @@ int WebappWindow::run(HINSTANCE instance) {
             updateTitle(statFrames / elapsed);
             statFrames = 0;
             statStart = now;
+        }
+        if (frameNumber == 1 || frameNumber == 60 || frameNumber % 600 == 0) {
+            char line[160];
+            std::snprintf(line, sizeof line, "frame %d: %u draws, %zu geometries, %zu instance sets",
+                          frameNumber, lastDraws_, geometries_.size(), instances_.size());
+            log("info", line);
         }
         if (frameNumber == 30 && !bootDialogShown_) {
             const std::string status = host_.statusJson();
