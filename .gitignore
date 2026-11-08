@@ -8,4 +8,6 @@
 *.dll
 node_modules/
 dist/
+launcher/bin/
+launcher/obj/
 .DS_Store

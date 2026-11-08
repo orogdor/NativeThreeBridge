@@ -55,14 +55,14 @@ test('DX12 handles native sound events and keeps restart/mute controls safe',()=
   assert.match(dx,/gAudio\.shutdown\(\)/);
 });
 
-test('release includes editable WAVs synthesized from original sources',()=>{
+test('battle fixture synthesizes native WAVs while test ZIP defaults to Kuningriigid source',()=>{
   const generator=read('tools/generate_native_audio_samples.py');
   assert.match(generator,/with wave\.open/);
   assert.match(generator,/make\("signal"/);
   assert.match(generator,/make\("step"/);
   assert.match(generator,/make\("restart"/);
   assert.match(workflow,/python tools\/generate_native_audio_samples\.py/);
-  assert.match(workflow,/Copy-Item game\/audio\/\*\.wav dist\/game\/audio\//);
-  assert.match(workflow,/Test-Path verify\/game\/audio\/signal\.wav/);
-  assert.equal(read('version.txt').trim(),'0.26.0');
+  assert.match(workflow,/Copy-Item game\/SOURCE\.txt dist\/game\/SOURCE\.txt/);
+  assert.doesNotMatch(workflow,/Copy-Item game\/audio\/\*\.wav dist\/game\/audio\//);
+  assert.equal(read('version.txt').trim(),'0.27.0-test.1');
 });

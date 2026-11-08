@@ -1726,6 +1726,37 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
     return DefWindowProcW(win,msg,wp,lp);
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
+    // The downloaded Kuningriigid source is a browser application. Never feed
+    // it to the fixed-layout battle-scene QuickJS/DX12 host as executable JS.
+    wchar_t exePath[MAX_PATH]={};
+    DWORD exeLength=GetModuleFileNameW(nullptr,exePath,MAX_PATH);
+    if(!exeLength || exeLength>=MAX_PATH)return 40;
+    wchar_t* separator=wcsrchr(exePath,L'\\');
+    if(!separator)return 40;
+    *separator=0;
+    wchar_t sourceMarker[MAX_PATH]={};
+    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",exePath)<0)return 40;
+    const bool importedGame=GetFileAttributesW(sourceMarker)!=INVALID_FILE_ATTRIBUTES;
+    wchar_t scenePath[MAX_PATH]={};
+    if(swprintf_s(scenePath,L"%s\\game\\scene.js",exePath)<0)return 40;
+    const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
+    if(importedGame || !battleScene){
+        const char* report=importedGame
+            ? "Kuningriigid source was installed in game/, but this DX12 test engine cannot run it yet. "
+              "The game uses browser DOM, HTML/CSS, module loading and WebGLRenderer APIs; "
+              "the native host currently accepts only its dedicated scene.js contract. "
+              "No downloaded game code was executed."
+            : "No compatible scene.js is installed. Run Game-Updater.exe to download Kuningriigid. "
+              "The current DX12 engine cannot execute that browser game yet.";
+        char reportPath[MAX_PATH]={};
+        if(sprintf_s(reportPath,"%ls\\compatibility-report.txt",exePath)>0){
+            FILE* file=nullptr;
+            if(!fopen_s(&file,reportPath,"wb") && file){fputs(report,file);fputc('\n',file);fclose(file);}
+        }
+        if(GetEnvironmentVariableA("CI",nullptr,0)==0)
+            MessageBoxA(nullptr,report,"NativeThreeBridge compatibility",MB_OK|MB_ICONWARNING);
+        return 42;
+    }
     WNDCLASSW wc={};
     wc.lpfnWndProc=WindowProc;
     wc.hInstance=instance;
