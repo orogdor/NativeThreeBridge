@@ -18,7 +18,7 @@ test('1000 soldier animations have dedicated in-flight state buffers',()=>{
   assert.match(dx,/gWalkBuffers\[FRAME_COUNT\]/);
   assert.match(dx,/gWalkBuffers\[frame\]=uploadBuffer\(nullptr,LIGHT_COUNT\*4\*sizeof\(float\)\)/);
   assert.match(dx,/soldierWalk.update\(renderMatrices.data\(\)\+TREE_COUNT\*16/);
-  assert.match(dx,/rs.NumParameters=10/);
+  assert.match(dx,/rs.NumParameters=11/);
 });
 test('exact same gait deformation affects both rendered soldiers and their real shadows',()=>{
   assert.match(dx,/float4 walk=gWalkStates\[soldierIndex\]/);
