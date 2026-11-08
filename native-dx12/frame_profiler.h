@@ -11,8 +11,11 @@
 namespace native_three {
 class AsyncCsvLogger {
 public:
-    explicit AsyncCsvLogger(std::string filename):filename_(std::move(filename)),
-        thread_([this]{run();}){}
+    explicit AsyncCsvLogger(std::string filename):filename_(std::move(filename)){
+        // All mutexes, condition variables and queue state are fully
+        // constructed before the writer thread can access this object.
+        thread_=std::thread([this]{run();});
+    }
     AsyncCsvLogger(const AsyncCsvLogger&)=delete;
     AsyncCsvLogger& operator=(const AsyncCsvLogger&)=delete;
     ~AsyncCsvLogger(){
@@ -34,12 +37,12 @@ public:
     }
 private:
     std::string filename_;
-    std::thread thread_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<std::string> queue_;
     bool stopping_=false;
     unsigned discarded_=0;
+    std::thread thread_;
     void run(){
         std::ofstream file(filename_,std::ios::app);
         if(file && file.tellp()==0)
