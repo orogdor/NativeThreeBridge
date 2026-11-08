@@ -1,10 +1,20 @@
 #include "three_js_host.h"
 #include <cmath>
+#include <array>
+#include <cstring>
 #include <cstdio>
 #include <vector>
 int main(){
     constexpr int TREES=10000, PER_ARMY=500, SOLDIERS=1000, INSTANCE_FLOATS=11000*16, LIGHT_FLOATS=1000*8;
     NativeThreeJS_Init();  // Validates 10000-tree forest, 1000 A* agents and two armies
+    // Exercise actual QuickJS -> C++ sound dispatch with no audio hardware.
+    if(!NativeThreeJS_TriggerAudioTest())return 20;
+    std::array<native_three::AudioCommand,8> initialAudio{};
+    const auto count=NativeThreeJS_PopAudioCommands(initialAudio.data(),initialAudio.size());
+    if(count!=1 || std::strcmp(initialAudio[0].asset,"signal")!=0 ||
+       initialAudio[0].spatial || initialAudio[0].volume<0.7f)
+        return 21;
+    if(NativeThreeJS_PopAudioCommands(initialAudio.data(),8)!=0)return 22;
     std::vector<float> debugSegments(60000);
     const size_t debugFloats=NativeThreeJS_DebugSegments(debugSegments.data(),debugSegments.size());
     if(debugFloats<5000 || debugFloats%5!=0){
@@ -69,7 +79,11 @@ int main(){
     std::puts("PASS: real-time navigation status reports moving soldiers, path plans and A* waypoint progress");
     // Native restart is a real scene/navigation reset, not an OS process relaunch.
     // Units and moving lights must return to the exact deterministic start.
+    // In-flight step events from old scene must be discarded during restart.
     NativeThreeJS_Restart();
+    if(NativeThreeJS_PopAudioCommands(initialAudio.data(),8)!=0)return 23;
+    if(!NativeThreeJS_TriggerAudioTest() ||
+       NativeThreeJS_PopAudioCommands(initialAudio.data(),8)!=1)return 24;
     NativeThreeNavStatus reset{};
     NativeThreeJS_GetNavStatus(&reset);
     if(reset.moved!=0 || reset.planned!=0 || reset.searches!=0 ||
@@ -87,6 +101,7 @@ int main(){
         return 12;
     }
     std::puts("PASS: CSS Restart command recreates Three.js scene, A* state and initial army/light transforms");
+    std::puts("PASS: QuickJS emits typed native audio events, reset clears old sounds");
     NativeThreeJS_Shutdown();
     return 0;
 }
