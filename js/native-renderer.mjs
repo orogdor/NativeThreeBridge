@@ -278,8 +278,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._collect(scene, camera, opaque, transparent, lights, ambient);
 
       if (this.sortObjects) {
-        opaque.sort((a, b) => a.z - b.z);
-        transparent.sort((a, b) => b.z - a.z);
+        opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
+        transparent.sort((a, b) => a.renderOrder - b.renderOrder || b.z - a.z);
       }
 
       // ---- pass header
@@ -445,8 +445,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity: m.opacity ?? 1,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
-        matrix: mesh.matrixWorld.elements, z: base.z,
+        matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
+      if (globalThis.__ntDebugDraws) {
+        const g = mesh.geometry, c = g.attributes.color;
+        globalThis.__ntDebugDraws.push({
+          mesh: mesh.name || mesh.type, material: m.type, matName: m.name || '', color: color && color.isColor ? color.getHexString() : null,
+          vertexColors: !!m.vertexColors, colorAttr: c ? `${c.itemSize}/${c.array.constructor.name}/${c.normalized}` : null,
+          map: !!m.map, onBeforeCompile: m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString(),
+          uniforms: m.uniforms ? Object.keys(m.uniforms).slice(0, 12) : null, emissive: emissive ? emissive.getHexString() : null,
+          transparent: !!m.transparent, opacity: m.opacity, count, instances: draw.instanceCount, defines: m.defines ? Object.keys(m.defines) : null,
+        });
+      }
       if (flags & DrawFlags.TRANSPARENT) transparent.push(draw); else opaque.push(draw);
       this.info.render.triangles += (flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? 0 : Math.floor(count / 3) * draw.instanceCount;
       if (flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) this.info.render.lines += count;

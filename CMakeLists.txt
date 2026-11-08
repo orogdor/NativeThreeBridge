@@ -88,6 +88,8 @@ target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xa
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
 # Webapp JavaScript can recurse deeply; Windows' default 1 MB stack crashed silently.
 target_link_options(NativeThreeJS PRIVATE /STACK:67108864)
+# Sources are UTF-8 (em dashes in window titles etc.).
+target_compile_options(NativeThreeJS PRIVATE /utf-8)
 
 # Headless CI check of the webapp runtime with the same embedded resources.
 add_executable(WebappSmoke native-dx12/webapp_smoke.cpp ${WEBAPP_RUNTIME})
