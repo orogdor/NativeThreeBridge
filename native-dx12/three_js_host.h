@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include "native_audio_core.h"
 
 // Owns a real QuickJS-NG runtime executing the bundled official Three.js classes.
 // Data copied from THREE.InstancedMesh world matrices into DX12's upload buffer.
@@ -29,3 +30,10 @@ std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t floatCap
 void NativeThreeJS_Shutdown();
 // Native window command: completely re-create the original Three.js scene.
 void NativeThreeJS_Restart();
+
+// Lossless JS-to-native audio events. C++ drives XAudio2; the JS scene never
+// needs AudioContext, media decoding or an embedded web browser.
+std::size_t NativeThreeJS_PopAudioCommands(native_three::AudioCommand* out,
+                                          std::size_t capacity);
+// Explicit UI/F10 test: asks scene.js to send a named audio event via the bridge.
+bool NativeThreeJS_TriggerAudioTest();
