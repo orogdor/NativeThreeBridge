@@ -1,3 +1,20 @@
+NativeThreeBridge v0.28.2 - LARGE APP STARTUP DIAGNOSTICS
+=======================================================
+The native window is shown before the game JavaScript is evaluated, so large
+apps no longer appear only as an invisible Task Manager background process.
+Promise jobs are drained in bounded batches instead of monopolizing Win32.
+A QuickJS execution watchdog interrupts infinite loops and reports which
+JavaScript module was last loaded or executing. The default synchronous JS
+call limit is 45000 ms; NTB_JS_WATCHDOG_MS=200 sets it to 200 ms for tests.
+On startup failures inspect NativeThreeBridge-webapp-log.txt beside the EXE.
+The last 'QuickJS evaluating/compiling' entry narrows down the failing script.
+The game/ folder is still automatically loaded, no special meta tag needed.
+The native legacy 10k-tree/1000-soldier battle stays available via --battle.
+This is NOT yet full compatibility with every HTML/WebGL/Three.js game.
+Texture decoding, GLB loading, CSS overlay rendering and custom GLSL are
+still incomplete; a startup watchdog is a safety/diagnostic fix, not a full
+renderer compatibility implementation.
+
 NativeThreeBridge v0.28.1 GAME FOLDER AUTOLOAD (EXPERIMENT)
 ===================================================
 The Windows EXE now tries game/index.html automatically on every launch.
