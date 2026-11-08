@@ -6,18 +6,18 @@ const js=readFileSync(new URL('../game/scene.js',import.meta.url),'utf8');
 const host=readFileSync(new URL('../native-dx12/three_js_host.cpp',import.meta.url),'utf8');
 const workflow=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.meta.url),'utf8');
 
-test('500 native Three.js spotlights each follow a soldier; only 16 depth maps',()=>{
+test('1000 native Three.js spotlights each follow a soldier; only 16 depth maps',()=>{
   assert.match(js,/new THREE\.SpotLight\(/);
   assert.match(js,/lamp\.castShadow=true/);
   assert.match(js,/lamp\.shadow\.mapSize\.set\(256,256\)/);
   assert.match(js,/lamp\.position\.x=unit\.x/);
   assert.match(js,/__nativeThreeLightFrame/);
-  assert.match(host,/constexpr size_t FLOATS = 500 \* 8/);
+  assert.match(host,/constexpr size_t FLOATS = 1000 \* 8/);
   assert.match(dx,/NativeThreeJS_Lights\(lights,LIGHT_COUNT\*8\)/);
   assert.match(dx,/SHADOW_COUNT=16/);
-  assert.match(dx,/LIGHT_COUNT=500/);
+  assert.match(dx,/LIGHT_COUNT=1000/);
 });
-test('DX12 bins all 500 lights and shades with 16 nearest per pixel',()=>{
+test('DX12 bins all 1000 lights and shades with 16 nearest per pixel',()=>{
   assert.match(dx,/LightGridConstants/);
   assert.match(dx,/MAX_CELL_LIGHTS=16/);
   assert.match(dx,/gGridCounts\[64\]/);
@@ -25,7 +25,7 @@ test('DX12 bins all 500 lights and shades with 16 nearest per pixel',()=>{
   assert.match(dx,/for\(UINT li=0;li<LIGHT_COUNT;li\+\+\)/);
   assert.match(dx,/gGridCB->GetGPUVirtualAddress\(\)/);
   assert.match(dx,/gLightsCB->GetGPUVirtualAddress\(\)/);
-  assert.match(dx,/gShadowSlots\[500\]/);
+  assert.match(dx,/gShadowSlots\[1000\]/);
 });
 test('real DX12 shadow depth array captures tree and soldier silhouettes',()=>{
   assert.match(dx,/void PSShadow\(Vout v\)/);
@@ -54,7 +54,7 @@ test('shadow slots are selected from lights nearest the visible camera focus',()
   assert.match(dx,/constants\.shadowSlots\[li\]\.x=gEnableShadows\?\(float\)k:-1\.f/);
 });
 test('camera can inspect either army close up and toggle real route overlays',()=>{
-  assert.match(dx,/gCameraMode=1/);
+  assert.match(dx,/gCameraMode=0/);
   assert.match(dx,/wp==VK_F1/);
   assert.match(dx,/wp==VK_F2/);
   assert.match(dx,/wp==VK_F3/);

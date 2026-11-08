@@ -10,7 +10,7 @@
 #include "three_js_host.h"
 
 namespace {
-constexpr std::size_t MATRIX_FLOATS = 1500 * 16;
+constexpr std::size_t MATRIX_FLOATS = 11000 * 16;
 JSRuntime *runtime = nullptr;
 JSContext *context = nullptr;
 JSValue frameFunction = JS_UNDEFINED;
@@ -125,8 +125,8 @@ void NativeThreeJS_Init() {
     JS_FreeValue(context, check);
     JS_FreeValue(context, diagnostics);
     JS_FreeValue(context, global);
-    if (soldiers != 500 || armyCount != 2 || pines != 1000 || pathFailures != 0)
-        die("Unexpected JS scene: expected 1000 pines and two 250-soldier armies");
+    if (soldiers != 1000 || armyCount != 2 || pines != 10000 || pathFailures != 0)
+        die("Unexpected JS scene: expected 10000 pines and two 500-soldier armies");
     // Starting the JS scene must NOT precompute all 500 soldiers' routes.
     JSValue nav=JS_GetGlobalObject(context);
     JSValue navFunction=JS_GetPropertyStr(context,nav,"__nativeThreeNavStats");
@@ -154,7 +154,7 @@ void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t cap
     JSValue arrayBuffer = JS_GetTypedArrayBuffer(context, transforms, &offset, &length, &elementBytes);
     if (JS_IsException(arrayBuffer) || elementBytes != sizeof(float) ||
         length != MATRIX_FLOATS * sizeof(float)) {
-        die("Three.js frame must produce Float32Array(24000): 1000 trees + 500 soldiers");
+        die("Three.js frame must produce Float32Array(176000): 10000 trees + 1000 soldiers");
     }
     size_t arrayBytes = 0;
     uint8_t *bytes = JS_GetArrayBuffer(context, &arrayBytes, arrayBuffer);
@@ -164,7 +164,7 @@ void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t cap
     JS_FreeValue(context, transforms);
 }
 void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
-    constexpr size_t FLOATS = 500 * 8;
+    constexpr size_t FLOATS = 1000 * 8;
     if (!ready || !outLights || capacity < FLOATS)
         die("NativeThreeJS_Lights invalid state");
     JSValue result = JS_Call(context, lightFunction, JS_UNDEFINED, 0, nullptr);
@@ -172,7 +172,7 @@ void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
     size_t offset=0, bytes=0, elementBytes=0;
     JSValue buffer = JS_GetTypedArrayBuffer(context, result, &offset, &bytes, &elementBytes);
     if (JS_IsException(buffer) || elementBytes != sizeof(float) ||
-        bytes != FLOATS * sizeof(float)) die("Expected 500 Three.js SpotLight records");
+        bytes != FLOATS * sizeof(float)) die("Expected 1000 Three.js SpotLight records");
     size_t totalBytes=0;
     uint8_t *address = JS_GetArrayBuffer(context, &totalBytes, buffer);
     if (!address || offset + bytes > totalBytes) die("Three.js lights array bounds error");
