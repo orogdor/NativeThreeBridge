@@ -58,3 +58,24 @@ native callbacks. An arbitrary `index.html` is **not yet** a native game.
 The 2026-11-08 experiment targets the forest webapp only. It does **not**
 assert that the full Kuningriigid web repository is executable in the native
 DX12 engine.
+
+## Standalone Windows WebApp Battle
+
+The separately packaged `NativeThree-WebApp-Battle.exe` variant runs the
+simulation owned by `webapp/battle-scene.js`. Its native entry is declared
+in `webapp/index.html`, and the conversion writes `webapp/native-scene.js`.
+The EXE loads this native script directly: it does not read `game/scene.js`.
+
+The resulting ZIP includes a standalone EXE, a webapp directory and the
+Win32 UI/audio files. It intentionally does not include the old `game/scene.js`
+file or an auto-updater. A dedicated native QuickJS smoke executable tests
+the converted webapp script on Windows; the original scene is tested separately.
+
+Download the `NativeThree-WebApp-Battle-Windows-x64` artifact from the
+PR #15 Windows workflow run. Extract the inner ZIP and launch
+`NativeThree-WebApp-Battle.exe`. Read `README-WINDOWS.txt` inside.
+
+This is a **native rendering of the webapp's gameplay simulation**, not
+the browser HTML/WebGLRenderer running inside the EXE. Browser UI is replaced
+by existing native controls. GitHub's headless smoke tests cannot confirm
+DX12 image correctness or real FPS on a user's GPU.

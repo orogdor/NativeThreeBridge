@@ -61,7 +61,7 @@ jobs:
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke NativeThreeJS --parallel 4
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke NativeThreeJS NativeThreeWebApp WebAppSceneSmoke --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
       - name: Verify generic scene registry, spatial index and async path worker pool
         shell: pwsh
@@ -88,21 +88,54 @@ jobs:
         env:
           CI: '1'
         run: |
-          node tools/html-to-native.mjs webapp/index.html build/html-native/scene.js build/html-native/report.json
+          node tools/html-to-native.mjs webapp/index.html build/Release/webapp/native-scene.js build/html-native/report.json
           if ($LASTEXITCODE -ne 0) { throw "HTML conversion failed; inspect build/html-native/report.json" }
           $report=Get-Content build/html-native/report.json -Raw | ConvertFrom-Json
           if (!$report.readyForNativeSmoke -or $report.entryKind -ne "explicit-native") { throw "Converted game is not native-ready" }
-          Copy-Item build/html-native/scene.js build/Release/game/scene.js -Force
+          if (!(Test-Path build/Release/webapp/native-scene.js)) { throw "HTML-derived scene missing" }
+          & .\\build\\Release\\WebAppSceneSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Webapp-derived scene failed in native QuickJS host" }
           & .\\build\\Release\\ThreeSceneSmoke.exe
-          if ($LASTEXITCODE -ne 0) { throw "Converted HTML scene failed inside real native QuickJS host" }
-          Copy-Item game/scene.js build/Release/game/scene.js -Force
+          if ($LASTEXITCODE -ne 0) { throw "Default scene must remain independent and functional" }
       - name: Upload HTML to native first-test JavaScript
         uses: actions/upload-artifact@v4
         with:
           name: HTML-to-Native-Scene-Test
           path: |
-            build/html-native/scene.js
+            build/Release/webapp/native-scene.js
             build/html-native/report.json
+      - name: Package standalone native WebApp Battle for Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir="build/WebAppBattlePackage"
+          New-Item -ItemType Directory -Force "$dir/webapp","$dir/game/audio" | Out-Null
+          Copy-Item build/Release/NativeThree-WebApp-Battle.exe "$dir/NativeThree-WebApp-Battle.exe"
+          Copy-Item build/Release/webapp/native-scene.js "$dir/webapp/native-scene.js"
+          Copy-Item webapp/index.html "$dir/webapp/index.html"
+          Copy-Item webapp/battle-scene.js "$dir/webapp/battle-scene.js"
+          Copy-Item webapp/main.mjs "$dir/webapp/main.mjs"
+          Copy-Item webapp/style.css "$dir/webapp/style.css"
+          Copy-Item game/ui.html "$dir/game/ui.html"
+          Copy-Item game/ui.css "$dir/game/ui.css"
+          Copy-Item game/audio/*.wav "$dir/game/audio/"
+          Copy-Item generated/soldier-rigged.glb "$dir/game/odamees-rigged.glb"
+          Copy-Item webapp/README-WINDOWS.txt "$dir/README-WINDOWS.txt"
+          Copy-Item node_modules/three/LICENSE "$dir/LICENSE-ThreeJS.txt"
+          Copy-Item third_party/quickjs/LICENSE "$dir/LICENSE-QuickJS.txt"
+          if (Test-Path "$dir/game/scene.js") { throw "WebApp ZIP must not depend on game/scene.js" }
+          Compress-Archive -Path "$dir/*" -DestinationPath build/NativeThree-WebApp-Battle-Windows-x64.zip -Force
+          Expand-Archive build/NativeThree-WebApp-Battle-Windows-x64.zip -DestinationPath build/WebAppBattleVerify -Force
+          if (!(Test-Path build/WebAppBattleVerify/NativeThree-WebApp-Battle.exe) -or
+              !(Test-Path build/WebAppBattleVerify/webapp/native-scene.js) -or
+              (Test-Path build/WebAppBattleVerify/game/scene.js)) { throw "WebApp ZIP contains invalid scene paths" }
+          $sceneHash=(Get-FileHash build/WebAppBattleVerify/webapp/native-scene.js -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "Standalone WebApp native battle ZIP verified: $sceneHash"
+      - name: Upload runnable WebApp Battle ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeThree-WebApp-Battle-Windows-x64
+          path: build/NativeThree-WebApp-Battle-Windows-x64.zip
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |

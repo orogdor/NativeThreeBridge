@@ -61,7 +61,7 @@ function frame(now){
 }
 async function start(){
   try{
-    const response=await fetch('./scene.js');
+    const response=await fetch('./battle-scene.js');
     if(!response.ok)throw new Error(`Lahingustseen puudub: HTTP ${response.status}`);
     const source=await response.text();
     // This is bundled, trusted project source. User-provided game code is not

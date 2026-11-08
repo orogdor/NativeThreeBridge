@@ -21,7 +21,10 @@ test('webapp index.html converts to the SAME scene script used by native QuickJS
     assert.equal(info.scriptsIncluded,1);
     assert.ok(info.warnings.some(w=>w.code==='BROWSER_SCRIPTS_EXCLUDED'));
     const generated=await readFile(target,'utf8');
-    const original=await readFile(join(root,'game/scene.js'),'utf8');
+    const original=await readFile(join(root,'webapp/battle-scene.js'),'utf8');
+    const html=await readFile(join(root,'webapp/index.html'),'utf8');
+    assert.match(html,/src="\.\/battle-scene\.js"/);
+    assert.doesNotMatch(html,/src="\.\.\/game\/scene\.js"/);
     assert.ok(generated.includes(original));
     assert.ok(generated.includes('__nativeThreeFrame'));
     assert.ok(!generated.includes('OrbitControls'));

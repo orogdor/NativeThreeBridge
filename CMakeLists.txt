@@ -38,6 +38,26 @@ target_include_directories(NativeThreeJS PRIVATE native-dx12)
 target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32)
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
 
+# Dedicated HTML-derived scene variant, loading webapp/native-scene.js.
+add_executable(NativeThreeWebApp WIN32
+  native-dx12/NativeThree-DX12.cpp
+  native-dx12/three_js_host.cpp
+  ${ASSETS}
+)
+set_target_properties(NativeThreeWebApp PROPERTIES OUTPUT_NAME "NativeThree-WebApp-Battle")
+target_include_directories(NativeThreeWebApp PRIVATE native-dx12)
+target_link_libraries(NativeThreeWebApp PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32)
+target_compile_definitions(NativeThreeWebApp PRIVATE UNICODE _UNICODE NATIVE_THREE_WEBAPP=1)
+
+add_executable(WebAppSceneSmoke
+  native-dx12/three_scene_smoke.cpp
+  native-dx12/three_js_host.cpp
+  ${ASSETS}
+)
+target_include_directories(WebAppSceneSmoke PRIVATE native-dx12)
+target_link_libraries(WebAppSceneSmoke PRIVATE qjs user32)
+target_compile_definitions(WebAppSceneSmoke PRIVATE UNICODE _UNICODE NATIVE_THREE_WEBAPP=1)
+
 add_executable(ThreeSceneSmoke
   native-dx12/three_scene_smoke.cpp
   native-dx12/three_js_host.cpp
