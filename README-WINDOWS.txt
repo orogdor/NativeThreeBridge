@@ -1,3 +1,22 @@
+NativeThreeBridge v0.28.1 GAME FOLDER AUTOLOAD (EXPERIMENT)
+===================================================
+The Windows EXE now tries game/index.html automatically on every launch.
+NO special <meta name="native-three-entry"> tag is required.
+You can replace the entire game/ webapp contents with your own index.html,
+JavaScript modules, styles, folders and assets. Keep index.html at game/ root.
+Double-click NativeThree-Game.exe. There is no need to set --webapp.
+For an app in another folder: NativeThree-Game.exe --webapp "C:\\your-app"
+To play the ORIGINAL v0.26.0 forest-battle renderer/benchmark unchanged,
+run NativeThree-Game.exe --battle, keeping game/scene.js available.
+The demo game/index.html is intentionally included so the EXE works from
+the freshly extracted ZIP; the webapp JS bridge is exercised by CI.
+
+WARNING: "attempts any webapp" DOES NOT mean universal browser support.
+This is a native Three.js runtime (QuickJS + custom DX12 scene renderer),
+not Chromium/WebView. Other browser APIs, textures, GLB models, custom
+shaders, full HTML/CSS layouts, sound, and advanced effects are incomplete.
+Read NativeThreeBridge-webapp-log.txt for missing feature reports.
+
 NativeThreeBridge v0.28.0 - THREE.JS WEBAPPS IN THE ENGINE (TEST)
 =================================================================
 NEW: a whole Three.js webapp folder (index.html + ES modules) now runs in
