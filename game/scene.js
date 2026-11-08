@@ -103,6 +103,8 @@ function protectedFormationCell(x,z) {
   // native XAudio2; in a browser it may be supplied by another backend.
   const nativeAudio=globalThis.NativeThreeAudio??null;
   let footstepClock=0;
+  // Independent combat pose stream: [swing, impact, death, stance] for each instance.
+  const combatData=new Float32Array(SOLDIERS*4);
   if(nativeNavigation)nativeNavigation.configure(GRID,GRID,blocked);
   const nativeTickets=new Map();
   const nativeOccupied=new Int32Array(SOLDIERS);
@@ -211,12 +213,12 @@ function protectedFormationCell(x,z) {
     return true;
   }
   function planForImmediate(unit) {
-    if(unit.next!==-1 || unit.arrived)return false;
+    if(unit.next!==-1 || unit.arrived || unit.dead || unit.hold)return false;
     return acceptPath(unit,findPath(unit));
   }
   function planFor(unit) {
     if(!nativeNavigation)return planForImmediate(unit);
-    if(unit.next!==-1 || unit.arrived || unit.navTicket)return false;
+    if(unit.next!==-1 || unit.arrived || unit.navTicket || unit.dead || unit.hold)return false;
     // Worker captures an immutable navigation snapshot; route application
     // checks that the unit is still at the request's start and target.
     const token=nativeNavigation.request(unit.cell,unit.goal,unit.plans>0);
@@ -251,7 +253,11 @@ function protectedFormationCell(x,z) {
     const unit={id,team,index:i,cell,goal,next:-1,progress:0,
       path:[],at:0,plans:0,wait:0,retry:0,arrived:false,navTicket:0,
       x:toWorld(sx),z:toWorld(sz),startX:toWorld(sx),startZ:toWorld(sz),
-      yaw:team===0?1.57:-1.57,speed:10.5+(i%5)*0.35};
+      startCell:cell,initialGoal:goal,
+      yaw:team===0?1.57:-1.57,speed:10.5+(i%5)*0.35,
+      armor:15,dead:false,deathTime:0,targetId:-1,hold:false,
+      returning:false,attackTime:0,hitTime:0,attackCooldown:0.18+(i%13)*0.055,
+      chaseTime:0,attacks:0,kills:0};
     units.push(unit);
     const lamp=new THREE.SpotLight(lightColors[team],4.0,LIGHT_RADIUS,Math.PI/3,0.25,1.5);
     lamp.name=(team===0?'Red':'Blue')+' spotlight '+i;
@@ -271,6 +277,263 @@ function protectedFormationCell(x,z) {
     put(team===0?red:blue,i,unit.x,unit.z,unit.yaw);
   }
 
+
+  // ══════ Reusable stress-test melee AI (no separate JS object per strike) ══════
+  // Health: 15 armor points, front hit = 3 (5 strikes), side = 5 (3),
+  // rear = 15 (instant kill). Mixed-angle damage adds up on one health pool.
+  const MELEE_RANGE=5.25, ACQUIRE_RANGE=105, MELEE_RANGE_SQ=MELEE_RANGE*MELEE_RANGE;
+  const living=[PER_ARMY,PER_ARMY],hitAngles=[0,0,0];
+  let battleStarted=false,battleFinished=false,winner=-1,battleSeconds=0;
+  let attackCount=0,deathCount=0,engagedCount=0,combatScanCursor=0;
+  let combatSoundBudget=0;
+  function battleSound(name,unit,volume=0.55){
+    if(!nativeAudio || combatSoundBudget<1)return;
+    combatSoundBudget-=1;
+    nativeAudio.play(name,unit.x,0,unit.z,volume,true,false);
+  }
+  function cancelRoute(unit){
+    if(nativeNavigation && unit.navTicket){
+      nativeNavigation.cancel(unit.navTicket);
+      nativeTickets.delete(unit.navTicket);unit.navTicket=0;
+    }
+    unit.path=[];unit.at=0;unit.wait=0;unit.retry=0;
+    queuedUrgent[unit.id]=0;
+  }
+  function setCombatGoal(unit,goal){
+    if(unit.dead || unit.cell===goal || goal<0 || unit.goal===goal)return false;
+    cancelRoute(unit);
+    unit.goal=goal;unit.arrived=false;unit.hold=false;
+    // If already moving along an edge, finish that reservation before
+    // requesting a new path. Unit and tile ownership remain unchanged.
+    if(unit.next===-1)requestUrgentPlan(unit);
+    return true;
+  }
+  function faceToward(unit,target,dt){
+    const desired=Math.atan2(target.x-unit.x,target.z-unit.z);
+    let delta=((desired-unit.yaw+Math.PI*3)%(Math.PI*2))-Math.PI;
+    const turn=Math.min(Math.abs(delta),dt*3.8);
+    unit.yaw+=Math.sign(delta)*turn;
+  }
+  function strikeDamage(defender,attacker){
+    const dx=attacker.x-defender.x,dz=attacker.z-defender.z;
+    const distance=Math.hypot(dx,dz)||1;
+    const dot=(Math.sin(defender.yaw)*dx+Math.cos(defender.yaw)*dz)/distance;
+    if(dot>=0.5){hitAngles[0]++;return 3;} // FRONT: five hits
+    if(dot<=-0.5){hitAngles[2]++;return 15;} // REAR: one hit
+    hitAngles[1]++;return 5;               // SIDE: three hits
+  }
+  function killSoldier(defender,attacker){
+    if(defender.dead)return;
+    defender.dead=true;defender.deathTime=0;defender.armor=0;
+    defender.hold=true;defender.arrived=true;defender.targetId=-1;
+    cancelRoute(defender);
+    // Release reservations/occupancy; corpses remain visible but have no
+    // collision and do not prevent other agents returning to spawn.
+    if(defender.next!==-1){
+      if(reservations[defender.next]===defender.id)
+        reservations[defender.next]=-1;
+      defender.next=-1;defender.progress=0;
+      defender.x=toWorld(defender.cell%GRID);
+      defender.z=toWorld((defender.cell/GRID)|0);
+    }
+    if(occupants[defender.cell]===defender.id)
+      occupants[defender.cell]=-1;
+    occupancyRevision++;
+    const lamp=soldierLights[defender.id];
+    lamp.intensity=0;
+    lightData[defender.id*8+7]=0;
+    living[defender.team]--;deathCount++;
+    attacker.kills++;
+    battleSound('death',defender,0.9);
+  }
+  function nearestEnemy(unit){
+    let best=-1,bestD=ACQUIRE_RANGE*ACQUIRE_RANGE;
+    // 500 simple squared-distance checks per periodic retarget. No mesh or
+    // animation allocations; nearest search is spread across 16 frames.
+    const first=(1-unit.team)*PER_ARMY;
+    for(let j=first;j<first+PER_ARMY;j++){
+      const other=units[j];
+      if(other.dead)continue;
+      const dx=other.x-unit.x,dz=other.z-unit.z;
+      const d=dx*dx+dz*dz;
+      if(d<bestD){bestD=d;best=j;}
+    }
+    return best;
+  }
+  function freeAdjacentGoal(unit,enemy){
+    const ex=enemy.cell%GRID,ez=(enemy.cell/GRID)|0;
+    const ux=unit.cell%GRID,uz=(unit.cell/GRID)|0;
+    let best=-1,bestDist=1e12;
+    // Prefer an unobstructed neighbor, never the tile occupied by a unit.
+    for(let dz=-3;dz<=3;dz++)for(let dx=-3;dx<=3;dx++){
+      if(Math.abs(dx)+Math.abs(dz)<1 || Math.abs(dx)+Math.abs(dz)>4)continue;
+      const gx=ex+dx,gz=ez+dz;
+      if(gx<1||gz<1||gx>=GRID-1||gz>=GRID-1)continue;
+      const tile=gridIndex(gx,gz);
+      if(blocked[tile] || (occupants[tile]!==-1&&occupants[tile]!==unit.id) ||
+         (reservations[tile]!==-1&&reservations[tile]!==unit.id))continue;
+      const cost=(gx-ux)**2+(gz-uz)**2+((dx*dx+dz*dz)*0.4);
+      if(cost<bestDist){bestDist=cost;best=tile;}
+    }
+    return best;
+  }
+  function startReturnToSpawn(){
+    if(battleFinished)return;
+    battleFinished=true;winner=living[0]>0?0:(living[1]>0?1:-1);
+    for(const unit of units){
+      if(unit.dead)continue;
+      unit.targetId=-1;unit.hold=false;unit.returning=true;
+      unit.attackTime=0;unit.attackCooldown=0;
+      if(unit.cell===unit.startCell) {
+        cancelRoute(unit);unit.goal=unit.startCell;unit.arrived=true;
+      } else setCombatGoal(unit,unit.startCell);
+    }
+  }
+  function updateBattle(dt) {
+    if(dt<=0)return;
+    battleSeconds+=dt;
+    combatSoundBudget=Math.min(3,combatSoundBudget+dt*6);
+    // Offset work across frames; one search/candidate update per soldier
+    // roughly every 16 frames, even with 1000 agents.
+    for(let j=0;j<64;j++){
+      const unit=units[combatScanCursor];
+      combatScanCursor=(combatScanCursor+1)%SOLDIERS;
+      if(unit.dead||unit.returning||battleFinished)continue;
+      const previous=unit.targetId>=0?units[unit.targetId]:null;
+      if(previous?.dead)unit.targetId=-1;
+      const best=nearestEnemy(unit);
+      if(best>=0){
+        if(unit.targetId<0)unit.targetId=best;
+        else {
+          const current=units[unit.targetId],other=units[best];
+          const oldSq=(current.x-unit.x)**2+(current.z-unit.z)**2;
+          const newSq=(other.x-unit.x)**2+(other.z-unit.z)**2;
+          if(newSq<oldSq*0.62)unit.targetId=best;
+        }
+      }
+    }
+    engagedCount=0;
+    for(const unit of units){
+      if(unit.dead){
+        unit.deathTime=Math.min(1,unit.deathTime+dt/0.7);
+      }else{
+        unit.hitTime=Math.max(0,unit.hitTime-dt/0.28);
+        unit.attackTime=Math.max(0,unit.attackTime-dt/0.36);
+        unit.attackCooldown-=dt;
+        if(!unit.returning && !battleFinished){
+          const target=unit.targetId<0?null:units[unit.targetId];
+          if(target && !target.dead){
+            const dx=target.x-unit.x,dz=target.z-unit.z;
+            const distSq=dx*dx+dz*dz;
+            unit.chaseTime=Math.max(0,unit.chaseTime-dt);
+            // Hold after the existing reserved cell edge completes. Never
+            // interrupt a half-traversed edge or ignore collision tiles.
+            if(distSq<=MELEE_RANGE_SQ){
+              if(unit.next===-1){
+                if(!unit.hold){cancelRoute(unit);unit.hold=true;}
+                engagedCount++;
+                faceToward(unit,target,dt);
+                if(unit.attackCooldown<=0){
+                  battleStarted=true;
+                  unit.attackTime=1;
+                  unit.attacks++;attackCount++;
+                  unit.attackCooldown=0.76+((unit.id*7)%13)*0.033;
+                  battleSound('swing',unit,0.35);
+                  target.armor-=strikeDamage(target,unit);
+                  target.hitTime=1;
+                  battleSound('hit',target,0.55);
+                  if(target.armor<=0)killSoldier(target,unit);
+                }
+              }
+            }else if(unit.next===-1){
+              if(unit.hold){
+                unit.hold=false;
+                unit.chaseTime=0;
+              }
+              if(unit.chaseTime<=0){
+                const goal=freeAdjacentGoal(unit,target);
+                if(goal>=0 && goal!==unit.cell &&
+                   (unit.goal!==goal || unit.arrived))
+                  setCombatGoal(unit,goal);
+                unit.chaseTime=0.75+(unit.id%9)*0.055;
+              }
+            }
+          }else if(unit.targetId>=0){
+            unit.targetId=-1;unit.hold=false;
+            if(!unit.returning)setCombatGoal(unit,unit.initialGoal);
+          }
+        }
+      }
+      const c=unit.id*4;
+      combatData[c]=unit.attackTime>0?Math.sin((1-unit.attackTime)*Math.PI):0;
+      combatData[c+1]=unit.hitTime;
+      combatData[c+2]=unit.deathTime;
+      combatData[c+3]=unit.hold?1:0;
+    }
+    if(!battleFinished && (living[0]===0 || living[1]===0))
+      startReturnToSpawn();
+  }
+  // F12 fast battle fixture. Move 48 per side into a clear mid-map arena;
+  // all other soldiers continue their original A* battle and remain untouched.
+  function quickBattle(){
+    if(battleStarted||battleFinished)return false;
+    const selected=[];
+    function relocate(unit,centerX,centerZ){
+      cancelRoute(unit);
+      if(unit.next!==-1){
+        if(reservations[unit.next]===unit.id)reservations[unit.next]=-1;
+        unit.next=-1;unit.progress=0;
+      }
+      if(occupants[unit.cell]===unit.id)occupants[unit.cell]=-1;
+      for(let radius=0;radius<=20;radius++)
+        for(let dz=-radius;dz<=radius;dz++)
+          for(let dx=-radius;dx<=radius;dx++){
+            if(Math.max(Math.abs(dx),Math.abs(dz))!==radius)continue;
+            const gx=centerX+dx,gz=centerZ+dz;
+            if(gx<2||gz<2||gx>=GRID-2||gz>=GRID-2)continue;
+            const pos=gridIndex(gx,gz);
+            if(blocked[pos]||occupants[pos]!==-1||reservations[pos]!==-1)continue;
+            unit.cell=pos;unit.x=toWorld(gx);unit.z=toWorld(gz);
+            occupants[pos]=unit.id;unit.goal=unit.initialGoal;
+            unit.arrived=false;unit.hold=false;unit.targetId=-1;
+            unit.chaseTime=0;occupancyRevision++;
+            selected.push(unit.id);
+            return true;
+          }
+      throw new Error('No clear battle staging cell');
+    }
+    for(let i=0;i<48;i++){
+      relocate(units[i],176,177);
+      relocate(units[PER_ARMY+i],181,177);
+    }
+    for(const id of selected){
+      const unit=units[id];
+      unit.targetId=nearestEnemy(unit);
+      if(unit.targetId<0)throw new Error('Fast battle lacks a nearby enemy');
+      requestUrgentPlan(unit);
+    }
+    return true;
+  }
+  globalThis.__nativeThreeQuickBattle=quickBattle;
+  globalThis.__nativeThreeCombatFrame=()=>combatData;
+  globalThis.__nativeThreeBattleStatus=()=>({
+    aliveRed:living[0],aliveBlue:living[1],deaths:deathCount,
+    hits:hitAngles[0]+hitAngles[1]+hitAngles[2],
+    frontHits:hitAngles[0],sideHits:hitAngles[1],rearHits:hitAngles[2],
+    attacks:attackCount,engaged:engagedCount,started:battleStarted,
+    finished:battleFinished,winner,
+    returning:units.filter(u=>!u.dead&&u.returning&&!u.arrived).length,
+    returned:units.filter(u=>!u.dead&&u.returning&&u.arrived).length
+  });
+  globalThis.__nativeThreeTestStrike=(attackerId,defenderId)=>{
+    const attacker=units[attackerId],defender=units[defenderId];
+    if(!attacker||!defender||attacker.dead||defender.dead||attacker.team===defender.team)return false;
+    defender.armor-=strikeDamage(defender,attacker);
+    defender.hitTime=1;
+    if(defender.armor<=0)killSoldier(defender,attacker);
+    return true;
+  };
+
   function pollNativeNavigation() {
     if(!nativeNavigation)return;
     if(occupancyRevision!==lastNativeOccupancyRevision){
@@ -289,7 +552,7 @@ function protectedFormationCell(x,z) {
       if(unit.navTicket!==response.token)continue;
       unit.navTicket=0;
       if(unit.cell!==request.start || unit.goal!==request.goal ||
-         unit.next!==-1 || unit.arrived){
+         unit.next!==-1 || unit.arrived || unit.dead || unit.hold){
         requestUrgentPlan(unit);
         continue;
       }
@@ -314,14 +577,14 @@ function protectedFormationCell(x,z) {
         continue;
       }
       queuedUrgent[id]=0;
-      if(unit.arrived||unit.path.length>1)continue;
+      if(unit.arrived||unit.dead||unit.hold||unit.path.length>1)continue;
       planFor(unit);budget--;urgentUsed++;
     }
     // The remaining slots are fair round-robin requests from all soldiers.
     for(let checked=0;checked<SOLDIERS && budget>0;checked++){
       const unit=units[planningCursor];
       planningCursor=(planningCursor+1)%SOLDIERS;
-      if(unit.arrived||unit.next!==-1||unit.path.length>1||unit.retry>0||
+      if(unit.arrived||unit.dead||unit.hold||unit.next!==-1||unit.path.length>1||unit.retry>0||
          unit.navTicket||queuedUrgent[unit.id])continue;
       planFor(unit);budget--;
     }
@@ -340,7 +603,7 @@ function protectedFormationCell(x,z) {
     const first=simFrames%SOLDIERS;
     for(let j=0;j<SOLDIERS;j++){
       const unit=units[(j+first)%SOLDIERS];
-      let distance=unit.speed*dt,segments=0;
+      let distance=unit.dead||unit.hold?0:unit.speed*dt,segments=0;
       while(distance>0.000001 && segments<8 && !unit.arrived){
         if(unit.next===-1){
           if(unit.cell===unit.goal){unit.arrived=true;arrivals++;break;}
@@ -391,6 +654,7 @@ function protectedFormationCell(x,z) {
       lamp.position.x=unit.x+LIGHT_OFFSET_X;lamp.position.z=unit.z+LIGHT_OFFSET_Z;
       lamp.target.position.x=unit.x;lamp.target.position.z=unit.z;
       lightData[base]=lamp.position.x;lightData[base+2]=lamp.position.z;
+      lightData[base+7]=unit.dead?0:lamp.intensity;
     }
     red.instanceMatrix.needsUpdate=true;
     blue.instanceMatrix.needsUpdate=true;
@@ -403,6 +667,7 @@ function protectedFormationCell(x,z) {
   scene.updateMatrixWorld(true); // initialization only
   matrices.set(treeBark.instanceMatrix.array,0); // static trees once
   function frame(dt=1/60){
+    updateBattle(dt);
     updateSoldiers(dt);
     // Demonstrate spatial JS->native one-shots without 1000 overlapping
     // sources: two separate soldiers, at most ~3 footsteps per second.
@@ -412,7 +677,7 @@ function protectedFormationCell(x,z) {
         footstepClock-=0.65;
         for(const id of [0,PER_ARMY]) {
           const u=units[id];
-          if(u.next!==-1 || u.progress>0)
+          if(!u.dead && (u.next!==-1 || u.progress>0))
             nativeAudio.play('step',u.x,0,u.z,0.65,true,false);
         }
       }
@@ -436,7 +701,8 @@ function protectedFormationCell(x,z) {
       active:units.filter(u=>!u.arrived).length,
       routeSteps:units.reduce((n,u)=>n+u.at,0),
       scene:scene.isScene,group:forest.isGroup,mesh:ground.isMesh,
-      instances:red.isInstancedMesh};
+      instances:red.isInstancedMesh,
+      battle:globalThis.__nativeThreeBattleStatus()};
   }
   globalThis.__nativeThreeNavStats=()=>({
     routeFailures,
@@ -475,7 +741,7 @@ function protectedFormationCell(x,z) {
   // Live movement orders: each soldier chooses/replans their own path.
   // A new destination never bypasses a unit's in-progress cell reservation.
   globalThis.__nativeThreeSetDestination=(id,gx,gz)=>{
-    if(!Number.isInteger(id)||id<0||id>=SOLDIERS ||
+    if(!Number.isInteger(id)||id<0||id>=SOLDIERS || units[id].dead ||
        !Number.isInteger(gx)||!Number.isInteger(gz)||
        gx<0||gx>=GRID||gz<0||gz>=GRID)return false;
     const target=gridIndex(gx,gz);
