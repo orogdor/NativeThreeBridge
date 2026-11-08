@@ -17,14 +17,16 @@ test('1000 native Three.js spotlights each follow a soldier; only 16 depth maps'
   assert.match(dx,/SHADOW_COUNT=16/);
   assert.match(dx,/LIGHT_COUNT=1000/);
 });
-test('DX12 bins all 1000 lights and shades with 16 nearest per pixel',()=>{
-  assert.match(dx,/LightGridConstants/);
-  assert.match(dx,/MAX_CELL_LIGHTS=16/);
-  assert.match(dx,/gGridCounts\[64\]/);
-  assert.match(dx,/gGridIndices\[1024\]/);
-  assert.match(dx,/for\(UINT li=0;li<LIGHT_COUNT;li\+\+\)/);
-  assert.match(dx,/gGridCB->GetGPUVirtualAddress\(\)/);
-  assert.match(dx,/gLightsCB->GetGPUVirtualAddress\(\)/);
+test('DX12 includes every overlapping soldier light with no hard tile cap',()=>{
+  assert.match(dx,/GRID_BUFFER_UINT_COUNT=GRID_INDEX_BASE\+GRID_CELL_COUNT\*LIGHT_COUNT/);
+  assert.match(dx,/Buffer<uint> gLightGridData : register\(t4\)/);
+  assert.match(dx,/gLightGridData\[512\+start\+k\]/);
+  assert.match(dx,/gDynamicLights\.queryRadius\(worldX,worldZ,searchRadius/);
+  assert.match(dx,/std::fabs\(l\[0\]-worldX\)-halfCell/);
+  assert.match(dx,/std::fabs\(l\[2\]-worldZ\)-halfCell/);
+  assert.doesNotMatch(dx,/MAX_CELL_LIGHTS/);
+  assert.match(dx,/SetGraphicsRootDescriptorTable\(6,gGridSRV\[back\]\)/);
+  assert.match(dx,/SetGraphicsRootConstantBufferView\(5,gLightsCB/);
   assert.match(dx,/gShadowSlots\[1000\]/);
 });
 test('real DX12 shadow depth array captures tree and soldier silhouettes',()=>{

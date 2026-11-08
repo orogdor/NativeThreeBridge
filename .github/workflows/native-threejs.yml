@@ -2,6 +2,8 @@ name: Build native Three.js Windows Game and separate Updater
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: write
@@ -114,6 +116,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.19.0: NativeThreeBridge engine-core upgrade with generic C++ chunk spatial index for static objects, clustered moving light candidates, cached stationary-camera visibility, stable-ID scene registry/dirty tracking, incremental JS-native matrix copy, fixed 60Hz simulation with native render/light interpolation and bounded catchup. NativeThreeNavigation exposes nonblocking C++ worker-based A* with dynamic cell occupancy snapshots while retaining a synchronous browser fallback. GPU timestamp queries and asynchronous NativeThreeBridge-frames.csv stutter logger distinguish shadow/main GPU durations from CPU, Present and fences. NTX2 offline mipmaps with alpha coverage for foliage, screen-space LOD policy foundation and Three.js scene manifest export CLI (npm run convert). 10k pines/1k soldiers/1k lights/16 shadow maps remain the default night test. This is NOT yet a universal DX12 manifest loader: mesh LOD assets, ExecuteIndirect and arbitrary JS/custom shader compatibility remain to be built. FPS/shadow pixels require physical Windows DX12 testing."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.20.0: Fixed moving square boundaries in night lighting by replacing nearest-16-per-tile truncation with compact variable-length lists of every radius-overlapping soldier light. Retains the 16x16 broad-phase, per-pixel cone and falloff, 16 real-time shadow maps, 10k trees, 1k moving soldiers, DX12 profiling and existing native engine services. Windows CI validates C++ and HLSL compilation, navigation smoke tests and packaging; actual FPS and appearance require physical Windows GPU testing.
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
