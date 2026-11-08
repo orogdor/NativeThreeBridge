@@ -119,6 +119,7 @@ export async function runWebapp(root, options = {}) {
   const CtxArrayBuffer = vm.runInContext('ArrayBuffer', context);
   let importMap = [];
   const moduleCache = new Map();
+  const warnedThree = new Set();
 
   const readGameFile = (rel) => {
     const clean = normalizeGamePath(rel);
@@ -128,13 +129,23 @@ export async function runWebapp(root, options = {}) {
     return readFileSync(full);
   };
   const metaURL = (name) => (name.startsWith('nt:') ? name : `nt://game/${name.replace(/#.*$/, '')}`);
+  // Dynamic import(): same resolution as static imports (QuickJS uses the
+  // same normalize/loader callbacks for both).
+  const importDynamic = async (specifier, referrer) => {
+    const base = referrer && referrer.identifier ? referrer.identifier : 'index.html';
+    const m = await linker(specifier, { identifier: base });
+    if (m.status === 'unlinked') await m.link(linker);
+    if (m.status === 'linked') await m.evaluate();
+    return m;
+  };
   const makeModule = (source, name) => new vm.SourceTextModule(source, {
     context, identifier: name,
     initializeImportMeta(meta) { meta.url = metaURL(name); meta.main = false; },
+    importModuleDynamically: (specifier, referrer) => importDynamic(specifier, referrer),
   });
   const linker = async (specifier, referencing) => {
     const name = resolveModule(referencing.identifier, specifier, importMap, builtinNames);
-    if (name === 'nt:three' && specifier !== 'three' && !specifier.startsWith('nt:')) rec.logs.push(['warn', `'${specifier}' replaced by built-in three`]);
+    if (name === 'nt:three' && specifier !== 'three' && !specifier.startsWith('nt:') && !warnedThree.has(specifier) && warnedThree.add(specifier)) rec.logs.push(['warn', `'${specifier}' replaced by built-in three`]);
     if (moduleCache.has(name)) return moduleCache.get(name);
     let source;
     if (name.startsWith('nt:')) {
@@ -161,7 +172,7 @@ export async function runWebapp(root, options = {}) {
       return ab;
     },
     setImportMap(list) { importMap = Array.from(list, String); },
-    evalScript(source, name) { return vm.runInContext(String(source), context, { filename: String(name) }); },
+    evalScript(source, name) { return vm.runInContext(String(source), context, { filename: String(name), importModuleDynamically: (spec) => importDynamic(spec, { identifier: String(name).includes('#') ? 'index.html' : String(name) }) }); },
     async evalModule(source, name) {
       const m = makeModule(String(source), String(name));
       await m.link(linker);

@@ -241,6 +241,12 @@
     get returnValue() { return !this.defaultPrevented; }
     composedPath() { const p = []; for (let n = this.target; n; n = n.parentNode) p.push(n); if (p.length && p[p.length - 1] === document) p.push(window); return p; }
   }
+  class ProgressEvent extends Event {
+    constructor(t, i = {}) { super(t, i); this.lengthComputable = !!i.lengthComputable; this.loaded = i.loaded || 0; this.total = i.total || 0; }
+  }
+  class ErrorEvent extends Event {
+    constructor(t, i = {}) { super(t, i); this.message = i.message || ''; this.error = i.error ?? null; this.filename = i.filename || ''; this.lineno = i.lineno || 0; this.colno = i.colno || 0; }
+  }
   class CustomEvent extends Event { constructor(t, i = {}) { super(t, i); this.detail = i.detail ?? null; } }
   class UIEvent extends Event { constructor(t, i = {}) { super(t, i); this.view = window; this.detail = i.detail || 0; } }
   class FocusEvent extends UIEvent {}
@@ -389,17 +395,158 @@
       return copy;
     }
     getRootNode() { let n = this; while (n.parentNode) n = n.parentNode; return n; }
+    remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+    before(...n) { const p = this.parentNode; if (p) for (const c of n) p.insertBefore(typeof c === 'string' ? new Text(c) : c, this); }
+    after(...n) { const p = this.parentNode; if (!p) return; const next = this.nextSibling; for (const c of n) p.insertBefore(typeof c === 'string' ? new Text(c) : c, next); }
+    replaceWith(...n) { const p = this.parentNode; if (!p) return; const next = this.nextSibling; p.removeChild(this); for (const c of n) p.insertBefore(typeof c === 'string' ? new Text(c) : c, next); }
+    isSameNode(o) { return o === this; }
+    isEqualNode(o) { return !!o && serialize(o) === serialize(this); }
+    compareDocumentPosition(o) {
+      if (o === this) return 0;
+      if (this.contains(o)) return 20; // CONTAINED_BY | FOLLOWING
+      if (o.contains(this)) return 10; // CONTAINS | PRECEDING
+      const all = []; (function walk(n) { all.push(n); for (const c of n.childNodes) walk(c); })(this.getRootNode());
+      const a = all.indexOf(this), b = all.indexOf(o);
+      if (a < 0 || b < 0) return 1;
+      return b > a ? 4 : 2;
+    }
+    normalize() {}
   }
+  const NODE_TYPES = { ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11 };
+  Object.assign(Node, NODE_TYPES);
+  Object.assign(Node.prototype, NODE_TYPES);
+  Object.assign(Node, { DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16 });
+
+  const NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4, SHOW_CDATA_SECTION: 0x8,
+    SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80, SHOW_DOCUMENT: 0x100, SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400,
+  };
+  function filterNode(walker, node) {
+    if (!((1 << (node.nodeType - 1)) & walker.whatToShow)) return NodeFilter.FILTER_SKIP;
+    const f = walker.filter;
+    if (!f) return NodeFilter.FILTER_ACCEPT;
+    return (typeof f === 'function' ? f(node) : f.acceptNode(node)) ?? NodeFilter.FILTER_ACCEPT;
+  }
+  class TreeWalker {
+    constructor(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+      this.root = root; this.whatToShow = whatToShow >>> 0; this.filter = filter; this.currentNode = root;
+    }
+    parentNode() {
+      for (let n = this.currentNode; n && n !== this.root;) {
+        n = n.parentNode;
+        if (n && filterNode(this, n) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = n);
+      }
+      return null;
+    }
+    _child(first) {
+      const kids = this.currentNode.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const n = kids[first ? i : kids.length - 1 - i];
+        if (filterNode(this, n) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = n);
+      }
+      return null;
+    }
+    firstChild() { return this._child(true); }
+    lastChild() { return this._child(false); }
+    _sibling(next) {
+      if (this.currentNode === this.root) return null;
+      for (let n = next ? this.currentNode.nextSibling : this.currentNode.previousSibling; n; n = next ? n.nextSibling : n.previousSibling) {
+        if (filterNode(this, n) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = n);
+      }
+      return null;
+    }
+    nextSibling() { return this._sibling(true); }
+    previousSibling() { return this._sibling(false); }
+    // DOM spec "next node" walk in document order.
+    nextNode() {
+      let node = this.currentNode, result = NodeFilter.FILTER_ACCEPT;
+      for (;;) {
+        while (result !== NodeFilter.FILTER_REJECT && node.childNodes.length) {
+          node = node.childNodes[0];
+          result = filterNode(this, node);
+          if (result === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+        }
+        let sibling = null;
+        for (let temp = node; temp; temp = temp.parentNode) {
+          if (temp === this.root) return null;
+          sibling = temp.nextSibling;
+          if (sibling) break;
+        }
+        if (!sibling) return null;
+        node = sibling;
+        result = filterNode(this, node);
+        if (result === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+      }
+    }
+    previousNode() {
+      let node = this.currentNode;
+      while (node !== this.root) {
+        let sibling = node.previousSibling;
+        while (sibling) {
+          node = sibling;
+          let result = filterNode(this, node);
+          while (result !== NodeFilter.FILTER_REJECT && node.childNodes.length) {
+            node = node.childNodes[node.childNodes.length - 1];
+            result = filterNode(this, node);
+          }
+          if (result === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+          sibling = node.previousSibling;
+        }
+        if (node === this.root || !node.parentNode) return null;
+        node = node.parentNode;
+        if (filterNode(this, node) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+      }
+      return null;
+    }
+  }
+  class NodeIterator {
+    constructor(root, whatToShow = NodeFilter.SHOW_ALL, filter = null) {
+      this.root = root; this.whatToShow = whatToShow >>> 0; this.filter = filter;
+      this.referenceNode = root; this.pointerBeforeReferenceNode = true;
+    }
+    _ordered() {
+      const out = [];
+      (function walk(n) { out.push(n); for (const c of n.childNodes) walk(c); })(this.root);
+      return out;
+    }
+    nextNode() {
+      const nodes = this._ordered();
+      let i = nodes.indexOf(this.referenceNode);
+      if (!this.pointerBeforeReferenceNode) i++;
+      for (; i >= 0 && i < nodes.length; i++) {
+        if (filterNode(this, nodes[i]) === NodeFilter.FILTER_ACCEPT) { this.referenceNode = nodes[i]; this.pointerBeforeReferenceNode = false; return nodes[i]; }
+      }
+      return null;
+    }
+    previousNode() {
+      const nodes = this._ordered();
+      let i = nodes.indexOf(this.referenceNode);
+      if (this.pointerBeforeReferenceNode) i--;
+      for (; i >= 0; i--) {
+        if (filterNode(this, nodes[i]) === NodeFilter.FILTER_ACCEPT) { this.referenceNode = nodes[i]; this.pointerBeforeReferenceNode = true; return nodes[i]; }
+      }
+      return null;
+    }
+    detach() {}
+  }
+
   class Text extends Node {
     constructor(data = '') { super(3, '#text'); this.data = String(data); }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
     get nodeValue() { return this.data; }
+    set nodeValue(v) { this.data = String(v ?? ''); }
+    get wholeText() { return this.data; }
+    get length() { return this.data.length; }
+    splitText(offset) { const rest = new Text(this.data.slice(offset)); this.data = this.data.slice(0, offset); if (this.parentNode) this.parentNode.insertBefore(rest, this.nextSibling); return rest; }
     _shallowClone() { return new Text(this.data); }
   }
   class Comment extends Node {
     constructor(data = '') { super(8, '#comment'); this.data = String(data); }
     get textContent() { return ''; }
+    get nodeValue() { return this.data; }
+    set nodeValue(v) { this.data = String(v ?? ''); }
     _shallowClone() { return new Comment(this.data); }
   }
   class DocumentFragment extends Node {
@@ -478,9 +625,6 @@
     append(...n) { for (const c of n) this.appendChild(typeof c === 'string' ? new Text(c) : c); }
     prepend(...n) { for (const c of n.reverse()) this.insertBefore(typeof c === 'string' ? new Text(c) : c, this.firstChild); }
     replaceChildren(...n) { this.textContent = ''; this.append(...n); }
-    remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-    before(...n) { for (const c of n) this.parentNode && this.parentNode.insertBefore(typeof c === 'string' ? new Text(c) : c, this); }
-    after(...n) { const next = this.nextSibling; for (const c of n) this.parentNode && this.parentNode.insertBefore(typeof c === 'string' ? new Text(c) : c, next); }
     get innerText() { return this.textContent; }
     set innerText(v) { this.textContent = v; }
     get innerHTML() { return this.childNodes.map(serialize).join(''); }
@@ -539,7 +683,27 @@
     attachShadow() { unsupported('Shadow DOM'); const f = new DocumentFragment(); f.host = this; return f; }
     _shallowClone() { const e = document.createElement(this.localName); for (const [k, v] of this._attrs) e.setAttribute(k, v); return e; }
   }
+  // href/src read back as absolute URLs, like in a browser.
+  function reflectURL(el, attr) {
+    const v = el.getAttribute(attr);
+    if (v === null || v === '') return v === '' ? documentURL : '';
+    if (/^(data|blob|javascript|mailto):/i.test(v)) return v;
+    try { return new URL(v, documentURL).href; } catch { return v; }
+  }
   class HTMLElement extends Element {
+    get href() { return reflectURL(this, 'href'); }
+    set href(v) { this.setAttribute('href', v); }
+    get rel() { return this.getAttribute('rel') || ''; }
+    set rel(v) { this.setAttribute('rel', v); }
+    get name() { return this.getAttribute('name') || ''; }
+    set name(v) { this.setAttribute('name', v); }
+    get lang() { return this.getAttribute('lang') || ''; }
+    set lang(v) { this.setAttribute('lang', v); }
+    get dir() { return this.getAttribute('dir') || ''; }
+    set dir(v) { this.setAttribute('dir', v); }
+    get disabled() { return this._disabled ?? this.hasAttribute('disabled'); }
+    set disabled(v) { this._disabled = !!v; }
+    get sheet() { return null; }
     get hidden() { return this.hasAttribute('hidden'); }
     set hidden(v) { this.toggleAttribute('hidden', !!v); }
     get title() { return this.getAttribute('title') || ''; }
@@ -562,7 +726,7 @@
     set disabled(v) { this.toggleAttribute('disabled', !!v); }
   }
   class HTMLScriptElement extends HTMLElement {
-    get src() { return this.getAttribute('src') || ''; }
+    get src() { return reflectURL(this, 'src'); }
     set src(v) { this.setAttribute('src', v); }
     get type() { return this.getAttribute('type') || ''; }
     set type(v) { this.setAttribute('type', v); }
@@ -603,9 +767,10 @@
   }
   class HTMLImageElement extends HTMLElement {
     constructor(tag = 'img', ns) { super(tag, ns); this.complete = false; this.naturalWidth = 0; this.naturalHeight = 0; this.width = 0; this.height = 0; this.crossOrigin = null; this.decoding = 'auto'; }
-    get src() { return this._src || ''; }
+    get src() { return this._src ? (/^(data|blob):/i.test(this._src) ? this._src : new URL(this._src, documentURL).href) : ''; }
     set src(v) {
       this._src = String(v);
+      this.setAttribute('src', this._src);
       // Image decoding arrives in a later engine version. Fail like a broken
       // image so THREE.TextureLoader calls onError and the game keeps running.
       unsupported('Image/texture decoding', 'textures stay untextured (planned for v0.30)');
@@ -664,6 +829,8 @@
     createTextNode(t) { const n = new Text(t); n.ownerDocument = this; return n; }
     createComment(t) { return new Comment(t); }
     createDocumentFragment() { return new DocumentFragment(); }
+    createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
+    createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     createEvent() { return new Event(''); }
     getElementById(id) { return findFirst(this, (e) => e.getAttribute('id') === id); }
     querySelector(s) { return querySelectorAll(this, s)[0] || null; }
@@ -911,13 +1078,173 @@
     arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
     text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
     slice(a, b, type) { const blob = new Blob([], { type }); blob._bytes = this._bytes.slice(a, b); return blob; }
+    stream() { return new ReadableStream({ _ntBytes: Promise.resolve(this._bytes) }); }
+    bytes() { return Promise.resolve(this._bytes.slice()); }
   }
+  // ---- minimal streams: enough for blob.stream().pipeThrough(new DecompressionStream('gzip'))
+  // and new Response(stream).arrayBuffer() / stream.getReader().
+  class ReadableStream {
+    constructor(source) {
+      // Internal form: whole payload as a promise of Uint8Array.
+      if (source && source._ntBytes) { this._ntBytes = source._ntBytes; return; }
+      const chunks = [];
+      let done, fail;
+      this._ntBytes = new Promise((res, rej) => { done = res; fail = rej; });
+      const controller = {
+        enqueue: (c) => chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c.buffer || c)),
+        close: () => done(concatBytes(chunks)), error: (e) => fail(e), desiredSize: 1,
+      };
+      Promise.resolve().then(async () => {
+        try {
+          if (source && source.start) await source.start(controller);
+          if (source && source.pull) { let guard = 0; while (!controller._closed && guard++ < 1e6) { const before = chunks.length; await source.pull(controller); if (chunks.length === before) break; } }
+          if (!source || (!source.pull && !source.start)) controller.close();
+        } catch (e) { fail(e); }
+      });
+      const close = controller.close; controller.close = () => { controller._closed = true; close(); };
+    }
+    pipeThrough(transform) { return transform._ntTransform(this); }
+    pipeTo(dest) { return this._ntBytes.then((b) => dest.write && dest.write(b)).then(() => dest.close && dest.close()); }
+    getReader() {
+      let sent = false;
+      return {
+        read: () => (sent ? Promise.resolve({ done: true, value: undefined }) : this._ntBytes.then((value) => { sent = true; return { done: false, value }; })),
+        releaseLock() {}, cancel: () => Promise.resolve(), closed: Promise.resolve(),
+      };
+    }
+    cancel() { return Promise.resolve(); }
+    tee() { return [new ReadableStream({ _ntBytes: this._ntBytes }), new ReadableStream({ _ntBytes: this._ntBytes })]; }
+    get locked() { return false; }
+  }
+  function concatBytes(chunks) {
+    const size = chunks.reduce((n, c) => n + c.length, 0), out = new Uint8Array(size);
+    let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+  // RFC 1951 inflate (+ zlib / gzip wrappers), pure JS.
+  function inflateRaw(src, start = 0) {
+    let pos = start, bitBuf = 0, bitCnt = 0, out = new Uint8Array(Math.max(1024, src.length * 4)), outLen = 0;
+    const need = (n) => { while (bitCnt < n) { if (pos >= src.length) throw new Error('inflate: unexpected end of data'); bitBuf |= src[pos++] << bitCnt; bitCnt += 8; } };
+    const bits = (n) => { need(n); const v = bitBuf & ((1 << n) - 1); bitBuf >>>= n; bitCnt -= n; return v; };
+    const ensure = (n) => { if (outLen + n > out.length) { const bigger = new Uint8Array(Math.max(out.length * 2, outLen + n)); bigger.set(out.subarray(0, outLen)); out = bigger; } };
+    function build(lengths) {
+      const counts = new Uint16Array(16), offs = new Uint16Array(16);
+      for (const l of lengths) counts[l]++;
+      counts[0] = 0;
+      for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + counts[i - 1];
+      const symbols = new Uint16Array(lengths.length);
+      for (let i = 0; i < lengths.length; i++) if (lengths[i]) symbols[offs[lengths[i]]++] = i;
+      return { counts, symbols };
+    }
+    function decode(t) {
+      let code = 0, first = 0, index = 0;
+      for (let len = 1; len < 16; len++) {
+        code |= bits(1);
+        const count = t.counts[len];
+        if (code - count < first) return t.symbols[index + (code - first)];
+        index += count; first += count; first <<= 1; code <<= 1;
+      }
+      throw new Error('inflate: bad Huffman code');
+    }
+    const LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    const LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+    const DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+    const DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+    let fixedL = null, fixedD = null;
+    let final = 0;
+    while (!final) {
+      final = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        bitBuf = 0; bitCnt = 0;
+        if (pos + 4 > src.length) throw new Error('inflate: truncated stored block');
+        const len = src[pos] | (src[pos + 1] << 8); pos += 4;
+        ensure(len); out.set(src.subarray(pos, pos + len), outLen); outLen += len; pos += len;
+        continue;
+      }
+      let lt, dt;
+      if (type === 1) {
+        if (!fixedL) {
+          const l = new Uint8Array(288); l.fill(8, 0, 144); l.fill(9, 144, 256); l.fill(7, 256, 280); l.fill(8, 280, 288);
+          fixedL = build(l); fixedD = build(new Uint8Array(30).fill(5));
+        }
+        lt = fixedL; dt = fixedD;
+      } else if (type === 2) {
+        const hlit = bits(5) + 257, hdist = bits(5) + 1, hclen = bits(4) + 4;
+        const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+        const cl = new Uint8Array(19);
+        for (let i = 0; i < hclen; i++) cl[ORDER[i]] = bits(3);
+        const ct = build(cl), lengths = new Uint8Array(hlit + hdist);
+        for (let i = 0; i < hlit + hdist;) {
+          const sym = decode(ct);
+          if (sym < 16) lengths[i++] = sym;
+          else if (sym === 16) { const prev = lengths[i - 1]; for (let r = 3 + bits(2); r > 0; r--) lengths[i++] = prev; }
+          else if (sym === 17) i += 3 + bits(3);
+          else i += 11 + bits(7);
+        }
+        lt = build(lengths.subarray(0, hlit)); dt = build(lengths.subarray(hlit));
+      } else throw new Error('inflate: invalid block type');
+      for (;;) {
+        const sym = decode(lt);
+        if (sym < 256) { ensure(1); out[outLen++] = sym; }
+        else if (sym === 256) break;
+        else {
+          const li = sym - 257, len = LBASE[li] + bits(LEXT[li]);
+          const di = decode(dt), dist = DBASE[di] + bits(DEXT[di]);
+          if (dist > outLen) throw new Error('inflate: distance too far back');
+          ensure(len);
+          for (let k = 0; k < len; k++, outLen++) out[outLen] = out[outLen - dist];
+        }
+      }
+    }
+    return { bytes: out.slice(0, outLen), end: pos };
+  }
+  function gunzip(src) {
+    const chunks = [];
+    let pos = 0;
+    while (pos + 10 <= src.length && src[pos] === 0x1f && src[pos + 1] === 0x8b) {
+      const flags = src[pos + 3];
+      let p = pos + 10;
+      if (flags & 4) p += 2 + (src[p] | (src[p + 1] << 8));
+      if (flags & 8) while (src[p++] !== 0);
+      if (flags & 16) while (src[p++] !== 0);
+      if (flags & 2) p += 2;
+      const r = inflateRaw(src, p);
+      chunks.push(r.bytes);
+      pos = r.end + 8; // CRC32 + ISIZE
+    }
+    if (!chunks.length) throw new TypeError('DecompressionStream: not gzip data');
+    return concatBytes(chunks);
+  }
+  class DecompressionStream {
+    constructor(format) {
+      this.format = String(format);
+      if (!['gzip', 'deflate', 'deflate-raw'].includes(this.format)) throw new TypeError(`Unsupported compression format: ${format}`);
+    }
+    _ntTransform(readable) {
+      const fmt = this.format;
+      return new ReadableStream({ _ntBytes: readable._ntBytes.then((b) => (fmt === 'gzip' ? gunzip(b) : fmt === 'deflate' ? inflateRaw(b, 2).bytes : inflateRaw(b).bytes)) });
+    }
+  }
+  class CompressionStream {
+    constructor(format) { this.format = format; }
+    _ntTransform() { unsupported('CompressionStream', 'compressing data in the engine'); return new ReadableStream({ _ntBytes: Promise.reject(new TypeError('CompressionStream is not supported yet')) }); }
+  }
+
   class File extends Blob { constructor(parts, name, o = {}) { super(parts, o); this.name = name; this.lastModified = o.lastModified || 0; } }
   class Response {
     constructor(body = null, init = {}) {
       this._body = body; this.status = init.status ?? 200; this.statusText = init.statusText ?? 'OK';
       this.ok = this.status >= 200 && this.status < 300; this.headers = new Headers(init.headers); this.url = init.url || '';
-      this.redirected = false; this.type = 'basic'; this.bodyUsed = false; this.body = undefined;
+      this.redirected = false; this.type = 'basic'; this.bodyUsed = false;
+    }
+    // response.body as a stream (used for fetch(...).body.pipeThrough(...)).
+    get body() {
+      const b = this._body;
+      if (b === null || b === undefined) return null;
+      if (b._ntBytes) return b;
+      if (!this._stream) this._stream = new ReadableStream({ _ntBytes: Promise.resolve().then(() => this._bytes()) });
+      return this._stream;
     }
     _bytes() {
       this.bodyUsed = true;
@@ -928,10 +1255,15 @@
       if (b instanceof Blob) return b._bytes;
       return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
     }
-    arrayBuffer() { const u = this._bytes(); return Promise.resolve(u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : u.slice().buffer); }
-    text() { return Promise.resolve(typeof this._body === 'string' ? (this.bodyUsed = true, this._body) : new TextDecoder().decode(this._bytes())); }
+    _bytesAsync() {
+      if (this._body && this._body._ntBytes) { this.bodyUsed = true; return this._body._ntBytes; }
+      try { return Promise.resolve(this._bytes()); } catch (e) { return Promise.reject(e); }
+    }
+    arrayBuffer() { return this._bytesAsync().then((u) => (u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : u.slice().buffer)); }
+    bytes() { return this._bytesAsync().then((u) => u.slice()); }
+    text() { if (typeof this._body === 'string') { this.bodyUsed = true; return Promise.resolve(this._body); } return this._bytesAsync().then((u) => new TextDecoder().decode(u)); }
     json() { return this.text().then(JSON.parse); }
-    blob() { return Promise.resolve(new Blob([this._bytes()], { type: this.headers.get('content-type') || '' })); }
+    blob() { return this._bytesAsync().then((u) => new Blob([u], { type: this.headers.get('content-type') || '' })); }
     clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url }); }
   }
   class Request {
@@ -1078,9 +1410,12 @@
     Node, Text, Comment, Element, HTMLElement, HTMLCanvasElement, HTMLImageElement, HTMLInputElement, HTMLButtonElement, HTMLScriptElement,
     HTMLVideoElement: HTMLMediaElement, HTMLAudioElement: HTMLMediaElement, HTMLMediaElement, SVGElement: Element, Document, HTMLDocument: Document, DocumentFragment,
     Image: class extends HTMLImageElement { constructor(w, h) { super('img'); if (w) this.width = w; if (h) this.height = h; this.ownerDocument = document; } },
-    EventTarget, Event, CustomEvent, UIEvent, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent,
+    NodeFilter, TreeWalker, NodeIterator,
+    EventTarget, Event, CustomEvent, ProgressEvent, ErrorEvent, UIEvent, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent,
     AbortController, AbortSignal, URL, URLSearchParams, TextEncoder, TextDecoder, atob, btoa,
     fetch, Headers, Request, Response, Blob, File, XMLHttpRequest, DOMParser,
+    ReadableStream, DecompressionStream, CompressionStream,
+    createImageBitmap: () => { unsupported('Image/texture decoding', 'textures stay untextured (planned for v0.30)'); return Promise.reject(new Error('createImageBitmap is not supported yet (textures arrive in NativeThreeBridge v0.30)')); },
     ResizeObserver, MutationObserver, IntersectionObserver,
   };
   for (const [k, v] of Object.entries(assign)) {

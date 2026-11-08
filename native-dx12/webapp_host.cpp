@@ -185,6 +185,7 @@ struct WebappHost::Impl {
     std::map<std::string, std::string> builtins;
     std::vector<std::string> builtinNames;
     std::vector<std::string> importMap;
+    std::set<std::string> warnedThreeImports;
     WebappRenderSink* sink = nullptr;
     std::string title;
     bool started = false;
@@ -449,7 +450,7 @@ char* moduleNormalize(JSContext* ctx, const char* base, const char* name, void*)
         return nullptr;
     }
     if (resolved == "nt:three" && name && std::strcmp(name, "three") != 0 &&
-        std::strncmp(name, "nt:", 3) != 0)
+        std::strncmp(name, "nt:", 3) != 0 && self->warnedThreeImports.insert(name).second)
         self->log("warn", std::string("[NativeThreeBridge] '") + name +
                               "' replaced by the engine's built-in Three.js r181");
     return js_strdup(ctx, resolved.c_str());

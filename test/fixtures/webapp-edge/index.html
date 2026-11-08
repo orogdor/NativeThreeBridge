@@ -44,6 +44,20 @@
     document.querySelector('#ui .label > b').textContent = '7';
     window.counts = { lis: document.querySelectorAll('#list li').length, panels: document.getElementsByClassName('panel dark').length };
     setTimeout(() => { window.timeoutRan = true; }, 30);
+    // DOM APIs Kuningriigid needs: href/src reflection, TreeWalker, NodeFilter, replaceWith, gzip streams, dynamic import.
+    const link = document.createElement('link'); link.setAttribute('href', 'css/a.css?v=1');
+    window.linkPath = new URL(link.href).pathname;
+    const texts = []; const walker = document.createTreeWalker(document.getElementById('list'), NodeFilter.SHOW_TEXT);
+    let t; while ((t = walker.nextNode())) { texts.push(t.nodeValue); t.nodeValue = t.nodeValue.toUpperCase(); }
+    window.walked = texts.join(',') + '>' + document.getElementById('list').textContent;
+    const old = document.querySelector('#list li'); const fresh = document.createElement('li'); fresh.textContent = 'new'; old.replaceWith(fresh);
+    window.afterReplace = document.getElementById('list').textContent;
+    const gz = await (await fetch('lib/payload.bin.gz')).arrayBuffer();
+    window.gunzipped = await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+    const raw = new Uint8Array(await new Response((await fetch('lib/payload.deflate')).body.pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+    window.inflatedOk = raw.length === 5120 && raw.every((v, i) => v === (i & 255));
+    window.dynamicTint = (await import('./lib/colors.js')).helperColor;
+    window.fileLoaderValue = JSON.parse(await new THREE.FileLoader().loadAsync('lib/data.json')).value;
     renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
   </script>
 </body>
