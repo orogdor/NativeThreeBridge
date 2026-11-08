@@ -201,21 +201,29 @@ static std::string loadGameScene() {
     size_t slash = filename.find_last_of(L"\\/");
     if (slash == std::wstring::npos) die("Cannot locate executable folder.");
     filename.resize(slash);
+#if defined(NATIVE_THREE_WEBAPP)
+    filename += L"\\webapp\\native-scene.js";
+#else
     filename += L"\\game\\scene.js";
+#endif
     HANDLE f = CreateFileW(filename.c_str(), GENERIC_READ, FILE_SHARE_READ,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE)
+#if defined(NATIVE_THREE_WEBAPP)
+        die("Missing webapp/native-scene.js. Extract the complete WebApp Battle ZIP beside the EXE.");
+#else
         die("Missing game/scene.js. Extract the complete Windows ZIP beside the EXE.");
+#endif
     LARGE_INTEGER size = {};
     if (!GetFileSizeEx(f, &size) || size.QuadPart < 32 || size.QuadPart > (8 * 1024 * 1024)) {
         CloseHandle(f);
-        die("game/scene.js is empty, invalid or larger than 8 MB.");
+        die("Native scene script is empty, invalid or larger than 8 MB.");
     }
     std::string source(static_cast<size_t>(size.QuadPart), '\0');
     DWORD received = 0;
     BOOL ok = ReadFile(f, source.data(), static_cast<DWORD>(source.size()), &received, nullptr);
     CloseHandle(f);
-    if (!ok || received != source.size()) die("Unable to read game/scene.js.");
+    if (!ok || received != source.size()) die("Unable to read native scene script.");
     return source;
 }
 
@@ -240,7 +248,11 @@ void NativeThreeJS_Init() {
     installNativeNavigation(context);
     installNativeAudio(context);
     const std::string gameScript = loadGameScene();
+#if defined(NATIVE_THREE_WEBAPP)
+    result = JS_Eval(context, gameScript.data(), gameScript.size(), "webapp/native-scene.js", JS_EVAL_TYPE_GLOBAL);
+#else
     result = JS_Eval(context, gameScript.data(), gameScript.size(), "game/scene.js", JS_EVAL_TYPE_GLOBAL);
+#endif
     if (JS_IsException(result)) dieWithJS("Game scene.js evaluation failed");
     JS_FreeValue(context, result);
 

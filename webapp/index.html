@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="et">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NativeThreeBridge · metsalahingu veebikatse</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="importmap">{"imports":{"three":"./vendor/three.module.js"}}</script>
+</head>
+<body>
+  <main id="app">
+    <canvas id="view" aria-label="Metsalahingu 3D vaade"></canvas>
+    <section id="hud" aria-label="Lahingu juhtimine">
+      <h1>Metsalahingu veebikatse</h1>
+      <p id="status">Stseeni laadimine…</p>
+      <div class="controls">
+        <button id="battle" type="button">Alusta kiirlahingut</button>
+        <button id="pause" type="button">Peata</button>
+        <button id="reset" type="button">Alusta uuesti</button>
+      </div>
+      <p id="score">Punased 500 · Sinised 500</p>
+      <p class="hint">Hiirega pööra ja suumi. See veebirakendus kasutab sama lahinguloogikat kui native test.</p>
+    </section>
+  </main>
+  <!-- Inert in browsers: offline converter uses this same simulation as the native entry. -->
+  <script type="application/x-nativethree-scene" src="./battle-scene.js"></script>
+  <script type="module" src="./main.mjs"></script>
+</body>
+</html>

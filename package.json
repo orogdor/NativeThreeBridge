@@ -5,6 +5,8 @@
   "private": true,
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "web:build": "node tools/build-webapp.mjs",
+    "web:serve": "node tools/serve-webapp.mjs",
     "export": "node js/export-demo.mjs",
     "convert": "node tools/convert-three-scene.mjs"
   },

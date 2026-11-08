@@ -1735,8 +1735,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!separator)return 40;
     *separator=0;
     wchar_t sourceMarker[MAX_PATH]={},scenePath[MAX_PATH]={};
-    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",executable)<0 ||
-       swprintf_s(scenePath,L"%s\\game\\scene.js",executable)<0)return 40;
+    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",executable)<0)return 40;
+#if defined(NATIVE_THREE_WEBAPP)
+    if(swprintf_s(scenePath,L"%s\\webapp\\native-scene.js",executable)<0)return 40;
+#else
+    if(swprintf_s(scenePath,L"%s\\game\\scene.js",executable)<0)return 40;
+#endif
     const bool importedGame=GetFileAttributesW(sourceMarker)!=INVALID_FILE_ATTRIBUTES;
     const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
     if(importedGame || !battleScene) {
@@ -1744,8 +1748,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
             ? "Kuningriigid source is installed in game/, but this DX12 engine cannot run it yet. "
               "Browser DOM, HTML/CSS, module loading and WebGLRenderer are not implemented. "
               "No downloaded game code was executed."
+#if defined(NATIVE_THREE_WEBAPP)
+            : "Missing webapp/native-scene.js. Extract the complete WebApp Battle ZIP. "
+              "This native DX12 build requires the HTML-derived forest scene contract.";
+#else
             : "No compatible game/scene.js found. Install a game with its own updater. "
               "This DX12 engine still requires the forest battle scene contract.";
+#endif
         char reportPath[MAX_PATH]={};
         if(sprintf_s(reportPath,"%ls\\compatibility-report.txt",executable)>0) {
             FILE* file=nullptr;
