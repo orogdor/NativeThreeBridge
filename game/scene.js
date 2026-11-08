@@ -190,6 +190,7 @@ function protectedFormationCell(x,z) {
     const oldPlans=unit.plans;
     const path=findPath(unit);
     searches++; if(oldPlans>0)replans++;
+    else initialRoutesRemaining--;
     unit.plans++;unit.wait=0;unit.path=path;unit.at=0;
     if(path.length<2){
       unit.path=[];unit.retry=0.30+(unit.id%9)*0.045;
@@ -203,7 +204,7 @@ function protectedFormationCell(x,z) {
   const matrices=new Float32Array(TOTAL*16);
   const lightData=new Float32Array(SOLDIERS*8);
   const lightColors=[new THREE.Color(0xffbc88),new THREE.Color(0x94c5ff)];
-  let arrivals=0,planningCursor=0,simFrames=0;
+  let arrivals=0,planningCursor=0,simFrames=0,initialRoutesRemaining=SOLDIERS;
   const urgentPlans=[],queuedUrgent=new Uint8Array(SOLDIERS);
   function requestUrgentPlan(unit) {
     if(!queuedUrgent[unit.id]){
@@ -250,7 +251,12 @@ function protectedFormationCell(x,z) {
     // New movement orders and released collisions cannot wait behind 1000
     // first-time route requests. Defer busy units without losing their ticket.
     let budget=MAX_PLANS_PER_FRAME;
-    for(let attempts=urgentPlans.length;attempts>0 && budget>0;attempts--){
+    // Reserve at least 3 of 4 slots for never-planned soldiers until the
+    // full 1000-agent formation has a first route. Prevents replan starvation.
+    const urgentQuota=initialRoutesRemaining>0?1:MAX_PLANS_PER_FRAME;
+    let urgentUsed=0;
+    for(let attempts=urgentPlans.length;attempts>0 &&
+        budget>0 && urgentUsed<urgentQuota;attempts--){
       const id=urgentPlans.shift(),unit=units[id];
       if(unit.next!==-1||unit.retry>0){
         urgentPlans.push(id);
@@ -258,7 +264,7 @@ function protectedFormationCell(x,z) {
       }
       queuedUrgent[id]=0;
       if(unit.arrived||unit.path.length>1)continue;
-      planFor(unit);budget--;
+      planFor(unit);budget--;urgentUsed++;
     }
     // The remaining slots are fair round-robin requests from all soldiers.
     for(let checked=0;checked<SOLDIERS && budget>0;checked++){
