@@ -35,7 +35,11 @@ using namespace DirectX;
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
 static const UINT SHADOW_COUNT=16, SHADOW_SIZE=256;
 static const UINT TREE_COUNT=10000, LIGHT_COUNT=1000, PER_ARMY=500, INSTANCE_COUNT=11000;
-static const UINT GRID_DIM=16, MAX_CELL_LIGHTS=16;
+// Coarse spatial bins are only candidate lists, never a lighting quantization.
+static const UINT GRID_DIM=16, GRID_CELL_COUNT=GRID_DIM*GRID_DIM;
+static const UINT GRID_INDEX_BASE=GRID_CELL_COUNT*2;
+static const UINT GRID_BUFFER_UINT_COUNT=GRID_INDEX_BASE+GRID_CELL_COUNT*LIGHT_COUNT;
+static const float GRID_WORLD_MIN=-540.0f, GRID_CELL_SIZE=1080.0f/GRID_DIM;
 static HWND gWindow=nullptr;
 static float gYaw=0.52f, gPitch=0.85f, gDistance=780.0f;
 static UINT gCameraMode=0; // 1=red, 2=blue, 0=forest overview
@@ -102,7 +106,7 @@ static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_
 static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
-static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{},gGridSRV[FRAME_COUNT]{};
 static UINT gMainVisibleTrees=0;
 static XMFLOAT4X4 gLastVisibilityMatrix{};
 static bool gHaveVisibilityCache=false;
@@ -401,10 +405,9 @@ cbuffer Lights : register(b3) {
     float4 gLightColorIntensity[1000];
     float4 gShadowSlots[1000];
 };
-cbuffer LightGrid : register(b4) {
-    uint4 gGridCounts[64];
-    uint4 gGridIndices[1024];
-};
+// Compact per-tile light lists: [start,count] for each tile, then contiguous IDs.
+// No 16-light cap: every light whose radius intersects the pixel's tile is listed.
+Buffer<uint> gLightGridData : register(t4);
 Texture2D gTexture : register(t0);
 Texture2DArray gShadowDepthTexture : register(t1);
 Buffer<uint> gShadowInstanceIDs : register(t2);
@@ -460,14 +463,15 @@ float4 PSMain(Vout v):SV_TARGET {
     float diffuseSky=abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
     float day=lerp(0.20+0.34*diffuseSky,0.018+0.026*diffuseSky,gNight);
     float3 illumination=day.xxx;
-    // CPU bins all 1000 moving lights into 16x16 tiles across the expanded forest.
-    // Only the nearest 16 in this tile are evaluated per pixel.
+    // The grid is a conservative acceleration structure. Light influence is
+    // still evaluated continuously per pixel, including at tile boundaries.
     int gx=clamp((int)floor((v.worldPos.x+540.0)/67.5),0,15);
     int gz=clamp((int)floor((v.worldPos.z+540.0)/67.5),0,15);
     uint cell=(uint)(gz*16+gx);
-    uint count=gGridCounts[cell/4][cell%4];
+    uint start=gLightGridData[cell*2];
+    uint count=gLightGridData[cell*2+1];
     [loop] for(uint k=0;k<count;k++){
-        uint index=gGridIndices[cell*4+k/4][k%4];
+        uint index=gLightGridData[512+start+k];
         if(index>=1000)continue;
         float3 toLight=gLightPosRadius[index].xyz-v.worldPos;
         float distSq=dot(toLight,toLight);
@@ -499,7 +503,7 @@ static void makePipeline() {
     rp[1].Constants.ShaderRegister=1;
     rp[1].Constants.Num32BitValues=11;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[4]={};
+    D3D12_DESCRIPTOR_RANGE ranges[5]={};
     for(UINT i=0;i<3;i++){
         ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors=1;
@@ -524,8 +528,13 @@ static void makePipeline() {
     rp[5].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[5].Descriptor.ShaderRegister=3;
     rp[5].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
-    rp[6].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rp[6].Descriptor.ShaderRegister=4;
+    // Per-frame variable-length tiled light index stream, bound as a typed SRV.
+    ranges[4].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[4].NumDescriptors=1;
+    ranges[4].BaseShaderRegister=4;
+    rp[6].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[6].DescriptorTable.NumDescriptorRanges=1;
+    rp[6].DescriptorTable.pDescriptorRanges=&ranges[4];
     rp[6].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
     rp[7].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[7].Descriptor.ShaderRegister=5;
@@ -686,7 +695,7 @@ static void initializeDX12() {
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=4+FRAME_COUNT+1;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4+FRAME_COUNT+1+FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -768,7 +777,7 @@ static void initializeDX12() {
         gCameraBuffers[frame]=uploadBuffer(nullptr,256);
         gSoldierBuffers[frame]=uploadBuffer(nullptr,65536); // 1000 matrices = 64000 bytes
         gLightBuffers[frame]=uploadBuffer(nullptr,49152); // 1000 lights + 16 shadow matrices
-        gGridBuffers[frame]=uploadBuffer(nullptr,17408);
+        gGridBuffers[frame]=uploadBuffer(nullptr,(UINT64)GRID_BUFFER_UINT_COUNT*sizeof(UINT));
         gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
         // 16 shadow casters x 1500 possible tree/soldier instance indices.
         gShadowIndexBuffers[frame]=uploadBuffer(nullptr,
@@ -783,6 +792,16 @@ static void initializeDX12() {
         gDevice->CreateShaderResourceView(gShadowIndexBuffers[frame].Get(),&idsView,idsCpu);
         gShadowIndexSRV[frame]=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
         gShadowIndexSRV[frame].ptr+=(UINT64)(4+frame)*gSRVStep;
+        D3D12_SHADER_RESOURCE_VIEW_DESC gridView={};
+        gridView.Format=DXGI_FORMAT_R32_UINT;
+        gridView.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+        gridView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        gridView.Buffer.NumElements=GRID_BUFFER_UINT_COUNT;
+        auto gridCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        gridCpu.ptr+=(SIZE_T)(5+FRAME_COUNT+frame)*gSRVStep;
+        gDevice->CreateShaderResourceView(gGridBuffers[frame].Get(),&gridView,gridCpu);
+        gGridSRV[frame]=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+        gGridSRV[frame].ptr+=(UINT64)(5+FRAME_COUNT+frame)*gSRVStep;
     }
     gShadowIndexCB=gShadowIndexBuffers[0];
     gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];
@@ -805,12 +824,8 @@ struct LightConstants {
     XMFLOAT4 colorsIntensity[LIGHT_COUNT];
     XMFLOAT4 shadowSlots[LIGHT_COUNT];        // -1 = unshadowed this frame
 };
-struct LightGridConstants {
-    XMUINT4 counts[GRID_DIM*GRID_DIM/4];
-    XMUINT4 indices[GRID_DIM*GRID_DIM*MAX_CELL_LIGHTS/4];
-};
 static_assert(sizeof(LightConstants)==49024,"1000-light CB layout mismatch");
-static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
+static_assert(GRID_INDEX_BASE==GRID_CELL_COUNT*2,"Tiled-light header layout mismatch");
 
 static void updateLightsAndShadowCameras(const float *matrices,const float *lights) {
     LightConstants constants{};
@@ -899,52 +914,42 @@ static void updateLightsAndShadowCameras(const float *matrices,const float *ligh
     }
     gShadowCameraCB->Unmap(0,nullptr);
 
-    LightGridConstants grid{};
-    // 16x16 tiles, 30 world units each, spanning the 480-unit-wide world.
-    // Each pixel evaluates at most 16 nearby lights, instead of all 500.
-    for(UINT cell=0;cell<GRID_DIM*GRID_DIM;cell++) {
+    // No nearest-N cap or tile-centre-only decisions: include each light in
+    // every grid tile overlapped by its actual radius. This guarantees that
+    // crossing a grid boundary does not remove a contributing light.
+    UINT *grid=nullptr;
+    check(gGridCB->Map(0,nullptr,(void**)&grid),"Map compact light index grid");
+    UINT nextIndex=0;
+    const float halfCell=GRID_CELL_SIZE*0.5f;
+    const float searchRadius=maximumLightRange+GRID_CELL_SIZE*0.707107f;
+    for(UINT cell=0;cell<GRID_CELL_COUNT;cell++) {
         const UINT cx=cell%GRID_DIM,cz=cell/GRID_DIM;
-        const float worldX=-540.0f+((float)cx+0.5f)*67.5f;
-        const float worldZ=-540.0f+((float)cz+0.5f)*67.5f;
-        float bestDist[MAX_CELL_LIGHTS];
-        UINT bestIndex[MAX_CELL_LIGHTS];
-        for(UINT k=0;k<MAX_CELL_LIGHTS;k++) {
-            bestDist[k]=1.e30f;bestIndex[k]=0;
-        }
-        UINT count=0;
-        // Search only light chunks whose influence can touch this tile.
-        gDynamicLights.queryRadius(worldX,worldZ,maximumLightRange+48.f,
+        const float worldX=GRID_WORLD_MIN+((float)cx+0.5f)*GRID_CELL_SIZE;
+        const float worldZ=GRID_WORLD_MIN+((float)cz+0.5f)*GRID_CELL_SIZE;
+        const UINT start=nextIndex;
+        gDynamicLights.queryRadius(worldX,worldZ,searchRadius,
           [&](const native_three::SpatialItem& lightItem) {
             ++gLightCandidateChecks;
             const UINT li=lightItem.id;
             const float *l=lights+li*8;
-            const float dx=l[0]-worldX,dz=l[2]-worldZ;
-            const float d2=dx*dx+dz*dz;
-            const float radius=l[3]+48.0f; // conservative tile-diagonal margin
-            if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
-                return;
-            UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
-            if(count<MAX_CELL_LIGHTS)++count;
-            while(pos>0 && d2<bestDist[pos-1]) {
-                bestDist[pos]=bestDist[pos-1];
-                bestIndex[pos]=bestIndex[pos-1];
-                --pos;
-            }
-            bestDist[pos]=d2;bestIndex[pos]=li;
+            // Exact sphere-vs-tile-AABB test in XZ; never drop a light that
+            // can contribute to a ground pixel or an object inside this tile.
+            const float dx=std::max(std::fabs(l[0]-worldX)-halfCell,0.0f);
+            const float dz=std::max(std::fabs(l[2]-worldZ)-halfCell,0.0f);
+            if(dx*dx+dz*dz>=l[3]*l[3])return;
+            // A light can appear only once per tile, so the allocated upper
+            // bound of GRID_CELL_COUNT * LIGHT_COUNT entries is sufficient.
+            if(nextIndex<GRID_CELL_COUNT*LIGHT_COUNT)
+                grid[GRID_INDEX_BASE+nextIndex++]=li;
         });
-        reinterpret_cast<UINT*>(&grid.counts[cell/4])[cell%4]=count;
-        for(UINT k=0;k<count;k++) {
-            UINT word=cell*MAX_CELL_LIGHTS/4+k/4;
-            reinterpret_cast<UINT*>(&grid.indices[word])[k%4]=bestIndex[k];
-        }
+        grid[cell*2]=start;
+        grid[cell*2+1]=nextIndex-start;
     }
+    gGridCB->Unmap(0,nullptr);
     void *data=nullptr;
-    check(gLightsCB->Map(0,nullptr,&data),"Map 500 dynamic light records");
+    check(gLightsCB->Map(0,nullptr,&data),"Map 1000 dynamic light records");
     memcpy(data,&constants,sizeof(constants));
     gLightsCB->Unmap(0,nullptr);
-    check(gGridCB->Map(0,nullptr,&data),"Map 16x16 light index grid");
-    memcpy(data,&grid,sizeof(grid));
-    gGridCB->Unmap(0,nullptr);
 }
 
 static void drawShadowMaps() {
@@ -1282,7 +1287,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
-    gCmd->SetGraphicsRootConstantBufferView(6,gGridCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(6,gGridSRV[back]);
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     // Instanced draws for 1500 objects: two tree parts,
     // 250 red soldiers, 250 blue soldiers; plus one ground draw.
