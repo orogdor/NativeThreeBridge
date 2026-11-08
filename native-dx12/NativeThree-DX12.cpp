@@ -19,6 +19,7 @@
 #include <vector>
 #include <algorithm>
 #include "three_js_host.h"
+#include "spatial_index.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -86,6 +87,11 @@ static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
 static UINT gMainVisibleTrees=0;
+// Shared engine spatial lookups. Object classes do not affect the index.
+static native_three::SpatialIndex2D gStaticObjects(36.f);
+static native_three::SpatialIndex2D gDynamicLights(36.f);
+static bool gStaticObjectsRegistered=false;
+static UINT gLightCandidateChecks=0,gShadowTreeCandidateChecks=0,gVisibleTreeCandidateChecks=0;
 static double gFenceWaitTotal=0,gWorstFrameMs=0,gLastFrameEndSeconds=0;
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
 static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
@@ -747,6 +753,14 @@ static void updateLightsAndShadowCameras(const float *matrices) {
     float lights[LIGHT_COUNT*8]{};
     NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
     LightConstants constants{};
+    gDynamicLights.clear();
+    float maximumLightRange=0.f;
+    for(UINT li=0;li<LIGHT_COUNT;li++) {
+        const float *l=lights+li*8;
+        gDynamicLights.insert(li,l[0],l[2]);
+        maximumLightRange=std::max(maximumLightRange,l[3]);
+    }
+    gLightCandidateChecks=gShadowTreeCandidateChecks=0;
     for(UINT li=0;li<LIGHT_COUNT;li++) {
         const float *l=lights+li*8;
         constants.positionsRadius[li]={l[0],l[1],l[2],l[3]};
@@ -789,10 +803,11 @@ static void updateLightsAndShadowCameras(const float *matrices) {
             const float treeDist2=treeRange*treeRange,unitDist2=unitRange*unitRange;
             const UINT base=slot*INSTANCE_COUNT;
             UINT trees=0,reds=0,blues=0;
-            for(UINT i=0;i<TREE_COUNT;i++){
-                const float dx=matrices[i*16+12]-lx,dz=matrices[i*16+14]-lz;
-                if(dx*dx+dz*dz<=treeDist2)ids[base+trees++]=i;
-            }
+            // Query nearby static chunks once, not all 10,000 trees per light.
+            gStaticObjects.queryRadius(lx,lz,treeRange,[&](const native_three::SpatialItem& entry){
+                ++gShadowTreeCandidateChecks;
+                ids[base+trees++]=entry.id;
+            });
             for(UINT i=0;i<PER_ARMY;i++){
                 const UINT red=TREE_COUNT+i,blue=TREE_COUNT+PER_ARMY+i;
                 const float rx=matrices[red*16+12]-lx,rz=matrices[red*16+14]-lz;
@@ -836,13 +851,17 @@ static void updateLightsAndShadowCameras(const float *matrices) {
             bestDist[k]=1.e30f;bestIndex[k]=0;
         }
         UINT count=0;
-        for(UINT li=0;li<LIGHT_COUNT;li++) {
+        // Search only light chunks whose influence can touch this tile.
+        gDynamicLights.queryRadius(worldX,worldZ,maximumLightRange+48.f,
+          [&](const native_three::SpatialItem& lightItem) {
+            ++gLightCandidateChecks;
+            const UINT li=lightItem.id;
             const float *l=lights+li*8;
             const float dx=l[0]-worldX,dz=l[2]-worldZ;
             const float d2=dx*dx+dz*dz;
-            const float radius=l[3]+48.0f; // covers diagonal of 67.5x67.5 tile
+            const float radius=l[3]+48.0f; // conservative tile-diagonal margin
             if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
-                continue;
+                return;
             UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
             if(count<MAX_CELL_LIGHTS)++count;
             while(pos>0 && d2<bestDist[pos-1]) {
@@ -851,7 +870,7 @@ static void updateLightsAndShadowCameras(const float *matrices) {
                 --pos;
             }
             bestDist[pos]=d2;bestIndex[pos]=li;
-        }
+        });
         reinterpret_cast<UINT*>(&grid.counts[cell/4])[cell%4]=count;
         for(UINT k=0;k<count;k++) {
             UINT word=cell*MAX_CELL_LIGHTS/4+k/4;
@@ -925,17 +944,41 @@ static void updateMainTreeVisibility(const float *matrices,
     const float padX=XMVectorGetX(projection.r[0])*14.f;
     const float padY=XMVectorGetY(projection.r[1])*20.f;
     UINT visible=0;
-    for(UINT i=0;i<TREE_COUNT;i++){
-        const float *m=matrices+i*16;
-        const XMVECTOR at=XMVectorSet(m[12],8.f,m[14],1.f);
-        const XMVECTOR clip=XMVector4Transform(at,viewProjection);
-        const float w=XMVectorGetW(clip);
-        if(w<=-18.f)continue;
-        const float x=XMVectorGetX(clip),y=XMVectorGetY(clip);
-        if(x < -w-padX || x > w+padX ||
-           y < -w-padY || y > w+padY)continue;
-        ids[offset+visible++]=i;
-    }
+    gVisibleTreeCandidateChecks=0;
+    gStaticObjects.forEachChunk([&](int cx,int cz,
+                           const std::vector<native_three::SpatialItem>& entries){
+        // Reject an entire spatial chunk only if all eight corners of its
+        // conservative 3D bounds are outside the SAME clip-space plane.
+        // Unknown trees/methods remain visible rather than risk false culls.
+        const float size=gStaticObjects.chunkSize();
+        const float x0=cx*size-18.f,x1=(cx+1)*size+18.f;
+        const float z0=cz*size-18.f,z1=(cz+1)*size+18.f;
+        int rejectedLeft=0,rejectedRight=0,rejectedBelow=0,rejectedAbove=0;
+        for(int corner=0;corner<8;corner++){
+            const float x=(corner&1)?x1:x0,z=(corner&2)?z1:z0;
+            const float y=(corner&4)?36.f:-2.f;
+            const XMVECTOR clip=XMVector4Transform(XMVectorSet(x,y,z,1.f),viewProjection);
+            const float w=XMVectorGetW(clip),px=XMVectorGetX(clip),py=XMVectorGetY(clip);
+            rejectedLeft+=(px < -w-padX);
+            rejectedRight+=(px > w+padX);
+            rejectedBelow+=(py < -w-padY);
+            rejectedAbove+=(py > w+padY);
+        }
+        if(rejectedLeft==8 || rejectedRight==8 || rejectedBelow==8 || rejectedAbove==8)
+            return;
+        for(const auto& entry:entries){
+            ++gVisibleTreeCandidateChecks;
+            const UINT i=entry.id;
+            const XMVECTOR at=XMVectorSet(entry.x,8.f,entry.z,1.f);
+            const XMVECTOR clip=XMVector4Transform(at,viewProjection);
+            const float w=XMVectorGetW(clip);
+            if(w<=-18.f)continue;
+            const float x=XMVectorGetX(clip),y=XMVectorGetY(clip);
+            if(x < -w-padX || x > w+padX ||
+               y < -w-padY || y > w+padY)continue;
+            ids[offset+visible++]=i;
+        }
+    });
     gMainVisibleTrees=visible;
     gShadowIndexCB->Unmap(0,nullptr);
 }
@@ -984,6 +1027,13 @@ static void renderFrame() {
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
+    // Static scene objects register once; moving objects use their own grid.
+    if(!gStaticObjectsRegistered){
+        gStaticObjects.reserve(1024);
+        for(UINT i=0;i<TREE_COUNT;i++)
+            gStaticObjects.insert(i,matrices[i*16+12],matrices[i*16+14]);
+        gStaticObjectsRegistered=true;
+    }
     const double lightsStart=cpuSeconds();
     updateLightsAndShadowCameras(matrices.data());
     gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
@@ -1131,11 +1181,12 @@ static void renderFrame() {
         wchar_t title[620];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f ms FENCE %.2f | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | A* %d/1000 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
-            gMainVisibleTrees,navigation.moved,navigation.planned,shadowInstances,
+            gMainVisibleTrees,gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
+            navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
