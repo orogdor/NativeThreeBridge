@@ -1,4 +1,4 @@
-NativeThreeBridge v0.21.0 - PER-SOLDIER PROCEDURAL WALK TEST
+NativeThreeBridge v0.22.0 - RED ARMY SKELETON / BLUE ARMY BASELINE
 ================================================================
 New: all radius-overlapping lights contribute to each 16x16 spatial tile.
 The former nearest-16 light list created hard moving square boundaries.
@@ -6,11 +6,13 @@ Light indices are now compact per-frame SRVs; 16 real shadow maps remain.
 Compare v0.19.0 and v0.20.0 on the same Windows DX12 camera and settings.
 A physical GPU is needed to check lighting pixels and FPS. FPS is not guaranteed.
 
-Experimental: each moving spearman now walks with a distinct leg stride and
-light body bob; stationary soldiers gradually return to rest. The original
-unrigged GLB is unchanged: this is procedural vertex deformation, NOT a
-true skeletal/rigged animation clip. Shadows use the same deformed mesh.
-F8 toggles WALK ON/OFF for direct FPS and appearance comparison.
+NEW: Red army 500 spearmen use an actual 8-bone skin generated from the original
+Odamees GLB, with JOINTS_0, WEIGHTS_0, hierarchy and inverse bind matrices.
+Knees, hips, spine and arms are procedurally moved using skeletal influences.
+Blue army 500 retains the v0.21 unrigged procedural gait for comparison.
+The same skinning runs in the real shadow depth pass. F8 toggles animation.
+game/odamees-rigged.glb contains the exported rig for inspection and reuse.
+Rigging is automatic/experimental; it needs a close visual assessment.
 
 10,000 pines / two 500-unit armies / 1,000 lights / 16 shadow maps.
 C++ scene registry, spatial index, async A*, native fixed 60Hz simulation
