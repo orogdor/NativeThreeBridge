@@ -5,9 +5,10 @@ import { readFileSync } from 'node:fs';
 const dx=readFileSync(new URL('../native-dx12/NativeThree-DX12.cpp',import.meta.url),'utf8');
 const workflow=readFileSync(new URL('../.github/workflows/native-threejs.yml',import.meta.url),'utf8');
 
-test('forest battle stays the bundled default scene',()=>{
-  assert.match(workflow,/Copy-Item game\/scene\.js dist\/game\/scene\.js/);
-  assert.match(workflow,/Test-Path verify\/game\/scene\.js/);
+test('forest battle remains the main-branch engine smoke scene, not this game package',()=>{
+  assert.match(workflow,/ThreeSceneSmoke\.exe/);
+  assert.match(workflow,/Copy-Item game\/SOURCE\.txt dist\/game\/SOURCE\.txt/);
+  assert.doesNotMatch(workflow,/Copy-Item game\/scene\.js dist\/game\/scene\.js/);
 });
 
 test('downloaded browser source is rejected before DX12 or QuickJS initialization',()=>{
@@ -19,7 +20,8 @@ test('downloaded browser source is rejected before DX12 or QuickJS initializatio
   assert.match(dx,/return 42;/);
 });
 
-test('stable engine release includes an engine-only checksum manifest',()=>{
+test('separate game package fetches and verifies the latest stable engine release',()=>{
+  assert.match(workflow,/NativeThreeBridge\/releases\/latest/);
   assert.match(workflow,/engine-update-v1\.json/);
   assert.match(workflow,/Get-FileHash dist\/NativeThree-Game\.exe -Algorithm SHA256/);
 });

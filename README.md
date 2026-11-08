@@ -1,3 +1,7 @@
+# Kuningriigid compatibility experiment (separate branch)
+
+This branch packages Kuningriigid source in `game/` through Game-Updater.exe and uses the **latest stable main-branch engine release** as its NativeThree-Game.exe. Engine-Updater.exe updates only that shared engine binary; Game-Updater.exe updates only Kuningriigid. Both show a download percentage. The main branch and its forest battle package remain the engine development baseline. At present Kuningriigid is refused before JavaScript execution because browser DOM, modules and WebGLRenderer are unsupported.
+
 # NativeThreeBridge v0.27.1 — forest battle remains the main engine test
 
 The original forest battle is the default Windows package and remains the engine development scenario. Releases now also include `engine-update-v1.json` with the native EXE's SHA-256, allowing separate game installations to update the engine without changing their game files. Imported browser source is refused before JavaScript execution until the needed DOM, module and WebGLRenderer adapters exist. Kuningriigid experiments live on a separate branch.

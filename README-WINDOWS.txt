@@ -1,98 +1,41 @@
-NativeThreeBridge v0.27.1 - FOREST BATTLE ENGINE
-The forest battle is still the primary scenario and starts normally from
-NativeThree-Game.exe. A separate engine-update-v1.json release asset lets
-other game installations update only the engine binary. Browser projects
-in game/ are reported as incompatible before their JavaScript is executed.
+NativeThreeBridge v0.27.1-kuningriigid.1 - SEPARATE GAME TEST
+==========================================================
 
-NativeThreeBridge v0.26.0 - SMOOTH CLOSE-UP SOLDIER MOTION
-FIX: same fractional 60 Hz simulation time is used for character XYZ,
-rotation, battle animation and tracking camera at all DX12 frame rates.
-A* waypoint-facing rotates smoothly; F12 instantly refreshes instances.
-Compare with v0.25.0 by following soldiers using F2/F3 and zooming in.
-F8 still toggles gait, F7 day/night, F12 quick battle, CSS Restart resets.
+This package is built from the experiment/kuningriigid-game branch. The main
+NativeThreeBridge release remains the forest battle engine test. Extract
+this complete ZIP to a separate writable folder. It contains exactly
+three EXE files:
 
-NativeThreeBridge v0.25.0 - 1000 SOLDIER DIRECTIONAL BATTLE TEST
-================================================================
-NEW: 500 vs 500 soldiers now acquire an opponent, fight in melee,
-and seek their next living enemy after defeating the current target.
-F12 jumps 48 from each army into a central skirmish while the full
-1000-soldier A* / 10,000-tree workload continues running.
-Front: 5 hits to die; flank: 3 hits; rear: 1 hit (15 armor points).
-Weapon thrust, stagger and fallen-body animation are in the main AND
-real shadow DX12 passes; dead units free navigation slots and lose lights.
-When one army loses all soldiers, survivors return to original positions.
-The title now reports BATTLE red/blue alive, kills, hits and engaged units.
-Three extra editable native WAV cues: game/audio/{swing,hit,death}.wav
-F9/CSS Restart resets the battle; F10 tests sound, F11 toggles sound.
-Press F2/F3 to follow armies, wheel to zoom and inspect fighting closely.
+  Game-Updater.exe       Downloads changed files from orogdor/Kuningriigid
+                         main into game/, showing download percentage.
+  Engine-Updater.exe     Checks the latest stable forest-battle engine release
+                         and updates only NativeThree-Game.exe, showing %.
+  NativeThree-Game.exe   Starts the local engine without checking the network.
 
-NEW: JavaScript now emits sound events through NativeThreeAudio.play().
-Windows C++ plays short PCM16 WAVs with XAudio2 (no Web Audio browser).
-F10 plays the JavaScript-to-XAudio2 test ping. F11 toggles sound output.
-Two moving soldiers provide positional footstep cues with stereo panning.
-Restart stops all old voices and plays a new acknowledgement sound.
-The ZIP includes game/audio/signal.wav, step.wav and restart.wav.
-Add short PCM16 mono/stereo WAVs (8-96 kHz) to the game/audio folder.
-Example: NativeThreeAudio.play('my_sound',x,y,z,0.7,true,false).
-24 simultaneous native voices maximum, with shared cached sound clips.
-Not yet: complete Three.js Audio/PositionalAudio API, MP3/OGG decoder,
-streaming background music or sophisticated HRTF/audio occlusion.
+Run Game-Updater.exe first. It installs the repository source in game/ and
+keeps the previous game directory as game.previous. The updater refuses to
+overwrite locally edited tracked files. Engine updates keep the previous
+NativeThree-Game.exe as NativeThree-Game.exe.previous. Do not combine this
+test ZIP with the forest-battle installation; extract to a separate folder.
 
-CSS test: game/ui.html declares <button id=restart-button>; game/ui.css
-sets right/top/size/background/text/border/radius/font. Engine parses these
-on startup and creates a real owner-drawn Win32 BUTTON, no browser or WebView.
-Press Restart to reset 1000 soldiers, A* routes, lights and gait to initial
-conditions without reloading the static 10000-tree GPU assets.
-You can edit game/ui.css and relaunch to test supported native styles.
-F9 is a keyboard shortcut to invoke the same C++ restart command.
-Full web CSS layout, animations, flexbox and scripts are NOT implemented.
+IMPORTANT COMPATIBILITY RESULT
+Kuningriigid is the first compatibility experiment, not the engine's main
+development scenario. This native DX12 host does not implement its
+HTML/DOM, CSS, module loading, WebGLRenderer, or full asset pipeline. When
+NativeThree-Game.exe sees the downloaded source, it writes
+compatibility-report.txt and exits with a clear warning before executing
+any downloaded JavaScript. There is no claim that Kuningriigid currently
+runs on native DirectX 12. The latest stable main-branch ZIP is the working
+forest battle development release.
 
-New: all radius-overlapping lights contribute to each 16x16 spatial tile.
-The former nearest-16 light list created hard moving square boundaries.
-Light indices are now compact per-frame SRVs; 16 real shadow maps remain.
-Compare v0.19.0 and v0.20.0 on the same Windows DX12 camera and settings.
-A physical GPU is needed to check lighting pixels and FPS. FPS is not guaranteed.
+Game-Updater.exe uses a pinned Git commit for each update, verifies every
+download against its Git blob SHA-1 and records SHA-256 checksums in
+game/.native-three-game-manifest.json. It downloads only files whose Git
+blob changed or whose local copy is missing, but the update needs temporary
+disk space to copy the full game directory before a directory swap. It does
+not run scripts from the repository. Git LFS pointers, symbolic links,
+truncated GitHub trees and oversized downloads are rejected. GitHub/TLS is
+the trust source; these checksums do not provide independent code signing.
 
-NEW: Red army 500 spearmen use an actual 8-bone skin generated from the original
-Odamees GLB, with JOINTS_0, WEIGHTS_0, hierarchy and inverse bind matrices.
-Knees, hips, spine and arms are procedurally moved using skeletal influences.
-Blue army 500 retains the v0.21 unrigged procedural gait for comparison.
-The same skinning runs in the real shadow depth pass. F8 toggles animation.
-game/odamees-rigged.glb contains the exported rig for inspection and reuse.
-Rigging is automatic/experimental; it needs a close visual assessment.
-
-10,000 pines / two 500-unit armies / 1,000 lights / 16 shadow maps.
-C++ scene registry, spatial index, async A*, native fixed 60Hz simulation
-with render interpolation, GPU timing and offline texture mipmaps.
-
-Extract ZIP with NativeThree-Game.exe and game/scene.js together.
-Run NativeThree-Game.exe directly to bypass updater checks.
-Run NativeThree-Updater.exe separately to check GitHub for deltas.
-
-Controls: F1 overview, F2/F3 army follow, F4 routes, F5 shadow toggle,
-F6 VSync, F7 day/night, F8 walking, F9 restart scene.
-Mouse drag orbit, wheel zoom; F2/F3 follow army to see legs close up.
-Space pause; Esc exit.
-
-Window title metrics: FPS, MAX longest frame ms, GPU FENCE wait ms, CPU
-JS/LIGHT/DRAW/PRESENT ms, GPU shadow/main ms, visible trees and dirty objects.
-NativeThreeBridge-frames.csv is created in the CURRENT WORKING DIRECTORY,
-with one-second summaries and frames longer than 40 ms. File I/O is async.
-GPU times are only available if DirectX 12 timestamp queries are supported.
-
-The bundled demo now uses the async native path service; the browser/Node
-fallback remains synchronous. Workers find paths on immutable map snapshots.
-The test still uses local occupancy/reservation avoidance.
-NativeThreeNavigation JS API (Windows only): configure(width,height,blocked
-Uint8Array); updateAgents(occupiedInt32Array,reservedInt32Array);
-request(startCell,goalCell,urgent); poll(32); cancel(token).
-
-Reusing engine components in new games: generic C++ spatial_index.h,
-scene_registry.h, navigation_service.h, fixed_stepper.h, lod_policy.h.
-For trusted local Three.js ESM scene modules, run on a developer PC:
-  npm install
-  npm run convert -- ./my-scene.mjs ./manifest.json
-This currently EXPORTS a JSON manifest with compatibility diagnostics;
-the DX12 game cannot yet directly run arbitrary imported manifest games.
-Full mesh LOD, universal DX12 scene imports and GPU ExecuteIndirect still
-need implementing. Windows CI cannot measure your actual GPU FPS.
+Game-Updater.log and Engine-Updater.log contain errors. Network access is
+required only when running an updater. The game EXE never updates itself.
