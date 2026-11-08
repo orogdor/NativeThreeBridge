@@ -53,8 +53,8 @@ jobs:
         env:
           CI: '1'
         run: |
-          & .\build-webapp\Release\NativeThreeWebApp.exe --self-test --warp
-          $exitCode = $LASTEXITCODE
+          $p = Start-Process -FilePath (Resolve-Path '.\build-webapp\Release\NativeThreeWebApp.exe') -ArgumentList @('--self-test','--warp') -PassThru -Wait
+          $exitCode = $p.ExitCode
           if (Test-Path build-webapp/Release/webapp-startup.log) {
             Get-Content build-webapp/Release/webapp-startup.log
           }
