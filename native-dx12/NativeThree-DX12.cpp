@@ -1732,6 +1732,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     wchar_t executable[MAX_PATH]={};
     const DWORD executableLength=GetModuleFileNameW(nullptr,executable,MAX_PATH);
     if(!executableLength || executableLength>=MAX_PATH)return 40;
+    // Separate NativeThree-V8.exe selects the experimental bundled V8 runtime.
+    // --v8 also enables it on NativeThree-Game.exe. No game source edits.
+    const std::wstring launchName=std::filesystem::path(executable).filename().wstring();
+    const std::wstring requested=commandLine ? commandLine : L"";
+    const bool useV8=launchName==L"NativeThree-V8.exe" || requested==L"--v8" ||
+        requested.find(L"--v8 ")!=std::wstring::npos ||
+        requested.find(L" --v8")!=std::wstring::npos;
     wchar_t* separator=wcsrchr(executable,L'\\');
     if(!separator)return 40;
     *separator=0;
@@ -1756,7 +1763,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     if(!forceBattle) {
         std::filesystem::path webappRoot;
         if(NativeWebapp_FindRoot(commandLine,executable,webappRoot))
-            return NativeWebapp_Run(instance,webappRoot);
+            return NativeWebapp_Run(instance,webappRoot,useV8);
     }
     if(!battleScene) {
         const char* report=importedGame
