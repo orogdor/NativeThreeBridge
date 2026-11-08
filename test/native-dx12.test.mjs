@@ -10,10 +10,10 @@ test('native DX12 backend renders 10000 trees and 1000 instanced soldiers with s
   assert.match(dx,/INSTANCE_COUNT=11000/);
   assert.match(dx,/TREE_COUNT=10000/);
   assert.match(dx,/PER_ARMY=500/);
-  assert.match(dx,/gSoldierBuffers\[frame\]=uploadBuffer\(nullptr,32768\)/);
+  assert.match(dx,/gSoldierBuffers\[frame\]=uploadBuffer\(nullptr,65536\)/);
   assert.match(dx,/gSoldierCB=gSoldierBuffers\[back\]/);
-  assert.match(dx,/gInstancesCB=staticGpuBuffer\(matrices,TREE_COUNT\*16\*sizeof\(float\)/);
-  assert.match(dx,/p==1\|\|p==2\?TREE_COUNT:PER_ARMY/);
+  assert.match(dx,/gInstancesCB=staticGpuBuffer\(matrices\.data\(\),TREE_COUNT\*16\*sizeof\(float\)/);
+  assert.match(dx,/p==1\|\|p==2\?gMainVisibleTrees:PER_ARMY/);
 });
 test('source GLBs are original Kuningriigid spearman and Sapling pine',()=>{
   assert.match(pack,/models-trellis-v262\/odamees\.glb/);
