@@ -143,7 +143,10 @@ jobs:
           path: |
             dist/NativeThreeBridge-Windows-x64.zip
       - name: Publish marked test release after Windows tests succeed
-        if: github.ref == 'refs/heads/experiment/kuningriigid-game'
+        # Manual dispatch only while the latest stable engine EXE is being
+        # reviewed after a local Defender detection. Branch pushes build an
+        # artifact but must not publish it automatically.
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/experiment/kuningriigid-game'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
