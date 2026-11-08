@@ -12,7 +12,7 @@ test('1000 native Three.js spotlights each follow a soldier; only 16 depth maps'
   assert.match(js,/lamp\.shadow\.mapSize\.set\(256,256\)/);
   assert.match(js,/lamp\.position\.x=unit\.x/);
   assert.match(js,/__nativeThreeLightFrame/);
-  assert.match(host,/constexpr size_t FLOATS = 500 \* 8/);
+  assert.match(host,/constexpr size_t FLOATS = 1000 \* 8/);
   assert.match(dx,/NativeThreeJS_Lights\(lights,LIGHT_COUNT\*8\)/);
   assert.match(dx,/SHADOW_COUNT=16/);
   assert.match(dx,/LIGHT_COUNT=1000/);
@@ -25,7 +25,7 @@ test('DX12 bins all 1000 lights and shades with 16 nearest per pixel',()=>{
   assert.match(dx,/for\(UINT li=0;li<LIGHT_COUNT;li\+\+\)/);
   assert.match(dx,/gGridCB->GetGPUVirtualAddress\(\)/);
   assert.match(dx,/gLightsCB->GetGPUVirtualAddress\(\)/);
-  assert.match(dx,/gShadowSlots\[500\]/);
+  assert.match(dx,/gShadowSlots\[1000\]/);
 });
 test('real DX12 shadow depth array captures tree and soldier silhouettes',()=>{
   assert.match(dx,/void PSShadow\(Vout v\)/);
