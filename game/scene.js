@@ -99,6 +99,10 @@ function protectedFormationCell(x,z) {
   // Generic native asynchronous navigation is preferred in Windows.
   // Browser/Node Three.js tests keep the identical synchronous JS fallback.
   const nativeNavigation=globalThis.NativeThreeNavigation??null;
+  // Optional portable audio command layer. In Windows it is forwarded to
+  // native XAudio2; in a browser it may be supplied by another backend.
+  const nativeAudio=globalThis.NativeThreeAudio??null;
+  let footstepClock=0;
   if(nativeNavigation)nativeNavigation.configure(GRID,GRID,blocked);
   const nativeTickets=new Map();
   const nativeOccupied=new Int32Array(SOLDIERS);
@@ -400,6 +404,19 @@ function protectedFormationCell(x,z) {
   matrices.set(treeBark.instanceMatrix.array,0); // static trees once
   function frame(dt=1/60){
     updateSoldiers(dt);
+    // Demonstrate spatial JS->native one-shots without 1000 overlapping
+    // sources: two separate soldiers, at most ~3 footsteps per second.
+    if(nativeAudio && dt>0) {
+      footstepClock+=Math.min(0.2,dt);
+      if(footstepClock>=0.65){
+        footstepClock-=0.65;
+        for(const id of [0,PER_ARMY]) {
+          const u=units[id];
+          if(u.next!==-1 || u.progress>0)
+            nativeAudio.play('step',u.x,0,u.z,0.65,true,false);
+        }
+      }
+    }
     matrices.set(red.instanceMatrix.array,TREES*16);
     matrices.set(blue.instanceMatrix.array,(TREES+PER_ARMY)*16);
     return matrices;
@@ -473,6 +490,10 @@ function protectedFormationCell(x,z) {
     requestUrgentPlan(unit);
     return true;
   };
+  // Explicit functional audio-bridge test triggered by F10 in native DX12.
+  // Audible UI sound is intentionally non-spatial even in an overview camera.
+  globalThis.__nativeThreeAudioTest=()=>nativeAudio
+    ?nativeAudio.play('signal',0,0,0,0.75,false,false):false;
   globalThis.__nativeThreeScene=scene;
   globalThis.__nativeThreeFrame=frame;
   globalThis.__nativeThreeLightFrame=()=>lightData;
