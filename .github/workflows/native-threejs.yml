@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main]
+    branches: [main, perf/v017-night-and-smooth]
   workflow_dispatch:
 permissions:
   contents: write
