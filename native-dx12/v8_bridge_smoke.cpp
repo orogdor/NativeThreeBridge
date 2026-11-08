@@ -1,6 +1,7 @@
 // NativeThreeBridge V8 IPC headless regression; no GPU needed.
 #include "v8_webapp_host.h"
 #include <cstdio>
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>
