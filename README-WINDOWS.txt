@@ -61,3 +61,16 @@ v0.16.0 PERFORMANCE TEST (DX12):
 - Window title displays GPU adapter, FPS and visible shadow instance count.
 - Run v0.15.0 vs v0.16.0 on the same GPU, camera and resolution.
 - Windows CI validates compilation, not GPU fps or visual shadow correctness.
+
+
+v0.17.0 NIGHT LIGHTING + SMOOTHER CPU:
+- Starts in NIGHT mode: near-black sky, faint ambient fill, warm/red and cool/blue angled soldier spotlights.
+- All 500 lights move with soldiers and 16 selected lights cast real DX12 shadow depth maps.
+- F7 toggles day/night for comparison; F5 toggles shadows; F6 toggles VSync.
+- F4 path lines are OFF initially so they don't brighten the night test.
+- A* uses typed-array heap and avoids per-node object/adjacency allocations.
+- 12 dynamic A* searches/frame retained to preserve 500 soldier routing responsiveness.
+- Three.js instanced matrices copied directly without full scene update per frame.
+- 1000 static tree transforms uploaded once to GPU-local DEFAULT memory.
+- CPU timing in title: JS, light binning, draw recording, Present (ms).
+- Win CI tests compilation and navigation, not real GPU image or FPS.

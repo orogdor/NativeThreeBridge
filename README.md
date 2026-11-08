@@ -1,3 +1,13 @@
+# NativeThreeBridge v0.17.0 — dark-night benchmark, smoother CPU and pathfinding
+
+The DX12 demo now opens in **dark-night mode** by default. The 500 moving soldier spotlights are angled above/aside their units so tree/soldier shadows are easier to inspect. Use **F7** to switch between day and night, **F5** to switch depth shadows on/off, **F6** to toggle VSync, **F4** to show A* debug paths (off by default). Sunlight is not used for this test; the night terrain has only a tiny ambient fill.
+
+Performance optimizations: reusable typed-array A* binary heap avoids per-node JavaScript allocations while preserving 12 searches/frame, direct copying of official Three.js InstancedMesh matrices without forced whole-scene matrix updates each frame, and one-time GPU-local DEFAULT heap upload of all 1000 static tree matrices. CPU timing breakdown in window title: JS frame, light processing, DX12 command recording and Present. High-resolution QueryPerformanceCounter delta replaces millisecond GetTickCount64 for simulation.
+
+Night lighting remains an actual DX12 forward shading calculation for 500 moving lights (up to 16 per tile/pixel, 16 real moving shadow maps), not just fake translucent light decals. This is a native DX12-only night mode; the offline WebGL2 HTML benchmark is separate. GitHub Actions validates JS navigation, Windows compilation and HLSL shaders; real hardware FPS and shadow image validation need a Windows GPU.
+
+---
+
 # NativeThreeBridge v0.16.0 — DX12 performance fixes
 
 DX12 performance pass (Windows):

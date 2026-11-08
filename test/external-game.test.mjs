@@ -150,10 +150,35 @@ test('all lights remain attached to their dynamically moving soldiers',()=>{
   assert.equal(after.length,500*8);
   for(let i=0;i<500;i++){
     const p=i*8;
-    assert.ok(near(after[p],nav.positions[i][0],0.001));
-    assert.ok(near(after[p+2],nav.positions[i][1],0.001));
-    assert.equal(after[p+1],9.5);
+    assert.ok(near(after[p],nav.positions[i][0]+6,0.001));
+    assert.ok(near(after[p+2],nav.positions[i][1]+4,0.001));
+    assert.equal(after[p+1],12.5);
   }
   assert.ok(Math.hypot(after[0]-before[0],after[2]-before[2])>3);
   assert.ok(Math.hypot(after[250*8]-before[250*8],after[250*8+2]-before[250*8+2])>3);
+});
+
+test('night scene uses dark ambient and oblique moving spotlights',()=>{
+ const x=create(),scene=x.__nativeThreeScene;
+ assert.equal(scene.background.getHex(),0x030611);
+ const lamps=scene.children.filter(o=>o.isSpotLight);
+ assert.equal(lamps.length,500);
+ for(const l of lamps){
+   assert.ok(l.castShadow);
+   assert.ok(Math.abs(l.position.y-12.5)<1e-6);
+   assert.ok(Math.abs(l.position.x-l.target.position.x-6)<1e-5);
+   assert.ok(Math.abs(l.position.z-l.target.position.z-4)<1e-5);
+ }
+});
+test('native transforms directly match official Three.js InstancedMesh buffers',()=>{
+ const x=create();
+ const red=x.__nativeThreeScene.getObjectByName('Red army 250');
+ const blue=x.__nativeThreeScene.getObjectByName('Blue army 250');
+ assert.ok(red?.isInstancedMesh&&blue?.isInstancedMesh);
+ for(let i=0;i<20;i++)x.__nativeThreeFrame(1/60);
+ const matrices=x.__nativeThreeFrame(0);
+ for(let i=0;i<250*16;i++){
+   assert.ok(near(matrices[1000*16+i],red.instanceMatrix.array[i],1e-6));
+   assert.ok(near(matrices[(1000+250)*16+i],blue.instanceMatrix.array[i],1e-6));
+ }
 });

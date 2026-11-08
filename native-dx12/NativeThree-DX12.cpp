@@ -36,10 +36,18 @@ static HWND gWindow=nullptr;
 static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
 static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
 static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
-static bool gShowDebugPaths=true;
+static bool gShowDebugPaths=false; // avoid bright diagnostic overlay during night lighting tests
 static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
 static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
+static bool gNightMode=true; // Night default; F7 toggles day/night
+static double gPreviousFrameSeconds=0;
+static double gJsCpuMsTotal=0,gLightCpuMsTotal=0,gRecordCpuMsTotal=0,gPresentCpuMsTotal=0;
+static double cpuSeconds() {
+    LARGE_INTEGER ticks{},frequency{};
+    QueryPerformanceCounter(&ticks);QueryPerformanceFrequency(&frequency);
+    return (double)ticks.QuadPart/(double)frequency.QuadPart;
+}
 static bool gDrag=false,gPause=false;
 static int gMouseX=0,gMouseY=0;
 static ULONGLONG gStatStart=0, gPreviousFrame=0;
@@ -82,7 +90,7 @@ static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
 struct Vertex {float x,y,z,nx,ny,nz,u,v;};
 struct MeshHeader {char magic[4];uint32_t vertices,indices,reserved;};
-struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];UINT shadowOffset=0,shadowPass=0;};
+struct DrawParams {UINT kind;float scale;float yOffset;float alphaCut;float tint[4];UINT shadowOffset=0,shadowPass=0;float night=1.f;};
 struct Mesh {
     ComPtr<ID3D12Resource> vertices,indices,texture;
     D3D12_VERTEX_BUFFER_VIEW vbv={};
@@ -328,6 +336,7 @@ cbuffer Draw : register(b1) {
     float4 gTint;
     uint gShadowOffset;
     uint gShadowPass;
+    float gNight;
 };
 // Two CBVs: one 64000-byte buffer for 1000 static pines and one for 500 soldiers.
 cbuffer TreeTransforms : register(b2) { float4x4 gTreeInstances[1000]; };
@@ -394,7 +403,8 @@ float4 PSMain(Vout v):SV_TARGET {
     float4 albedo=gTexture.Sample(gSampler,v.uv)*gTint;
     if(gAlphaCut>0)clip(albedo.a-gAlphaCut);
     float3 normal=normalize(v.n);
-    float day=0.20+0.34*abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
+    float diffuseSky=abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
+    float day=lerp(0.20+0.34*diffuseSky,0.018+0.026*diffuseSky,gNight);
     float3 illumination=day.xxx;
     // CPU bins all 500 moving lights into 16x16 tiles across the expanded forest.
     // Only the nearest 16 in this tile are evaluated per pixel.
@@ -406,11 +416,14 @@ float4 PSMain(Vout v):SV_TARGET {
         uint index=gGridIndices[cell*4+k/4][k%4];
         if(index>=500)continue;
         float3 toLight=gLightPosRadius[index].xyz-v.worldPos;
-        float dist=length(toLight);
+        float distSq=dot(toLight,toLight);
         float radius=gLightPosRadius[index].w;
-        if(dist<0.001 || dist>=radius)continue;
-        float3 direction=toLight/dist;
-        float cone=direction.y;
+        if(distSq<0.000001 || distSq>=radius*radius)continue;
+        float invDist=rsqrt(distSq);
+        float dist=distSq*invDist;
+        float3 direction=toLight*invDist;
+        // All offset lamps aim diagonally back toward their soldiers.
+        float cone=dot(direction,normalize(float3(6.0,12.5,4.0)));
         if(cone<0.5)continue;
         float diff=saturate(dot(normal,direction));
         if(diff<=0)continue;
@@ -418,7 +431,7 @@ float4 PSMain(Vout v):SV_TARGET {
         float falloff=saturate(1.0-dist/radius);
         float vis=shadowVisibility(v.worldPos,index);
         illumination+=gLightColorIntensity[index].rgb*
-            (gLightColorIntensity[index].a*falloff*falloff*fade*diff*vis*0.42);
+            (gLightColorIntensity[index].a*falloff*falloff*fade*diff*vis*lerp(0.42,0.90,gNight));
     }
     return float4(saturate(albedo.rgb*illumination),1);
 }
@@ -430,7 +443,7 @@ static void makePipeline() {
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     rp[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[1].Constants.ShaderRegister=1;
-    rp[1].Constants.Num32BitValues=10;
+    rp[1].Constants.Num32BitValues=11;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
     D3D12_DESCRIPTOR_RANGE ranges[3]={};
     for(UINT i=0;i<3;i++){
@@ -670,7 +683,8 @@ static void initializeDX12() {
     if(!gFenceEvent)fatal("Create GPU fence event",HRESULT_FROM_WIN32(GetLastError()));
 
     // Each in-flight backbuffer has dedicated upload buffers and allocator.
-    gInstancesCB=uploadBuffer(nullptr,65536); // 1000 static tree transforms
+    // gInstancesCB is created on first real JS frame in GPU-local DEFAULT memory.
+    // Static tree transforms never need a per-frame UPLOAD heap.
     for(UINT frame=0;frame<FRAME_COUNT;frame++) {
         if(frame==0)gFrameAllocators[frame]=gAllocator;
         else check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -791,7 +805,7 @@ static void updateLightsAndShadowCameras(const float *matrices) {
     for(UINT i=0;i<SHADOW_COUNT;i++) {
         const float *l=lights+gShadowSourceIndices[i]*8;
         const XMVECTOR eye=XMVectorSet(l[0],l[1],l[2],1.f);
-        const XMVECTOR target=XMVectorSet(l[0],l[1]-1.f,l[2],1.f);
+        const XMVECTOR target=XMVectorSet(l[0]-6.f,0.f,l[2]-4.f,1.f);
         const XMMATRIX view=XMMatrixLookAtLH(eye,target,XMVectorSet(0,0,1,0));
         const XMMATRIX projection=XMMatrixPerspectiveFovLH(
             XMConvertToRadians(118.f),1.f,0.1f,32.f);
@@ -875,11 +889,12 @@ static void drawShadowMaps() {
         for(UINT p=0;p<4;p++){
             Mesh &m=gMesh[order[p]];
             DrawParams draw=m.draw;
+            draw.night=gNightMode?1.f:0.f;
             if(p==3) draw.kind=3; // blue soldier CBV range 250..499
             draw.shadowPass=1;
             draw.shadowOffset=li*INSTANCE_COUNT+
                 (p<2?0:(p==2?TREE_COUNT:TREE_COUNT+PER_ARMY));
-            gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
+            gCmd->SetGraphicsRoot32BitConstants(1,11,&draw,0);
             gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
             gCmd->IASetVertexBuffers(0,1,&m.vbv);
             gCmd->IASetIndexBuffer(&m.ibv);
@@ -914,9 +929,13 @@ static void renderFrame() {
     // objects in QuickJS, not hardcoded into C++ instance positioning.
     float matrices[INSTANCE_COUNT*16]={};
     const ULONGLONG tick=GetTickCount64();
-    const float dt = gPreviousFrame ? (float)(tick-gPreviousFrame)/1000.0f : (1.0f/60.0f);
-    gPreviousFrame=tick;
+    const double now=cpuSeconds();
+    const float dt=gPreviousFrameSeconds ?
+        (float)std::min(0.25,std::max(0.0,now-gPreviousFrameSeconds)) : (1.f/60.f);
+    gPreviousFrameSeconds=now;
+    const double jsStart=cpuSeconds();
     NativeThreeJS_Frame(dt,matrices,INSTANCE_COUNT*16);
+    gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
     // guarantees that replacing the upload resource is safe.
@@ -930,13 +949,16 @@ static void renderFrame() {
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
+    const double lightsStart=cpuSeconds();
     updateLightsAndShadowCameras(matrices);
+    gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
-        void *treeData=nullptr;
-        check(gInstancesCB->Map(0,nullptr,&treeData),"Map static 1000-tree matrices");
-        memcpy(treeData,matrices,TREE_COUNT*16*sizeof(float));
-        gInstancesCB->Unmap(0,nullptr);
+        // 1000 tree matrices = 64000 bytes, exactly within a DX12 root CBV.
+        // One-time GPU-local upload avoids 1000 repeated vertex shader reads
+        // from PCIe-visible UPLOAD memory on discrete GPUs.
+        gInstancesCB=staticGpuBuffer(matrices,TREE_COUNT*16*sizeof(float),
+                         D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
         gTreesUploaded=true;
     }
     void *soldierData=nullptr;
@@ -958,6 +980,7 @@ static void renderFrame() {
     memcpy(cbptr,&vp,sizeof(vp));
     gFrameCB->Unmap(0,nullptr);
 
+    const double recordStart=cpuSeconds();
     check(gAllocator->Reset(),"Reset draw allocator");
     check(gCmd->Reset(gAllocator.Get(),gShadowPSO.Get()),"Reset draw commands");
     if(gEnableShadows)drawShadowMaps();
@@ -977,7 +1000,8 @@ static void renderFrame() {
     gCmd->RSSetViewports(1,&gViewport);
     gCmd->RSSetScissorRects(1,&gScissor);
     gCmd->OMSetRenderTargets(1,&rtv,FALSE,&dsv);
-    float bg[]={0.075f,0.11f,0.18f,1};
+    float bg[]={gNightMode?0.002f:0.075f,gNightMode?0.004f:0.11f,
+                gNightMode?0.015f:0.18f,1};
     gCmd->ClearRenderTargetView(rtv,bg,0,nullptr);
     gCmd->ClearDepthStencilView(dsv,D3D12_CLEAR_FLAG_DEPTH,1.0f,0,0,nullptr);
     gCmd->SetGraphicsRootSignature(gRoot.Get());
@@ -997,11 +1021,12 @@ static void renderFrame() {
     for(UINT p=0;p<5;p++) {
         Mesh &m=gMesh[order[p]];
         DrawParams draw=m.draw;
+            draw.night=gNightMode?1.f:0.f;
         if(p==4){
             draw.kind=3; // selects 250 blue soldiers in second army CBV range
             draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
         }
-        gCmd->SetGraphicsRoot32BitConstants(1,10,&draw,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,11,&draw,0);
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
@@ -1014,10 +1039,10 @@ static void renderFrame() {
         gCmd->IASetVertexBuffers(0,1,&gDebugPathVBV);
         gCmd->SetGraphicsRootDescriptorTable(2,gMesh[1].srv);
         DrawParams overlay={4,1.0f,0.0f,0.0f,{1.f,0.68f,0.03f,1.f}};
-        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,11,&overlay,0);
         gCmd->DrawInstanced(gDebugRedVertices,1,0,0);
         overlay.tint[0]=0.05f;overlay.tint[1]=0.93f;overlay.tint[2]=1.0f;
-        gCmd->SetGraphicsRoot32BitConstants(1,10,&overlay,0);
+        gCmd->SetGraphicsRoot32BitConstants(1,11,&overlay,0);
         gCmd->DrawInstanced(gDebugBlueVertices,1,gDebugRedVertices,0);
     }
     auto toPresent=transition(gTargets[back].Get(),
@@ -1030,7 +1055,10 @@ static void renderFrame() {
     check(gCmd->Close(),"Close draw commands");
     ID3D12CommandList *lists[]={gCmd.Get()};
     gQueue->ExecuteCommandLists(1,lists);
+    gRecordCpuMsTotal+=(cpuSeconds()-recordStart)*1000.0;
+    const double presentStart=cpuSeconds();
     check(gSwap->Present(gVSync?1:0,0),"Present frame");
+    gPresentCpuMsTotal+=(cpuSeconds()-presentStart)*1000.0;
     const UINT64 submitted=++gFenceValue;
     check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
     gFrameFenceValues[back]=submitted;
@@ -1044,13 +1072,17 @@ static void renderFrame() {
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
                              gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
-        wchar_t title[380];
+        wchar_t title[520];
+        const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | FPS %d | A* %d/500 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6)",
-            gAdapterName,frames,navigation.moved,navigation.planned,shadowInstances,
+            L"DX12 %s | NIGHT %s | FPS %d | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f ms | A* %d/500 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
+            gAdapterName,gNightMode?L"ON":L"OFF",frames,
+            gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
+            navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
+        gJsCpuMsTotal=gLightCpuMsTotal=gRecordCpuMsTotal=gPresentCpuMsTotal=0;
         gStatStart=t;
     }
 }
@@ -1087,6 +1119,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             }
             if(wp==VK_F5)gEnableShadows=!gEnableShadows;
             if(wp==VK_F6)gVSync=!gVSync;
+            if(wp==VK_F7)gNightMode=!gNightMode;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -1101,14 +1134,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.15 | 500 dynamic A* soldiers avoiding each other",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.17 NIGHT | 500 dynamic A* soldiers",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
     if(!gWindow)return 2;
     initializeDX12();
     NativeThreeJS_Init();
-    createDebugRouteGeometry();
+    // Debug route overlay is explicitly requested with F4, not precomputed at startup.
     ShowWindow(gWindow,show);
     UpdateWindow(gWindow);
     gStatStart=GetTickCount64();

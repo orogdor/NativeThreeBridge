@@ -12,7 +12,7 @@ test('native DX12 backend renders 1000 trees and 500 instanced soldiers with spl
   assert.match(dx,/PER_ARMY=250/);
   assert.match(dx,/gSoldierBuffers\[frame\]=uploadBuffer\(nullptr,32768\)/);
   assert.match(dx,/gSoldierCB=gSoldierBuffers\[back\]/);
-  assert.match(dx,/gInstancesCB=uploadBuffer\(nullptr,65536\)/);
+  assert.match(dx,/gInstancesCB=staticGpuBuffer\(matrices,TREE_COUNT\*16\*sizeof\(float\)/);
   assert.match(dx,/p==1\|\|p==2\?TREE_COUNT:PER_ARMY/);
 });
 test('source GLBs are original Kuningriigid spearman and Sapling pine',()=>{
