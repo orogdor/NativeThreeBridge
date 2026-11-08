@@ -1738,7 +1738,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
         DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     gBattleHud=CreateWindowExW(0,L"STATIC",L"RED 500 | BLUE 500 | HITS 0",
-        WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,12,12,540,32,
+        WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE,12,12,780,32,
         gWindow,(HMENU)2302,instance,nullptr);
     if(!gBattleHud)fatal("Create native battle scoreboard",E_FAIL);
     if(gBattleHudFont)SendMessageW(gBattleHud,WM_SETFONT,(WPARAM)gBattleHudFont,TRUE);
