@@ -1,3 +1,9 @@
+# NativeThreeBridge v0.22.0 — first real skinned odamees, red army vs blue baseline
+
+**Red army (500)** uses a real eight-joint glTF 2.0 skin generated from the original, previously unrigged `odamees.glb`: pelvis, spine, left/right thigh, left/right shin, left/right arm. A build-time asset generator assigns normalized per-vertex `JOINTS_0` / `WEIGHTS_0`, a parent-child bone hierarchy, and inverse bind matrices, exports a valid `game/odamees-rigged.glb` in the Windows ZIP, and supplies the exact influences as an embedded immutable GPU buffer. DX12 vertex shaders evaluate weighted bone movement in the **main and shadow passes**. This first-pass rig is envelope-based; it is not a hand-authored clip.
+
+**Blue army (500)** is unchanged from v0.21: the old unrigged procedural leg motion. The contrast allows verifying whether true skeletal deform produces better walking, shadows, and acceptable FPS using F2/F3 close-up and F8 toggling animation. **10,000 trees, 1,000 individually pathfinding soldiers, 16 shadow maps, and v0.20 smooth lighting remain unchanged.** The rig is shared by all red instances; no one-draw-call-per-soldier fallback. Real GPU profiling and close camera screenshots are required before adopting rigging for both armies.
+
 # NativeThreeBridge v0.21.0 — per-soldier walking animation prototype
 
 The current original odamees GLB has no glTF skin or animation channels. This **first walk test** therefore procedurally deforms leg vertices around a hip pivot in the DX12 vertex shader, with a small individual body bounce. Each soldier uses its real interpolated movement distance to advance a separately randomized gait phase. Stationary and blocked units fade to idle. The deformation also runs during the **real shadow depth pass**, so cast silhouettes follow the walk cycle without separate shadow geometry. One 16-KB per-frame upload buffer holds 1,000 float4 gait states: **no extra draw calls or changed A* collision/path logic**.
