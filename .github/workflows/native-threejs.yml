@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main, experiments/game-folder-autoload-v029]
+    branches: [main, experiments/game-folder-autoload-v029, experiments/v029-quickjs-boot-fix]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -94,6 +94,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed in the native webapp runtime" }
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-bad-import 0 expect-boot-error
           if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly" }
+          # Verify a deliberately infinite JS module is interrupted, not left
+          # burning one CPU core with an invisible game window.
+          $env:NTB_JS_WATCHDOG_MS = '200'
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-runaway 0 expect-boot-timeout
+          $watchdogExit = $LASTEXITCODE
+          Remove-Item Env:\NTB_JS_WATCHDOG_MS
+          if ($watchdogExit -ne 0) { throw "Runaway JavaScript startup was not interrupted" }
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |
@@ -198,4 +205,19 @@ jobs:
           } else {
             gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "NativeThreeBridge v0.28.1 – automatic game folder" --notes "Automatically run Three.js game/index.html with real embedded QuickJS and DX12 when double-clicking NativeThree-Game.exe. Replace game/ with your own webapp folder without any native-three-entry meta. --battle keeps the original 10k-tree/1k-soldier benchmark implementation. Tests cover native Three.js loader, the packaged game folder and executable auto-discovery. Limitations remain: no complete browser, texture/GLTF/shadow/custom ShaderMaterial/HTML overlay compatibility."
             if ($LASTEXITCODE -ne 0) { throw "Could not publish game auto-load test release" }
+          }
+
+      - name: Publish isolated QuickJS large-app startup test release
+        if: github.ref == 'refs/heads/experiments/v029-quickjs-boot-fix'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.28.2-quickjs-startup-test.1'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing test release is preserved."
+          } else {
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "NativeThreeBridge v0.28.2 – large WebApp startup diagnostics" --notes "Show DX12 window before JS initialization, bound microtask queue processing, detect runaway JS with QuickJS interrupt watchdog, and log the module/script name before evaluation. Extract ZIP and replace game/ with your own index.html + assets. Not universal WebGL/browser compatibility; unsupported textures/shaders/GLB still need implementation. Original --battle renderer unchanged."
+            if ($LASTEXITCODE -ne 0) { throw "Could not publish QuickJS startup test release" }
           }
