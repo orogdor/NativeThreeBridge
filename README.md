@@ -1,8 +1,6 @@
-# NativeThreeBridge v0.27.0-test.1 — Kuningriigid source test
+# NativeThreeBridge v0.27.1 — forest battle remains the main engine test
 
-This separate Windows test package has exactly three executables: `Game-Updater.exe`, `Engine-Updater.exe`, and `NativeThree-Game.exe`. The first downloads changed files from the pinned current commit of `orogdor/Kuningriigid` into `game/` with checksum verification and a previous-directory rollback snapshot. The second updates only the native engine EXE from a NativeThreeBridge release manifest. The third does no network work.
-
-**Compatibility limit:** Kuningriigid's browser DOM, HTML/CSS, ES modules, asset loading and Three.js `WebGLRenderer` are not implemented by this DX12 scene host. The new game EXE reports this before evaluating any downloaded JavaScript. This release tests acquisition, separation, rollback and clear failure, not native Kuningriigid gameplay. The forest battle is preserved as the complete [v0.26.0 release](https://github.com/orogdor/NativeThreeBridge/releases/tag/v0.26.0). See `README-WINDOWS.txt` for the Windows procedure.
+The original forest battle is the default Windows package and remains the engine development scenario. Releases now also include `engine-update-v1.json` with the native EXE's SHA-256, allowing separate game installations to update the engine without changing their game files. Imported browser source is refused before JavaScript execution until the needed DOM, module and WebGLRenderer adapters exist. Kuningriigid experiments live on a separate branch.
 
 # NativeThreeBridge v0.25.0 — directional 500-vs-500 melee battle fixture
 

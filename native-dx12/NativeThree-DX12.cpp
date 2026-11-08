@@ -1726,32 +1726,30 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
     return DefWindowProcW(win,msg,wp,lp);
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
-    // The downloaded Kuningriigid source is a browser application. Never feed
-    // it to the fixed-layout battle-scene QuickJS/DX12 host as executable JS.
-    wchar_t exePath[MAX_PATH]={};
-    DWORD exeLength=GetModuleFileNameW(nullptr,exePath,MAX_PATH);
-    if(!exeLength || exeLength>=MAX_PATH)return 40;
-    wchar_t* separator=wcsrchr(exePath,L'\\');
+    // Browser projects downloaded into game/ are inspected before DX12 or JS
+    // startup. The bundled battle scene keeps its existing game/scene.js path.
+    wchar_t executable[MAX_PATH]={};
+    const DWORD executableLength=GetModuleFileNameW(nullptr,executable,MAX_PATH);
+    if(!executableLength || executableLength>=MAX_PATH)return 40;
+    wchar_t* separator=wcsrchr(executable,L'\\');
     if(!separator)return 40;
     *separator=0;
-    wchar_t sourceMarker[MAX_PATH]={};
-    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",exePath)<0)return 40;
+    wchar_t sourceMarker[MAX_PATH]={},scenePath[MAX_PATH]={};
+    if(swprintf_s(sourceMarker,L"%s\\game\\.native-three-game-manifest.json",executable)<0 ||
+       swprintf_s(scenePath,L"%s\\game\\scene.js",executable)<0)return 40;
     const bool importedGame=GetFileAttributesW(sourceMarker)!=INVALID_FILE_ATTRIBUTES;
-    wchar_t scenePath[MAX_PATH]={};
-    if(swprintf_s(scenePath,L"%s\\game\\scene.js",exePath)<0)return 40;
     const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
-    if(importedGame || !battleScene){
+    if(importedGame || !battleScene) {
         const char* report=importedGame
-            ? "Kuningriigid source was installed in game/, but this DX12 test engine cannot run it yet. "
-              "The game uses browser DOM, HTML/CSS, module loading and WebGLRenderer APIs; "
-              "the native host currently accepts only its dedicated scene.js contract. "
+            ? "Kuningriigid source is installed in game/, but this DX12 engine cannot run it yet. "
+              "Browser DOM, HTML/CSS, module loading and WebGLRenderer are not implemented. "
               "No downloaded game code was executed."
-            : "No compatible scene.js is installed. Run Game-Updater.exe to download Kuningriigid. "
-              "The current DX12 engine cannot execute that browser game yet.";
+            : "No compatible game/scene.js found. Install a game with its own updater. "
+              "This DX12 engine still requires the forest battle scene contract.";
         char reportPath[MAX_PATH]={};
-        if(sprintf_s(reportPath,"%ls\\compatibility-report.txt",exePath)>0){
+        if(sprintf_s(reportPath,"%ls\\compatibility-report.txt",executable)>0) {
             FILE* file=nullptr;
-            if(!fopen_s(&file,reportPath,"wb") && file){fputs(report,file);fputc('\n',file);fclose(file);}
+            if(!fopen_s(&file,reportPath,"wb") && file) { fputs(report,file);fputc('\n',file);fclose(file); }
         }
         if(GetEnvironmentVariableA("CI",nullptr,0)==0)
             MessageBoxA(nullptr,report,"NativeThreeBridge compatibility",MB_OK|MB_ICONWARNING);

@@ -33,5 +33,5 @@ test('red bone skinning is bound to both shadow and main GPU passes',()=>{
   assert.equal((dx.match(/gCmd->SetGraphicsRootDescriptorTable\(10,gRigSkinSRV\)/g)||[]).length,2);
   assert.match(dx,/D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE/);
   assert.match(dx,/if\(wp==VK_F8\)gWalkEnabled=!gWalkEnabled/);
-  assert.match(workflow,/Test-Path generated\/soldier-rigged\.glb/);
+  assert.match(workflow,/Copy-Item generated\/soldier-rigged.glb/);
 });

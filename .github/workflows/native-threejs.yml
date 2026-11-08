@@ -1,4 +1,4 @@
-name: Build NativeThreeBridge Windows test package
+name: Build native Three.js Windows Game and separate Updater
 on:
   push:
     branches: [main]
@@ -18,9 +18,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '9.0.x'
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -86,56 +83,47 @@ jobs:
           if (!(Test-Path build/Release/game/scene.js)) { throw "External scene.js missing" }
           & .\build\Release\ThreeSceneSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Embedded Three.js JavaScript execution failed" }
-      - name: Build three separate Windows executables and package Kuningriigid source mode
+      - name: Build separate update checker and package editable game files
         shell: pwsh
-        env:
-          CI: '1'
         run: |
           New-Item -ItemType Directory -Force dist/game | Out-Null
           Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Game.exe
-          Copy-Item game/SOURCE.txt dist/game/SOURCE.txt
-          dotnet publish launcher/GameUpdater.csproj -c Release -r win-x64 --self-contained true -o dist/game-updater-build
-          if ($LASTEXITCODE -ne 0) { throw "Game updater failed to publish" }
-          dotnet publish launcher/EngineUpdater.csproj -c Release -r win-x64 --self-contained true -o dist/engine-updater-build
-          if ($LASTEXITCODE -ne 0) { throw "Engine updater failed to publish" }
-          Move-Item dist/game-updater-build/Game-Updater.exe dist/Game-Updater.exe
-          Move-Item dist/engine-updater-build/Engine-Updater.exe dist/Engine-Updater.exe
-          Remove-Item dist/game-updater-build,dist/engine-updater-build -Recurse -Force
-          $gameTest=Start-Process -FilePath (Resolve-Path dist/Game-Updater.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
-          if ($gameTest.ExitCode -ne 0) { throw "Game updater self-test failed" }
-          $engineTest=Start-Process -FilePath (Resolve-Path dist/Engine-Updater.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
-          if ($engineTest.ExitCode -ne 0) { throw "Engine updater self-test failed" }
+          Copy-Item game/scene.js dist/game/scene.js
+          Copy-Item game/ui.html dist/game/ui.html
+          Copy-Item game/ui.css dist/game/ui.css
+          New-Item -ItemType Directory -Force dist/game/audio | Out-Null
+          Copy-Item game/audio/*.wav dist/game/audio/
+          Copy-Item generated/soldier-rigged.glb dist/game/odamees-rigged.glb
+          cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
+          & .\dist\NativeThree-Updater.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Offline independent updater self-test failed" }
           $v = (Get-Content version.txt -Raw).Trim()
-          if ($v -notmatch '^\d+\.\d+\.\d+-test\.\d+$') { throw "Invalid test version" }
-          Set-Content dist/engine-version.txt -Value "v$v" -Encoding ascii -NoNewline
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
+          Set-Content dist/installed-version.txt -Value $v -Encoding ascii -NoNewline
           Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
           Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
           Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
           $gameHash=(Get-FileHash dist/NativeThree-Game.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sceneHash=(Get-FileHash dist/game/scene.js -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path (Get-Location) "dist/update-v2.txt"), ("NTB2`n" + $v + "`n" + $gameHash + "`n" + $sceneHash + "`n"), [Text.Encoding]::ASCII)
           $gameSize=(Get-Item dist/NativeThree-Game.exe).Length
           @{ tag="v$v"; sha256=$gameHash; size=$gameSize } | ConvertTo-Json -Compress | Set-Content dist/engine-update-v1.json -Encoding utf8
           Compress-Archive -Path dist/* -DestinationPath NativeThreeBridge-Windows-x64.zip -Force
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          $executables=@(Get-ChildItem verify -Recurse -Filter *.exe)
-          if ($executables.Count -ne 3) { throw "ZIP must contain exactly three EXEs, found $($executables.Count)" }
-          foreach ($name in @('Game-Updater.exe','Engine-Updater.exe','NativeThree-Game.exe')) {
-            if (!(Test-Path "verify/$name")) { throw "Missing $name" }
-          }
-          if (Test-Path verify/game/scene.js) { throw "Forest battle must not be the new default" }
-          $probe=Start-Process -FilePath (Resolve-Path verify/NativeThree-Game.exe) -Wait -PassThru -WindowStyle Hidden -WorkingDirectory (Resolve-Path verify)
-          if ($probe.ExitCode -ne 42) { throw "Native game did not refuse unsupported browser game with code 42" }
-          if (!(Select-String -Path verify/compatibility-report.txt -Pattern 'cannot execute that browser game yet' -Quiet)) { throw "Missing compatibility report" }
-          Write-Host "Three EXEs and safe compatibility response verified: $v"
-      - name: Upload Windows test package
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav)) { throw "Incomplete ZIP structure" }
+          Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
+      - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
         with:
           name: NativeThreeBridge-Windows-x64
           path: |
             dist/NativeThreeBridge-Windows-x64.zip
+            dist/update-v2.txt
             dist/engine-update-v1.json
-      - name: Publish marked test release after Windows tests succeed
+      - name: Publish stable release (only after Windows tests succeed)
         if: github.ref == 'refs/heads/main'
         shell: pwsh
         env:
@@ -147,6 +135,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/Game-Updater.exe dist/Engine-Updater.exe dist/engine-update-v1.json --prerelease --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – Kuningriigid source test" --notes "Three separate EXEs: Game-Updater downloads changed files from orogdor/Kuningriigid into game/ with checks and rollback; Engine-Updater updates only the native engine; NativeThree-Game starts locally without network access. The current DX12 host cannot run the Kuningriigid browser application. It reports the missing DOM/module/WebGLRenderer compatibility before executing downloaded game code. The forest battle remains available in v0.26.0."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/audio/swing.wav dist/game/audio/hit.wav dist/game/audio/death.wav dist/game/odamees-rigged.glb dist/update-v2.txt dist/engine-update-v1.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – forest battle engine" --notes "The forest battle remains the primary engine development scene. Engine changes from v0.26.0 are preserved. This release adds an engine-only SHA-256 manifest so separately installed games can update the shared engine binary without changing their own game files. Browser games such as Kuningriigid still lack DOM, HTML/CSS, module and WebGLRenderer compatibility; imported browser source is rejected before JavaScript execution."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
