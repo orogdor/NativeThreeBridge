@@ -1,5 +1,18 @@
-NativeThreeBridge v0.24.0 - NATIVE AUDIO / XAUDIO2 TEST
+NativeThreeBridge v0.25.0 - 1000 SOLDIER DIRECTIONAL BATTLE TEST
 ================================================================
+NEW: 500 vs 500 soldiers now acquire an opponent, fight in melee,
+and seek their next living enemy after defeating the current target.
+F12 jumps 48 from each army into a central skirmish while the full
+1000-soldier A* / 10,000-tree workload continues running.
+Front: 5 hits to die; flank: 3 hits; rear: 1 hit (15 armor points).
+Weapon thrust, stagger and fallen-body animation are in the main AND
+real shadow DX12 passes; dead units free navigation slots and lose lights.
+When one army loses all soldiers, survivors return to original positions.
+The title now reports BATTLE red/blue alive, kills, hits and engaged units.
+Three extra editable native WAV cues: game/audio/{swing,hit,death}.wav
+F9/CSS Restart resets the battle; F10 tests sound, F11 toggles sound.
+Press F2/F3 to follow armies, wheel to zoom and inspect fighting closely.
+
 NEW: JavaScript now emits sound events through NativeThreeAudio.play().
 Windows C++ plays short PCM16 WAVs with XAudio2 (no Web Audio browser).
 F10 plays the JavaScript-to-XAudio2 test ping. F11 toggles sound output.

@@ -48,7 +48,7 @@ jobs:
         run: |
           python tools/generate_native_audio_samples.py
           if ($LASTEXITCODE -ne 0) { throw "Native audio WAV generation failed" }
-          foreach ($name in @('signal','step','restart')) {
+          foreach ($name in @('signal','step','restart','swing','hit','death')) {
             if (!(Test-Path "game/audio/$name.wav")) { throw "Missing $name WAV" }
           }
       - name: Acquire pinned QuickJS-NG native JavaScript engine
@@ -111,7 +111,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
@@ -132,6 +132,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.24.0: Native Three.js/QuickJS audio event bridge to Windows XAudio2 2.9 (no WebAudio, WebView or browser). scene.js sends NativeThreeAudio.play(name,x,y,z,volume,spatial,loop), while C++ decodes user-editable PCM16 WAV, caches clips, mixes positional audio with distance attenuation and stereo panning, and caps at 24 simultaneous native voices. F10 emits a JavaScript-to-C++ audible test ping, F11 toggles sound, and two army footsteps demonstrate separate moving sound emitters. CSS Restart stops old voices and resets the JS audio event queue. Includes original generated signal, step and restart WAVs and an audio core/runtime smoke test. Only WAV PCM16 is supported for now; complete Three.js WebAudio API compatibility and streaming compressed music are future work."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/audio/swing.wav dist/game/audio/hit.wav dist/game/audio/death.wav dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.25.0: 1000-soldier melee battle test in 10,000-tree forest. Each soldier finds nearest enemy, uses A* movement and tile reservations, and attacks from an independently animated pose. Directional damage is 5 front hits, 3 side hits or 1 back hit (15 armor points; damage 3, 5, 15 respectively). Fallen units release collision and fade their light but stay visible as bodies, surviving units seek another enemy, and the victorious army returns to each original starting cell. Red-army rigged joints and blue legacy animation both get GPU attack, hit recoil and falling death pose in the real shadow pass. F12 quickly stages a 48-vs-48 duel for fast checks. Three new native XAudio2 cues are original synthesized swing/hit/death WAV. Existing FPS, lighting, CSS Restart and audio functionality remain. CI checks actual QuickJS combat states, HLSL, route collision and battle invariants. This is a diagnostic battle prototype, not final combat AI."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }

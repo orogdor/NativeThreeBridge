@@ -40,3 +40,7 @@ if __name__=="__main__":
     make("signal",0.28,650,True)
     make("step",0.065,148)
     make("restart",0.18,500,True)
+    # Three deliberately different short synthesized melee cues.
+    make("swing",0.17,340,True)
+    make("hit",0.12,180)
+    make("death",0.35,110)
