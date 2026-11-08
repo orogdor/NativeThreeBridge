@@ -1,3 +1,9 @@
+# NativeThreeBridge v0.20.0 — continuous DX12 night illumination
+
+This update fixes visibly moving square boundaries caused by selecting only the 16 lights nearest each 67.5-unit tile center. The 16×16 broad-phase grid remains for performance, but every moving light with a radius overlapping a tile is included in that tile's variable-length GPU index stream; the existing per-pixel distance, spotlight cone and shadow visibility remain continuous. There is **no per-tile nearest-N truncation**. This does **not** change the 16 available real-time shadow maps.
+
+The DX12 renderer now binds tiled light indices through a per-frame typed SRV instead of the old 17 KB constant-buffer light list. Regression tests use 1,000 lights densely clustered around grid boundaries. Windows CI checks C++ and HLSL compilation, runtime script behavior, and packaging, but correct output pixels and actual FPS must still be verified on a physical DX12 GPU. Compare v0.19.0 and v0.20.0 with the same camera (F1/F2/F3), shadow switch (F5), VSync (F6), and night setting (F7). If more overlapping lights reduce FPS, review the GPU main-pass milliseconds and optimize based on the measured bottleneck.
+
 # NativeThreeBridge v0.19.0 — reusable engine core and smoother 10k/1k test
 
 This release converts several hardcoded benchmark optimizations into reusable **engine services** while keeping the v0.18.0 night stress scene (10,000 trees, 1,000 soldiers, 1,000 moving lights, 16 shadow maps) for regression testing.
