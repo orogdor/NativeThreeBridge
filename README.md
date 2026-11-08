@@ -1,3 +1,11 @@
+# NativeThreeBridge v0.23.0 — translating a CSS Restart button to native C++
+
+**First CSS→native UI experiment:** \`game/ui.html\` declares a single \`<button id="restart-button">Restart</button>\`, and \`game/ui.css\` styles it with \`#restart-button\`. A reusable, small C++ parser reads the markup and a deliberately restricted CSS subset (position by right/top pixels, width/height, colors, border, radius and font size/weight), then instantiates a native Win32 **owner-drawn BUTTON**. No browser, WebView or HTML/CSS renderer is included.
+
+A click is handled as native \`WM_COMMAND/BN_CLICKED\` and invokes \`NativeThreeJS_Restart()\`: the C++ engine destroys and reconstructs the live Three.js/QuickJS scene and native A* worker state, resets interpolation/gait and resumes the original 10,000-tree / 1,000-soldier test with all soldiers and their lamps at their original formation positions. The static forest GPU data is reused rather than uploaded again. **F9** performs the identical restart for comparison. The control should remain usable when the game is paused.
+
+This is a focused **CSS-to-C++ feasibility test**, not a general browser-compatible CSS implementation: selector scope and supported properties are documented in \`game/ui.css\`. Real Win32/DX12 display and button clicking require physical Windows verification. v0.22.0 remains available as the baseline.
+
 # NativeThreeBridge v0.22.0 — first real skinned odamees, red army vs blue baseline
 
 **Red army (500)** uses a real eight-joint glTF 2.0 skin generated from the original, previously unrigged `odamees.glb`: pelvis, spine, left/right thigh, left/right shin, left/right arm. A build-time asset generator assigns normalized per-vertex `JOINTS_0` / `WEIGHTS_0`, a parent-child bone hierarchy, and inverse bind matrices, exports a valid `game/odamees-rigged.glb` in the Windows ZIP, and supplies the exact influences as an embedded immutable GPU buffer. DX12 vertex shaders evaluate weighted bone movement in the **main and shadow passes**. This first-pass rig is envelope-based; it is not a hand-authored clip.
