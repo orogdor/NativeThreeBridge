@@ -1,3 +1,18 @@
+# NativeThreeBridge v0.18.0 — 10,000-tree / 1,000-soldier DX12 stress test
+
+This release extends the v0.17.0 **native Windows DirectX 12 benchmark**, not yet the universal Three.js importer. It renders 10,000 randomly scattered Sapling pine instances (one bark batch + one alpha-tested foliage batch), **two 500-soldier armies**, 1,000 independently moving Three.js SpotLight objects, and **16 live depth-map shadow-casting lights** selected from the 1,000. All 10,000 trees are created and used as navigation obstacles; only camera-visible trees are submitted to the main DX12 tree draw calls (CPU frustum-culling with GPU index indirection). The shadow passes retain independent per-light visibility lists.
+
+- World: 360x360 navigation cells, 3 world units each; a forest spanning roughly 300x300 cells. A* plans are independent for each soldier, collision/reservation protected, and capped at **four complete searches per frame** to avoid bursts on the expanded grid. This is not yet asynchronous worker-based pathfinding.
+- Tree matrix data: 10,000 x 16 floats = 640,000 bytes. The engine **uses a GPU-local structured shader resource buffer**, avoiding the 64KB D3D constant buffer cap. Soldier matrices: 1,000 x 16 floats = 64,000 bytes, inside a 64KB per-frame constant buffer. Per-frame upload buffers and two-frame GPU fences are retained.
+- Night mode is enabled by default. The 1,000 moving spotlights use angled positions; at most 16 real 256x256 depth shadow maps are updated per frame. The light grid chooses up to 16 affecting lights per tile.
+- Diagnostics now include FPS, the worst completed frame duration within the preceding one-second interval, average frame-buffer fence-wait time, CPU JS/LIGHT/DRAW/PRESENT averages, number of camera-visible trees, and route status. These **are not GPU timestamp metrics**.
+
+Controls: **F1** whole forest (default); **F2** near red army; **F3** near blue army; **F4** A* debug paths; **F5** real shadow maps on/off; **F6** VSync; **F7** day/night; mouse drag/scroll to move camera; Space pause; Escape exit.
+
+This build is intended to determine whether the present bridge can run at larger scales. Windows GitHub Actions tests JavaScript logic, native JS execution, DX12 compilation, HLSL shader compilation, and packaged updater. **Only a real Windows DX12-capable GPU can establish actual FPS, frame pacing, and correct final lighting/shadows**. Compare F1/F2, F5 shadows ON/OFF, F6 VSync OFF; avoid comparing F1 to the former v0.17 close camera as though workload were identical.
+
+---
+
 # NativeThreeBridge v0.17.0 — dark-night benchmark, smoother CPU and pathfinding
 
 The DX12 demo now opens in **dark-night mode** by default. The 500 moving soldier spotlights are angled above/aside their units so tree/soldier shadows are easier to inspect. Use **F7** to switch between day and night, **F5** to switch depth shadows on/off, **F6** to toggle VSync, **F4** to show A* debug paths (off by default). Sunlight is not used for this test; the night terrain has only a tiny ambient fill.
