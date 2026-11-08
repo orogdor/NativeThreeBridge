@@ -336,6 +336,10 @@ std::size_t NativeThreeJS_DebugSegments(float *outSegments, std::size_t capacity
     JS_FreeValue(context,value);
     return bytes/sizeof(float);
 }
+void NativeThreeJS_Restart() {
+    NativeThreeJS_Shutdown();
+    NativeThreeJS_Init();
+}
 void NativeThreeJS_Shutdown() {
     // Worker pool may own in-flight navigation requests. Shutdown does not
     // wait for queued work to finish, and no worker touches the JS context.

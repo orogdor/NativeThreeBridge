@@ -1,5 +1,14 @@
-NativeThreeBridge v0.22.0 - RED ARMY SKELETON / BLUE ARMY BASELINE
+NativeThreeBridge v0.23.0 - CSS RESTART BUTTON TO NATIVE C++
 ================================================================
+CSS test: game/ui.html declares <button id=restart-button>; game/ui.css
+sets right/top/size/background/text/border/radius/font. Engine parses these
+on startup and creates a real owner-drawn Win32 BUTTON, no browser or WebView.
+Press Restart to reset 1000 soldiers, A* routes, lights and gait to initial
+conditions without reloading the static 10000-tree GPU assets.
+You can edit game/ui.css and relaunch to test supported native styles.
+F9 is a keyboard shortcut to invoke the same C++ restart command.
+Full web CSS layout, animations, flexbox and scripts are NOT implemented.
+
 New: all radius-overlapping lights contribute to each 16x16 spatial tile.
 The former nearest-16 light list created hard moving square boundaries.
 Light indices are now compact per-frame SRVs; 16 real shadow maps remain.
@@ -23,7 +32,7 @@ Run NativeThree-Game.exe directly to bypass updater checks.
 Run NativeThree-Updater.exe separately to check GitHub for deltas.
 
 Controls: F1 overview, F2/F3 army follow, F4 routes, F5 shadow toggle,
-F6 VSync, F7 day/night (night default), F8 walking on/off.
+F6 VSync, F7 day/night, F8 walking, F9 restart scene.
 Mouse drag orbit, wheel zoom; F2/F3 follow army to see legs close up.
 Space pause; Esc exit.
 

@@ -1,0 +1,16 @@
+/* NativeThreeBridge CSS-to-Win32 experiment.
+   Supported native subset: right, top, width, height, background-color,
+   color, border-color, border-radius, font-size, font-weight. */
+#restart-button {
+  position: absolute;
+  right: 18px;
+  top: 18px;
+  width: 156px;
+  height: 44px;
+  background-color: #18374b;
+  color: #f4fbff;
+  border-color: #79d5e8;
+  border-radius: 11px;
+  font-size: 16px;
+  font-weight: bold;
+}
