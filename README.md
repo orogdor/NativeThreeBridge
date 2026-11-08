@@ -1,3 +1,59 @@
+# NativeThreeBridge v0.19.0 — reusable engine core and smoother 10k/1k test
+
+This release converts several hardcoded benchmark optimizations into reusable **engine services** while keeping the v0.18.0 night stress scene (10,000 trees, 1,000 soldiers, 1,000 moving lights, 16 shadow maps) for regression testing.
+
+### Changes implemented
+
+- **SpatialIndex2D** (native C++): shared, general-purpose chunk queries for visible meshes, nearby light sources and shadow caster candidates. Stationary camera views reuse previously computed visible IDs across both GPU backbuffers; dynamic light chunk storage is reused between frames.
+- **SceneRegistry**: stable ID/generation handles, object categories and dirty-position events for generic game objects, with independent C++ tests.
+- **FixedStepper**: 60 Hz gameplay simulation, at most four catch-up ticks per rendered frame, with independent render interpolation of moving instance positions and moving lights.
+- **Async navigation**: a reusable C++ navigation worker pool with priority requests, cancellation, immutable grid/occupancy snapshots and non-blocking polling. The native Windows demo uses this API, while browser and Node Three.js retain their original synchronous A* fallback. Note: the shared grid service is a foundation, not a complete navmesh/traffic/crowd system; local occupancy and reservations still protect collisions in the demo.
+- **Delta matrix transfer**: after first initialization, only the moving 1,000 instance transforms cross QuickJS→C++ instead of copying 10,000 static trees every frame.
+- **GPU/CPU profiling**: DX12 GPU timestamp queries separately report shadow and forward-pass time (if hardware supports queries); elapsed CPU JS, lighting, recording, Present and fence waits are tracked. The asynchronous CSV writer saves one-second summaries and frames slower than 40 ms in `NativeThreeBridge-frames.csv` in the current working directory.
+- **Texture quality and memory locality**: offline-generated mipmaps in `NTX2` assets, DX12 per-mip uploads and alpha-coverage preservation for cutout foliage; legacy texture payloads are still accepted.
+- **LOD selection foundation**: reusable native screen-space LOD policy with hysteresis. Importing real simplified GLBs/impostor assets into the live renderer remains a separate step.
+- **Generic Three.js conversion preview**: `js/native-three-converter.mjs` and a CLI export normal Three.js scenes, geometry, instancing, transforms, lights, cameras and supported materials to a neutral JSON manifest with an explicit unsupported-feature report. **The current DX12 runtime does not yet load arbitrary exported manifests.**
+
+### Try the test
+
+Download `NativeThreeBridge-Windows-x64.zip` from the v0.19.0 release, extract all files and run `NativeThree-Game.exe`. Keep `game/scene.js` beside it. **F1** overview, **F2/F3** army views, **F4** routes, **F5** shadows, **F6** VSync, **F7** night/day. Night is the default.
+
+Compare the 10k/1k scenario with **v0.18.0** using identical camera, shadow and VSync settings. Review `MAX`, `FENCE`, `JS`, `LIGHT`, `DRAW`, `PRESENT`, `GPU shadow`, `GPU main`, visible instance counts and the CSV file. CSV writing is done by a worker to avoid frame-thread disk stalls. GPU queries measure execution times on the GPU when supported, but do not independently prove correct pixels.
+
+### Reusing the native services in another game
+
+The natively exposed optional JS navigation API is:
+
+```js
+// Native Windows mode only. Browser Three.js can provide a JS fallback.
+if (globalThis.NativeThreeNavigation) {
+  const nav = NativeThreeNavigation;
+  nav.configure(width, height, blockedUint8Array);
+  nav.updateAgents(occupiedInt32Array, reservedInt32Array);
+  const ticket = nav.request(startCell, targetCell, true); // urgent
+  // Poll once per simulation tick; no blocking or awaiting on the render thread.
+  for (const response of nav.poll(32)) {
+    // response: {token, status, cells}, status===0 means route found.
+  }
+  nav.cancel(ticket); // optional: when an order changes
+}
+```
+
+For a **trusted local** Three.js ESM scene module (default export, `scene`, or `buildScene()`):
+
+```sh
+npm install
+npm run convert -- ./my-scene.mjs ./my-scene.native.json
+```
+
+The converter **analyzes and exports**, but it is not yet a drop-in import of every Three.js game. ShaderMaterial, DOM/canvas UI, video, audio, custom effects and skinned animation still need native implementation or adapters. Arbitrary game logic stays JavaScript in QuickJS. This is **not** a fork of the whole Three.js library or a universal JS-to-C++ compiler.
+
+### What still needs work
+
+A full native manifest loader, dynamically sized mesh/light buffers, real mesh LOD variants/impostors, GPU-driven `ExecuteIndirect` culling, clustered GPU lighting and a complete traffic/navmesh plugin are **not** claimed as implemented. Prioritize those based on profiler evidence and compatibility tests, not arbitrary object counts. Windows CI verifies C++/JS/HLSL compilation and native script behavior; **only a real DX12 GPU can provide actual FPS or shadow-image correctness**.
+
+---
+
 # NativeThreeBridge v0.18.0 — 10,000-tree / 1,000-soldier DX12 stress test
 
 This release extends the v0.17.0 **native Windows DirectX 12 benchmark**, not yet the universal Three.js importer. It renders 10,000 randomly scattered Sapling pine instances (one bark batch + one alpha-tested foliage batch), **two 500-soldier armies**, 1,000 independently moving Three.js SpotLight objects, and **16 live depth-map shadow-casting lights** selected from the 1,000. All 10,000 trees are created and used as navigation obstacles; only camera-visible trees are submitted to the main DX12 tree draw calls (CPU frustum-culling with GPU index indirection). The shadow passes retain independent per-light visibility lists.
