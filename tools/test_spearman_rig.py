@@ -63,7 +63,7 @@ def main():
         assert len(parsed["skins"][0]["joints"])==8
         bin_start=20+json_length
         bin_length=struct.unpack_from("<I",glb,bin_start)[0]
-        assert glb[bin_start+4:bin_start+8]==b"BIN\\x00"
+        assert glb[bin_start+4:bin_start+8]==b"BIN\x00"
         assert bin_length>=parsed["buffers"][0]["byteLength"]
         native=(out/"skin.bin").read_bytes()
         magic,count,bones,stride=struct.unpack_from("<4sIII",native)
