@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <climits>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <cwchar>
 #include "app_host.h"
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -23,6 +26,14 @@ using namespace DirectX;
 namespace {
 constexpr UINT WIDTH=960, HEIGHT=640, FRAMES=2;
 HWND windowHandle=nullptr;
+std::filesystem::path logPath;
+void logLine(const std::string& msg) {
+  if(!logPath.empty()) {
+    std::ofstream out(logPath, std::ios::app);
+    if(out) out << msg << "\n";
+  }
+  OutputDebugStringA((std::string("NativeThreeWebApp: ") + msg + "\n").c_str());
+}
 void check(HRESULT hr, const char* label) {
   if (FAILED(hr)) {
     char message[256];
@@ -103,11 +114,23 @@ struct Renderer {
       WaitForSingleObject(eventHandle,INFINITE);
     }
   }
-  void init(HWND hwnd) {
+  void init(HWND hwnd, bool forceWarp) {
+    logLine("DX12: creating factory");
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)),"CreateDXGIFactory1");
-    check(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),
-          "D3D12CreateDevice");
+    HRESULT hardware = E_FAIL;
+    if(!forceWarp) hardware = D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device));
+    if(FAILED(hardware)) {
+      logLine(forceWarp ? "DX12: WARP explicitly requested" :
+                               "DX12: hardware device unavailable; trying WARP");
+      ComPtr<IDXGIAdapter> warp;
+      check(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp)),"EnumWarpAdapter");
+      check(D3D12CreateDevice(warp.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device)),
+            "D3D12CreateDevice WARP");
+      logLine("DX12: WARP software device initialized");
+    } else {
+      logLine("DX12: hardware device initialized");
+    }
     D3D12_COMMAND_QUEUE_DESC q{};
     q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue)),"CreateCommandQueue");
@@ -121,6 +144,7 @@ struct Renderer {
     check(factory->CreateSwapChainForHwnd(queue.Get(),hwnd,&sw,nullptr,nullptr,&swap1),
           "CreateSwapChainForHwnd");
     check(swap1.As(&swap),"Query IDXGISwapChain3");
+    logLine("DX12: swapchain initialized");
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
     heapDesc.NumDescriptors=FRAMES;heapDesc.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -202,6 +226,7 @@ float4 PS(Out i):SV_TARGET {
     pipe.SampleDesc.Count=1;
     check(device->CreateGraphicsPipelineState(&pipe,IID_PPV_ARGS(&pso)),
           "Create cube pipeline");
+    logLine("DX12: HLSL shaders and pipeline initialized");
 
     // 6 independent faces, 2 triangles per face (36 vertices).
     std::vector<Vertex> mesh;
@@ -236,6 +261,7 @@ float4 PS(Out i):SV_TARGET {
     check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"CreateFence");
     eventHandle=CreateEventW(nullptr,FALSE,FALSE,nullptr);
     if(!eventHandle)throw std::runtime_error("CreateEvent failed");
+    logLine("DX12: renderer initialization complete");
   }
   void render(const WebAppFrame& frame) {
     XMMATRIX model = XMMatrixSet(
@@ -295,8 +321,18 @@ float4 PS(Out i):SV_TARGET {
 };
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR args,int show) {
+  const std::wstring options = args ? args : L"";
+  const bool selfTest = options.find(L"--self-test") != std::wstring::npos;
+  const bool warp = selfTest || options.find(L"--warp") != std::wstring::npos;
   try {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD exeChars=GetModuleFileNameW(nullptr,exe,MAX_PATH);
+    if(!exeChars||exeChars>=MAX_PATH)throw std::runtime_error("Cannot locate executable for log");
+    logPath=std::filesystem::path(exe).parent_path()/L"webapp-startup.log";
+    { std::ofstream reset(logPath,std::ios::trunc); }
+    logLine("NativeThreeBridge WebApp v0.26.1 test.2 starting");
+    logLine(selfTest ? "Mode: DX12 WARP smoke" : (warp ? "Mode: DX12 WARP" : "Mode: DX12 hardware with WARP fallback"));
     WNDCLASSW cls{};
     cls.lpfnWndProc=windowProc;cls.hInstance=instance;
     cls.lpszClassName=L"NativeThree-WebApp-DX12";
@@ -310,7 +346,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
       CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,
       nullptr,nullptr,instance,nullptr);
     if(!windowHandle)throw std::runtime_error("CreateWindowW failed");
-    ShowWindow(windowHandle,show);
+    ShowWindow(windowHandle,selfTest?SW_HIDE:show);
+    logLine("Win32: window created");
 
     wchar_t module[MAX_PATH]{};
     DWORD n=GetModuleFileNameW(nullptr,module,MAX_PATH);
@@ -320,12 +357,14 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     std::string jsError;
     if(!WebApp_Init(base+L"\\webapp\\index.html",jsError))
       throw std::runtime_error("Cannot open webapp/index.html:\n"+jsError);
-    Renderer dx12;dx12.init(windowHandle);
+    logLine("QuickJS: HTML entry and Three.js app initialized");
+    Renderer dx12;dx12.init(windowHandle,warp);
     LARGE_INTEGER freq{},start{},clock{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
     MSG message{};
     bool running=true;
+    unsigned frames=0;
     while(running) {
       while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
         if(message.message==WM_QUIT){running=false;break;}
@@ -338,12 +377,18 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
       if(!WebApp_Tick(ms,frame,jsError))
         throw std::runtime_error("Three.js WebApp frame failed:\n"+jsError);
       dx12.render(frame);
+      ++frames;
+      if(frames==1) logLine("DX12: first animated frame presented");
+      if(selfTest && frames>=3) running=false;
     }
+    logLine("WebApp: clean shutdown after " + std::to_string(frames) + " frames");
     WebApp_Shutdown();
     return 0;
   } catch(const std::exception& e) {
+    logLine(std::string("FAILED: ") + e.what());
     WebApp_Shutdown();
-    MessageBoxA(windowHandle,e.what(),"NativeThreeBridge WebApp error",MB_OK|MB_ICONERROR);
+    if(!selfTest && GetEnvironmentVariableA("CI",nullptr,0)==0)
+      MessageBoxA(windowHandle,e.what(),"NativeThreeBridge WebApp error",MB_OK|MB_ICONERROR);
     return 1;
   }
 }
