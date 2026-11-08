@@ -97,3 +97,18 @@ test('F12 quick skirmish relocates both detachments collision-free and attacks h
   assert.ok(ArrayBuffer.isView(w.__nativeThreeCombatFrame()));
   assert.equal(w.__nativeThreeCombatFrame().length,4000);
 });
+
+test('native battle test has visible scoreboard and the F12 battle shortcut',()=>{
+  const dx=readFileSync(new URL('../native-dx12/NativeThree-DX12.cpp',import.meta.url),'utf8');
+  const host=readFileSync(new URL('../native-dx12/three_js_host.cpp',import.meta.url),'utf8');
+  assert.match(dx,/gBattleHud=CreateWindowExW/);
+  assert.match(dx,/FIGHTING %d/);
+  assert.match(dx,/VICTORY: %s/);
+  assert.match(dx,/if\(wp==VK_F12\)/);
+  assert.match(dx,/gForceBattleCameraSnap=true/);
+  assert.match(dx,/gCombatStates\[1000\]/);
+  assert.match(dx,/SetGraphicsRootConstantBufferView\(11,gCombatCB->GetGPUVirtualAddress\(\)\)/);
+  assert.equal((dx.match(/SetGraphicsRootConstantBufferView\(11,gCombatCB->GetGPUVirtualAddress\(\)\)/g)||[]).length,2);
+  assert.match(host,/NativeThreeJS_CombatStates/);
+  assert.match(host,/NativeThreeJS_GetBattleStatus/);
+});
