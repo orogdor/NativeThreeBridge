@@ -6,6 +6,7 @@
 #include "native_css_style.h"
 #include "native_audio_core.h"
 #include "walk_animation.h"
+#include "transform_interpolation.h"
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -109,6 +110,40 @@ int main(){
     unsigned negative=0;
     trees.queryAabb(-482.f,-482.f,-470.f,-470.f,[&](const SpatialItem&){negative++;});
     assert(negative>0);
+
+    // Regression: 60 Hz simulation, >100 Hz render. Character and camera
+    // must see the same sub-frame interpolation, including yaw wrapping.
+    auto yawMatrix=[](float theta,float x,float* m){
+        std::fill_n(m,16,0.f);
+        const float sn=std::sin(theta),cs=std::cos(theta);
+        m[0]=cs;m[2]=-sn;m[5]=1.f;m[8]=sn;m[10]=cs;
+        m[12]=x;m[15]=1.f;
+    };
+    float poseA[16]{},poseB[16]{},smoothed[16]{};
+    yawMatrix(0,0,poseA);
+    yawMatrix(1.57079632679f,10,poseB);
+    interpolateAffine(poseA,poseB,0.5f,smoothed);
+    if(std::abs(smoothed[12]-5.f)>0.001f ||
+       std::abs(smoothed[0]-0.7071068f)>0.002f ||
+       std::abs(smoothed[8]-0.7071068f)>0.002f)
+        return 61; // half-step translation and yaw at render time
+    interpolateAffine(poseA,poseB,0.f,smoothed);
+    if(smoothed[12]!=poseA[12]||smoothed[8]!=poseA[8])return 62;
+    interpolateAffine(poseA,poseB,1.f,smoothed);
+    if(smoothed[12]!=poseB[12]||smoothed[8]!=poseB[8])return 63;
+    yawMatrix(3.12413936f,0,poseA);  // +179 degrees
+    yawMatrix(-3.12413936f,0,poseB); // -179 degrees
+    interpolateAffine(poseA,poseB,0.5f,smoothed);
+    if(smoothed[0]>-0.999f || std::abs(smoothed[8])>0.02f)
+        return 64; // shortest arc, not 358-degree back rotation
+    yawMatrix(0,0,poseA);
+    std::copy_n(poseA,16,poseB);
+    poseB[5]=0;poseB[6]=1;poseB[9]=-1;poseB[10]=0; // X-axis tilt
+    interpolateAffine(poseA,poseB,0.5f,smoothed);
+    if(std::abs(smoothed[5]-0.7071068f)>0.003f ||
+       std::abs(smoothed[6]-0.7071068f)>0.003f)
+        return 65; // generic rotated game objects, not just yaw soldiers
+    std::puts("PASS: sub-frame affine and shortest-arc rotation interpolation");
 
     FixedStepper stepper(1.0/60.0,4);
     unsigned simTicks=0;

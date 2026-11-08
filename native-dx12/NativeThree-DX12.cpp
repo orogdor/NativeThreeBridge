@@ -26,6 +26,7 @@
 #include "native_css_win32.h"
 #include "native_audio_xaudio2.h"
 #include "walk_animation.h"
+#include "transform_interpolation.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -1292,6 +1293,8 @@ static void renderFrame() {
     static native_three::WalkAnimation<LIGHT_COUNT> soldierWalk;
     static std::array<float,LIGHT_COUNT*4> walkStates{};
     static std::array<float,LIGHT_COUNT*4> combatStates{};
+    static std::array<float,LIGHT_COUNT*4> previousCombatStates{};
+    static std::array<float,LIGHT_COUNT*4> currentCombatStates{};
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
     static UINT seenSceneEpoch=~0u;
@@ -1304,6 +1307,8 @@ static void renderFrame() {
         soldierWalk=native_three::WalkAnimation<LIGHT_COUNT>();
         walkStates.fill(0.f);
         combatStates.fill(0.f);
+        previousCombatStates.fill(0.f);
+        currentCombatStates.fill(0.f);
         seenSceneEpoch=gSceneEpoch;
     }
     const ULONGLONG tick=GetTickCount64();
@@ -1318,15 +1323,19 @@ static void renderFrame() {
         previous=matrices;renderMatrices=matrices;
         NativeThreeJS_Lights(currentLights.data(),currentLights.size());
         previousLights=currentLights;
+        NativeThreeJS_CombatStates(currentCombatStates.data(),currentCombatStates.size());
+        previousCombatStates=currentCombatStates;
         firstSceneFrame=false;
     }
     const float alpha=simulation.advance(dt,[&](double step){
         std::copy(matrices.begin()+TREE_COUNT*16,matrices.end(),
                   previous.begin()+TREE_COUNT*16);
         previousLights=currentLights;
+        previousCombatStates=currentCombatStates;
         NativeThreeJS_FrameFrom((float)step,matrices.data(),INSTANCE_COUNT*16,
                                 gTreesUploaded ? TREE_COUNT : 0);
         NativeThreeJS_Lights(currentLights.data(),currentLights.size());
+        NativeThreeJS_CombatStates(currentCombatStates.data(),currentCombatStates.size());
     });
     // Interpolate independently moving light objects, not assuming they are
     // attached to a soldier or occupy the same index as a mesh.
@@ -1337,15 +1346,19 @@ static void renderFrame() {
             renderedLights[k+c]=previousLights[k+c]+
                                  (currentLights[k+c]-previousLights[k+c])*alpha;
     }
-    // Native interpolator works on the generic transform matrix layout.
-    // Only changed/animated instances are copied; static tree matrices stay.
+    // The previous implementation interpolated XYZ but copied yaw and the
+    // skeletal strike pose directly from the most recent 60 Hz tick. At
+    // 100-170 FPS that made close-up characters rotate and hit in tiny jumps.
+    // Interpolate the full affine basis, with a fast yaw-only path for this
+    // benchmark and generic quaternion handling for other Three.js scenes.
     for(UINT i=TREE_COUNT;i<INSTANCE_COUNT;i++){
         const size_t off=(size_t)i*16;
-        memcpy(renderMatrices.data()+off,matrices.data()+off,16*sizeof(float));
-        for(size_t k=12;k<=14;k++)
-            renderMatrices[off+k]=previous[off+k]+
-                                  (matrices[off+k]-previous[off+k])*alpha;
+        native_three::interpolateAffine(previous.data()+off,
+            matrices.data()+off,alpha,renderMatrices.data()+off);
     }
+    for(size_t i=0;i<combatStates.size();i++)
+        combatStates[i]=previousCombatStates[i]+
+            (currentCombatStates[i]-previousCombatStates[i])*alpha;
     gLastJSms=(cpuSeconds()-jsStart)*1000.0;
     gJsCpuMsTotal+=gLastJSms;
     // F4 route visualization tracks live replanning instead of showing
@@ -1356,8 +1369,11 @@ static void renderFrame() {
         gLastPathRefresh=tick;
     }
     const UINT followIndex= gCameraMode==2 ? TREE_COUNT+PER_ARMY : TREE_COUNT;
-    gCameraFocusX=gCameraMode==0?0.f:matrices[followIndex*16+12];
-    gCameraFocusZ=gCameraMode==0?0.f:matrices[followIndex*16+14];
+    // Camera and soldier MUST sample the same interpolated time. Otherwise
+    // the camera jumps each 60 Hz simulation tick while its target slides
+    // smoothly at 100+ Hz, creating the close-up vibration seen by the user.
+    gCameraFocusX=gCameraMode==0?0.f:renderMatrices[followIndex*16+12];
+    gCameraFocusZ=gCameraMode==0?0.f:renderMatrices[followIndex*16+14];
     // Place the viewed soldier near the forest's edge for visible A* turns.
     if(gCameraMode==1) gCameraFocusX+=16.0f;
     if(gCameraMode==2) gCameraFocusX-=16.0f;
@@ -1423,7 +1439,7 @@ static void renderFrame() {
     check(gWalkCB->Map(0,nullptr,&walkData),"Map 1000 soldier walk states");
     memcpy(walkData,walkStates.data(),walkStates.size()*sizeof(float));
     gWalkCB->Unmap(0,nullptr);
-    NativeThreeJS_CombatStates(combatStates.data(),combatStates.size());
+    // combatStates already interpolates the two fixed-tick samples above.
     void* combatMapped=nullptr;
     check(gCombatCB->Map(0,nullptr,&combatMapped),"Map 1000 combat poses");
     memcpy(combatMapped,combatStates.data(),combatStates.size()*sizeof(float));
