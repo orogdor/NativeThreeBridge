@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Edge &amp; cases</title>
+  <script type="importmap">
+  { "imports": { "three": "./vendor/three.module.js", "@lib/": "./lib/", "three/addons/": "https://unpkg.com/three@0.181.0/examples/jsm/" } }
+  </script>
+  <script>
+    // Classic scripts run before deferred modules, like in a browser.
+    window.classicOrder = ['classic'];
+    var classicGlobal = 42;
+  </script>
+</head>
+<body>
+  <div id="ui" class="panel dark"><span class="label">Score: <b id="score">0</b></span><button id="go" data-mode="fast">Go</button></div>
+  <ul id="list"><li>one<li>two<li>three</ul>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { makeThing } from '@lib/thing.js';
+    window.classicOrder.push('module');
+    const renderer = new THREE.WebGLRenderer();
+    document.body.appendChild(renderer.domElement);
+    renderer.setSize(innerWidth, innerHeight);
+    const scene = new THREE.Scene();
+    const camera = new THREE.OrthographicCamera(-5, 5, 5, -5, 0.1, 100);
+    camera.position.set(0, 0, 10);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    scene.add(makeThing(THREE));
+    const shader = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({ vertexShader: 'void main(){}', fragmentShader: 'void main(){}' }));
+    scene.add(shader);
+    scene.add(new THREE.Points(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3()]), new THREE.PointsMaterial()));
+    scene.add(new THREE.GridHelper(4, 4));
+    const textured = new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshStandardMaterial({ color: 0x00ff00 }));
+    new THREE.TextureLoader().load('missing.png', (t) => { textured.material.map = t; }, undefined, () => { window.textureFailedGracefully = true; });
+    textured.material.map = new THREE.Texture();
+    scene.add(textured);
+    const data = await (await fetch('lib/data.json')).json();
+    window.fetchedValue = data.value;
+    window.metaUrl = import.meta.url;
+    try { await fetch('https://example.com/x.json'); } catch (e) { window.networkBlocked = e.message; }
+    document.getElementById('go').addEventListener('click', (e) => { window.clicked = e.target.dataset.mode; });
+    document.querySelector('#ui .label > b').textContent = '7';
+    window.counts = { lis: document.querySelectorAll('#list li').length, panels: document.getElementsByClassName('panel dark').length };
+    setTimeout(() => { window.timeoutRan = true; }, 30);
+    renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+  </script>
+</body>
+</html>

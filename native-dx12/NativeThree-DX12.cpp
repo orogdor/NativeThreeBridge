@@ -27,6 +27,7 @@
 #include "native_audio_xaudio2.h"
 #include "walk_animation.h"
 #include "transform_interpolation.h"
+#include "webapp_dx12.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -1725,7 +1726,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
     }
     return DefWindowProcW(win,msg,wp,lp);
 }
-int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     // Browser projects downloaded into game/ are inspected before DX12 or JS
     // startup. The bundled battle scene keeps its existing game/scene.js path.
     wchar_t executable[MAX_PATH]={};
@@ -1739,13 +1740,22 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
        swprintf_s(scenePath,L"%s\\game\\scene.js",executable)<0)return 40;
     const bool importedGame=GetFileAttributesW(sourceMarker)!=INVALID_FILE_ATTRIBUTES;
     const bool battleScene=GetFileAttributesW(scenePath)!=INVALID_FILE_ATTRIBUTES;
+    // v0.28 webapp mode: an ordinary Three.js webapp folder (index.html + ES
+    // modules) passed with --webapp <folder>, dropped on the EXE, or installed
+    // as game/index.html runs in its own window. Without one, the forest
+    // battle (game/scene.js) below stays the default engine scene.
+    if(!importedGame) {
+        std::filesystem::path webappRoot;
+        if(NativeWebapp_FindRoot(commandLine,executable,webappRoot))
+            return NativeWebapp_Run(instance,webappRoot);
+    }
     if(importedGame || !battleScene) {
         const char* report=importedGame
             ? "Kuningriigid source is installed in game/, but this DX12 engine cannot run it yet. "
               "Browser DOM, HTML/CSS, module loading and WebGLRenderer are not implemented. "
               "No downloaded game code was executed."
-            : "No compatible game/scene.js found. Install a game with its own updater. "
-              "This DX12 engine still requires the forest battle scene contract.";
+            : "No game/scene.js or game/index.html found. Install a game with its own updater, "
+              "or open a Three.js webapp folder: NativeThree-Game.exe --webapp <folder>.";
         char reportPath[MAX_PATH]={};
         if(sprintf_s(reportPath,"%ls\\compatibility-report.txt",executable)>0) {
             FILE* file=nullptr;

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="et">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hello webapp</title>
+  <link rel="stylesheet" href="./style.css">
+  <!-- In a browser Three.js comes from the CDN. NativeThreeBridge always maps
+       'three' to its own embedded Three.js and ignores this URL. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.181.0/build/three.module.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <div id="hud">
+    <h1>Hello webapp</h1>
+    <p id="status">Laadimine…</p>
+    <p class="hint">Lohista hiirega: pööra · Ratas: suumi · Tühik: paus · R: kaamera algusesse · L: punktvalgus</p>
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

@@ -1,3 +1,22 @@
+NativeThreeBridge v0.28.0 - THREE.JS WEBAPPS IN THE ENGINE (TEST)
+=================================================================
+NEW: a whole Three.js webapp folder (index.html + ES modules) now runs in
+the engine, not only one scene.js file. No browser, WebView or WebGL.
+TRY IT: double-click Run-Hello-Webapp.bat. Drag = orbit, wheel = zoom,
+Space = pause, R = reset camera, L = point light on/off.
+YOUR OWN WEBAPP: NativeThree-Game.exe --webapp "C:\path\to\folder"
+or drag the folder (or its index.html) onto NativeThree-Game.exe.
+'three' always uses the engine's built-in Three.js r181; THREE.WebGLRenderer
+renders natively with DX12. Built-in addons: OrbitControls, PointerLockControls.
+Works now: meshes, InstancedMesh, groups, Basic/Lambert/Phong/Standard/
+Normal materials, colours, vertex colours, opacity, ambient/hemisphere/
+directional/point/spot lights, lines (GridHelper), keyboard/mouse/wheel,
+resize, timers, fetch of files inside the webapp folder, document.title.
+Not yet (reported in NativeThreeBridge-webapp-log.txt): textures/images,
+GLTF models, shadows, fog, ShaderMaterial, post-processing, HTML/CSS
+overlays (DOM exists but is not drawn), audio, internet URLs.
+Without --webapp the forest battle starts exactly as before.
+
 NativeThreeBridge v0.27.1 - FOREST BATTLE ENGINE
 The forest battle is still the primary scenario and starts normally from
 NativeThree-Game.exe. A separate engine-update-v1.json release asset lets

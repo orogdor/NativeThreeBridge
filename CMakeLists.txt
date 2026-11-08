@@ -28,15 +28,35 @@ file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/Release/game")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/game/scene.js"
                "${CMAKE_BINARY_DIR}/Release/game/scene.js" COPYONLY)
 
+# v0.28 webapp runtime: official Three.js builds + shim + NativeRenderer are
+# embedded so any Three.js webapp folder can be opened without a browser.
+set(WEBAPP_THREE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/node_modules/three/build" CACHE PATH "three/build folder")
+set(WEBAPP_ADDONS_DIR "${WEBAPP_THREE_DIR}/../examples/jsm")
+set(WEBAPP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+if(NOT EXISTS "${WEBAPP_THREE_DIR}/three.module.min.js" OR NOT EXISTS "${WEBAPP_ADDONS_DIR}/controls/OrbitControls.js")
+  message(FATAL_ERROR "Run npm install first: webapp mode embeds node_modules/three")
+endif()
+configure_file(native-dx12/webapp_assets.rc.in "${CMAKE_BINARY_DIR}/webapp_assets.rc" @ONLY)
+set(WEBAPP_ASSETS "${CMAKE_BINARY_DIR}/webapp_assets.rc")
+set(WEBAPP_RUNTIME native-dx12/webapp_host.cpp native-dx12/webapp_resources.cpp ${WEBAPP_ASSETS})
+
 add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
   native-dx12/three_js_host.cpp
+  native-dx12/webapp_dx12.cpp
+  ${WEBAPP_RUNTIME}
   ${ASSETS}
 )
 set_target_properties(NativeThreeJS PROPERTIES OUTPUT_NAME "NativeThree-Diagnostics")
 target_include_directories(NativeThreeJS PRIVATE native-dx12)
-target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32)
+target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32 shell32)
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
+
+# Headless CI check of the webapp runtime with the same embedded resources.
+add_executable(WebappSmoke native-dx12/webapp_smoke.cpp ${WEBAPP_RUNTIME})
+target_include_directories(WebappSmoke PRIVATE native-dx12)
+target_link_libraries(WebappSmoke PRIVATE qjs d3dcompiler user32)
+target_compile_definitions(WebappSmoke PRIVATE UNICODE _UNICODE)
 
 add_executable(ThreeSceneSmoke
   native-dx12/three_scene_smoke.cpp

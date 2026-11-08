@@ -61,7 +61,7 @@ jobs:
         run: |
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
-          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke NativeThreeJS --parallel 4
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke WebappSmoke NativeThreeJS --parallel 4
           if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
       - name: Verify generic scene registry, spatial index and async path worker pool
         shell: pwsh
@@ -83,6 +83,17 @@ jobs:
           if (!(Test-Path build/Release/game/scene.js)) { throw "External scene.js missing" }
           & .\build\Release\ThreeSceneSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Embedded Three.js JavaScript execution failed" }
+      - name: Run Three.js webapp folders through the embedded webapp runtime (headless)
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build\Release\WebappSmoke.exe samples/hello-webapp 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "hello-webapp failed in the native webapp runtime" }
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-edge 3
+          if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed in the native webapp runtime" }
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-bad-import 0 expect-boot-error
+          if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly" }
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |
@@ -94,6 +105,9 @@ jobs:
           New-Item -ItemType Directory -Force dist/game/audio | Out-Null
           Copy-Item game/audio/*.wav dist/game/audio/
           Copy-Item generated/soldier-rigged.glb dist/game/odamees-rigged.glb
+          New-Item -ItemType Directory -Force dist/webapps/hello-webapp | Out-Null
+          Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
+          Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
           cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
           if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
           & .\dist\NativeThree-Updater.exe --self-test
@@ -113,7 +127,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav) -or !(Test-Path verify/webapps/hello-webapp/index.html) -or !(Test-Path verify/webapps/hello-webapp/main.js) -or !(Test-Path verify/webapps/hello-webapp/world.js) -or !(Test-Path verify/Run-Hello-Webapp.bat)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
@@ -135,6 +149,23 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/audio/swing.wav dist/game/audio/hit.wav dist/game/audio/death.wav dist/game/odamees-rigged.glb dist/update-v2.txt dist/engine-update-v1.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – forest battle engine" --notes "The forest battle remains the primary engine development scene. Engine changes from v0.26.0 are preserved. This release adds an engine-only SHA-256 manifest so separately installed games can update the shared engine binary without changing their own game files. Browser games such as Kuningriigid still lack DOM, HTML/CSS, module and WebGLRenderer compatibility; imported browser source is rejected before JavaScript execution."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/audio/swing.wav dist/game/audio/hit.wav dist/game/audio/death.wav dist/game/odamees-rigged.glb dist/update-v2.txt dist/engine-update-v1.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – Three.js webapps in the engine" --notes "Whole Three.js webapp folders (index.html + ES modules, importmap, DOM, events, fetch) now run in the engine with THREE.WebGLRenderer rendered natively by DX12. Run Run-Hello-Webapp.bat, or NativeThree-Game.exe --webapp <folder>. Textures, GLTF, shadows, ShaderMaterial and HTML overlays are not drawn yet; see README-WINDOWS.txt. Without --webapp the forest battle starts as before."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
+      - name: Publish downloadable webapp test pre-release for this pull request
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'feature/webapp')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$v-webapp-test"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Could not replace the previous test pre-release" }
+          }
+          gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – Three.js webapp test build" --notes "Test build from pull request #$env:PR_NUMBER (commit $env:HEAD_SHA). Download the ZIP, extract everything and double-click Run-Hello-Webapp.bat. Your own webapp: NativeThree-Game.exe --webapp <folder>. Not a stable release; it is replaced on every push to the pull request."
+          if ($LASTEXITCODE -ne 0) { throw "Test pre-release failed" }

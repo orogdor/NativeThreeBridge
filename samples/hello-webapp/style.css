@@ -1,0 +1,10 @@
+html, body { margin: 0; height: 100%; overflow: hidden; background: #10141a; }
+#view { display: block; width: 100vw; height: 100vh; }
+#hud {
+  position: absolute; left: 16px; top: 12px;
+  color: #e8eef5; font: 14px/1.4 system-ui, sans-serif;
+  text-shadow: 0 1px 2px #000; pointer-events: none;
+}
+#hud h1 { margin: 0 0 4px; font-size: 18px; }
+#hud p { margin: 0; }
+#hud .hint { opacity: 0.75; font-size: 12px; margin-top: 4px; }
