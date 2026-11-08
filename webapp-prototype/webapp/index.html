@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- NativeThreeBridge's deliberately small native HTML entry contract. -->
+  <meta name="nativethree-entry" content="app.js">
+  <title>NativeThreeBridge - rotating Three.js cube</title>
+  <style>
+    html,body { margin:0; height:100%; overflow:hidden; background:#0b1426; }
+    #stage { width:100vw; height:100vh; display:block; }
+    #hint { position:fixed; left:18px; top:16px; color:#d9efff; font:15px Arial,sans-serif; }
+  </style>
+  <script type="importmap">
+    {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.181.0/build/three.module.js"}}
+  </script>
+</head>
+<body>
+  <canvas id="stage" width="960" height="640"></canvas>
+  <div id="hint">Three.js rotating cube - browser / native DX12 comparison</div>
+  <script type="module">
+    import * as THREE from "three";
+    globalThis.THREE = THREE;
+    await import("./app.js");
+  </script>
+</body>
+</html>
