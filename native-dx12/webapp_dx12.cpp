@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "webapp_host.h"
+#include "v8_webapp_host.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
 
@@ -35,8 +36,48 @@
 
 using Microsoft::WRL::ComPtr;
 using native_three::WebappHost;
+using native_three::V8WebappHost;
 
 namespace {
+
+// One DX12 renderer, interchangeable JavaScript runtimes. This adapter
+// delegates the SAME scene upload/pass protocol to the exact same renderer.
+// The established QuickJS benchmark path is never changed.
+class WebappRuntimeMux {
+public:
+    explicit WebappRuntimeMux(bool v8) : useV8_(v8) {}
+    bool start(const std::filesystem::path& root,const std::string& shim,
+               std::vector<native_three::WebappBuiltin> builtins,
+               native_three::WebappRenderSink* sink,int w,int h,std::string& err) {
+        if(useV8_) return v8_.start(root,shim,std::move(builtins),sink,w,h,err);
+        return qjs_.start(root,shim,std::move(builtins),sink,w,h,err);
+    }
+    bool running() const {return useV8_?v8_.running():qjs_.running();}
+    void shutdown(){if(useV8_)v8_.shutdown();else qjs_.shutdown();}
+    void resize(int w,int h,double ratio){if(useV8_)v8_.resize(w,h,ratio);else qjs_.resize(w,h,ratio);}
+    void frame(double ms){if(useV8_)v8_.frame(ms);else qjs_.frame(ms);}
+    void key(bool down,const std::string& key,const std::string& code,
+             bool repeat,bool alt,bool ctrl,bool shift,bool meta){
+        if(useV8_)v8_.key(down,key,code,repeat,alt,ctrl,shift,meta);
+        else qjs_.key(down,key,code,repeat,alt,ctrl,shift,meta);
+    }
+    void pointer(const char* kind,double x,double y,int button){
+        if(useV8_)v8_.pointer(kind,x,y,button);
+        else qjs_.pointer(kind,x,y,button);
+    }
+    void wheel(double x,double y,double dx,double dy){
+        if(useV8_)v8_.wheel(x,y,dx,dy);else qjs_.wheel(x,y,dx,dy);
+    }
+    void focus(bool focused){if(useV8_)v8_.focus(focused);else qjs_.focus(focused);}
+    std::string statusJson() {
+        return useV8_?v8_.statusJson():qjs_.statusJson();
+    }
+private:
+    bool useV8_;
+    WebappHost qjs_;
+    V8WebappHost v8_;
+};
+
 
 constexpr UINT kFrameCount = 2;
 constexpr UINT kVertexStride = 9 * sizeof(float);    // position, normal, colour
@@ -96,7 +137,7 @@ struct Retired {
 
 class WebappWindow final : public native_three::WebappRenderSink {
 public:
-    explicit WebappWindow(std::filesystem::path root) : root_(std::move(root)) {}
+    explicit WebappWindow(std::filesystem::path root, bool useV8) : root_(std::move(root)), host_(useV8), v8Mode_(useV8) {}
     int run(HINSTANCE instance);
 
     // ---- WebappRenderSink
@@ -132,7 +173,8 @@ private:
     HWND window_ = nullptr;
     UINT width_ = 1280, height_ = 720;
     bool minimized_ = false;
-    WebappHost host_;
+    WebappRuntimeMux host_;
+    bool v8Mode_ = false;
     std::FILE* log_ = nullptr;
     std::wstring pageTitle_ = L"Three.js webapp";
     std::wstring adapterName_ = L"GPU";
@@ -749,6 +791,8 @@ int WebappWindow::run(HINSTANCE instance) {
     SetThreadStackGuarantee(&guarantee);
     SetUnhandledExceptionFilter(webappCrashFilter);
     log("info", "Opening webapp: " + root_.u8string());
+    log("info", v8Mode_ ? "JavaScript engine: Node/V8 (experimental subprocess bridge)" :
+                        "JavaScript engine: QuickJS-NG (unchanged legacy backend)");
 
     std::string shim, error;
     std::vector<native_three::WebappBuiltin> builtins;
@@ -900,7 +944,7 @@ bool NativeWebapp_FindRoot(const wchar_t* commandLine, const std::filesystem::pa
     return false;
 }
 
-int NativeWebapp_Run(HINSTANCE instance, const std::filesystem::path& webappRoot) {
-    auto window = std::make_unique<WebappWindow>(webappRoot);
+int NativeWebapp_Run(HINSTANCE instance, const std::filesystem::path& webappRoot, bool useV8) {
+    auto window = std::make_unique<WebappWindow>(webappRoot, useV8);
     return window->run(instance);
 }
