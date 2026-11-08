@@ -1534,7 +1534,7 @@ static void renderFrame() {
         wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s | RED RIG 8 / BLUE LEGACY | RESTARTS %u",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
@@ -1543,7 +1543,7 @@ static void renderFrame() {
             gMainVisibleTrees,gDirtySceneObjects,
             gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
-            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF");
+            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF",gSceneEpoch);
         SetWindowTextW(gWindow,title);
         char summary[512];
         sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
@@ -1627,7 +1627,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
     gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.18 NIGHT | 10k trees / 1k dynamic A* soldiers",
-       WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
+       WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
     if(!gWindow)return 2;
@@ -1661,6 +1661,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
             gShowDebugPaths=false;
             gPause=false;
             gStatFrames=0;
+            gStatStart=GetTickCount64();
             gWorstFrameMs=0;
         }
         if(!gPause&&!IsIconic(gWindow))renderFrame();
