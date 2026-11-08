@@ -48,6 +48,21 @@ jobs:
         run: |
           & .\build-webapp\Release\ThreeWebAppSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "QuickJS WebApp runtime or rotation failed" }
+      - name: Run real DX12 WARP scene in headless Windows smoke
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build-webapp\Release\NativeThreeWebApp.exe --self-test --warp
+          $exitCode = $LASTEXITCODE
+          if (Test-Path build-webapp/Release/webapp-startup.log) {
+            Get-Content build-webapp/Release/webapp-startup.log
+          }
+          if ($exitCode -ne 0) { throw "DX12 frame rendering failed with code $exitCode" }
+          $log = Get-Content build-webapp/Release/webapp-startup.log -Raw
+          if ($log -notmatch 'first animated frame presented') {
+            throw "DX12 did not present a frame"
+          }
       - name: Package an independently testable Windows EXE
         shell: pwsh
         run: |
@@ -56,13 +71,14 @@ jobs:
           Copy-Item build-webapp/Release/ThreeWebAppSmoke.exe dist/ThreeWebAppSmoke.exe
           Copy-Item webapp-prototype/webapp/index.html dist/webapp/index.html
           Copy-Item webapp-prototype/webapp/app.js dist/webapp/app.js
+          Copy-Item webapp-prototype/Run-WebApp.cmd dist/Run-WebApp.cmd
           Copy-Item webapp-prototype/README.md dist/README.txt
           Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
           Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
           Compress-Archive -Path dist/* -DestinationPath NativeThreeWebApp-v026-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive NativeThreeWebApp-v026-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-WebApp.exe) -or !(Test-Path verify/webapp/index.html) -or !(Test-Path verify/webapp/app.js)) {
+          if (!(Test-Path verify/NativeThree-WebApp.exe) -or !(Test-Path verify/Run-WebApp.cmd) -or !(Test-Path verify/webapp/index.html) -or !(Test-Path verify/webapp/app.js)) {
             throw "ZIP missing WebApp executable or original app files"
           }
           & .\verify\ThreeWebAppSmoke.exe
@@ -79,11 +95,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag='v0.26.1-webapp-test.1'
+          $tag='v0.26.1-webapp-test.2'
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Existing preview release retained unchanged"
           } else {
-            gh release create $tag NativeThreeWebApp-v026-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title 'NativeThreeBridge v0.26.1 WebApp cube test' --notes 'Isolated v0.26.0-based Three.js HTML+JS -> QuickJS -> DX12 spinning-cube proof of concept. Not the Kuningriigid game. Native support is intentionally restricted to one BoxGeometry mesh; Windows DX12 visual check required.'
+            gh release create $tag NativeThreeWebApp-v026-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title 'NativeThreeBridge v0.26.1 WebApp cube test.2' --notes 'Isolated v0.26.0-based Three.js HTML+JS -> QuickJS -> DX12 spinning-cube proof of concept. Not the Kuningriigid game. Native support is intentionally restricted to one BoxGeometry mesh; Win32 DX12 WARP self-test added; visual hardware check still required.'
             if ($LASTEXITCODE -ne 0) { throw "Could not publish WebApp preview" }
           }
