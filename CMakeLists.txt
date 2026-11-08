@@ -35,7 +35,7 @@ add_executable(NativeThreeJS WIN32
 )
 set_target_properties(NativeThreeJS PROPERTIES OUTPUT_NAME "NativeThree-Diagnostics")
 target_include_directories(NativeThreeJS PRIVATE native-dx12)
-target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32)
+target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2)
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
 
 add_executable(ThreeSceneSmoke
