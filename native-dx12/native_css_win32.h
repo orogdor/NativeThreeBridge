@@ -45,7 +45,7 @@ public:
         GetClientRect(parent_,&client);
         const UINT dpi=GetDpiForWindow(parent_);
         const int w=MulDiv(style_.width,dpi,96),h=MulDiv(style_.height,dpi,96);
-        const int x=std::max(0,client.right-MulDiv(style_.right,dpi,96)-w);
+        const int x=std::max(0,(int)client.right-MulDiv(style_.right,dpi,96)-w);
         const int y=MulDiv(style_.top,dpi,96);
         MoveWindow(button_,x,y,w,h,TRUE);
     }
