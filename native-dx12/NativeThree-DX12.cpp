@@ -21,6 +21,7 @@
 #include "three_js_host.h"
 #include "spatial_index.h"
 #include "fixed_stepper.h"
+#include "scene_registry.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -92,6 +93,9 @@ static UINT gMainVisibleTrees=0;
 static native_three::SpatialIndex2D gStaticObjects(36.f);
 static native_three::SpatialIndex2D gDynamicLights(36.f);
 static bool gStaticObjectsRegistered=false;
+static native_three::SceneRegistry gSceneRegistry;
+static std::vector<native_three::ObjectHandle> gMovingObjectHandles;
+static UINT gDirtySceneObjects=0;
 static UINT gLightCandidateChecks=0,gShadowTreeCandidateChecks=0,gVisibleTreeCandidateChecks=0;
 static double gFenceWaitTotal=0,gWorstFrameMs=0,gLastFrameEndSeconds=0;
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
@@ -750,9 +754,7 @@ struct LightGridConstants {
 static_assert(sizeof(LightConstants)==49024,"1000-light CB layout mismatch");
 static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
-static void updateLightsAndShadowCameras(const float *matrices) {
-    float lights[LIGHT_COUNT*8]{};
-    NativeThreeJS_Lights(lights,LIGHT_COUNT*8);
+static void updateLightsAndShadowCameras(const float *matrices,const float *lights) {
     LightConstants constants{};
     gDynamicLights.clear();
     float maximumLightRange=0.f;
@@ -1009,6 +1011,9 @@ static void renderFrame() {
     static std::vector<float> matrices(INSTANCE_COUNT*16,0.f);
     static std::vector<float> previous(INSTANCE_COUNT*16,0.f);
     static std::vector<float> renderMatrices(INSTANCE_COUNT*16,0.f);
+    static std::vector<float> currentLights(LIGHT_COUNT*8,0.f);
+    static std::vector<float> previousLights(LIGHT_COUNT*8,0.f);
+    static std::vector<float> renderedLights(LIGHT_COUNT*8,0.f);
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
     const ULONGLONG tick=GetTickCount64();
@@ -1021,14 +1026,27 @@ static void renderFrame() {
         // A fresh scene exposes all static and dynamic transforms exactly once.
         NativeThreeJS_FrameFrom(0.f,matrices.data(),INSTANCE_COUNT*16,0);
         previous=matrices;renderMatrices=matrices;
+        NativeThreeJS_Lights(currentLights.data(),currentLights.size());
+        previousLights=currentLights;
         firstSceneFrame=false;
     }
     const float alpha=simulation.advance(dt,[&](double step){
         std::copy(matrices.begin()+TREE_COUNT*16,matrices.end(),
                   previous.begin()+TREE_COUNT*16);
+        previousLights=currentLights;
         NativeThreeJS_FrameFrom((float)step,matrices.data(),INSTANCE_COUNT*16,
                                 gTreesUploaded ? TREE_COUNT : 0);
+        NativeThreeJS_Lights(currentLights.data(),currentLights.size());
     });
+    // Interpolate independently moving light objects, not assuming they are
+    // attached to a soldier or occupy the same index as a mesh.
+    for(UINT i=0;i<LIGHT_COUNT;i++){
+        const size_t k=(size_t)i*8;
+        memcpy(renderedLights.data()+k,currentLights.data()+k,8*sizeof(float));
+        for(size_t c=0;c<3;c++)
+            renderedLights[k+c]=previousLights[k+c]+
+                                 (currentLights[k+c]-previousLights[k+c])*alpha;
+    }
     // Native interpolator works on the generic transform matrix layout.
     // Only changed/animated instances are copied; static tree matrices stay.
     for(UINT i=TREE_COUNT;i<INSTANCE_COUNT;i++){
@@ -1055,12 +1073,30 @@ static void renderFrame() {
     // Static scene objects register once; moving objects use their own grid.
     if(!gStaticObjectsRegistered){
         gStaticObjects.reserve(1024);
-        for(UINT i=0;i<TREE_COUNT;i++)
-            gStaticObjects.insert(i,matrices[i*16+12],matrices[i*16+14]);
+        for(UINT i=0;i<TREE_COUNT;i++){
+            const float x=matrices[i*16+12],z=matrices[i*16+14];
+            const auto h=gSceneRegistry.create(native_three::ObjectKind::Mesh,x,0,z);
+            gStaticObjects.insert(h.slot,x,z);
+        }
+        gMovingObjectHandles.reserve(LIGHT_COUNT);
+        for(UINT i=0;i<LIGHT_COUNT;i++){
+            const UINT index=TREE_COUNT+i;
+            gMovingObjectHandles.push_back(gSceneRegistry.create(
+                native_three::ObjectKind::Agent,
+                matrices[index*16+12],0,matrices[index*16+14]));
+        }
         gStaticObjectsRegistered=true;
     }
+    for(UINT i=0;i<LIGHT_COUNT;i++){
+        const UINT index=TREE_COUNT+i;
+        gSceneRegistry.setPosition(gMovingObjectHandles[i],
+            renderMatrices[index*16+12],0,renderMatrices[index*16+14]);
+    }
+    gDirtySceneObjects=0;
+    gSceneRegistry.consumeChanges([&](native_three::ObjectHandle,
+                       const native_three::SceneRecord&){++gDirtySceneObjects;});
     const double lightsStart=cpuSeconds();
-    updateLightsAndShadowCameras(renderMatrices.data());
+    updateLightsAndShadowCameras(renderMatrices.data(),renderedLights.data());
     gLightCpuMsTotal+=(cpuSeconds()-lightsStart)*1000.0;
     // Tree geometry is static; write its 1000 matrices once, not every frame.
     if(!gTreesUploaded){
@@ -1207,11 +1243,12 @@ static void renderFrame() {
         wchar_t title[620];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
-            gMainVisibleTrees,gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
+            gMainVisibleTrees,gDirtySceneObjects,
+            gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
