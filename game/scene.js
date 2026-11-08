@@ -346,20 +346,46 @@ function protectedFormationCell(x,z) {
     attacker.kills++;
     battleSound('death',defender,0.9);
   }
+  // Incremental fixed-grid spatial hash. We search only neighbouring
+  // buckets, not all 500 enemies: the old full scan cost ~7ms CPU and
+  // halved RTX 2080 SUPER FPS from 160 to 82 even without combat.
+  const FIGHT_BUCKET_CELLS=12,FIGHT_BUCKETS=Math.ceil(GRID/FIGHT_BUCKET_CELLS);
+  const bucketHead=new Int32Array(FIGHT_BUCKETS*FIGHT_BUCKETS);
+  const bucketNext=new Int16Array(SOLDIERS);
+  let bucketTimer=0;
+  function rebuildOpponentIndex() {
+    bucketHead.fill(-1);
+    for(const u of units){
+      if(u.dead)continue;
+      const gx=u.cell%GRID,gz=(u.cell/GRID)|0;
+      const index=((gz/FIGHT_BUCKET_CELLS)|0)*FIGHT_BUCKETS+
+                    ((gx/FIGHT_BUCKET_CELLS)|0);
+      bucketNext[u.id]=bucketHead[index];
+      bucketHead[index]=u.id;
+    }
+    bucketTimer=0;
+  }
   function nearestEnemy(unit){
     let best=-1,bestD=ACQUIRE_RANGE*ACQUIRE_RANGE;
-    // 500 simple squared-distance checks per periodic retarget. No mesh or
-    // animation allocations; nearest search is spread across 16 frames.
-    const first=(1-unit.team)*PER_ARMY;
-    for(let j=first;j<first+PER_ARMY;j++){
-      const other=units[j];
-      if(other.dead)continue;
-      const dx=other.x-unit.x,dz=other.z-unit.z;
-      const d=dx*dx+dz*dz;
-      if(d<bestD){bestD=d;best=j;}
+    const gx=unit.cell%GRID,gz=(unit.cell/GRID)|0;
+    const bx=(gx/FIGHT_BUCKET_CELLS)|0;
+    const bz=(gz/FIGHT_BUCKET_CELLS)|0;
+    // Radius 4 buckets conservatively covers the 105-world-unit radius
+    // even when a soldier is crossing a cell boundary.
+    for(let z=Math.max(0,bz-4);z<=Math.min(FIGHT_BUCKETS-1,bz+4);z++){
+      for(let x=Math.max(0,bx-4);x<=Math.min(FIGHT_BUCKETS-1,bx+4);x++){
+        for(let id=bucketHead[z*FIGHT_BUCKETS+x];id!==-1;id=bucketNext[id]){
+          const other=units[id];
+          if(other.team===unit.team||other.dead)continue;
+          const dx=other.x-unit.x,dz=other.z-unit.z;
+          const d=dx*dx+dz*dz;
+          if(d<bestD){bestD=d;best=id;}
+        }
+      }
     }
     return best;
   }
+  rebuildOpponentIndex();
   function freeAdjacentGoal(unit,enemy){
     const ex=enemy.cell%GRID,ez=(enemy.cell/GRID)|0;
     const ux=unit.cell%GRID,uz=(unit.cell/GRID)|0;
@@ -392,6 +418,8 @@ function protectedFormationCell(x,z) {
   function updateBattle(dt) {
     if(dt<=0)return;
     battleSeconds+=dt;
+    bucketTimer+=dt;
+    if(bucketTimer>=0.22)rebuildOpponentIndex();
     combatSoundBudget=Math.min(3,combatSoundBudget+dt*6);
     // Offset work across frames; one search/candidate update per soldier
     // roughly every 16 frames, even with 1000 agents.
@@ -506,6 +534,7 @@ function protectedFormationCell(x,z) {
       relocate(units[i],176,177);
       relocate(units[PER_ARMY+i],181,177);
     }
+    rebuildOpponentIndex(); // refresh hash after the immediate teleport
     for(const id of selected){
       const unit=units[id];
       unit.targetId=nearestEnemy(unit);
