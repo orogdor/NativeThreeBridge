@@ -37,3 +37,14 @@ std::size_t NativeThreeJS_PopAudioCommands(native_three::AudioCommand* out,
                                           std::size_t capacity);
 // Explicit UI/F10 test: asks scene.js to send a named audio event via the bridge.
 bool NativeThreeJS_TriggerAudioTest();
+
+// 1000 four-float combat animation states: swing, recoil, death pose, stance.
+// Kept separate from walk data so both can be animated by the vertex shader.
+void NativeThreeJS_CombatStates(float *out, std::size_t floatCapacity);
+struct NativeThreeBattleStatus {
+    int aliveRed=500,aliveBlue=500,deaths=0,hits=0,attacks=0;
+    int engaged=0,frontHits=0,sideHits=0,rearHits=0;
+    int winner=-1,returning=0,returned=0;
+};
+void NativeThreeJS_GetBattleStatus(NativeThreeBattleStatus* out);
+bool NativeThreeJS_QuickBattle(); // F12: relocate a test detachment into melee
