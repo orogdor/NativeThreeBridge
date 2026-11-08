@@ -97,7 +97,7 @@
   const pathParents=new Int32Array(GRID*GRID);
   const seen=new Uint32Array(GRID*GRID), closed=new Uint32Array(GRID*GRID);
   let searchId=0,searches=0,replans=0,blockedMoves=0,routeFailures=0;
-  const MAX_PLANS_PER_FRAME=8; // avoid 12 expensive searches in one frame
+  const MAX_PLANS_PER_FRAME=12; // preserve navigation throughput; the A* heap no longer allocates JS objects
   // Preallocated A* heap eliminates transient JS allocations per expanded node.
   const HEAP_CAPACITY=GRID*GRID*4;
   const heapNodes=new Int32Array(HEAP_CAPACITY);
