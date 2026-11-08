@@ -36,7 +36,7 @@ int main(){
     }
     float firstRedX=matrices[TREES*16+12];
     float firstBlueX=matrices[(TREES+PER_ARMY)*16+12];
-    for(int frame=0;frame<400;frame++) NativeThreeJS_Frame(1.f/60.f,matrices.data(),matrices.size());
+    for(int frame=0;frame<450;frame++) NativeThreeJS_Frame(1.f/60.f,matrices.data(),matrices.size());
     NativeThreeJS_Lights(lights.data(),lights.size());
     NativeThreeNavStatus nav{};
     NativeThreeJS_GetNavStatus(&nav);
