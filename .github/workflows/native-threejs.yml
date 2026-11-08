@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main, perf/v017-night-and-smooth]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: write
@@ -109,6 +109,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Host "Release $tag exists; it is NOT overwritten"
           } else {
-            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.16.0 DX12 performance: CPU/GPU frame overlap using two per-frame allocators and fence-protected upload buffers; static GPU-local vertex and index buffers; per-spotlight visible tree/soldier instance lists to avoid full-scene shadow rendering; F5 genuinely skips shadow passes; F6 VSync toggle for benchmarks; explicit high-performance adapter selection; GPU name and shadow-instance diagnostics in title. 1000 random pines, 500 dynamically pathfinding soldiers and 500 moving lights preserved. Automated Windows compile, HLSL and navigation tests passed. Physical GPU performance and shadows require testing on Windows hardware."
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.17.0: Night-time DX12 stress test by default: near-black ambient, angled moving soldier spotlights and real depth-map shadows. F7 toggles day/night, F5 shadow rendering and F6 VSync, with debug A* lines disabled by default. Faster QuickJS A* using a preallocated typed-array binary heap and no per-cell adjacency arrays, preserving 12 path searches/frame and collision-free 500 soldier traffic. Direct instanceMatrix bulk export avoids forced scene matrix updates, static tree matrices moved to GPU-local DEFAULT heap. Added high-resolution frame timing and per-stage CPU instrumentation to the window title. Windows automated build and HLSL tests do not prove real GPU FPS or visual shadows."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
