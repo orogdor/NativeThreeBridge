@@ -525,6 +525,18 @@ function protectedFormationCell(x,z) {
     returning:units.filter(u=>!u.dead&&u.returning&&!u.arrived).length,
     returned:units.filter(u=>!u.dead&&u.returning&&u.arrived).length
   });
+  globalThis.__nativeThreeBattleInspect=(id)=>{
+    const u=units[id];
+    return u?{armor:u.armor,dead:u.dead,position:[u.x,u.z],
+      targetId:u.targetId,kills:u.kills,returning:u.returning,
+      returned:u.returning&&u.arrived,deathTime:u.deathTime,
+      attacks:u.attacks,yaw:u.yaw,cell:u.cell}:null;
+  };
+  globalThis.__nativeThreeBattleFace=(id,yaw)=>{
+    const u=units[id];
+    if(!u||!Number.isFinite(yaw)||u.dead)return false;
+    u.yaw=yaw;return true;
+  };
   globalThis.__nativeThreeTestStrike=(attackerId,defenderId)=>{
     const attacker=units[attackerId],defender=units[defenderId];
     if(!attacker||!defender||attacker.dead||defender.dead||attacker.team===defender.team)return false;
@@ -538,8 +550,8 @@ function protectedFormationCell(x,z) {
     if(!nativeNavigation)return;
     if(occupancyRevision!==lastNativeOccupancyRevision){
       for(const unit of units){
-        nativeOccupied[unit.id]=unit.cell;
-        nativeReserved[unit.id]=unit.next;
+        nativeOccupied[unit.id]=unit.dead?-1:unit.cell;
+        nativeReserved[unit.id]=unit.dead?-1:unit.next;
       }
       nativeNavigation.updateAgents(nativeOccupied,nativeReserved);
       lastNativeOccupancyRevision=occupancyRevision;
