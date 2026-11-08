@@ -4,6 +4,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <filesystem>
+#include <stdexcept>
+#include <cstdint>
 #include <fstream>
 #include <regex>
 #include <string>
@@ -98,7 +100,7 @@ const char* shim = R"NTB(
       throw Error('WebApp must render a THREE.Scene with PerspectiveCamera');
     const meshes = [];
     scene.traverse(obj => { if (obj.isMesh) meshes.push(obj); });
-    if (meshes.length !== 1 || !meshes[0].geometry?.isBoxGeometry)
+    if (meshes.length !== 1 || meshes[0].geometry?.type !== 'BoxGeometry')
       throw Error('Native v0.26 WebApp prototype supports exactly one THREE.BoxGeometry mesh');
     const mesh = meshes[0];
     if (!mesh.material?.color?.isColor)
