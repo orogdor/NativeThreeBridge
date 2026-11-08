@@ -7,10 +7,11 @@ import {join} from 'node:path';
 const root = new URL('../', import.meta.url);
 function file(path){return readFileSync(new URL(path, root));}
 function gitBlobSha(content){
-  return createHash('sha1')
-    .update(Buffer.from('blob '+content.byteLength+'\\0'.replace('\\0','\0')))
-    .update(content)
-    .digest('hex');
+  // Git stores LF bytes. Windows Git checkout may convert working-tree text
+  // to CRLF; compare normalized content without altering the source files.
+  const bytes=Buffer.from(content.toString('utf8').replace(/\r\n/g,'\n'),'utf8');
+  const header=Buffer.from('blob '+bytes.length+'\0','utf8');
+  return createHash('sha1').update(header).update(bytes).digest('hex');
 }
 test('v0.26 HTML battle wrapper keeps the ORIGINAL battle JS byte-for-byte',()=>{
   const original = file('game/scene.js');
