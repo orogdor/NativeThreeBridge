@@ -1,5 +1,17 @@
-NativeThreeBridge v0.23.0 - CSS RESTART BUTTON TO NATIVE C++
+NativeThreeBridge v0.24.0 - NATIVE AUDIO / XAUDIO2 TEST
 ================================================================
+NEW: JavaScript now emits sound events through NativeThreeAudio.play().
+Windows C++ plays short PCM16 WAVs with XAudio2 (no Web Audio browser).
+F10 plays the JavaScript-to-XAudio2 test ping. F11 toggles sound output.
+Two moving soldiers provide positional footstep cues with stereo panning.
+Restart stops all old voices and plays a new acknowledgement sound.
+The ZIP includes game/audio/signal.wav, step.wav and restart.wav.
+Add short PCM16 mono/stereo WAVs (8-96 kHz) to the game/audio folder.
+Example: NativeThreeAudio.play('my_sound',x,y,z,0.7,true,false).
+24 simultaneous native voices maximum, with shared cached sound clips.
+Not yet: complete Three.js Audio/PositionalAudio API, MP3/OGG decoder,
+streaming background music or sophisticated HRTF/audio occlusion.
+
 CSS test: game/ui.html declares <button id=restart-button>; game/ui.css
 sets right/top/size/background/text/border/radius/font. Engine parses these
 on startup and creates a real owner-drawn Win32 BUTTON, no browser or WebView.
