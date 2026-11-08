@@ -1012,7 +1012,8 @@ static void renderFrame() {
         (float)std::min(0.25,std::max(0.0,now-gPreviousFrameSeconds)) : (1.f/60.f);
     gPreviousFrameSeconds=now;
     const double jsStart=cpuSeconds();
-    NativeThreeJS_Frame(dt,matrices.data(),INSTANCE_COUNT*16);
+    NativeThreeJS_FrameFrom(dt,matrices.data(),INSTANCE_COUNT*16,
+                            gTreesUploaded ? TREE_COUNT : 0);
     gJsCpuMsTotal+=(cpuSeconds()-jsStart)*1000.0;
     // F4 route visualization tracks live replanning instead of showing
     // stale paths from launch time. The previous frame's waitGPU() fence
