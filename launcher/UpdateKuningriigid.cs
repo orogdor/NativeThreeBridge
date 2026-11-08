@@ -115,33 +115,88 @@ internal static class GameUpdater
                     unchanged.Add(relative);
                 else downloadBytes += size;
             }
-            Console.WriteLine($"Laen alla {wanted.Count - unchanged.Count} muutunud faili ({downloadBytes / 1_000_000} MB)...");
-            ProgressMeter meter = new("Kuningriigid");
-            long completedBytes = 0;
-            meter.Report(0, downloadBytes);
-            foreach ((string relative, (string sha, long size)) in wanted)
+            List<(string relative, string sha, long size)> needed = wanted
+                .Where(w => !unchanged.Contains(w.Key)).Select(w => (w.Key, w.Value.sha, w.Value.size)).ToList();
+            foreach (string relative in unchanged) nextFiles.Add(relative, old.Files[relative]);
+            Console.WriteLine($"Vaja alla laadida {needed.Count} faili ({downloadBytes / 1_000_000} MB).");
+            object gate = new();
+            // Verifies one downloaded file against its Git blob SHA-1 and writes it to the stage.
+            bool Install(string relative, string sha, long size, byte[] bytes)
             {
-                string target = Common.SafePath(stage, relative);
-                if (unchanged.Contains(relative))
-                {
-                    nextFiles.Add(relative, old.Files[relative]);
-                    continue;
-                }
-                string url = $"https://raw.githubusercontent.com/{Repository}/{commit}/{Common.EncodePath(relative)}";
-                byte[] bytes = await Common.Download(url, 128_000_000,
-                    current => meter.Report(completedBytes + current, downloadBytes));
-                if (bytes.LongLength != size || GitBlobSha(bytes) != sha)
-                    throw new InvalidDataException("Git blob checksum mismatch: " + relative);
+                if (bytes.LongLength != size || GitBlobSha(bytes) != sha) return false;
                 if (bytes.AsSpan().StartsWith("version https://git-lfs.github.com/spec/v1"u8))
                     throw new InvalidDataException("Git LFS pointer requires a separate asset loader: " + relative);
+                string target = Common.SafePath(stage, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                 File.WriteAllBytes(target, bytes);
-                nextFiles.Add(relative, new(sha, Common.Sha256(bytes), size));
-                downloaded++;
-                completedBytes += size;
-                meter.Report(completedBytes, downloadBytes);
+                lock (gate) { nextFiles[relative] = new(sha, Common.Sha256(bytes), size); downloaded++; }
+                return true;
             }
-            meter.Report(downloadBytes, downloadBytes);
+
+            List<(string relative, string sha, long size)> remaining = needed;
+            // Many files (first install): one archive download is far faster than thousands of requests.
+            if (needed.Count > 100)
+            {
+                string archive = Path.Combine(Common.Root, GameFolder + ".download.zip");
+                try
+                {
+                    Console.WriteLine("Laen alla Kuningriigid ühe ZIP-failina...");
+                    await Common.DownloadToFile($"https://codeload.github.com/{Repository}/zip/{commit}", archive, 3_000_000_000,
+                        (done, total) => ProgressMeter.Bytes("Kuningriigid", done, total > 0 ? total : 0));
+                    Console.WriteLine();
+                    Console.WriteLine("Kontrollin ja paigaldan faile...");
+                    Dictionary<string, System.IO.Compression.ZipArchiveEntry> entries = new(StringComparer.OrdinalIgnoreCase);
+                    using System.IO.Compression.ZipArchive zip = System.IO.Compression.ZipFile.OpenRead(archive);
+                    foreach (var entry in zip.Entries)
+                    {
+                        int slash = entry.FullName.IndexOf('/');
+                        if (slash < 0 || entry.FullName.EndsWith('/')) continue;
+                        entries[entry.FullName[(slash + 1)..]] = entry;
+                    }
+                    List<(string, string, long)> fallback = new();
+                    int checkedFiles = 0;
+                    foreach ((string relative, string sha, long size) in needed)
+                    {
+                        bool ok = false;
+                        if (entries.TryGetValue(relative, out var entry) && entry.Length == size)
+                        {
+                            byte[] bytes = new byte[size];
+                            using (Stream input = entry.Open()) input.ReadExactly(bytes);
+                            ok = Install(relative, sha, size, bytes);
+                        }
+                        if (!ok) fallback.Add((relative, sha, size));
+                        if (++checkedFiles % 50 == 0 || checkedFiles == needed.Count)
+                            ProgressMeter.Files("Paigaldamine", checkedFiles, needed.Count);
+                    }
+                    Console.WriteLine();
+                    remaining = fallback;
+                }
+                finally { try { File.Delete(archive); } catch { } }
+            }
+            // Remaining/changed files: 8 parallel downloads from raw.githubusercontent.com.
+            if (remaining.Count > 0)
+            {
+                long remainingBytes = remaining.Sum(r => r.size), doneBytes = 0;
+                int doneFiles = 0;
+                using SemaphoreSlim slots = new(8);
+                ProgressMeter.Files("Kuningriigid", 0, remaining.Count, 0, remainingBytes);
+                await Task.WhenAll(remaining.Select(async item =>
+                {
+                    await slots.WaitAsync();
+                    try
+                    {
+                        string url = $"https://raw.githubusercontent.com/{Repository}/{commit}/{Common.EncodePath(item.relative)}";
+                        byte[] bytes = await Common.Download(url, 128_000_000);
+                        if (!Install(item.relative, item.sha, item.size, bytes))
+                            throw new InvalidDataException("Git blob checksum mismatch: " + item.relative);
+                        long b = Interlocked.Add(ref doneBytes, item.size);
+                        int f = Interlocked.Increment(ref doneFiles);
+                        lock (gate) ProgressMeter.Files("Kuningriigid", f, remaining.Count, b, remainingBytes);
+                    }
+                    finally { slots.Release(); }
+                }));
+                Console.WriteLine();
+            }
             foreach (string relative in old.Files.Keys)
             {
                 if (wanted.ContainsKey(relative)) continue;

@@ -63,6 +63,30 @@ internal static class Common
         return data.ToArray();
     }
 
+    // Streams a large download to disk; progress(doneBytes, contentLength or -1).
+    internal static async Task DownloadToFile(string url, string path, long maxBytes, Action<long, long> progress)
+    {
+        using HttpResponseMessage response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        long total = response.Content.Headers.ContentLength ?? -1;
+        if (total > maxBytes) throw new InvalidDataException("File exceeds download limit: " + url);
+        await using Stream input = await response.Content.ReadAsStreamAsync();
+        await using FileStream output = new(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+        byte[] buffer = new byte[1 << 20];
+        long done = 0, lastReport = -1;
+        progress(0, total);
+        while (true)
+        {
+            int count = await input.ReadAsync(buffer);
+            if (count == 0) break;
+            done += count;
+            if (done > maxBytes) throw new InvalidDataException("File exceeds download limit: " + url);
+            await output.WriteAsync(buffer.AsMemory(0, count));
+            if (done - lastReport >= 512 * 1024) { progress(done, total); lastReport = done; }
+        }
+        progress(done, total);
+    }
+
     internal static string Sha256(byte[] data) => Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
     internal static string Sha256File(string file) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(file))).ToLowerInvariant();
     internal static bool HashValid(string hash, int length) => hash.Length == length && hash.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
@@ -131,6 +155,22 @@ internal static class Common
 
 internal sealed class ProgressMeter(string label)
 {
+    // "Kuningriigid: 123 / 550 MB" (total unknown -> "123 MB alla laaditud").
+    internal static void Bytes(string label, long done, long total)
+    {
+        string text = total > 0 ? $"{label}: {done / 1_000_000} / {total / 1_000_000} MB ({Percent(done, total)}%)"
+                                : $"{label}: {done / 1_000_000} MB alla laaditud";
+        Console.Write("\r" + text.PadRight(60));
+        try { Console.Title = text; } catch { }
+    }
+    // "Kuningriigid: 120 / 2228 faili, 30 / 550 MB"
+    internal static void Files(string label, int done, int total, long doneBytes = -1, long totalBytes = -1)
+    {
+        string text = $"{label}: {done} / {total} faili" + (totalBytes > 0 ? $", {doneBytes / 1_000_000} / {totalBytes / 1_000_000} MB" : "");
+        Console.Write("\r" + text.PadRight(60));
+        try { Console.Title = text; } catch { }
+    }
+
     private int lastPercent = -1;
     internal static int Percent(long completed, long total) =>
         total <= 0 ? 100 : (int)Math.Clamp(completed * 100 / total, 0, 100);
