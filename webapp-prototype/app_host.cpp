@@ -37,7 +37,10 @@ std::string jsError() {
   JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
   JSValue message = JS_IsUndefined(stack) ? JS_DupValue(ctx, exc) : JS_DupValue(ctx, stack);
   const char* s = JS_ToCString(ctx, message);
-  std::string error = s ? s : "unknown JavaScript exception";
+  const char* detail = JS_ToCString(ctx, exc);
+  std::string error = detail ? detail : "unknown JavaScript exception";
+  if (s && error != s) error += std::string("\n") + s;
+  if (detail) JS_FreeCString(ctx, detail);
   if (s) JS_FreeCString(ctx, s);
   JS_FreeValue(ctx, message);
   JS_FreeValue(ctx, stack);
@@ -57,6 +60,7 @@ bool evaluate(const char* source, std::size_t size, const char* name, std::strin
 }
 
 const char* shim = R"NTB(
+(function () {
   globalThis.window = globalThis;
   globalThis.innerWidth = 960;
   globalThis.innerHeight = 640;
@@ -115,6 +119,7 @@ const char* shim = R"NTB(
     sample[18] = mesh.material.color.b;
     return sample;
   };
+})();
 )NTB";
 }  // namespace
 
