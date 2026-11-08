@@ -13,9 +13,9 @@ test('real JS code is interpreted by QuickJS without Chromium',()=>{
 });
 test('DX12 consumes 11000 THREE.InstancedMesh transforms over split DirectX12 buffers',()=>{
   assert.match(dx,/NativeThreeJS_Frame\(/);
-  assert.match(dx,/SetGraphicsRootConstantBufferView\(3,gInstancesCB/);
-  assert.match(dx,/float4x4 gTreeInstances\[1000\]/);
-  assert.match(dx,/float4x4 gSoldierInstances\[500\]/);
+  assert.match(dx,/SetGraphicsRootDescriptorTable\(3,gTreeSRV/);
+  assert.match(dx,/StructuredBuffer<float4x4> gTreeInstances/);
+  assert.match(dx,/float4x4 gSoldierInstances\[1000\]/);
   assert.match(dx,/SetGraphicsRootConstantBufferView\(7,gSoldierCB/);
-  assert.match(host,/MATRIX_FLOATS = 1500 \* 16/);
+  assert.match(host,/MATRIX_FLOATS = 11000 \* 16/);
 });
