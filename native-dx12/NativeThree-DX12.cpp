@@ -23,6 +23,7 @@
 #include "fixed_stepper.h"
 #include "scene_registry.h"
 #include "frame_profiler.h"
+#include "walk_animation.h"
 
 #pragma comment(lib,"d3d12.lib")
 #pragma comment(lib,"dxgi.lib")
@@ -49,6 +50,7 @@ static ULONGLONG gLastPathRefresh=0;
 static bool gEnableShadows=true;
 static bool gVSync=false; // F6 toggles VSync for uncapped benchmarking
 static bool gNightMode=true; // Night default; F7 toggles day/night
+static bool gWalkEnabled=true; // F8 compares procedural walk with static soldiers
 static double gPreviousFrameSeconds=0;
 static double gJsCpuMsTotal=0,gLightCpuMsTotal=0,gRecordCpuMsTotal=0,gPresentCpuMsTotal=0;
 static double gLastJSms=0,gLastLightMs=0,gLastRecordMs=0,gLastPresentMs=0,gLastFenceMs=0;
@@ -102,7 +104,9 @@ struct RetiredResource { UINT64 fenceValue; ComPtr<ID3D12Resource> resource; };
 static std::vector<RetiredResource> gRetiredResources;
 static ComPtr<ID3D12CommandAllocator> gFrameAllocators[FRAME_COUNT];
 static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_COUNT],
-    gLightBuffers[FRAME_COUNT],gGridBuffers[FRAME_COUNT],gShadowCameraBuffers[FRAME_COUNT];
+    gLightBuffers[FRAME_COUNT],gGridBuffers[FRAME_COUNT],gShadowCameraBuffers[FRAME_COUNT],
+    gWalkBuffers[FRAME_COUNT];
+static ComPtr<ID3D12Resource> gWalkCB;
 static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
@@ -399,6 +403,8 @@ cbuffer Draw : register(b1) {
 // 10000 trees require 640 KB: too large for the DX12 64 KB constant buffer limit.
 StructuredBuffer<float4x4> gTreeInstances : register(t3);
 cbuffer SoldierTransforms : register(b5) { float4x4 gSoldierInstances[1000]; };
+// Per-instance walking, evaluated by the same shader in the main AND depth pass.
+cbuffer SoldierWalk : register(b6) { float4 gWalkStates[1000]; };
 cbuffer Lights : register(b3) {
     float4x4 gLightVP[16];
     float4 gLightPosRadius[1000];
@@ -427,11 +433,38 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     float3 n=v.n;
     if(gKind!=2 && gKind!=4){
         float4x4 instanceTransform;
-        if(gKind==0) instanceTransform=gTreeInstances[sourceInstance];
-        else instanceTransform=gSoldierInstances[sourceInstance+(gKind==3?500:0)];
-        p=mul(instanceTransform,float4(v.p*gScale,1)).xyz+
+        float3 localPos=v.p;
+        float3 localNormal=v.n;
+        if(gKind==0) {
+            instanceTransform=gTreeInstances[sourceInstance];
+        } else {
+            const uint soldierIndex=sourceInstance+(gKind==3?500:0);
+            instanceTransform=gSoldierInstances[soldierIndex];
+            // First walk test for the unrigged odamees GLB. Its local Y
+            // extents are approximately [-0.5,+0.5]; lower legs are below
+            // -0.13 and separated by local X. No bone asset is invented.
+            float4 walk=gWalkStates[soldierIndex];
+            float lowerBody=saturate((-0.12-v.p.y)*7.5);
+            float legSide=v.p.x<0.0?-1.0:1.0;
+            // Avoid moving spear tips or other wide lower accessories.
+            lowerBody*=1.0-saturate((abs(v.p.x)-0.17)*18.0);
+            float legSin=legSide*walk.x*walk.z*0.48;
+            float legCos=sqrt(saturate(1.0-legSin*legSin));
+            float dy=v.p.y+0.13;
+            float3 swung=float3(v.p.x,
+                -0.13+dy*legCos-v.p.z*legSin,
+                dy*legSin+v.p.z*legCos);
+            swung.y+=max(0.0,legSide*walk.x)*0.045*walk.z;
+            float3 swungNormal=float3(v.n.x,
+                v.n.y*legCos-v.n.z*legSin,
+                v.n.y*legSin+v.n.z*legCos);
+            localPos=lerp(v.p,swung,lowerBody);
+            localPos.y+=walk.w;
+            localNormal=normalize(lerp(v.n,swungNormal,lowerBody));
+        }
+        p=mul(instanceTransform,float4(localPos*gScale,1)).xyz+
           float3(0,gYOffset,0);
-        n=mul((float3x3)instanceTransform,v.n);
+        n=mul((float3x3)instanceTransform,localNormal);
     }
     o.p=mul(float4(p,1),gViewProjection);
     o.n=normalize(n);
@@ -495,7 +528,7 @@ float4 PSMain(Vout v):SV_TARGET {
 }
 )";
 static void makePipeline() {
-    D3D12_ROOT_PARAMETER rp[9]={};
+    D3D12_ROOT_PARAMETER rp[10]={};
     rp[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
     rp[0].Descriptor.ShaderRegister=0;
     rp[0].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
@@ -543,6 +576,9 @@ static void makePipeline() {
     rp[8].DescriptorTable.NumDescriptorRanges=1;
     rp[8].DescriptorTable.pDescriptorRanges=&ranges[2];
     rp[8].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
+    rp[9].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[9].Descriptor.ShaderRegister=6;
+    rp[9].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[2]={};
     samplers[0].Filter=D3D12_FILTER_MIN_MAG_MIP_LINEAR;
     samplers[0].AddressU=samplers[0].AddressV=samplers[0].AddressW=D3D12_TEXTURE_ADDRESS_MODE_WRAP;
@@ -555,7 +591,7 @@ static void makePipeline() {
     samplers[1].AddressU=samplers[1].AddressV=samplers[1].AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister=1;
     D3D12_ROOT_SIGNATURE_DESC rs={};
-    rs.NumParameters=9;rs.pParameters=rp;
+    rs.NumParameters=10;rs.pParameters=rp;
     rs.NumStaticSamplers=2;rs.pStaticSamplers=samplers;
     rs.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> signature,error;
@@ -776,6 +812,7 @@ static void initializeDX12() {
                    IID_PPV_ARGS(&gFrameAllocators[frame])),"Create frame allocator");
         gCameraBuffers[frame]=uploadBuffer(nullptr,256);
         gSoldierBuffers[frame]=uploadBuffer(nullptr,65536); // 1000 matrices = 64000 bytes
+        gWalkBuffers[frame]=uploadBuffer(nullptr,LIGHT_COUNT*4*sizeof(float)); // 1000 float4 gait states
         gLightBuffers[frame]=uploadBuffer(nullptr,49152); // 1000 lights + 16 shadow matrices
         gGridBuffers[frame]=uploadBuffer(nullptr,(UINT64)GRID_BUFFER_UINT_COUNT*sizeof(UINT));
         gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
@@ -804,7 +841,7 @@ static void initializeDX12() {
         gGridSRV[frame].ptr+=(UINT64)(5+FRAME_COUNT+frame)*gSRVStep;
     }
     gShadowIndexCB=gShadowIndexBuffers[0];
-    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];
+    gFrameCB=gCameraBuffers[0];gSoldierCB=gSoldierBuffers[0];gWalkCB=gWalkBuffers[0];
     gLightsCB=gLightBuffers[0];gGridCB=gGridBuffers[0];
     gShadowCameraCB=gShadowCameraBuffers[0];
     makePipeline();
@@ -968,6 +1005,7 @@ static void drawShadowMaps() {
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
     // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
     // and the two distinct army instance ranges. The depth texture is shared
     // as a 20-layer texture array and sampled by the forward lighting pass.
@@ -1111,6 +1149,7 @@ static void renderFrame() {
         }),gRetiredResources.end());
     gAllocator=gFrameAllocators[back];
     gFrameCB=gCameraBuffers[back];gSoldierCB=gSoldierBuffers[back];
+    gWalkCB=gWalkBuffers[back];
     gLightsCB=gLightBuffers[back];gGridCB=gGridBuffers[back];
     gShadowCameraCB=gShadowCameraBuffers[back];
     gShadowIndexCB=gShadowIndexBuffers[back];
@@ -1122,6 +1161,8 @@ static void renderFrame() {
     static std::vector<float> currentLights(LIGHT_COUNT*8,0.f);
     static std::vector<float> previousLights(LIGHT_COUNT*8,0.f);
     static std::vector<float> renderedLights(LIGHT_COUNT*8,0.f);
+    static native_three::WalkAnimation<LIGHT_COUNT> soldierWalk;
+    static std::array<float,LIGHT_COUNT*4> walkStates{};
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
     const ULONGLONG tick=GetTickCount64();
@@ -1233,6 +1274,14 @@ static void renderFrame() {
     memcpy(soldierData,renderMatrices.data()+TREE_COUNT*16,
            LIGHT_COUNT*16*sizeof(float));
     gSoldierCB->Unmap(0,nullptr);
+    // Gait follows actual interpolated travel, not an arbitrary global timer.
+    // Do not alter unit world matrices or collision/reservation positions.
+    soldierWalk.update(renderMatrices.data()+TREE_COUNT*16,(float)dt,
+                       gWalkEnabled,walkStates.data());
+    void *walkData=nullptr;
+    check(gWalkCB->Map(0,nullptr,&walkData),"Map 1000 soldier walk states");
+    memcpy(walkData,walkStates.data(),walkStates.size()*sizeof(float));
+    gWalkCB->Unmap(0,nullptr);
     XMVECTOR target=XMVectorSet(gCameraFocusX,1.5f,gCameraFocusZ,1);
     XMVECTOR eye=XMVectorAdd(target,XMVectorSet(
         sinf(gYaw)*cosf(gPitch)*gDistance,
@@ -1284,6 +1333,7 @@ static void renderFrame() {
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootConstantBufferView(9,gWalkCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
     gCmd->SetGraphicsRootConstantBufferView(5,gLightsCB->GetGPUVirtualAddress());
@@ -1376,7 +1426,7 @@ static void renderFrame() {
         wchar_t title[760];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f FENCE %.2f | JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | GPU shadow %.2f main %.2f | TREES %u/10000 | dirty %u bins L%u S%u T%u | A* %d/1000 planned %d | shadows %u %s | VSync %s | WALK %s",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
@@ -1385,7 +1435,7 @@ static void renderFrame() {
             gMainVisibleTrees,gDirtySceneObjects,
             gLightCandidateChecks,gShadowTreeCandidateChecks,gVisibleTreeCandidateChecks,
             navigation.moved,navigation.planned,shadowInstances,
-            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
+            gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF",gWalkEnabled?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         char summary[512];
         sprintf_s(summary,"summary,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u,%u,%u,%u",
@@ -1440,6 +1490,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             if(wp==VK_F5)gEnableShadows=!gEnableShadows;
             if(wp==VK_F6)gVSync=!gVSync;
             if(wp==VK_F7)gNightMode=!gNightMode;
+            if(wp==VK_F8)gWalkEnabled=!gWalkEnabled;
             return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
     }
