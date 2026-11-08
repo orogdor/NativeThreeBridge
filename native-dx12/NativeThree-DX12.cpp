@@ -104,6 +104,11 @@ static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
 static UINT gMainVisibleTrees=0;
+static XMFLOAT4X4 gLastVisibilityMatrix{};
+static bool gHaveVisibilityCache=false;
+static std::vector<UINT> gCachedVisibleTreeIds;
+static UINT64 gVisibilityRevision=0;
+static UINT64 gUploadedVisibilityRevisions[FRAME_COUNT]={};
 // Shared engine spatial lookups. Object classes do not affect the index.
 static native_three::SpatialIndex2D gStaticObjects(36.f);
 static native_three::SpatialIndex2D gDynamicLights(36.f);
@@ -994,9 +999,27 @@ static void drawShadowMaps() {
 // The shadow passes maintain their own separate, per-light visibility lists.
 static void updateMainTreeVisibility(const float *matrices,
                                      FXMMATRIX viewProjection,FXMMATRIX projection) {
+    XMFLOAT4X4 cameraMatrix{};
+    XMStoreFloat4x4(&cameraMatrix,viewProjection);
+    const UINT offset=SHADOW_COUNT*INSTANCE_COUNT;
+    const UINT frame=gSwap->GetCurrentBackBufferIndex();
+    if(gHaveVisibilityCache && memcmp(&cameraMatrix,&gLastVisibilityMatrix,
+                                      sizeof(cameraMatrix))==0){
+        // A stationary camera sees the same static meshes. Each backbuffer
+        // needs its index table uploaded once, not a 10k frustum traversal.
+        gVisibleTreeCandidateChecks=0;
+        if(gUploadedVisibilityRevisions[frame]!=gVisibilityRevision){
+            UINT* ids=nullptr;
+            check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map cached tree IDs");
+            memcpy(ids+offset,gCachedVisibleTreeIds.data(),
+                   gCachedVisibleTreeIds.size()*sizeof(UINT));
+            gShadowIndexCB->Unmap(0,nullptr);
+            gUploadedVisibilityRevisions[frame]=gVisibilityRevision;
+        }
+        return;
+    }
     UINT *ids=nullptr;
     check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map camera-visible tree IDs");
-    const UINT offset=SHADOW_COUNT*INSTANCE_COUNT;
     const float padX=XMVectorGetX(projection.r[0])*14.f;
     const float padY=XMVectorGetY(projection.r[1])*20.f;
     UINT visible=0;
@@ -1036,6 +1059,11 @@ static void updateMainTreeVisibility(const float *matrices,
         }
     });
     gMainVisibleTrees=visible;
+    gCachedVisibleTreeIds.assign(ids+offset,ids+offset+visible);
+    gLastVisibilityMatrix=cameraMatrix;
+    gHaveVisibilityCache=true;
+    ++gVisibilityRevision;
+    gUploadedVisibilityRevisions[frame]=gVisibilityRevision;
     gShadowIndexCB->Unmap(0,nullptr);
 }
 
