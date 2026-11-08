@@ -88,13 +88,21 @@ jobs:
         env:
           CI: '1'
         run: |
-          node tools/html-to-native.mjs webapp/index.html build/Release/game/scene.js build/html-import-report.json
-          if ($LASTEXITCODE -ne 0) { throw "HTML conversion failed; inspect build/html-import-report.json" }
-          $report=Get-Content build/html-import-report.json -Raw | ConvertFrom-Json
+          node tools/html-to-native.mjs webapp/index.html build/html-native/scene.js build/html-native/report.json
+          if ($LASTEXITCODE -ne 0) { throw "HTML conversion failed; inspect build/html-native/report.json" }
+          $report=Get-Content build/html-native/report.json -Raw | ConvertFrom-Json
           if (!$report.readyForNativeSmoke -or $report.entryKind -ne "explicit-native") { throw "Converted game is not native-ready" }
+          Copy-Item build/html-native/scene.js build/Release/game/scene.js -Force
           & .\\build\\Release\\ThreeSceneSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Converted HTML scene failed inside real native QuickJS host" }
           Copy-Item game/scene.js build/Release/game/scene.js -Force
+      - name: Upload HTML to native first-test JavaScript
+        uses: actions/upload-artifact@v4
+        with:
+          name: HTML-to-Native-Scene-Test
+          path: |
+            build/html-native/scene.js
+            build/html-native/report.json
       - name: Build separate update checker and package editable game files
         shell: pwsh
         run: |
