@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main, feat/v019-engine-core]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: write
