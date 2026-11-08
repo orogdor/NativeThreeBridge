@@ -1,0 +1,74 @@
+name: WebApp v0.26 DX12 cube prototype
+on:
+  push:
+    branches:
+      - experiments/v026-webapp-cube
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-webapp:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Bundle official Three.js 0.181.0 for QuickJS
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+          npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
+          if ($LASTEXITCODE -ne 0) { throw "esbuild install failed" }
+          New-Item -ItemType Directory -Force generated,third_party | Out-Null
+          npx esbuild threejs-native/three-runtime-entry.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-runtime.bundle.js
+          if ($LASTEXITCODE -ne 0) { throw "Three.js bundle failed" }
+          node --check webapp-prototype/webapp/app.js
+          if ($LASTEXITCODE -ne 0) { throw "WebApp JS syntax invalid" }
+      - name: Acquire pinned native QuickJS-NG
+        shell: pwsh
+        run: |
+          git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS checkout failed" }
+      - name: Compile DX12 WebApp and standalone JavaScript smoke
+        shell: pwsh
+        run: |
+          cmake -S webapp-prototype -B build-webapp -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
+          cmake --build build-webapp --config Release --target NativeThreeWebApp ThreeWebAppSmoke --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "Native DX12 WebApp compilation failed" }
+      - name: Run embedded real-Three.js app without a GPU
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build-webapp\Release\ThreeWebAppSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS WebApp runtime or rotation failed" }
+      - name: Package an independently testable Windows EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/webapp | Out-Null
+          Copy-Item build-webapp/Release/NativeThreeWebApp.exe dist/NativeThree-WebApp.exe
+          Copy-Item build-webapp/Release/ThreeWebAppSmoke.exe dist/ThreeWebAppSmoke.exe
+          Copy-Item webapp-prototype/webapp/index.html dist/webapp/index.html
+          Copy-Item webapp-prototype/webapp/app.js dist/webapp/app.js
+          Copy-Item webapp-prototype/README.md dist/README.txt
+          Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
+          Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
+          Compress-Archive -Path dist/* -DestinationPath NativeThreeWebApp-v026-Windows-x64.zip -Force
+          New-Item -ItemType Directory -Force verify | Out-Null
+          Expand-Archive NativeThreeWebApp-v026-Windows-x64.zip -DestinationPath verify -Force
+          if (!(Test-Path verify/NativeThree-WebApp.exe) -or !(Test-Path verify/webapp/index.html) -or !(Test-Path verify/webapp/app.js)) {
+            throw "ZIP missing WebApp executable or original app files"
+          }
+          & .\verify\ThreeWebAppSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Extracted package cannot launch HTML + JS" }
+      - name: Upload Windows preview (not a stable release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeWebApp-v026-Windows-x64
+          path: NativeThreeWebApp-v026-Windows-x64.zip
