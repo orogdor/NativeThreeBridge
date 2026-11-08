@@ -429,6 +429,7 @@ function protectedFormationCell(x,z) {
     // scan 1000 fighters or write the same zero animation data 60x/second.
     // F12 staging updates the bounds immediately, so combat still starts.
     if(!battleStarted && !battleFinished &&
+       living[0]===PER_ARMY && living[1]===PER_ARMY &&
        blueFront-redFront>ACQUIRE_RANGE)return;
     combatSoundBudget=Math.min(3,combatSoundBudget+dt*6);
     // Offset work across frames; one search/candidate update per soldier
