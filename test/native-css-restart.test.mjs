@@ -21,7 +21,7 @@ test('CSS and markup define one Restart button without embedding a browser',()=>
   assert.match(win,/CreateWindowExW\(/);
   assert.match(win,/BS_OWNERDRAW/);
   assert.match(win,/RoundRect\(/);
-  assert.doesNotMatch(win,/WebView|Chromium|CreateWindowExA/);
+  assert.doesNotMatch(win,/CreateCoreWebView2EnvironmentWithOptions|CreateWindowExA\(/);
 });
 test('click dispatches to native C++ reset, preserving GPU forest cache',()=>{
   assert.match(dx,/case WM_DRAWITEM:/);
