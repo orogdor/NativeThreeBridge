@@ -30,11 +30,11 @@ using namespace DirectX;
 
 static const UINT WIDTH=1152, HEIGHT=768, FRAME_COUNT=2, MESH_COUNT=4;
 static const UINT SHADOW_COUNT=16, SHADOW_SIZE=256;
-static const UINT TREE_COUNT=1000, LIGHT_COUNT=500, PER_ARMY=250, INSTANCE_COUNT=1500;
+static const UINT TREE_COUNT=10000, LIGHT_COUNT=1000, PER_ARMY=500, INSTANCE_COUNT=11000;
 static const UINT GRID_DIM=16, MAX_CELL_LIGHTS=16;
 static HWND gWindow=nullptr;
-static float gYaw=0.52f, gPitch=0.85f, gDistance=92.0f;
-static UINT gCameraMode=1; // 1=red, 2=blue, 0=forest overview
+static float gYaw=0.52f, gPitch=0.85f, gDistance=780.0f;
+static UINT gCameraMode=0; // 1=red, 2=blue, 0=forest overview
 static float gCameraFocusX=0.0f,gCameraFocusZ=0.0f;
 static bool gShowDebugPaths=false; // avoid bright diagnostic overlay during night lighting tests
 static ULONGLONG gLastPathRefresh=0;
@@ -84,7 +84,7 @@ static ComPtr<ID3D12Resource> gCameraBuffers[FRAME_COUNT],gSoldierBuffers[FRAME_
 static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
-static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{};
+static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
 static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
@@ -312,8 +312,8 @@ static void createDebugRouteGeometry() {
 
 static void makeGround() {
     Vertex v[]={
-        {-250,0,-250,0,1,0,0,0},{250,0,-250,0,1,0,1,0},
-        {-250,0,250,0,1,0,0,1},{250,0,250,0,1,0,1,1}
+        {-540,0,-540,0,1,0,0,0},{540,0,-540,0,1,0,1,0},
+        {-540,0,540,0,1,0,0,1},{540,0,540,0,1,0,1,1}
     };
     uint32_t idx[]={0,2,1,1,2,3};
     Mesh &m=gMesh[3];
@@ -338,14 +338,14 @@ cbuffer Draw : register(b1) {
     uint gShadowPass;
     float gNight;
 };
-// Two CBVs: one 64000-byte buffer for 1000 static pines and one for 500 soldiers.
-cbuffer TreeTransforms : register(b2) { float4x4 gTreeInstances[1000]; };
-cbuffer SoldierTransforms : register(b5) { float4x4 gSoldierInstances[500]; };
+// 10000 trees require 640 KB: too large for the DX12 64 KB constant buffer limit.
+StructuredBuffer<float4x4> gTreeInstances : register(t3);
+cbuffer SoldierTransforms : register(b5) { float4x4 gSoldierInstances[1000]; };
 cbuffer Lights : register(b3) {
     float4x4 gLightVP[16];
-    float4 gLightPosRadius[500];
-    float4 gLightColorIntensity[500];
-    float4 gShadowSlots[500];
+    float4 gLightPosRadius[1000];
+    float4 gLightColorIntensity[1000];
+    float4 gShadowSlots[1000];
 };
 cbuffer LightGrid : register(b4) {
     uint4 gGridCounts[64];
@@ -371,7 +371,7 @@ Vout VSMain(Vin v, uint instance:SV_InstanceID) {
     if(gKind!=2 && gKind!=4){
         float4x4 instanceTransform;
         if(gKind==0) instanceTransform=gTreeInstances[sourceInstance];
-        else instanceTransform=gSoldierInstances[sourceInstance+(gKind==3?250:0)];
+        else instanceTransform=gSoldierInstances[sourceInstance+(gKind==3?500:0)];
         p=mul(instanceTransform,float4(v.p*gScale,1)).xyz+
           float3(0,gYOffset,0);
         n=mul((float3x3)instanceTransform,v.n);
@@ -406,15 +406,15 @@ float4 PSMain(Vout v):SV_TARGET {
     float diffuseSky=abs(dot(normal,normalize(float3(0.32,0.84,0.41))));
     float day=lerp(0.20+0.34*diffuseSky,0.018+0.026*diffuseSky,gNight);
     float3 illumination=day.xxx;
-    // CPU bins all 500 moving lights into 16x16 tiles across the expanded forest.
+    // CPU bins all 1000 moving lights into 16x16 tiles across the expanded forest.
     // Only the nearest 16 in this tile are evaluated per pixel.
-    int gx=clamp((int)floor((v.worldPos.x+240.0)/30.0),0,15);
-    int gz=clamp((int)floor((v.worldPos.z+240.0)/30.0),0,15);
+    int gx=clamp((int)floor((v.worldPos.x+540.0)/67.5),0,15);
+    int gz=clamp((int)floor((v.worldPos.z+540.0)/67.5),0,15);
     uint cell=(uint)(gz*16+gx);
     uint count=gGridCounts[cell/4][cell%4];
     [loop] for(uint k=0;k<count;k++){
         uint index=gGridIndices[cell*4+k/4][k%4];
-        if(index>=500)continue;
+        if(index>=1000)continue;
         float3 toLight=gLightPosRadius[index].xyz-v.worldPos;
         float distSq=dot(toLight,toLight);
         float radius=gLightPosRadius[index].w;
@@ -445,7 +445,7 @@ static void makePipeline() {
     rp[1].Constants.ShaderRegister=1;
     rp[1].Constants.Num32BitValues=11;
     rp[1].ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_DESCRIPTOR_RANGE ranges[3]={};
+    D3D12_DESCRIPTOR_RANGE ranges[4]={};
     for(UINT i=0;i<3;i++){
         ranges[i].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         ranges[i].NumDescriptors=1;
@@ -455,8 +455,13 @@ static void makePipeline() {
     rp[2].DescriptorTable.NumDescriptorRanges=1;
     rp[2].DescriptorTable.pDescriptorRanges=&ranges[0];
     rp[2].ShaderVisibility=D3D12_SHADER_VISIBILITY_PIXEL;
-    rp[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rp[3].Descriptor.ShaderRegister=2;
+    // Tree instance transforms are an SRV (10000 * 64B), not a 64KB CBV.
+    ranges[3].RangeType=D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[3].NumDescriptors=1;
+    ranges[3].BaseShaderRegister=3;
+    rp[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[3].DescriptorTable.NumDescriptorRanges=1;
+    rp[3].DescriptorTable.pDescriptorRanges=&ranges[3];
     rp[3].ShaderVisibility=D3D12_SHADER_VISIBILITY_VERTEX;
     rp[4].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[4].DescriptorTable.NumDescriptorRanges=1;
@@ -610,7 +615,7 @@ static void initializeDX12() {
     gRTVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     heap.NumDescriptors=1+SHADOW_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gDSVHeap)),"Create DSV heap");
-    heap.NumDescriptors=4+FRAME_COUNT;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors=4+FRAME_COUNT+1;heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(gDevice->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&gSRVHeap)),"Create SRV heap");
     gSRVStep=gDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -690,18 +695,18 @@ static void initializeDX12() {
         else check(gDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
                    IID_PPV_ARGS(&gFrameAllocators[frame])),"Create frame allocator");
         gCameraBuffers[frame]=uploadBuffer(nullptr,256);
-        gSoldierBuffers[frame]=uploadBuffer(nullptr,32768);
-        gLightBuffers[frame]=uploadBuffer(nullptr,32768);
+        gSoldierBuffers[frame]=uploadBuffer(nullptr,65536); // 1000 matrices = 64000 bytes
+        gLightBuffers[frame]=uploadBuffer(nullptr,49152); // 1000 lights + 16 shadow matrices
         gGridBuffers[frame]=uploadBuffer(nullptr,17408);
         gShadowCameraBuffers[frame]=uploadBuffer(nullptr,SHADOW_COUNT*256);
         // 16 shadow casters x 1500 possible tree/soldier instance indices.
         gShadowIndexBuffers[frame]=uploadBuffer(nullptr,
-                                   SHADOW_COUNT*INSTANCE_COUNT*sizeof(UINT));
+                                   (SHADOW_COUNT*INSTANCE_COUNT+TREE_COUNT)*sizeof(UINT));
         D3D12_SHADER_RESOURCE_VIEW_DESC idsView={};
         idsView.Format=DXGI_FORMAT_R32_UINT;
         idsView.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
         idsView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        idsView.Buffer.NumElements=SHADOW_COUNT*INSTANCE_COUNT;
+        idsView.Buffer.NumElements=SHADOW_COUNT*INSTANCE_COUNT+TREE_COUNT;
         auto idsCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
         idsCpu.ptr+=(SIZE_T)(4+frame)*gSRVStep;
         gDevice->CreateShaderResourceView(gShadowIndexBuffers[frame].Get(),&idsView,idsCpu);
@@ -733,7 +738,7 @@ struct LightGridConstants {
     XMUINT4 counts[GRID_DIM*GRID_DIM/4];
     XMUINT4 indices[GRID_DIM*GRID_DIM*MAX_CELL_LIGHTS/4];
 };
-static_assert(sizeof(LightConstants)==25024,"500-light CB layout mismatch");
+static_assert(sizeof(LightConstants)==49024,"1000-light CB layout mismatch");
 static_assert(sizeof(LightGridConstants)==17408,"16x16 light-bin CB layout mismatch");
 
 static void updateLightsAndShadowCameras(const float *matrices) {
@@ -821,8 +826,8 @@ static void updateLightsAndShadowCameras(const float *matrices) {
     // Each pixel evaluates at most 16 nearby lights, instead of all 500.
     for(UINT cell=0;cell<GRID_DIM*GRID_DIM;cell++) {
         const UINT cx=cell%GRID_DIM,cz=cell/GRID_DIM;
-        const float worldX=-240.0f+((float)cx+0.5f)*30.0f;
-        const float worldZ=-240.0f+((float)cz+0.5f)*30.0f;
+        const float worldX=-540.0f+((float)cx+0.5f)*67.5f;
+        const float worldZ=-540.0f+((float)cz+0.5f)*67.5f;
         float bestDist[MAX_CELL_LIGHTS];
         UINT bestIndex[MAX_CELL_LIGHTS];
         for(UINT k=0;k<MAX_CELL_LIGHTS;k++) {
@@ -833,7 +838,7 @@ static void updateLightsAndShadowCameras(const float *matrices) {
             const float *l=lights+li*8;
             const float dx=l[0]-worldX,dz=l[2]-worldZ;
             const float d2=dx*dx+dz*dz;
-            const float radius=l[3]+22.0f; // include diagonal of 30x30 tile
+            const float radius=l[3]+48.0f; // covers diagonal of 67.5x67.5 tile
             if(d2>radius*radius || (count==MAX_CELL_LIGHTS && d2>=bestDist[count-1]))
                 continue;
             UINT pos=count<MAX_CELL_LIGHTS?count:MAX_CELL_LIGHTS-1;
@@ -874,7 +879,7 @@ static void drawShadowMaps() {
     gCmd->RSSetViewports(1,&shadowViewport);
     gCmd->RSSetScissorRects(1,&shadowScissor);
     gCmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     // Four instanced batches per spotlight: tree trunks, alpha-cut foliage,
     // and the two distinct army instance ranges. The depth texture is shared
@@ -958,7 +963,18 @@ static void renderFrame() {
         // One-time GPU-local upload avoids 1000 repeated vertex shader reads
         // from PCIe-visible UPLOAD memory on discrete GPUs.
         gInstancesCB=staticGpuBuffer(matrices,TREE_COUNT*16*sizeof(float),
-                         D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_SHADER_RESOURCE_VIEW_DESC treeView={};
+        treeView.Format=DXGI_FORMAT_UNKNOWN;
+        treeView.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+        treeView.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        treeView.Buffer.NumElements=TREE_COUNT;
+        treeView.Buffer.StructureByteStride=sizeof(XMFLOAT4X4);
+        auto treeCpu=gSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        treeCpu.ptr+=(SIZE_T)(4+FRAME_COUNT)*gSRVStep;
+        gDevice->CreateShaderResourceView(gInstancesCB.Get(),&treeView,treeCpu);
+        gTreeSRV=gSRVHeap->GetGPUDescriptorHandleForHeapStart();
+        gTreeSRV.ptr+=(UINT64)(4+FRAME_COUNT)*gSRVStep;
         gTreesUploaded=true;
     }
     void *soldierData=nullptr;
@@ -1008,7 +1024,7 @@ static void renderFrame() {
     ID3D12DescriptorHeap *heaps[]={gSRVHeap.Get()};
     gCmd->SetDescriptorHeaps(1,heaps);
     gCmd->SetGraphicsRootConstantBufferView(0,gFrameCB->GetGPUVirtualAddress());
-    gCmd->SetGraphicsRootConstantBufferView(3,gInstancesCB->GetGPUVirtualAddress());
+    gCmd->SetGraphicsRootDescriptorTable(3,gTreeSRV);
     gCmd->SetGraphicsRootConstantBufferView(7,gSoldierCB->GetGPUVirtualAddress());
     gCmd->SetGraphicsRootDescriptorTable(8,gShadowIndexSRV[back]);
     gCmd->SetGraphicsRootDescriptorTable(4,gShadowSRV);
@@ -1075,7 +1091,7 @@ static void renderFrame() {
         wchar_t title[520];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f ms | A* %d/500 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
+            L"DX12 %s | NIGHT %s | FPS %d | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f ms | A* %d/1000 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
             navigation.moved,navigation.planned,shadowInstances,
@@ -1110,7 +1126,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_KEYDOWN:
             if(wp==VK_ESCAPE)DestroyWindow(win);
             if(wp==VK_SPACE)gPause=!gPause;
-            if(wp==VK_F1){gCameraMode=0;gDistance=535.f;}
+            if(wp==VK_F1){gCameraMode=0;gDistance=780.f;}
             if(wp==VK_F2){gCameraMode=1;gDistance=92.f;}
             if(wp==VK_F3){gCameraMode=2;gDistance=92.f;}
             if(wp==VK_F4){
@@ -1134,7 +1150,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show) {
     if(!RegisterClassW(&wc))return 1;
     RECT rc={0,0,(LONG)WIDTH,(LONG)HEIGHT};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
-    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.17 NIGHT | 500 dynamic A* soldiers",
+    gWindow=CreateWindowW(wc.lpszClassName,L"NativeThreeBridge v0.18 NIGHT | 10k trees / 1k dynamic A* soldiers",
        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
        CW_USEDEFAULT,CW_USEDEFAULT,rc.right-rc.left,rc.bottom-rc.top,
        nullptr,nullptr,instance,nullptr);
