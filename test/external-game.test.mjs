@@ -97,11 +97,12 @@ test('visual route request plans only the twelve sampled units, not all 1000',()
 test('all soldiers individually plan while running and nobody shares occupied/reserved tiles',()=>{
   const x=create();
   x.__nativeThreeDebugSegments(); // user-requested F4 overlay; only 12 routes
-  for(let i=0;i<300;i++){
+  for(let i=0;i<450;i++){
     x.__nativeThreeFrame(1/30);
     if(i%10===0)safePositions(x.__nativeNavTest());
   }
   const d=x.__nativeThreeDiagnostics();
+  console.log(`STRESS: moved=${d.moved} planned=${d.routes} searches=${d.searches} replans=${d.replans} blocked=${d.blockedMoves}`);
   assert.equal(d.unplanned,0,'every soldier must eventually request its own A* route');
   assert.ok(d.searches>=1000,'must run a separate search per soldier');
   const native=x.__nativeThreeNavStats();
