@@ -69,6 +69,7 @@ static double cpuSeconds() {
 }
 static bool gDrag=false,gPause=false;
 static bool gRestartRequested=false;
+static bool gForceBattleCameraSnap=false;
 static UINT gSceneEpoch=0;
 static native_three::NativeCssRestartButton gRestartButton;
 static native_three::NativeAudioEngine gAudio;
@@ -1291,8 +1292,9 @@ static void renderFrame() {
     static native_three::FixedStepper simulation(1.0/60.0,4);
     static bool firstSceneFrame=true;
     static UINT seenSceneEpoch=~0u;
-    if(seenSceneEpoch!=gSceneEpoch) {
-        // First frame after a native UI-driven JS scene reboot must never
+    if(seenSceneEpoch!=gSceneEpoch || gForceBattleCameraSnap) {
+        gForceBattleCameraSnap=false;
+        // First frame after an actual restart OR F12 scene relocation must never
         // interpolate toward old soldiers or reuse their old gait phases.
         firstSceneFrame=true;
         simulation=native_three::FixedStepper(1.0/60.0,4);
@@ -1672,6 +1674,7 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
                     // to whole-map view and F2/F3 follow opposing detachments.
                     gCameraMode=1;
                     gDistance=72.f;
+                    gForceBattleCameraSnap=true;
                     gHaveVisibilityCache=false;
                     gLastPathRefresh=0;
                 }
