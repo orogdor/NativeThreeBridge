@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main]
+    branches: [main, experiments/game-folder-autoload-v029]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -119,6 +119,15 @@ jobs:
           New-Item -ItemType Directory -Force dist/webapps/hello-webapp | Out-Null
           Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
           Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
+          # The default game folder IS a replaceable Three.js webapp, not a fixed scene file.
+          # A new webapp needs only index.html and its own JS/assets. No native-three-entry tag.
+          Copy-Item samples/hello-webapp/index.html dist/game/index.html
+          Copy-Item samples/hello-webapp/main.js dist/game/main.js
+          Copy-Item samples/hello-webapp/world.js dist/game/world.js
+          Copy-Item samples/hello-webapp/style.css dist/game/style.css
+          # Check that the freshly packaged game folder boots with the real QuickJS bridge.
+          & .\build\Release\WebappSmoke.exe dist/game 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "Packaged game/ webapp failed in QuickJS native runtime" }
           cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
           if ($LASTEXITCODE -ne 0) { throw "Separate updater EXE failed to compile" }
           & .\dist\NativeThree-Updater.exe --self-test
@@ -138,8 +147,14 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav) -or !(Test-Path verify/webapps/hello-webapp/index.html) -or !(Test-Path verify/webapps/hello-webapp/main.js) -or !(Test-Path verify/webapps/hello-webapp/world.js) -or !(Test-Path verify/Run-Hello-Webapp.bat)) { throw "Incomplete ZIP structure" }
-          Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
+          if (!(Test-Path verify/game/index.html) -or !(Test-Path verify/game/main.js) -or !(Test-Path verify/game/world.js) -or !(Test-Path verify/game/style.css) -or !(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav) -or !(Test-Path verify/webapps/hello-webapp/index.html) -or !(Test-Path verify/webapps/hello-webapp/main.js) -or !(Test-Path verify/webapps/hello-webapp/world.js) -or !(Test-Path verify/Run-Hello-Webapp.bat)) { throw "Incomplete ZIP structure" }
+          # Real executable startup routing: --check-default-webapp must select game/.
+          $testExe = (Resolve-Path verify/NativeThree-Game.exe).Path
+          $process = Start-Process -FilePath $testExe -ArgumentList '--check-default-webapp' -WorkingDirectory (Resolve-Path verify).Path -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Executable did not automatically discover game/index.html (exit $($process.ExitCode))" }
+          & .\build\Release\WebappSmoke.exe verify/game 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "Extracted game/ webapp failed to run" }
+          Write-Host "PASS: EXE automatically chooses game/index.html; webapp renders multiple native objects"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
         with:
@@ -180,3 +195,18 @@ jobs:
           }
           gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – Three.js webapp test build" --notes "Test build from pull request #$env:PR_NUMBER (commit $env:HEAD_SHA). Download the ZIP, extract everything and double-click Run-Hello-Webapp.bat. Your own webapp: NativeThree-Game.exe --webapp <folder>. Not a stable release; it is replaced on every push to the pull request."
           if ($LASTEXITCODE -ne 0) { throw "Test pre-release failed" }
+
+      - name: Publish isolated auto-game-folder test release
+        if: github.ref == 'refs/heads/experiments/game-folder-autoload-v029'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v0.28.1-game-autoload-test.1'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Test release already exists; do not overwrite existing binaries."
+          } else {
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "NativeThreeBridge v0.28.1 – automatic game folder" --notes "Automatically run Three.js game/index.html with real embedded QuickJS and DX12 when double-clicking NativeThree-Game.exe. Replace game/ with your own webapp folder without any native-three-entry meta. --battle keeps the original 10k-tree/1k-soldier benchmark implementation. Tests cover native Three.js loader, the packaged game folder and executable auto-discovery. Limitations remain: no complete browser, texture/GLTF/shadow/custom ShaderMaterial/HTML overlay compatibility."
+            if ($LASTEXITCODE -ne 0) { throw "Could not publish game auto-load test release" }
+          }
