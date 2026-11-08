@@ -1,3 +1,11 @@
+# NativeThreeBridge v0.25.0 — directional 500-vs-500 melee battle fixture
+
+This releases a real **autonomous combat test** on top of the existing 10,000 randomized trees and 1,000 individually navigating soldiers. Each living fighter searches for a nearby enemy, pursues via A* without passing occupied/reserved cells, turns toward its target and attacks on an individual cooldown. A 15-point durability pool implements **front 5 hits** (3 damage), **side 3 hits** (5 damage), and **rear 1 hit** (15 damage). A killer acquires the next living opponent. Bodies collapse and release occupied/reserved navigation slots. Once an army is defeated, every surviving fighter is assigned its individual original start cell for a return march. Combat status is visible in the DX12 window title.
+
+A four-float-per-soldier combat pose stream moves the **red army's real eight-bone skin** during attacks, hit staggers and death collapse; the **blue army's unrigged control** has a simpler attack animation. Both are drawn in the regular and real shadow passes with no extra soldier draw calls. Three new original synthesized native XAudio2 sounds are named `swing`, `hit`, and `death`. A budget caps simultaneous combat sounds and the native engine caps voices at 24.
+
+**F12** stages 48 red and 48 blue soldiers near each other, leaving the rest of the 1,000-agent pathfinding/forest stress scene intact. F2/F3 and the mouse wheel let you inspect combat. **F9** or the CSS Restart button resets all units. Native C++ and Node checks cover directional durability, occupancy integrity, combat pose buffers and the F12 fixture; physical GPU FPS and final battle completion require runtime verification.
+
 # NativeThreeBridge v0.24.0 — JavaScript sound events to native Windows XAudio2
 
 Native sound test: QuickJS exposes `NativeThreeAudio.play(name,x,y,z,volume=1,spatial=false,loop=false)` to game scripts. C++ consumes the bounded event queue and plays user-editable 16-bit PCM WAV files through Windows XAudio2 2.9, without Web Audio, Chromium or a browser. Files are loaded from `game/audio/<name>.wav` (mono/stereo, 8–96 kHz), cached by name, and played with at most 24 concurrent voices. Positional sounds have distance attenuation and stereo panning; each emitter keeps its own position and volume.
