@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main]
+    branches: [main, experiments/v026-battle-html-entry]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -80,7 +80,7 @@ jobs:
         env:
           CI: '1'
         run: |
-          if (!(Test-Path build/Release/game/scene.js)) { throw "External scene.js missing" }
+          if (!(Test-Path build/Release/game/scene.js) -or !(Test-Path build/Release/game/index.html) -or !(Test-Path build/Release/game/browser.js)) { throw "WebApp folder entry files missing" }
           & .\build\Release\ThreeSceneSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Embedded Three.js JavaScript execution failed" }
       - name: Build separate update checker and package editable game files
@@ -89,6 +89,8 @@ jobs:
           New-Item -ItemType Directory -Force dist/game | Out-Null
           Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Game.exe
           Copy-Item game/scene.js dist/game/scene.js
+          Copy-Item game/index.html dist/game/index.html
+          Copy-Item game/browser.js dist/game/browser.js
           Copy-Item game/ui.html dist/game/ui.html
           Copy-Item game/ui.css dist/game/ui.css
           New-Item -ItemType Directory -Force dist/game/audio | Out-Null
@@ -111,7 +113,7 @@ jobs:
           Move-Item NativeThreeBridge-Windows-x64.zip dist/NativeThreeBridge-Windows-x64.zip -Force
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive dist/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          if (!(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav)) { throw "Incomplete ZIP structure" }
+          if (!(Test-Path verify/game/index.html) -or !(Test-Path verify/game/browser.js) -or !(Test-Path verify/NativeThree-Updater.exe) -or !(Test-Path verify/NativeThree-Game.exe) -or !(Test-Path verify/game/scene.js) -or !(Test-Path verify/game/ui.css) -or !(Test-Path verify/game/ui.html) -or !(Test-Path verify/game/odamees-rigged.glb) -or !(Test-Path verify/game/audio/signal.wav) -or !(Test-Path verify/game/audio/step.wav) -or !(Test-Path verify/game/audio/restart.wav) -or !(Test-Path verify/game/audio/swing.wav) -or !(Test-Path verify/game/audio/hit.wav) -or !(Test-Path verify/game/audio/death.wav)) { throw "Incomplete ZIP structure" }
           Write-Host "Separate updater EXE + game EXE + editable Three.js scene verified: $v"
       - name: Upload independent Windows game and updater
         uses: actions/upload-artifact@v4
@@ -134,4 +136,19 @@ jobs:
           } else {
             gh release create $tag dist/NativeThreeBridge-Windows-x64.zip dist/NativeThree-Game.exe dist/NativeThree-Updater.exe dist/game/scene.js dist/game/ui.css dist/game/ui.html dist/game/audio/signal.wav dist/game/audio/step.wav dist/game/audio/restart.wav dist/game/audio/swing.wav dist/game/audio/hit.wav dist/game/audio/death.wav dist/game/odamees-rigged.glb dist/update-v2.txt --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "NativeThreeBridge $tag – separate updater + native Three.js game" --notes "v0.26.0: Close-up soldier jitter fix. 60 Hz simulation now interpolates entire 3D object transforms (XYZ and rotation, yaw fast-path plus generic 3D quaternion fallback) for displays running at 100-170+ FPS. The F2/F3 follow camera reads exactly the same interpolated pose instead of jumping to the last simulation tick. Attack, hit and death animation samples now interpolate between fixed steps; A* waypoint facing turns smoothly instead of snapping 90 degrees. F12 quick battle refreshes real Three.js instance transforms immediately to avoid one stale first frame. No changes to collision, route reservations, 10,000 trees, lighting, native XAudio2, CSS Restart, 5/3/1 combat health or win/return logic. Adds portable numeric angle-wrap/affine tests and end-to-end source-level motion regression. Use F2/F3 and mouse wheel to examine smooth animation; old v0.25.0 remains available for A/B comparison."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
+          }
+
+      - name: Publish battle HTML-entry test as isolated pre-release
+        if: github.ref == 'refs/heads/experiments/v026-battle-html-entry'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag='v0.26.2-battle-html-test.1'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing preview is preserved, not overwritten."
+          } else {
+            gh release create $tag dist/NativeThreeBridge-Windows-x64.zip --target $env:GITHUB_SHA --repo $env:GITHUB_REPOSITORY --prerelease --title 'NativeThreeBridge v0.26.2 – unchanged engine / HTML battle entry' --notes 'Exact v0.26.0 DX12 renderer, memory allocations, shader, A*, combat and 10k trees + 1k soldiers. Only game/scene.js loader points at game/index.html and resolves a local JS file from the manifest. Same unchanged scene.js bytes. Browser-only browser.js uses placeholder geometry in Chrome and is not run by native engine. Includes existing NativeThree-Game.exe and NativeThree-Updater.exe. No generic WebApp renderer.'
+            if ($LASTEXITCODE -ne 0) { throw "Failed to publish isolated v0.26 battle HTML test" }
           }
