@@ -94,6 +94,7 @@ int wmain(int argc, wchar_t** argv) {
     const std::filesystem::path root = argv[1];
     const int minDraws = _wtoi(argv[2]);
     const bool expectBootError = argc > 3 && std::wcscmp(argv[3], L"expect-boot-error") == 0;
+    const bool expectBootTimeout = argc > 3 && std::wcscmp(argv[3], L"expect-boot-timeout") == 0;
     const bool expectResize = argc > 3 && std::wcscmp(argv[3], L"expect-resize") == 0;
     expect(compileShaders(), "webapp HLSL (VSMain/PSMain) compiles");
 
@@ -105,6 +106,13 @@ int wmain(int argc, wchar_t** argv) {
     RecordingSink sink;
     WebappHost host;
     const bool started = host.start(root, shim, builtins, &sink, 1280, 720, error);
+    if (expectBootTimeout) {
+        expect(!started, "runaway JS was interrupted and bootstrap returned");
+        expect(error.find("watchdog") != std::string::npos, "clear QuickJS watchdog diagnostic");
+        std::printf("%s\n", error.c_str());
+        std::printf(failures ? "WEBAPP WATCHDOG SMOKE FAILED\n" : "WEBAPP WATCHDOG SMOKE PASSED\n");
+        return failures ? 1 : 0;
+    }
     expect(started, "QuickJS webapp runtime starts and boots index.html");
     if (!started) { std::printf("%s\n", error.c_str()); return 1; }
 
