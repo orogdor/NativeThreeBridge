@@ -22,6 +22,9 @@ JSValue frameFunction = JS_UNDEFINED;
 JSValue lightFunction = JS_UNDEFINED;
 JSValue navStatusFunction = JS_UNDEFINED;
 JSValue pathSegmentsFunction = JS_UNDEFINED;
+JSValue combatFunction = JS_UNDEFINED;
+JSValue battleStatusFunction = JS_UNDEFINED;
+JSValue quickBattleFunction = JS_UNDEFINED;
 bool ready = false;
 std::unique_ptr<native_three::NavigationService> navService;
 std::vector<native_three::AudioCommand> audioQueue; // shared on the JS/main thread
@@ -246,11 +249,17 @@ void NativeThreeJS_Init() {
     lightFunction = JS_GetPropertyStr(context, global, "__nativeThreeLightFrame");
     navStatusFunction = JS_GetPropertyStr(context, global, "__nativeThreeNavStats");
     pathSegmentsFunction = JS_GetPropertyStr(context, global, "__nativeThreeDebugSegments");
+    combatFunction = JS_GetPropertyStr(context,global,"__nativeThreeCombatFrame");
+    battleStatusFunction = JS_GetPropertyStr(context,global,"__nativeThreeBattleStatus");
+    quickBattleFunction = JS_GetPropertyStr(context,global,"__nativeThreeQuickBattle");
     JSValue diagnostics = JS_GetPropertyStr(context, global, "__nativeThreeDiagnostics");
     if (!JS_IsFunction(context, frameFunction) ||
         !JS_IsFunction(context, lightFunction) ||
         !JS_IsFunction(context, navStatusFunction) ||
         !JS_IsFunction(context, pathSegmentsFunction) ||
+        !JS_IsFunction(context, combatFunction) ||
+        !JS_IsFunction(context, battleStatusFunction) ||
+        !JS_IsFunction(context, quickBattleFunction) ||
         !JS_IsFunction(context, diagnostics))
         die("Real Three.js scene or dynamic light bridge API missing");
     JSValue check = JS_Call(context, diagnostics, JS_UNDEFINED, 0, nullptr);
@@ -339,6 +348,47 @@ void NativeThreeJS_Lights(float *outLights, std::size_t capacity) {
     JS_FreeValue(context, buffer);
     JS_FreeValue(context, result);
 }
+void NativeThreeJS_CombatStates(float* out,std::size_t capacity) {
+    constexpr std::size_t count=1000*4;
+    if(!ready||!out||capacity<count)die("Combat state buffer invalid");
+    JSValue result=JS_Call(context,combatFunction,JS_UNDEFINED,0,nullptr);
+    if(JS_IsException(result))dieWithJS("Combat poses from JavaScript");
+    size_t offset=0,length=0,elementBytes=0;
+    JSValue buffer=JS_GetTypedArrayBuffer(context,result,&offset,&length,&elementBytes);
+    if(JS_IsException(buffer)||elementBytes!=sizeof(float)||
+       length!=count*sizeof(float))die("Combat poses require Float32Array(4000)");
+    size_t bufferLength=0;
+    uint8_t* bytes=JS_GetArrayBuffer(context,&bufferLength,buffer);
+    if(!bytes||offset+length>bufferLength)die("Combat data outside ArrayBuffer");
+    std::memcpy(out,bytes+offset,length);
+    JS_FreeValue(context,buffer);
+    JS_FreeValue(context,result);
+}
+void NativeThreeJS_GetBattleStatus(NativeThreeBattleStatus* out){
+    if(!ready||!out)die("Battle status: runtime unavailable");
+    JSValue stats=JS_Call(context,battleStatusFunction,JS_UNDEFINED,0,nullptr);
+    if(JS_IsException(stats))dieWithJS("Battle status call");
+    const char* keys[]={"aliveRed","aliveBlue","deaths","hits","attacks","engaged",
+                         "frontHits","sideHits","rearHits","winner","returning","returned"};
+    int* dest[]={&out->aliveRed,&out->aliveBlue,&out->deaths,&out->hits,
+                 &out->attacks,&out->engaged,&out->frontHits,&out->sideHits,
+                 &out->rearHits,&out->winner,&out->returning,&out->returned};
+    for(int i=0;i<12;i++){
+        JSValue v=JS_GetPropertyStr(context,stats,keys[i]);
+        if(JS_IsException(v)||JS_ToInt32(context,dest[i],v)<0)
+            dieWithJS("Invalid battle counter");
+        JS_FreeValue(context,v);
+    }
+    JS_FreeValue(context,stats);
+}
+bool NativeThreeJS_QuickBattle(){
+    if(!ready)return false;
+    JSValue result=JS_Call(context,quickBattleFunction,JS_UNDEFINED,0,nullptr);
+    if(JS_IsException(result))dieWithJS("F12 quick battle");
+    const bool success=JS_ToBool(context,result)>0;
+    JS_FreeValue(context,result);
+    return success;
+}
 void NativeThreeJS_GetNavStatus(NativeThreeNavStatus *out) {
     if (!ready || !out) die("Navigation status: runtime not ready");
     JSValue stats = JS_Call(context,navStatusFunction,JS_UNDEFINED,0,nullptr);
@@ -407,6 +457,9 @@ void NativeThreeJS_Shutdown() {
     navService.reset();
     if (!ready) return;
     JS_FreeValue(context,pathSegmentsFunction);
+    JS_FreeValue(context,combatFunction);
+    JS_FreeValue(context,battleStatusFunction);
+    JS_FreeValue(context,quickBattleFunction);
     JS_FreeValue(context,navStatusFunction);
     JS_FreeValue(context,lightFunction);
     JS_FreeValue(context,frameFunction);
@@ -416,6 +469,9 @@ void NativeThreeJS_Shutdown() {
     lightFunction=JS_UNDEFINED;
     navStatusFunction=JS_UNDEFINED;
     pathSegmentsFunction=JS_UNDEFINED;
+    combatFunction=JS_UNDEFINED;
+    battleStatusFunction=JS_UNDEFINED;
+    quickBattleFunction=JS_UNDEFINED;
     context=nullptr;
     runtime=nullptr;
     ready=false;
