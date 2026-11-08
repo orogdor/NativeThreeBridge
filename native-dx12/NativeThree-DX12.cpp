@@ -85,6 +85,8 @@ static UINT64 gFrameFenceValues[FRAME_COUNT]={};
 static UINT gRTVStep=0,gSRVStep=0;
 static D3D12_CPU_DESCRIPTOR_HANDLE gShadowDSV[SHADOW_COUNT]{};
 static D3D12_GPU_DESCRIPTOR_HANDLE gShadowSRV{},gTreeSRV{};
+static UINT gMainVisibleTrees=0;
+static double gFenceWaitTotal=0,gWorstFrameMs=0,gLastFrameEndSeconds=0;
 static D3D12_VIEWPORT gViewport={0,0,(float)WIDTH,(float)HEIGHT,0,1};
 static D3D12_RECT gScissor={0,0,(LONG)WIDTH,(LONG)HEIGHT};
 
@@ -912,13 +914,41 @@ static void drawShadowMaps() {
     gCmd->ResourceBarrier(1,&ready);
 }
 
+// All 10000 trees exist in the scene, but only the ones intersecting the
+// camera view are submitted for the main two instanced tree draw calls.
+// The shadow passes maintain their own separate, per-light visibility lists.
+static void updateMainTreeVisibility(const float *matrices,
+                                     FXMMATRIX viewProjection,FXMMATRIX projection) {
+    UINT *ids=nullptr;
+    check(gShadowIndexCB->Map(0,nullptr,(void**)&ids),"Map camera-visible tree IDs");
+    const UINT offset=SHADOW_COUNT*INSTANCE_COUNT;
+    const float padX=XMVectorGetX(projection.r[0])*14.f;
+    const float padY=XMVectorGetY(projection.r[1])*20.f;
+    UINT visible=0;
+    for(UINT i=0;i<TREE_COUNT;i++){
+        const float *m=matrices+i*16;
+        const XMVECTOR at=XMVectorSet(m[12],8.f,m[14],1.f);
+        const XMVECTOR clip=XMVector4Transform(at,viewProjection);
+        const float w=XMVectorGetW(clip);
+        if(w<=-18.f)continue;
+        const float x=XMVectorGetX(clip),y=XMVectorGetY(clip);
+        if(x < -w-padX || x > w+padX ||
+           y < -w-padY || y > w+padY)continue;
+        ids[offset+visible++]=i;
+    }
+    gMainVisibleTrees=visible;
+    gShadowIndexCB->Unmap(0,nullptr);
+}
+
 static void renderFrame() {
     const UINT back=gSwap->GetCurrentBackBufferIndex();
     // Do not block after Present; wait only when reusing a busy buffer.
     const UINT64 reuseFence=gFrameFenceValues[back];
     if(reuseFence && gFence->GetCompletedValue()<reuseFence) {
+        const double waitBegin=cpuSeconds();
         check(gFence->SetEventOnCompletion(reuseFence,gFenceEvent),"Frame reuse event");
         WaitForSingleObject(gFenceEvent,INFINITE);
+        gFenceWaitTotal+=(cpuSeconds()-waitBegin)*1000.0;
     }
     const UINT64 completed=gFence->GetCompletedValue();
     gRetiredResources.erase(std::remove_if(gRetiredResources.begin(),
@@ -991,6 +1021,7 @@ static void renderFrame() {
                  (float)WIDTH/HEIGHT,0.1f,2200.0f);
     XMFLOAT4X4 vp;
     XMStoreFloat4x4(&vp,XMMatrixTranspose(view*proj));
+    updateMainTreeVisibility(matrices,view*proj,proj);
     void *cbptr=nullptr;
     check(gFrameCB->Map(0,nullptr,&cbptr),"Map view projection buffer");
     memcpy(cbptr,&vp,sizeof(vp));
@@ -1037,7 +1068,11 @@ static void renderFrame() {
     for(UINT p=0;p<5;p++) {
         Mesh &m=gMesh[order[p]];
         DrawParams draw=m.draw;
-            draw.night=gNightMode?1.f:0.f;
+        draw.night=gNightMode?1.f:0.f;
+        if(p==1||p==2){
+            draw.shadowPass=1; // reuse the GPU index indirection for camera culling
+            draw.shadowOffset=SHADOW_COUNT*INSTANCE_COUNT;
+        }
         if(p==4){
             draw.kind=3; // selects 250 blue soldiers in second army CBV range
             draw.tint[0]=0.40f;draw.tint[1]=0.66f;draw.tint[2]=1.0f;
@@ -1046,7 +1081,7 @@ static void renderFrame() {
         gCmd->SetGraphicsRootDescriptorTable(2,m.srv);
         gCmd->IASetVertexBuffers(0,1,&m.vbv);
         gCmd->IASetIndexBuffer(&m.ibv);
-        gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?TREE_COUNT:PER_ARMY),0,0,0);
+        gCmd->DrawIndexedInstanced(m.indexCount,p==0?1:(p==1||p==2?gMainVisibleTrees:PER_ARMY),0,0,0);
     }
     // Overlay 12 representative REAL A* routes over ground. F4 toggles them.
     // Warm yellow = red army; cyan = blue army. A bright diagnostic even
@@ -1079,6 +1114,11 @@ static void renderFrame() {
     check(gQueue->Signal(gFence.Get(),submitted),"Signal submitted frame");
     gFrameFenceValues[back]=submitted;
     ++gStatFrames;
+    const double endFrame=cpuSeconds();
+    if(gLastFrameEndSeconds){
+        gWorstFrameMs=std::max(gWorstFrameMs,(endFrame-gLastFrameEndSeconds)*1000.0);
+    }
+    gLastFrameEndSeconds=endFrame;
     ULONGLONG t=GetTickCount64();
     if(t-gStatStart>=1000) {
         int frames=(int)(gStatFrames*1000/(t-gStatStart));
@@ -1088,17 +1128,19 @@ static void renderFrame() {
         if(gEnableShadows)for(UINT i=0;i<SHADOW_COUNT;i++)
             shadowInstances+=2*gShadowVisibleCounts[i][0]+
                              gShadowVisibleCounts[i][1]+gShadowVisibleCounts[i][2];
-        wchar_t title[520];
+        wchar_t title[620];
         const double inv=1.0/(double)gStatFrames;
         swprintf_s(title,
-            L"DX12 %s | NIGHT %s | FPS %d | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f ms | A* %d/1000 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
+            L"DX12 %s | NIGHT %s | FPS %d | MAX %.1f ms FENCE %.2f | CPU JS %.2f LIGHT %.2f DRAW %.2f PRESENT %.2f | TREES %u/10000 | A* %d/1000 planned %d | shadow instances %u | shadows %s | VSync %s (F5/F6/F7)",
             gAdapterName,gNightMode?L"ON":L"OFF",frames,
+            gWorstFrameMs,gFenceWaitTotal*inv,
             gJsCpuMsTotal*inv,gLightCpuMsTotal*inv,gRecordCpuMsTotal*inv,gPresentCpuMsTotal*inv,
-            navigation.moved,navigation.planned,shadowInstances,
+            gMainVisibleTrees,navigation.moved,navigation.planned,shadowInstances,
             gEnableShadows?L"ON":L"OFF",gVSync?L"ON":L"OFF");
         SetWindowTextW(gWindow,title);
         gStatFrames=0;
         gJsCpuMsTotal=gLightCpuMsTotal=gRecordCpuMsTotal=gPresentCpuMsTotal=0;
+        gFenceWaitTotal=gWorstFrameMs=0;
         gStatStart=t;
     }
 }
