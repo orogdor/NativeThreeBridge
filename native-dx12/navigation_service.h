@@ -40,8 +40,25 @@ public:
         if(!width||!height||std::uint64_t(width)*height!=blocked.size())return;
         auto map=std::make_shared<Grid>();
         map->width=width;map->height=height;map->blocked=std::move(blocked);
+        map->staticBlocked=map->blocked;
         std::lock_guard<std::mutex> lock(mutex_);
+        baseGrid_=map;
         grid_=std::move(map);
+    }
+    // Copy one immutable snapshot per simulation tick; each path worker gets
+    // a consistent view. Only 1000 cell indices cross the JS/C++ boundary.
+    void updateAgents(const std::vector<std::int32_t>& occupied,
+                      const std::vector<std::int32_t>& reserved) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!baseGrid_)return;
+        auto next=std::make_shared<Grid>(*baseGrid_);
+        for(auto cell:occupied)
+            if(cell>=0 && (std::size_t)cell<next->blocked.size())
+                next->blocked[(std::size_t)cell]=1;
+        for(auto cell:reserved)
+            if(cell>=0 && (std::size_t)cell<next->blocked.size())
+                next->blocked[(std::size_t)cell]=1;
+        grid_=std::move(next);
     }
     std::uint64_t request(std::uint32_t start,std::uint32_t goal,bool urgent=false) {
         const auto token=nextToken_++;
@@ -79,7 +96,7 @@ public:
 private:
     struct Grid {
         std::uint32_t width=0,height=0;
-        std::vector<std::uint8_t> blocked;
+        std::vector<std::uint8_t> blocked,staticBlocked;
     };
     struct Request {
         std::uint64_t token;
@@ -93,7 +110,7 @@ private:
     std::deque<RouteResult> finished_;
     std::vector<std::thread> workers_;
     std::unordered_map<std::uint64_t,std::shared_ptr<std::atomic<bool>>> pendingFlags_;
-    std::shared_ptr<const Grid> grid_;
+    std::shared_ptr<const Grid> grid_,baseGrid_;
     std::atomic<std::uint64_t> nextToken_{1};
     bool stop_=false;
     struct HeapNode {std::uint32_t node;float cost;};
@@ -102,7 +119,7 @@ private:
         const Grid* grid=request.map.get();
         if(!grid||request.start>=grid->blocked.size()||
            request.goal>=grid->blocked.size()||
-           grid->blocked[request.start]||grid->blocked[request.goal])
+           grid->staticBlocked[request.start]||grid->blocked[request.goal])
             return result;
         const std::uint32_t w=grid->width,goal=request.goal;
         const auto h=[&](std::uint32_t n) {
