@@ -1,14 +1,14 @@
-// NativeThreeBridge Windows DX12 stress test: 1000 pines in a ~32x32 forest + 500 units/lights.
+// NativeThreeBridge Windows DX12 stress test: 10000 randomized pines + 1000 individually navigating soldiers and 1000 moving lights.
 // Real Three.js / QuickJS-NG; independent file, editable without recompiling EXE.
 (() => {
   'use strict';
-  const GRID=160, CELL=3, FOREST_SIDE=32, TREES=1000, PER_ARMY=250;
+  const GRID=360, CELL=3, FOREST_SIDE=100, TREES=10000, PER_ARMY=500;
   const SOLDIERS=2*PER_ARMY, TOTAL=TREES+SOLDIERS, LIGHT_HEIGHT=12.5, LIGHT_RADIUS=32, LIGHT_OFFSET_X=6, LIGHT_OFFSET_Z=4;
   const scene=new THREE.Scene();
-  scene.name='1000 randomly placed pines + 500 moving soldiers';
+  scene.name='10000 randomly placed pines + 1000 moving soldiers';
   scene.background=new THREE.Color(0x030611); // night benchmark by default
   const forest=new THREE.Group(), armies=new THREE.Group();
-  forest.name='1000 randomly scattered pines'; armies.name='Two armies of 250';
+  forest.name='10000 randomly scattered pines'; armies.name='Two armies of 500';
   scene.add(forest,armies);
   const pineGeo=new THREE.BufferGeometry();
   pineGeo.userData.nativeMesh='assets/sapling-trees/pine_01/mid.glb';
@@ -19,7 +19,7 @@
   forest.add(treeBark,treeNeedles);
   const red=new THREE.InstancedMesh(spearmanGeo,new THREE.MeshStandardMaterial({color:0xf4a9a9}),PER_ARMY);
   const blue=new THREE.InstancedMesh(spearmanGeo,new THREE.MeshStandardMaterial({color:0x9acaff}),PER_ARMY);
-  red.name='Red army 250';blue.name='Blue army 250';
+  red.name='Red army 500';blue.name='Blue army 500';
   armies.add(red,blue);
   const ground=new THREE.Mesh(new THREE.BufferGeometry(),new THREE.MeshStandardMaterial({color:0x405742}));
   ground.userData.nativePrimitive='ground';scene.add(ground);
@@ -44,12 +44,21 @@
   // Seeded pseudo-random blue-noise placement. Keep approximately the same
   // forest footprint but discard the rigid 32x32 planting lattice.
   // Each accepted tree occupies a navigation cell so A* routes avoid trunks.
-  const FOREST_MIN=32, FOREST_MAX=127, MIN_TREE_SPACING=2.05;
+  const FOREST_MIN=30, FOREST_MAX=329, MIN_TREE_SPACING=2.05;
+// Keep formation origins and destinations clear; otherwise a stress test may
+// fail during initialization simply because a random tree was planted there.
+function protectedFormationCell(x,z) {
+  const row=(z-90)/3;
+  if(!Number.isInteger(row)||row<0||row>=25)return false;
+  return (x>=10&&x<=48&&(x-10)%2===0) ||
+         (x>=311&&x<=349&&(349-x)%2===0) ||
+         (x>=285&&x<=304) || (x>=55&&x<=74);
+}
   const MIN_TREE_SPACING_SQ=MIN_TREE_SPACING*MIN_TREE_SPACING;
   const treeCellOwner=new Int32Array(GRID*GRID);
   treeCellOwner.fill(-1);
   let attempts=0;
-  while(treeCells.length<TREES && attempts<250000){
+  while(treeCells.length<TREES && attempts<3000000){
     attempts++;
     const gxFloat=FOREST_MIN+rand()*(FOREST_MAX-FOREST_MIN);
     const gzFloat=FOREST_MIN+rand()*(FOREST_MAX-FOREST_MIN);
@@ -59,7 +68,7 @@
     if(rand()>density)continue;
     const gx=Math.round(gxFloat),gz=Math.round(gzFloat);
     const index=gridIndex(gx,gz);
-    if(blocked[index])continue;
+    if(blocked[index]||protectedFormationCell(gx,gz))continue;
     // Check only neighbouring cells: O(1) instead of testing all 1000 trees.
     // Trunks are kept apart, while their canopies may naturally overlap.
     let collision=false;
@@ -90,14 +99,14 @@
 
   // Each unit plans on demand while the simulation is running.
   // Live cell occupancy AND in-transit reservations are A* obstacles.
-  // No 500-route upfront computation or overlapping/swap moves.
+  // No 1000-route upfront computation or overlapping/swap moves.
   const occupants=new Int16Array(GRID*GRID), reservations=new Int16Array(GRID*GRID);
   occupants.fill(-1); reservations.fill(-1);
   const pathCosts=new Float32Array(GRID*GRID);
   const pathParents=new Int32Array(GRID*GRID);
   const seen=new Uint32Array(GRID*GRID), closed=new Uint32Array(GRID*GRID);
   let searchId=0,searches=0,replans=0,blockedMoves=0,routeFailures=0;
-  const MAX_PLANS_PER_FRAME=12; // preserve navigation throughput; the A* heap no longer allocates JS objects
+  const MAX_PLANS_PER_FRAME=4; // bound heavy 360x360-grid searches to limit frame spikes
   // Preallocated A* heap eliminates transient JS allocations per expanded node.
   const HEAP_CAPACITY=GRID*GRID*4;
   const heapNodes=new Int32Array(HEAP_CAPACITY);
@@ -198,11 +207,11 @@
   for(let team=0;team<2;team++)for(let i=0;i<PER_ARMY;i++){
     // Two-spaced formations leave a free cell between soldiers: physically
     // viable queues that can get around one another without spawning overlaps.
-    const column=i%10,row=(i/10)|0;
-    const sx=team===0?10+column*2:149-column*2;
-    const sz=50+row*2;
+    const column=i%20,row=(i/20)|0;
+    const sx=team===0?10+column*2:349-column*2;
+    const sz=90+row*3;
     // Destinations are distinct and not initially occupied by enemy spawns.
-    const tx=team===0?150+column:9-column, tz=sz;
+    const tx=team===0?285+column:74-column, tz=sz;
     const id=team*PER_ARMY+i,cell=gridIndex(sx,sz),goal=gridIndex(tx,tz);
     if(blocked[cell]||occupants[cell]!==-1||blocked[goal])
       throw new Error('Invalid soldier start/goal '+id);
@@ -231,7 +240,7 @@
   }
 
   function planPending(dt) {
-    // Fair round-robin, max 12 independent A* searches per frame. Solders
+    // Fair round-robin, max four independent A* searches per frame. Solders
     // request a route only when needed; a stuck unit can request a new one.
     let budget=MAX_PLANS_PER_FRAME;
     for(let checked=0;checked<SOLDIERS && budget>0;checked++){
@@ -274,7 +283,9 @@
         const remaining=CELL-unit.progress;
         const step=Math.min(distance,remaining);
         unit.progress+=step;distance-=step;
-        const [sx,sz]=fromIndex(unit.cell),[tx,tz]=fromIndex(unit.next);
+        // Extract integer coordinates without allocating two JS arrays per unit.
+        const sx=unit.cell%GRID,sz=(unit.cell/GRID)|0;
+        const tx=unit.next%GRID,tz=(unit.next/GRID)|0;
         const t=unit.progress/CELL;
         unit.x=toWorld(sx)+(toWorld(tx)-toWorld(sx))*t;
         unit.z=toWorld(sz)+(toWorld(tz)-toWorld(sz))*t;
@@ -342,8 +353,8 @@
     planned:units.filter(u=>u.plans>0).length
   });
   // Only F4 diagnostic sampling requests these twelve individual paths.
-  // All remaining 488 soldiers still start with no precomputed route.
-  const sampleUnits=[0,29,79,129,179,229];
+  // All remaining 988 soldiers still start with no precomputed route.
+  const sampleUnits=[0,59,159,259,359,459];
   function debugSegments() {
     const output=[];
     for(let team=0;team<2;team++)for(const index of sampleUnits){
