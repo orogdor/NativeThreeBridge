@@ -1,0 +1,135 @@
+name: NativeThreeBridge V8+DX12 experimental Windows build
+on:
+  push:
+    branches: [experiments/v030-v8-node-bridge]
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  v8-native-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build official Three.js and run unchanged engine JavaScript tests
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+          npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
+          if ($LASTEXITCODE -ne 0) { throw "esbuild install failed" }
+          New-Item -ItemType Directory -Force generated,third_party | Out-Null
+          npx esbuild threejs-native/three-runtime-entry.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-runtime.bundle.js
+          if ($LASTEXITCODE -ne 0) { throw "Three.js bundle failed" }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw "Existing JS regressions failed" }
+      - name: Generate unchanged battle resources and compile native engine
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check Pillow
+          if ($LASTEXITCODE -ne 0) { throw "Pillow dependency failed" }
+          python tools/test_spearman_rig.py
+          if ($LASTEXITCODE -ne 0) { throw "Native model regression failed" }
+          python tools/pack_kuningriigid.py
+          if ($LASTEXITCODE -ne 0) { throw "Model asset pack failed" }
+          python tools/generate_native_audio_samples.py
+          if ($LASTEXITCODE -ne 0) { throw "Audio generation failed" }
+          git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS fallback checkout failed" }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build build --config Release --target NativeThreeJS WebappSmoke WebappV8Smoke ThreeSceneSmoke NativeCoreSmoke --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "V8/DX12 native engine compile failed" }
+      - name: Regression - original scene and DX12 shaders unchanged
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build\Release\NativeCoreSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Native core regression failed" }
+          & .\build\Release\ThreeSceneSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Original QuickJS forest battle regression failed" }
+          & .\build\Release\WebappSmoke.exe samples/hello-webapp 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS webapp regression failed" }
+      - name: Package BOTH native QuickJS and V8 executables with real V8 runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/game,dist/v8-runtime,dist/js,dist/test/helpers,dist/node_modules/three/build,dist/node_modules/three/examples/jsm/controls | Out-Null
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-V8.exe
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Game.exe
+          Copy-Item build/Release/WebappV8Smoke.exe dist/WebappV8Smoke.exe
+          Copy-Item samples/hello-webapp/* dist/game/
+          Copy-Item game/scene.js dist/game/scene.js
+          Copy-Item v8-runtime/worker.mjs dist/v8-runtime/worker.mjs
+          Copy-Item v8-runtime/README.md dist/v8-runtime/README.md
+          Copy-Item test/helpers/webapp-node-host.mjs dist/test/helpers/webapp-node-host.mjs
+          Copy-Item js/webapp-shim.js dist/js/webapp-shim.js
+          Copy-Item js/native-renderer.mjs dist/js/native-renderer.mjs
+          Copy-Item node_modules/three/build/three.core.min.js dist/node_modules/three/build/three.core.min.js
+          Copy-Item node_modules/three/build/three.module.min.js dist/node_modules/three/build/three.module.min.js
+          Copy-Item node_modules/three/examples/jsm/controls/OrbitControls.js dist/node_modules/three/examples/jsm/controls/
+          Copy-Item node_modules/three/examples/jsm/controls/PointerLockControls.js dist/node_modules/three/examples/jsm/controls/
+          Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
+          $nodeExe=(Get-Command node.exe).Source
+          Copy-Item $nodeExe dist/v8-runtime/node.exe
+          $nodeLicense=Join-Path (Split-Path $nodeExe) 'LICENSE'
+          if (!(Test-Path $nodeLicense)) { throw "Bundled Node/V8 LICENSE not found; refuse to package unlicensed runtime" }
+          Copy-Item $nodeLicense dist/v8-runtime/LICENSE-Node.txt
+          Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
+          Copy-Item Run-V8.cmd dist/Run-V8.cmd
+          Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
+          Copy-Item version.txt dist/version.txt
+          cl /nologo /O2 /W3 /TC launcher/NativeThree-Updater.c /Fe:dist/NativeThree-Updater.exe /link /SUBSYSTEM:WINDOWS kernel32.lib shell32.lib user32.lib winhttp.lib advapi32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Updater compile failed" }
+          & .\dist\NativeThree-Updater.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Updater self test failed" }
+      - name: Run V8 JavaScript-to-C++ geometry/render bridge smoke (real Node V8)
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          $folder=(Resolve-Path dist/game).Path
+          & .\dist\WebappV8Smoke.exe $folder 6
+          if ($LASTEXITCODE -ne 0) { throw "Native WebGLRenderer->DX12 V8 binary bridge failed" }
+          $exe=(Resolve-Path dist/NativeThree-V8.exe).Path
+          $root=(Resolve-Path dist).Path
+          $p=Start-Process -FilePath $exe -ArgumentList '--check-default-webapp' -WorkingDirectory $root -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "V8 executable cannot auto-locate game/ (exit $($p.ExitCode))" }
+      - name: Verify and upload standalone Windows V8 ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/* -DestinationPath NativeThreeBridge-V8-Windows-x64.zip -Force
+          New-Item -ItemType Directory -Force verify | Out-Null
+          Expand-Archive NativeThreeBridge-V8-Windows-x64.zip -DestinationPath verify -Force
+          foreach ($name in @('NativeThree-V8.exe','NativeThree-Game.exe','v8-runtime/node.exe','v8-runtime/worker.mjs','js/webapp-shim.js','game/index.html','Run-V8.cmd','v8-runtime/LICENSE-Node.txt')) {
+            if (!(Test-Path (Join-Path verify $name))) { throw "Missing V8 ZIP component: $name" }
+          }
+          & .\verify\WebappV8Smoke.exe (Resolve-Path verify/game).Path 6
+          if ($LASTEXITCODE -ne 0) { throw "Extracted V8 ZIP does not execute JS -> DX12 packets" }
+          Write-Host "PASS: independent Node V8 worker, original DX12 renderer IPC, separate QuickJS binary, extracted package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeBridge-V8-Windows-x64
+          path: NativeThreeBridge-V8-Windows-x64.zip
+      - name: Publish V8 experimental prerelease after all tests pass
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag='v0.29.0-v8-test.1'
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Existing test release preserved."
+          } else {
+            gh release create $tag NativeThreeBridge-V8-Windows-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "NativeThreeBridge v0.29.0 – V8 JavaScript + native DX12 test" --notes "Experimental full Three.js browser-shim execution using real V8 bundled in a separate Node.js process (no Chromium). NativeThree-V8.exe auto-runs game/index.html with unchanged game code. Geometry, instance buffers and render passes forwarded by binary IPC to the unchanged DX12 renderer. Original QuickJS/10k-tree forest test remains available via NativeThree-Game.exe --battle. V8 bridge and extracted ZIP tested on Windows CI; Kuningriigid full game and performance gain NOT yet confirmed. Missing textures, GLTF, shadows, custom GLSL and full HTML/CSS remain unsupported."
+            if ($LASTEXITCODE -ne 0) { throw "V8 test release publication failed" }
+          }
