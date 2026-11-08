@@ -5,6 +5,11 @@
 // Data copied from THREE.InstancedMesh world matrices into DX12's upload buffer.
 void NativeThreeJS_Init();
 void NativeThreeJS_Frame(float deltaSeconds, float *outMatrices, std::size_t floatCapacity);
+// Generic incremental ABI: copy matrices starting at an instance offset.
+// The caller must keep the earlier matrices initialized/persistent.
+// Pass 0 for a full state refresh; this is not tied to any game object type.
+void NativeThreeJS_FrameFrom(float deltaSeconds, float *outMatrices,
+                             std::size_t floatCapacity, std::size_t firstChangedInstance);
 // 20 moving Three.js SpotLight records: xyz, distance, rgb, intensity.
 void NativeThreeJS_Lights(float *outLights, std::size_t floatCapacity);
 struct NativeThreeNavStatus {
