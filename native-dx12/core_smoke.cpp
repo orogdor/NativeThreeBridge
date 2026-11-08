@@ -3,6 +3,7 @@
 #include "navigation_service.h"
 #include "fixed_stepper.h"
 #include "lod_policy.h"
+#include "native_css_style.h"
 #include "walk_animation.h"
 #include <algorithm>
 #include <cassert>
@@ -15,6 +16,30 @@
 
 using namespace native_three;
 int main(){
+    // Portable CSS/markup translator tests: no browser, Win32 or GPU needed.
+    const std::string buttonHtml=R"(<button id="restart-button">Reset battle</button>)";
+    const std::string buttonCss=R"(
+       /* CSS is the source of the native control's styling */
+       #restart-button {
+         right: 27px; top: 19px; width: 164px; height: 46px;
+         background-color: #20415a; color: #eefaff;
+         border-color: #3c9ac1; border-radius: 12px;
+         font-size: 17px; font-weight: bold;
+       }
+       #restart-button:hover { color: #000000; }
+    )";
+    const auto cssButton=native_three::parseNativeButton(buttonHtml,buttonCss);
+    if(cssButton.id!="restart-button" || cssButton.text!="Reset battle" ||
+       cssButton.right!=27 || cssButton.top!=19 || cssButton.width!=164 ||
+       cssButton.height!=46 || cssButton.background!=0x20415a ||
+       cssButton.foreground!=0xeefaff || cssButton.radius!=12 ||
+       cssButton.fontSize!=17 || !cssButton.bold) {
+        std::fprintf(stderr,"Native CSS button translator produced incorrect values\n");
+        return 55;
+    }
+    const auto defaultButton=native_three::parseNativeButton("","bad CSS");
+    if(defaultButton.width<120 || defaultButton.text!="Restart")return 56;
+
     SceneRegistry scene;
     const auto mesh=scene.create(ObjectKind::Mesh,-10.f,0.f,3.f);
     const auto light=scene.create(ObjectKind::Light,4.f,6.f,8.f);
