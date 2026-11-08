@@ -1,7 +1,7 @@
 name: Build native Three.js Windows Game and separate Updater
 on:
   push:
-    branches: [main, perf/v018-10k-trees-1k-soldiers]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: write
