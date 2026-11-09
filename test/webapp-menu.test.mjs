@@ -87,3 +87,47 @@ test('select opens a list, commits only an enabled choice and fires change once'
   assert.equal(select.value, 'last');
   assert.deepEqual(events, ['input', 'change', 'input', 'change']);
 });
+
+test('select labels open the list and popup dismissal stays out of the page', { skip }, async () => {
+  const { context, host } = await runWebapp(fixture, { frames: 1, width: 1280, height: 720 });
+  const doc = context.document;
+  const select = doc.getElementById('quality'), label = doc.getElementById('quality-label');
+  const events = [];
+  for (const type of ['pointerdown', 'pointerup', 'contextmenu', 'wheel', 'keydown', 'keyup']) {
+    doc.addEventListener(type, (e) => events.push(e.type));
+  }
+  click(host, ...center(label));
+  assert.equal(doc.activeElement, select);
+  popupLabel(host, 'High detail');
+  events.length = 0;
+  host.pointer('down', 4, 4, 2);
+  host.pointer('up', 4, 4, 2);
+  assert.deepEqual(events, []);
+
+  click(host, ...center(select));
+  events.length = 0;
+  host.wheel(4, 4, 0, 100);
+  assert.deepEqual(events, []);
+
+  click(host, ...center(select));
+  events.length = 0;
+  for (const down of [true, false]) host.key(down, 'Escape', 'Escape', false, false, false, false, false);
+  assert.deepEqual(events, []);
+});
+
+test('focus loss cancels a captured pointer and suppresses the orphan release', { skip }, async () => {
+  const { context, host } = await runWebapp(fixture, { frames: 1, width: 1280, height: 720 });
+  const button = context.document.getElementById('quality-label');
+  const events = [];
+  for (const type of ['pointerdown', 'pointercancel', 'pointerup', 'click', 'contextmenu']) {
+    button.addEventListener(type, (e) => events.push(e.type));
+  }
+  const [x, y] = center(button);
+  host.pointer('down', x, y, 2);
+  host.focus(false);
+  host.focus(true);
+  host.pointer('up', x, y, 2);
+  assert.deepEqual(events, ['pointerdown', 'pointercancel']);
+  click(host, x, y);
+  assert.deepEqual(events, ['pointerdown', 'pointercancel', 'pointerdown', 'pointerup', 'click']);
+});

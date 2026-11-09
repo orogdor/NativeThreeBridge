@@ -2227,6 +2227,8 @@
   // ------------------------------------------------------- input mapping
   let pointerButtons = 0, lastPointer = { x: 0, y: 0 }, modifiers = {};
   let captureTarget = null, downTarget = null, hoverTarget = null;
+  let popupButtons = 0;
+  const popupKeys = new Set();
   const BUTTON_BIT = [1, 4, 2, 8, 16];
   function eventTarget() {
     return (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) ? document.activeElement : (document.body || document);
@@ -2313,7 +2315,12 @@
       if (tag === 'label') {
         const id = n.getAttribute('for');
         const control = id ? document.getElementById(id) : n.querySelector('input,select,textarea,button');
-        if (control && control !== target && !control.contains(target)) control.click();
+        if (control && control !== target && !control.contains(target) && !disabledControl(control)) {
+          if (control.localName === 'select') {
+            focusFor(control);
+            if (fire(control, new MouseEvent('click', PTR))) clickDefault(control);
+          } else control.click();
+        }
         return;
       }
       if (tag === 'button' || tag === 'a') return;
@@ -2333,11 +2340,21 @@
     }
   }
   function pointer(kind, x, y, button, mods) {
-    if (uiLayer?.selectPointer?.(kind, x, y, button)) return;
     const movementX = x - lastPointer.x, movementY = y - lastPointer.y;
     lastPointer = { x, y };
-    if (kind === 'down') pointerButtons |= BUTTON_BIT[button] || 0;
-    if (kind === 'up') pointerButtons &= ~(BUTTON_BIT[button] || 0);
+    const bit = BUTTON_BIT[button] || 0;
+    // Keep both halves of a popup press out of the page, even if the
+    // popup was dismissed before the release.
+    if (!captureTarget) {
+      const popupPress = kind === 'up' && (popupButtons & bit);
+      const handled = uiLayer?.selectPointer?.(kind, x, y, button);
+      if (kind === 'down' && handled) popupButtons |= bit;
+      if (kind === 'up') popupButtons &= ~bit;
+      if (handled || popupPress || popupButtons) return;
+    }
+    if (kind === 'up' && !(pointerButtons & bit)) return;
+    if (kind === 'down') pointerButtons |= bit;
+    if (kind === 'up') pointerButtons &= ~bit;
     const init = { ...PTR, ...mods, clientX: x, clientY: y, offsetX: x, offsetY: y, pageX: x, pageY: y, screenX: x, screenY: y, movementX, movementY, button: kind === 'move' ? -1 : button, buttons: pointerButtons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
     const under = hitTarget(x, y);
     // Implicit capture: a drag that starts on the canvas stays with it.
@@ -2476,7 +2493,17 @@
     },
     key(down, key, code, repeat, alt, ctrl, shift, meta) {
       modifiers = { altKey: !!alt, ctrlKey: !!ctrl, shiftKey: !!shift, metaKey: !!meta };
-      if (down && uiLayer?.selectKey?.(key)) return;
+      if (!down && popupKeys.delete(code || key)) return;
+      if (down) {
+        if (repeat && popupKeys.has(code || key)) {
+          uiLayer?.selectKey?.(key);
+          return;
+        }
+        if (uiLayer?.selectKey?.(key)) {
+          if (!repeat) popupKeys.add(code || key);
+          return;
+        }
+      }
       const keyCode = key.length === 1 ? key.toUpperCase().charCodeAt(0) : ({ Enter: 13, Escape: 27, ' ': 32, Tab: 9, Backspace: 8, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Shift: 16, Control: 17, Alt: 18, Delete: 46 }[key] || 0);
       const proceed = fire(eventTarget(), new KeyboardEvent(down ? 'keydown' : 'keyup', { bubbles: true, cancelable: true, key, code, repeat: !!repeat, keyCode, ...modifiers }));
       const focused = document.activeElement;
@@ -2505,7 +2532,18 @@
     // Cursor name (CSS `cursor`) for the element under the pointer.
     cursor() { return uiLayer && hoverTarget ? uiLayer.cursorAt(hoverTarget) : 'auto'; },
     focus(focused) {
-      if (!focused) { pointerButtons = 0; uiLayer?.closeSelect?.(); }
+      if (!focused) {
+        const captured = captureTarget;
+        pointerButtons = popupButtons = 0;
+        captureTarget = downTarget = null;
+        popupKeys.clear();
+        uiLayer?.setActive(null);
+        uiLayer?.closeSelect?.();
+        if (captured?.isConnected) fire(captured, new PointerEvent('pointercancel', {
+          ...PTR, ...modifiers, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+          clientX: lastPointer.x, clientY: lastPointer.y,
+        }));
+      }
       document.hidden = false;
       window.dispatchEvent(new FocusEvent(focused ? 'focus' : 'blur'));
     },

@@ -3787,7 +3787,7 @@ center{text-align:center}
         if (button === 0 && kind === 'down' && insideRect(p.anchor, x, y)) { p.pressed = -2; return true; }
         if (kind === 'up' && p.pressed !== -1) { closeSelect(); return true; }
         if (kind === 'down') closeSelect();
-        return kind === 'move';
+        return true;
       }
       const index = p.first + Math.floor((y - p.rect.y) / p.row);
       if (kind === 'move' && p.active !== index) { p.active = index; needPaint = true; }
@@ -3803,7 +3803,7 @@ center{text-align:center}
       ensurePaint();
       const p = selectPopup;
       if (!p) return false;
-      if (!insideRect(p.rect, x, y) && !insideRect(p.anchor, x, y)) { closeSelect(); return false; }
+      if (!insideRect(p.rect, x, y) && !insideRect(p.anchor, x, y)) { closeSelect(); return true; }
       p.wheel += dy;
       const rows = Math.trunc(p.wheel / p.row);
       p.wheel -= rows * p.row;

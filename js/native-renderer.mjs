@@ -44,10 +44,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _spriteScale = new THREE.Vector3();
   const _spriteQuat = new THREE.Quaternion();
   const _spriteTmp = new THREE.Matrix4();
-  const _identityMatrix = new THREE.Matrix4().elements;
-  const INSTANCE_CHUNK_SIZE = 64;
-  const BATCH_STATE = ['geometryId', 'renderOrder', 'start', 'count', 'flags', 'roughness', 'metalness', 'shininess',
-    'r', 'g', 'b', 'opacity', 'er', 'eg', 'eb', 'textureId', 'alphaTest', 'ua', 'ub', 'uc', 'ud', 'ue', 'uf'];
 
   let nextGeometryId = 1;
   let nextInstanceId = 1;
@@ -119,9 +115,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._patches = new WeakMap();    // material -> what its shader patch does to colours
       this._maskedGeometries = new WeakMap(); // geometry -> cached RGBA attribute-mask variants
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
-      this._autoBatches = [];
-      this._batchFrame = -1;
-      this._batchCursor = 0;
       this._opaque = [];
       this._transparent = [];
       this._lights = [];
@@ -209,8 +202,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     dispose() {
       this._disposed = true;
       this.setAnimationLoop(null);
-      for (const batch of this._autoBatches) nt.releaseInstances(batch.id);
-      this._autoBatches.length = 0;
     }
 
     // --------------------------------------------------------- animation
@@ -327,7 +318,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       let record = this._instances.get(mesh);
       const im = mesh.instanceMatrix, ic = mesh.instanceColor;
       if (!record) {
-        record = { id: nextInstanceId++, matrixVersion: -1, matrixRef: null, colorVersion: -1, colorRef: null, count: -1 };
+        record = { id: nextInstanceId++, matrixVersion: -1, colorVersion: -1, colorRef: null, count: -1 };
         this._instances.set(mesh, record);
         const onDispose = () => {
           mesh.removeEventListener('dispose', onDispose);
@@ -337,103 +328,16 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         mesh.addEventListener('dispose', onDispose);
       }
       const capacity = im.count;
-      const matrixChanged = record.matrixRef !== im || record.matrixVersion !== im.version || record.count !== capacity;
-      if (matrixChanged || record.colorRef !== ic || (ic && record.colorVersion !== ic.version)) {
+      if (record.matrixVersion !== im.version || record.colorRef !== ic || (ic && record.colorVersion !== ic.version) || record.count !== capacity) {
         const matrices = im.array instanceof Float32Array ? im.array : Float32Array.from(im.array);
         const colors = ic ? (ic.array instanceof Float32Array ? ic.array : Float32Array.from(ic.array)) : null;
         nt.uploadInstances(record.id, matrices, colors, capacity);
-        if (matrixChanged) {
-          record.chunkBounds = null;
-          record.matrixFrame = host?.state?.frame;
-        }
-        record.matrixRef = im;
         record.matrixVersion = im.version;
         record.colorVersion = ic ? ic.version : -1;
         record.colorRef = ic;
         record.count = capacity;
       }
       return record;
-    }
-
-    // Cache conservative bounds in instance order. Large static InstancedMesh
-    // objects often contain rows/tiles of trees, and one aggregate sphere alone
-    // makes every off-screen row render when only one is visible.
-    _visibleInstanceRanges(mesh, record, geometry) {
-      const count = mesh.count;
-      const frame = host?.state?.frame;
-      if (count < 2 * INSTANCE_CHUNK_SIZE || !mesh.frustumCulled || frame === undefined ||
-          mesh.instanceMatrix.usage !== THREE.StaticDrawUsage || record.matrixFrame === frame) return null;
-      const chunks = record.chunkBounds;
-      if (!chunks || record.chunkGeometry !== geometry.key || record.chunkPosition !== geometry.position || record.chunkCount !== count) {
-        const source = new THREE.Box3().setFromBufferAttribute(geometry.position);
-        if (source.isEmpty() || !Number.isFinite(source.min.lengthSq() + source.max.lengthSq())) return null;
-        const matrix = new THREE.Matrix4(), transformed = new THREE.Box3();
-        record.chunkBounds = [];
-        for (let start = 0; start < count; start += INSTANCE_CHUNK_SIZE) {
-          const box = new THREE.Box3();
-          for (let i = start; i < Math.min(count, start + INSTANCE_CHUNK_SIZE); ++i) {
-            mesh.getMatrixAt(i, matrix);
-            box.union(transformed.copy(source).applyMatrix4(matrix));
-          }
-          record.chunkBounds.push(box);
-        }
-        record.chunkGeometry = geometry.key;
-        record.chunkPosition = geometry.position;
-        record.chunkCount = count;
-      }
-      const world = new THREE.Box3();
-      const ranges = [];
-      let visible = 0;
-      for (let i = 0; i < record.chunkBounds.length; ++i) {
-        if (!_frustum.intersectsBox(world.copy(record.chunkBounds[i]).applyMatrix4(mesh.matrixWorld))) continue;
-        const start = i * INSTANCE_CHUNK_SIZE;
-        const n = Math.min(INSTANCE_CHUNK_SIZE, count - start);
-        visible += n;
-        const last = ranges[ranges.length - 1];
-        if (last && last.start + last.count === start) last.count += n;
-        else ranges.push({ start, count: n });
-      }
-      // Keep a single draw if splitting removes little work or creates many
-      // small commands. A zero-length result means all chunks are outside.
-      return visible > count * .75 || ranges.length > 8 ? null : ranges;
-    }
-
-    // Adjacent, compatible opaque draws share one native instance buffer.
-    // Adjacency keeps even equal-depth and explicitly ordered draws in place.
-    _batchOpaque(draws) {
-      const frame = host?.state?.frame;
-      if (frame === undefined) return;
-      if (this._batchFrame !== frame) {
-        this._batchFrame = frame;
-        this._batchCursor = 0;
-      }
-      let read = 0, write = 0;
-      while (read < draws.length) {
-        const first = draws[read];
-        let end = read + 1;
-        if (first.batchMaterial) {
-          while (end < draws.length) {
-            const next = draws[end];
-            if (next.batchMaterial !== first.batchMaterial || !BATCH_STATE.every((key) => next[key] === first[key])) break;
-            end++;
-          }
-        }
-        const count = end - read;
-        if (count >= 2) {
-          let batch = this._autoBatches[this._batchCursor];
-          if (!batch) this._autoBatches[this._batchCursor] = batch = { id: nextInstanceId++, matrices: new Float32Array(0) };
-          this._batchCursor++;
-          if (batch.matrices.length < count * 16) batch.matrices = new Float32Array(count * 16);
-          for (let i = 0; i < count; ++i) batch.matrices.set(draws[read + i].matrix, i * 16);
-          nt.uploadInstances(batch.id, batch.matrices, null, count);
-          first.instanceId = batch.id;
-          first.instanceCount = count;
-          first.matrix = _identityMatrix;
-        }
-        draws[write++] = first;
-        read = end;
-      }
-      draws.length = write;
     }
 
     // One native texture per image (THREE.Source), re-sent when needsUpdate.
@@ -565,8 +469,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
         transparent.sort((a, b) => a.renderOrder - b.renderOrder || b.z - a.z);
       }
-
-      this._batchOpaque(opaque);
 
       // ---- pass header
       const drawCount = opaque.length + transparent.length;
@@ -740,10 +642,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
     _queue(base, material, start, count, opaque, transparent) {
       const m = material, mesh = base.mesh;
-      const ordinaryMesh = mesh.isMesh && !mesh.isSkinnedMesh && !mesh.isBatchedMesh && !mesh.isLine &&
-        !mesh.geometry.morphAttributes?.position && mesh.onBeforeRender === THREE.Object3D.prototype.onBeforeRender &&
-        m.onBeforeCompile === THREE.Material.prototype.onBeforeCompile && !m.transparent &&
-        m.depthTest !== false && m.depthWrite !== false;
       let flags = 0;
       if (mesh.isLine) {
         flags |= DrawFlags.UNLIT | (mesh.isLineSegments ? DrawFlags.LINES : DrawFlags.LINE_STRIP);
@@ -867,19 +765,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           transparent: !!m.transparent, opacity: m.opacity, count, instances: draw.instanceCount, defines: m.defines ? Object.keys(m.defines) : null,
         });
       }
-      if (ordinaryMesh && !base.instances) draw.batchMaterial = m;
-      const ranges = ordinaryMesh && base.instances && base.record.position
-        ? this._visibleInstanceRanges(mesh, base.instances, base.record) : null;
-      const queue = flags & DrawFlags.TRANSPARENT ? transparent : opaque;
-      let drawnInstances = draw.instanceCount;
-      if (ranges) {
-        drawnInstances = 0;
-        for (const range of ranges) {
-          queue.push({ ...draw, firstInstance: range.start, instanceCount: range.count });
-          drawnInstances += range.count;
-        }
-      } else queue.push(draw);
-      this.info.render.triangles += (flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? 0 : Math.floor(count / 3) * drawnInstances;
+      if (flags & DrawFlags.TRANSPARENT) transparent.push(draw); else opaque.push(draw);
+      this.info.render.triangles += (flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? 0 : Math.floor(count / 3) * draw.instanceCount;
       if (flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) this.info.render.lines += count;
     }
   }
@@ -913,8 +800,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const value = d.colorStage?.uniforms[i]?.value;
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
-    p[o + 53] = d.firstInstance ?? 0;
-    p[o + 54] = p[o + 55] = 0;
+    p[o + 53] = p[o + 54] = p[o + 55] = 0;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {

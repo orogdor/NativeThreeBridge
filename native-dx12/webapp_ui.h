@@ -90,9 +90,7 @@ public:
     // changed. Returns true when new pixels are available.
     bool render(unsigned width, unsigned height);
 
-    // Premultiplied BGRA8 pixels of the last changed rectangle (top-down rows).
-    struct PixelRegion { unsigned x, y, width, height; };
-    PixelRegion pixelRegion() const;
+    // Premultiplied BGRA8 pixels of the last render (top-down rows).
     const std::uint8_t* pixels() const;
     unsigned stride() const;
     unsigned width() const;

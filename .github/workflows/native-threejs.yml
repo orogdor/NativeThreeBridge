@@ -267,25 +267,6 @@ jobs:
           if ((Get-ChildItem verify/game2 -Force | Measure-Object).Count -ne 0) { throw "game2 must be empty in the ZIP" }
           Get-ChildItem release | Format-Table Name, Length
           Write-Host "Two-game package verified: v$v"
-      - name: Verify partial uploads and batching on DX12
-        shell: pwsh
-        run: |
-          $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
-          $fixture = (Resolve-Path test/fixtures/webapp-upload).Path
-          $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $fixture -WorkingDirectory (Resolve-Path dist).Path -PassThru
-          try { Start-Sleep -Seconds 9 } finally { if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }; $p.WaitForExit() }
-          $csv = 'dist/NativeThreeBridge-webapp-frames.csv'
-          New-Item -ItemType Directory -Force shots | Out-Null
-          Copy-Item $csv shots/upload-fixture.csv
-          $rows = @(Import-Csv $csv)
-          $steady = @($rows | Where-Object { [double]$_.time_s -ge 2 -and [int]$_.draws -eq 6 })
-          if (!$steady.Count) { throw "Expected six draws after batching and culling" }
-          if (!($rows | Where-Object { [long]$_.geometry_upload_bytes -gt 0 })) { throw "No GPU geometry buffer copies" }
-          $ui = @($steady | Where-Object { [long]$_.ui_upload_bytes -gt 0 })
-          if (!$ui.Count -or ($ui | Where-Object { [long]$_.ui_upload_bytes -gt 131072 })) { throw "UI did not stay within the partial upload budget" }
-          $instances = @($steady | Where-Object { [long]$_.instance_upload_bytes -gt 0 })
-          if (!$instances.Count -or ($instances | Where-Object { [long]$_.instance_upload_bytes -gt 4096 })) { throw "Instance buffer did not stay within the partial upload budget" }
-          $steady | Format-Table time_s,draws,ui_upload_bytes,geometry_upload_bytes,instance_upload_bytes
       - name: Screenshot the HTML/CSS UI drawn by the engine (fixture and Kuningriigid)
         continue-on-error: true
         shell: pwsh
