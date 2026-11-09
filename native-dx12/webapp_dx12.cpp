@@ -111,6 +111,10 @@ public:
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
     void log(const std::string& level, const std::string& text) override;
+    void reportUi(double styleMs, double layoutMs, double paintMs, int forced, int full, int partial) override {
+        perf_.uiStyle += styleMs; perf_.uiLayout += layoutMs; perf_.uiPaint += paintMs;
+        perf_.forced += forced; perf_.full += full; perf_.partial += partial;
+    }
     void submitUi(const float* data, std::size_t floats, const std::string& strings) override {
         if (uiReady_) ui_.setDisplayList(data, floats, strings);
     }
@@ -193,6 +197,17 @@ private:
     UINT lastDraws_ = 0;
 
     std::chrono::steady_clock::time_point uiStatsAt_ = std::chrono::steady_clock::now();
+    // NativeThreeBridge-webapp-frames.csv: one summary row per second.
+    struct Perf {
+        int frames = 0;
+        double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0;
+        double uiStyle = 0, uiLayout = 0, uiPaint = 0;
+        int forced = 0, full = 0, partial = 0, rasters = 0;
+    } perf_;
+    std::FILE* perfCsv_ = nullptr;
+    std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
+    double fenceWaitMs_ = 0;
+    void writePerfRow(double atSeconds, double seconds);
     std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
     bool cursorHidden_ = false;
@@ -720,8 +735,10 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
 void WebappWindow::renderFrame() {
     const UINT frame = swap_->GetCurrentBackBufferIndex();
     if (fence_->GetCompletedValue() < frameFence_[frame]) {
+        const auto waitStart = std::chrono::steady_clock::now();
         fence_->SetEventOnCompletion(frameFence_[frame], fenceEvent_);
         WaitForSingleObject(fenceEvent_, INFINITE);
+        fenceWaitMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
     }
     collectRetired();
 
@@ -967,12 +984,32 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+void WebappWindow::writePerfRow(double atSeconds, double seconds) {
+    Perf& p = perf_;
+    if (perfCsv_ && p.frames > 0) {
+        const double n = p.frames;
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u\n",
+                     atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_);
+        std::fflush(perfCsv_);
+    }
+    p = Perf{};
+}
+
 int WebappWindow::run(HINSTANCE instance) {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     const std::filesystem::path logPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-log.txt";
     _wfopen_s(&log_, logPath.c_str(), L"wb");
     gCrashLog = log_;
+    const std::filesystem::path perfPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-frames.csv";
+    _wfopen_s(&perfCsv_, perfPath.c_str(), L"wb");
+    if (perfCsv_) {
+        std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws\n",
+                   perfCsv_);
+        std::fflush(perfCsv_);
+    }
     ULONG guarantee = 128 * 1024; // room for the crash handler after a stack overflow
     SetThreadStackGuarantee(&guarantee);
     SetUnhandledExceptionFilter(webappCrashFilter);
@@ -1034,6 +1071,7 @@ int WebappWindow::run(HINSTANCE instance) {
                 host_.shutdown();
                 gActive = nullptr;
                 if (log_) std::fclose(log_);
+                if (perfCsv_) std::fclose(perfCsv_);
                 return int(msg.wParam);
             }
             TranslateMessage(&msg);
@@ -1045,15 +1083,35 @@ int WebappWindow::run(HINSTANCE instance) {
         pendingPasses_.clear();
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
         host_.frame(ms);
+        const auto tJs = std::chrono::steady_clock::now();
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
         if (uiReady_) {
             gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
-            if (ui_.render(width_, height_)) uiUpload_ = true;
+            if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
             uiVisible_ = !ui_.empty();
             gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         }
+        const auto tRaster = std::chrono::steady_clock::now();
         renderFrame();
+        const auto tEnd = std::chrono::steady_clock::now();
+        {
+            using msd = std::chrono::duration<double, std::milli>;
+            const double frameMs = msd(tEnd - now).count();
+            perf_.frames++;
+            perf_.frameMs += frameMs;
+            perf_.frameMax = std::max(perf_.frameMax, frameMs);
+            perf_.jsMs += msd(tJs - now).count();
+            perf_.rasterMs += msd(tRaster - tJs).count();
+            perf_.renderMs += msd(tEnd - tRaster).count();
+            perf_.fenceMs += fenceWaitMs_;
+            fenceWaitMs_ = 0;
+            const double since = std::chrono::duration<double>(tEnd - perfAt_).count();
+            if (since >= 1.0) {
+                writePerfRow(std::chrono::duration<double>(tEnd - start).count(), since);
+                perfAt_ = tEnd;
+            }
+        }
         frameNumber++;
         statFrames++;
         const double elapsed = std::chrono::duration<double>(now - statStart).count();

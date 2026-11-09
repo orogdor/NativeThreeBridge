@@ -346,6 +346,14 @@ JSValue jsMeasureText(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv
     return JS_NewFloat64(ctx, self->sink->measureText(argString(ctx, argv[0]), size, int(weight), italic, argString(ctx, argv[4])));
 }
 
+JSValue jsReportUi(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 6 || !self->sink) return JS_UNDEFINED;
+    double v[6] = {};
+    for (int i = 0; i < 6; i++) JS_ToFloat64(ctx, &v[i], argv[i]);
+    self->sink->reportUi(v[0], v[1], v[2], int(v[3]), int(v[4]), int(v[5]));
+    return JS_UNDEFINED;
+}
 JSValue jsSetCursor(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     if (argc >= 1 && self->sink) self->sink->setCursor(argString(ctx, argv[0]));
@@ -467,7 +475,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", jsUploadGeometry, 5}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
         {"submitPass", jsSubmitPass, 2},
-        {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1},
+        {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1}, {"reportUi", jsReportUi, 6},
     };
     for (const Fn& f : functions)
         JS_SetPropertyStr(s.ctx, api, f.name, JS_NewCFunction(s.ctx, f.fn, f.name, f.length));

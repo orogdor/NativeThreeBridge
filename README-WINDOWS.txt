@@ -1,4 +1,4 @@
-NativeThreeBridge v0.31.0 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.31.1 - KAKS MÄNGU, ÜKS ENGINE
 ==================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)

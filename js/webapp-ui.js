@@ -943,7 +943,6 @@ center{text-align:center}
   let sheetSignature = '';
   let ruleIndex = null;
   let pseudoIndex = null;
-  let hoverRules = false;
   function readCss(path) {
     try { return nt.readText(path); } catch (e) { host.warnOnce(`ui-css-${path}`, `Stylesheet not found in game folder: ${path}`); return null; }
   }
@@ -1008,14 +1007,12 @@ center{text-align:center}
   function buildIndex() {
     ruleIndex = { id: new Map(), cls: new Map(), tag: new Map(), any: [] };
     pseudoIndex = { id: new Map(), cls: new Map(), tag: new Map(), any: [] };
-    hoverRules = false;
     let seq = 0;
     for (const { sheet, media } of sheets) {
       for (const rule of sheet.rules) {
         for (const sel of rule.sel) {
           if (sel.never) continue;
           const entry = { sel, rule, spec: sel.spec, order: seq++, media: joinMedia(media, rule.media) };
-          if (!hoverRules && /hover|active|focus/.test(JSON.stringify(sel.parts.map((p) => p.c.pcs.map((x) => x.name))))) hoverRules = true;
           const last = sel.parts[sel.parts.length - 1].c;
           const idx = sel.pseudoEl ? pseudoIndex : ruleIndex;
           if (last.id !== null) push(idx.id, last.id, entry);
@@ -1139,37 +1136,7 @@ center{text-align:center}
     return Number.isNaN(n) || n < 0 ? parentFs : n;
   }
 
-  // Styles every element (and ::before/::after) of the document.
-  let styleGeneration = 0;
-  function styleTree() {
-    styleGeneration++;
-    const root = document.documentElement;
-    if (!root) return;
-    ctx.vw = state.width; ctx.vh = state.height;
-    const walk = (el, parentCs) => {
-      const entries = candidates(ruleIndex, el).filter((e) => (!e.media || mediaMatches(e.media)) && matchSelector(el, e.sel));
-      const cs = cascade(el, entries, inlineDecls(el), parentCs);
-      if (el === root) { ctx.rootFs = cs.__fs; }
-      el._ntStyle = cs;
-      el._ntPseudo = null;
-      const pc = candidates(pseudoIndex, el);
-      if (pc.length) {
-        const before = [], after = [];
-        for (const e of pc) {
-          if (e.media && !mediaMatches(e.media)) continue;
-          if (!matchSelector(el, e.sel)) continue;
-          (e.sel.pseudoEl === 'before' ? before : after).push(e);
-        }
-        if (before.length || after.length) {
-          el._ntPseudo = {};
-          if (before.length) el._ntPseudo.before = cascade(el, before, null, cs);
-          if (after.length) el._ntPseudo.after = cascade(el, after, null, cs);
-        }
-      }
-      for (const c of el.childNodes) if (c.nodeType === 1) walk(c, cs);
-    };
-    walk(root, null);
-  }
+
 
   // ------------------------------------------------------------- images
   // Intrinsic sizes come from the file header; pixels are decoded natively.
@@ -2535,7 +2502,7 @@ center{text-align:center}
   // --------------------------------------------------------------- paint
   // Display list ops (same numbers in native-dx12/webapp_ui.h).
   const OP = { CLIP: 1, RECT: 2, BORDER: 3, IMAGE: 4, TEXT: 5, LGRAD: 6, RGRAD: 7, SHADOW: 8 };
-  let prims = [], hits = [], holeAt = -1, hitHoleAt = -1, holeRect = null;
+  let prims = [], hits = [], holeAt = -1, hitHoleAt = -1, holeRect = null, paintGen = 0;
   let strings = new Map();
   const str = (s) => { let i = strings.get(s); if (i === undefined) { i = strings.size; strings.set(s, i); } return i; };
 
@@ -2589,7 +2556,25 @@ center{text-align:center}
     visit(b.children);
     return out;
   }
+  // Paint-only style changes swap the style objects boxes and text fragments use.
+  function applyRemap(b) {
+    if (!b || b.isText || b.isBr) return;
+    if (csRemap.has(b.cs)) b.cs = csRemap.get(b.cs);
+    if (b.frags) for (const f of b.frags) if (csRemap.has(f.cs)) f.cs = csRemap.get(f.cs);
+    for (const c of b.children) {
+      if (c.isText) { if (csRemap.has(c.cs)) c.cs = csRemap.get(c.cs); if (c.anon && !b.anonText) applyRemap(c.anon); continue; }
+      if (c.isBr) continue;
+      applyRemap(c);
+    }
+  }
   function paintAll(root) {
+    if (csRemap.size) {
+      // chains: a -> b -> c when a value changed twice before a paint
+      for (const [k, v] of csRemap) { let t = v; while (csRemap.has(t) && csRemap.get(t) !== t) t = csRemap.get(t); csRemap.set(k, t); }
+      applyRemap(root);
+      csRemap.clear();
+    }
+    paintGen++;
     prims = []; hits = []; holeAt = -1; hitHoleAt = -1; holeRect = null; strings = new Map();
     // body background propagates to the root (and so sits behind the 3D canvas)
     const body = document.body && document.body._ntBox;
@@ -3073,14 +3058,137 @@ center{text-align:center}
   // -------------------------------------------------------------- driver
   let viewportRoot = null;
   let needStyle = true, needLayout = true, needPaint = true;
-  const styleRoots = new Set();
   let lastSize = '';
-  let siblingRules = true;
   let frameErrors = 0;
-  const timing = { style: 0, layout: 0, paint: 0, frames: 0 };
+  const timing = { style: 0, layout: 0, paint: 0, frames: 0, fullLayouts: 0, partialLayouts: 0, forcedLayouts: 0, staleReads: 0, exactReads: 0, fullRestyles: 0, restyled: 0 };
 
-  function styleElement(el, parentCs) {
+  let styleGeneration = 0;
+  // ---- what can make a change spread (computed from the stylesheets)
+  // Changes restyle only what selectors can reach: the element itself,
+  // its subtree (descendant selectors), following siblings (+ ~), the
+  // subjects of :has() rules, and :hover/:active/:focus chains.
+  const deps = { sibling: false, structural: false, hasKeys: null, hasSubjects: [], interactAncestor: [], interactSibling: false, interact: false };
+  const INTERACT = new Set(['hover', 'active', 'focus', 'focus-within', 'focus-visible']);
+  function analyzeSelectors() {
+    deps.sibling = false; deps.structural = false; deps.interact = false; deps.interactSibling = false;
+    deps.hasKeys = { id: new Set(), cls: new Set(), tag: new Set(), attr: new Set(), any: false };
+    deps.hasSubjects = []; deps.interactAncestor = [];
+    const seenHas = new Set();
+    const visitList = (list, inHas) => { for (const sel of list || []) visitSel(sel, inHas); };
+    const visitSel = (sel, inHas) => {
+      if (!sel || !sel.parts) return;
+      sel.parts.forEach((part, i) => {
+        const c = part.c;
+        if (part.comb === '+' || part.comb === '~') deps.sibling = true;
+        if (inHas) {
+          if (c.id !== null) deps.hasKeys.id.add(c.id);
+          for (const k of c.cls) deps.hasKeys.cls.add(k);
+          if (c.tag) deps.hasKeys.tag.add(c.tag);
+          for (const a of c.attrs) deps.hasKeys.attr.add(a.name);
+          if (c.id === null && !c.cls.length && !c.tag && !c.attrs.length && !c.pcs.length) deps.hasKeys.any = true;
+        }
+        for (const pc of c.pcs) {
+          if (/^(nth-|first-|last-|only-)|^empty$/.test(pc.name)) deps.structural = true;
+          if (INTERACT.has(pc.name)) {
+            deps.interact = true;
+            if (i < sel.parts.length - 1) {
+              deps.interactAncestor.push({ ...c, pcs: c.pcs.filter((x) => !INTERACT.has(x.name)) });
+              const next = sel.parts[i + 1];
+              if (next && (next.comb === '+' || next.comb === '~')) deps.interactSibling = true;
+            }
+          }
+          if (pc.name === 'has') {
+            if (!seenHas.has(sel)) { seenHas.add(sel); deps.hasSubjects.push(sel.parts[sel.parts.length - 1].c); }
+            visitList(pc.list, true);
+          } else if (pc.list) visitList(pc.list, inHas);
+          if (pc.of) visitList(pc.of, inHas);
+        }
+      });
+    };
+    for (const { sheet } of sheets) for (const rule of sheet.rules) visitList(rule.sel, false);
+  }
+  // Elements that a compound can match, found through the cheapest key.
+  function compoundTargets(c, out) {
     const root = document.documentElement;
+    if (!root) return;
+    if (c.id !== null) { const e = document.getElementById(c.id); if (e) out.add(e); return; }
+    if (c.cls.length) { for (const e of document.getElementsByClassName(c.cls[0])) out.add(e); return; }
+    if (c.tag) { for (const e of document.getElementsByTagName(c.tag)) out.add(e); return; }
+    const lists = c.pcs.filter((p) => (p.name === 'is' || p.name === 'where' || p.name === 'matches') && p.list);
+    if (lists.length) { for (const sel of lists[0].list) compoundTargets(sel.parts[sel.parts.length - 1].c, out); return; }
+    out.add(null); // matches anything: caller restyles everything
+  }
+  function subtreeRelevant(el) {
+    if (hasRelevant(el)) return true;
+    for (const c of el.childNodes) if (c.nodeType === 1 && subtreeRelevant(c)) return true;
+    return false;
+  }
+  function hasRelevant(el, attrName, oldClasses) {
+    const k = deps.hasKeys;
+    if (!k || !deps.hasSubjects.length) return false;
+    if (k.any) return true;
+    if (attrName && k.attr.has(attrName)) return true;
+    const id = el.getAttribute && el.getAttribute('id');
+    if (id && k.id.has(id)) return true;
+    if (k.tag.has(el.localName)) return true;
+    for (const c of (el._ntClassSet || classSet(el))) if (k.cls.has(c)) return true;
+    if (oldClasses) for (const c of oldClasses) if (k.cls.has(c)) return true;
+    if (attrName === 'id') return true;
+    return false;
+  }
+
+  // ---- pending work
+  const restyleQueue = new Map(); // element -> 'self' | 'subtree'
+  const layoutDirty = new Set();  // nodes whose layout may have changed
+  const requestRestyle = (el, mode) => {
+    if (!el || el.nodeType !== 1) return;
+    if (restyleQueue.get(el) !== 'subtree') restyleQueue.set(el, mode);
+  };
+  function requestHasRestyle() {
+    const targets = new Set();
+    for (const c of deps.hasSubjects) compoundTargets(c, targets);
+    if (targets.has(null)) { needStyle = true; return; }
+    for (const e of targets) requestRestyle(e, 'self');
+  }
+  function requestSiblings(el, mode) {
+    for (let n = el.nextElementSibling; n; n = n.nextElementSibling) requestRestyle(n, mode);
+  }
+
+  // ---- styling
+  // Properties that change only colours/pixels, never box sizes or positions.
+  const PAINT_ONLY = new Set(['color', 'background-color', 'background-image', 'background-position', 'background-size', 'background-repeat',
+    'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'box-shadow', 'text-shadow', 'opacity',
+    'cursor', 'outline', 'outline-color', 'outline-style', 'outline-width', 'filter', 'backdrop-filter', 'accent-color', 'caret-color',
+    'text-decoration-line', 'text-decoration-color', '-webkit-text-fill-color', 'transition', 'animation', 'will-change', 'pointer-events',
+    'image-rendering', 'mix-blend-mode', 'visibility', 'object-position']);
+  // 'none' | 'paint' | 'layout'
+  function styleDiff(a, b, pa, pb) {
+    if (!a) return 'layout';
+    if (a.__fs !== b.__fs) return 'layout';
+    if ((pa ? JSON.stringify(Object.keys(pa)) : '') !== (pb ? JSON.stringify(Object.keys(pb)) : '')) return 'layout';
+    let kind = 'none';
+    const check = (k) => {
+      if (k === '__custom' || k === '__bases' || k === '__fs') return;
+      if (a[k] === b[k]) return;
+      if (PAINT_ONLY.has(k)) { if (kind === 'none') kind = 'paint'; return; }
+      kind = 'layout';
+    };
+    for (const k in b) { check(k); if (kind === 'layout') return kind; }
+    for (const k in a) if (!(k in b)) { check(k); if (kind === 'layout') return kind; }
+    if (pa || pb) {
+      for (const w of ['before', 'after']) {
+        const x = pa && pa[w], y = pb && pb[w];
+        if (!x || !y) continue;
+        for (const k in y) if (k !== '__custom' && k !== '__bases' && x[k] !== y[k]) return 'layout';
+      }
+    }
+    return kind;
+  }
+  let diffing = false;          // false during a full restyle (everything is laid out anyway)
+  const csRemap = new Map();    // old style object -> new one, for paint-only changes
+  function styleOne(el, parentCs) {
+    const root = document.documentElement;
+    const oldCs = el._ntStyle, oldPseudo = el._ntPseudo;
     const entries = candidates(ruleIndex, el).filter((e) => (!e.media || mediaMatches(e.media)) && matchSelector(el, e.sel));
     const cs = cascade(el, entries, inlineDecls(el), parentCs);
     if (lower(cs['font-weight']) === 'bolder' || lower(cs['font-weight']) === 'lighter') {
@@ -3089,7 +3197,9 @@ center{text-align:center}
     }
     if (el === root) ctx.rootFs = cs.__fs;
     el._ntStyle = cs;
+    el._ntStyledParent = el.parentNode;
     el._ntPseudo = null;
+    timing.restyled++;
     const pc = candidates(pseudoIndex, el);
     if (pc.length) {
       const before = [], after = [];
@@ -3104,29 +3214,92 @@ center{text-align:center}
         if (after.length) el._ntPseudo.after = cascade(el, after, null, cs);
       }
     }
-    for (const c of el.childNodes) if (c.nodeType === 1) styleElement(c, cs);
+    if (diffing) {
+      const kind = styleDiff(oldCs, cs, oldPseudo, el._ntPseudo);
+      if (kind === 'layout') layoutDirty.add(el);
+      else if (kind === 'paint') { csRemap.set(oldCs, cs); needPaint = true; }
+    }
+    return cs;
+  }
+  // What children inherit: inherited properties, custom properties, font size.
+  function inheritSignature(cs) {
+    if (!cs) return '';
+    let sig = String(cs.__fs);
+    for (const p of INHERITED) sig += '|' + (cs[p] ?? '');
+    for (const k in cs.__custom) sig += '|' + k + '=' + cs.__custom[k];
+    return sig;
+  }
+  function styleSubtree(el, parentCs) {
+    const cs = styleOne(el, parentCs);
+    for (const c of el.childNodes) if (c.nodeType === 1) styleSubtree(c, cs);
+  }
+  // Restyles one element; its children follow only if what they inherit changed.
+  function styleSelf(el, parentCs) {
+    const before = inheritSignature(el._ntStyle);
+    const cs = styleOne(el, parentCs);
+    if (inheritSignature(cs) === before) {
+      // children whose parent changed (moved nodes) or never styled
+      for (const c of el.childNodes) if (c.nodeType === 1 && (!c._ntStyle || c._ntStyledParent !== el)) styleSubtree(c, cs);
+      return;
+    }
+    for (const c of el.childNodes) if (c.nodeType === 1) styleSelf(c, cs);
   }
   function fullRestyle() {
     styleGeneration++;
+    timing.fullRestyles++;
     ctx.vw = state.width; ctx.vh = state.height;
     const root = document.documentElement;
-    if (root) styleElement(root, null);
+    if (root) styleSubtree(root, null);
   }
-  function partialRestyle(roots) {
+  const depthOf = (el) => { let d = 0; for (let n = el; n; n = n.parentNode) d++; return d; };
+  function processRestyles() {
+    if (!restyleQueue.size) return;
     styleGeneration++;
-    const list = [...roots].filter((r) => r && r.nodeType === 1 && r.isConnected);
-    // skip roots inside other roots
-    const set = new Set(list);
-    for (const r of list) {
+    const items = [...restyleQueue].filter(([el]) => el.isConnected);
+    restyleQueue.clear();
+    if (items.length > 400) { fullRestyle(); fullLayoutNeeded = true; return; }
+    diffing = true;
+    try { processItems(items); } finally { diffing = false; }
+  }
+  function processItems(items) {
+    items.sort((a, b) => depthOf(a[0]) - depthOf(b[0]));
+    const doneSubtree = new Set();
+    for (const [el, mode] of items) {
       let covered = false;
-      for (let p = r.parentNode; p; p = p.parentNode) if (set.has(p)) { covered = true; break; }
+      for (let p = el.parentNode; p; p = p.parentNode) if (doneSubtree.has(p)) { covered = true; break; }
       if (covered) continue;
-      const parent = r.parentNode;
-      styleElement(r, parent && parent.nodeType === 1 ? parent._ntStyle || null : null);
+      const parent = el.parentNode;
+      const pcs = parent && parent.nodeType === 1 ? parent._ntStyle || null : null;
+      if (parent && parent.nodeType === 1 && !parent._ntStyle) { needStyle = true; return; }
+      if (mode === 'subtree') { styleSubtree(el, pcs); doneSubtree.add(el); } else styleSelf(el, pcs);
     }
   }
+  function ensureStyle() {
+    if (!document.documentElement) return;
+    const size = `${state.width}x${state.height}`;
+    if (size !== lastSize) { lastSize = size; needStyle = true; }
+    if (sheetsDirty) { sheetsDirty = false; if (collectSheets()) { needStyle = true; analyzeSelectors(); } }
+    const t0 = now();
+    if (needStyle) { restyleQueue.clear(); fullRestyle(); needStyle = false; needLayout = true; layoutDirty.clear(); fullLayoutNeeded = true; }
+    else if (restyleQueue.size) processRestyles();
+    if (needStyle) { fullRestyle(); needStyle = false; fullLayoutNeeded = true; }
+    timing.style += now() - t0;
+  }
+
+  // Stylesheets are re-collected only when <style>/<link> nodes change.
+  let sheetsDirty = true;
+  const isSheetNode = (n) => n && n.nodeType === 1 && (n.localName === 'style' || n.localName === 'link');
+  function touchesSheets(node) {
+    if (isSheetNode(node)) return true;
+    for (const c of node.childNodes || []) if (isSheetNode(c)) return true;
+    return node.localName === 'head';
+  }
+
+  // ---- layout: whole page, or only the out-of-flow panel that changed
+  let fullLayoutNeeded = true;
   function layoutAll() {
     layoutGen++;
+    timing.fullLayouts++;
     ctx.vw = state.width; ctx.vh = state.height;
     const rootEl = document.documentElement;
     viewportBox = { id: 0, isViewport: true, abs: [], x: 0, y: 0, w: ctx.vw, h: ctx.vh, cs: {}, children: [], _escapes: [] };
@@ -3139,21 +3312,93 @@ center{text-align:center}
     for (const a of viewportBox.abs) layoutAbs(a, viewportBox);
     return root;
   }
+  const isOutOfFlow = (cs) => { const p = lower(cs && cs.position); return p === 'absolute' || p === 'fixed'; };
+  // Nearest absolutely/fixed positioned box whose size cannot move anything
+  // outside it. null = the whole page has to be laid out again.
+  function layoutRootFor(node) {
+    for (let n = node && node.nodeType === 1 ? node : node && node.parentNode; n && n.nodeType === 1; n = n.parentNode) {
+      const b = n._ntBox;
+      if (!b || b._gen !== layoutGen || b.el !== n) continue;
+      if (b.pos !== 'absolute' && b.pos !== 'fixed') continue;
+      const cs = n._ntStyle;
+      if (!cs || !isOutOfFlow(cs) || displayOf(cs, n) === 'none' || lower(cs.position) !== b.pos) return null;
+      if (!b.parent || !b.cbBox) return null;
+      if (b.cbBox !== viewportBox && b.cbBox.clips) continue; // would change the container's scroll range
+      return b;
+    }
+    return null;
+  }
+  function retag(b, skip, oldGen) {
+    if (!b || b === skip || b.isText || b.isBr) return;
+    if (b._gen === oldGen) b._gen = layoutGen;
+    for (const c of b.children) {
+      if (c.isText) { if (c.anon && !b.anonText) retag(c.anon, skip, oldGen); continue; }
+      retag(c, skip, oldGen);
+    }
+  }
+  function relayoutPartial(roots) {
+    // nested roots: keep only the outermost
+    const list = [...roots].filter((r) => ![...roots].some((o) => o !== r && isAncestorBox(o, r)));
+    const oldGen = layoutGen;
+    const replaced = [];
+    for (const oldB of list) {
+      const parent = oldB.parent;
+      const idx = parent.children.indexOf(oldB);
+      if (idx < 0) return false;
+      const nb = buildBoxes(oldB.el, parent);
+      if (!nb || nb.pos !== oldB.pos) return false;
+      replaced.push({ oldB, nb, parent, idx });
+    }
+    layoutGen++;
+    for (const r of replaced) r.parent.children[r.idx] = r.nb;
+    retag(viewportRoot, null, oldGen);
+    for (const { oldB, nb } of replaced) {
+      // boxes of the old subtree were retagged through the parent: drop them
+      const cb = oldB.cbBox;
+      const ai = cb.abs.indexOf(oldB);
+      if (ai >= 0) cb.abs[ai] = nb; else cb.abs.push(nb);
+      nb.cbBox = cb; nb.staticX = oldB.staticX; nb.staticY = oldB.staticY;
+      layoutAbs(nb, cb);
+      if (nb._escapes && nb._escapes.length) return false; // fixed descendants: lay out everything
+      nb._clipInner = undefined;
+    }
+    timing.partialLayouts++;
+    return true;
+  }
+  const isAncestorBox = (anc, b) => { for (let p = b.parent; p; p = p.parent) if (p === anc) return true; return false; };
+  // Out-of-flow panels that contain every pending change; null when the
+  // change can move things outside them (then the whole page is laid out).
+  function dirtyRoots() {
+    if (fullLayoutNeeded || needLayout || !viewportRoot) return null;
+    const roots = new Set();
+    for (const n of layoutDirty) {
+      if (!n || !n.isConnected) continue;
+      const r = layoutRootFor(n);
+      if (!r) return null;
+      roots.add(r);
+    }
+    return roots;
+  }
+  const contains = (a, b) => { for (let n = b; n; n = n.parentNode) if (n === a) return true; return false; };
+  // Does a pending change touch this element (itself, an ancestor or a descendant)?
+  function touchesDirty(el) {
+    for (const n of layoutDirty) if (n && (contains(n, el) || contains(el, n))) return true;
+    for (const n of restyleQueue.keys()) if (contains(n, el) || contains(el, n)) return true;
+    return false;
+  }
   function ensureLayout() {
     if (!document.documentElement) return false;
-    const size = `${state.width}x${state.height}`;
-    if (size !== lastSize) { lastSize = size; needStyle = true; }
-    if (!needStyle && !styleRoots.size && !needLayout) return false;
-    const t0 = now();
-    if (collectSheets()) needStyle = true;
-    siblingRules = true;
-    if (needStyle || styleRoots.size > 64) fullRestyle();
-    else if (styleRoots.size) partialRestyle(styleRoots);
-    needStyle = false; styleRoots.clear();
+    ensureStyle();
+    if (!needLayout && !fullLayoutNeeded && !layoutDirty.size) return false;
     const t1 = now();
-    layoutAll();
-    const t2 = now();
-    timing.style += t1 - t0; timing.layout += t2 - t1;
+    let done = false;
+    const roots = dirtyRoots();
+    if (roots && roots.size) done = relayoutPartial(roots);
+    else if (roots && !roots.size) done = true;
+    if (!done) layoutAll();
+    layoutDirty.clear();
+    fullLayoutNeeded = false;
+    timing.layout += now() - t1;
     needLayout = false; needPaint = true;
     return true;
   }
@@ -3168,6 +3413,7 @@ center{text-align:center}
     timing.paint += now() - t0;
     return true;
   }
+  const layoutPending = () => needPaint || needStyle || sheetsDirty || restyleQueue.size > 0 || needLayout || layoutDirty.size > 0 || fullLayoutNeeded || lastSize !== `${state.width}x${state.height}`;
 
   // ---- hit testing
   function hitTest(x, y) {
@@ -3198,60 +3444,130 @@ center{text-align:center}
     if (frameErrors <= 3) nt.log('error', `[NativeThreeBridge UI] ${e && e.stack ? e.stack : e}`);
   }
 
+  // Geometry reads (getBoundingClientRect, offsetWidth ...): at most one
+  // layout per frame; later reads in the same frame see that layout, so a
+  // game that writes and reads in a loop does not lay the page out each time.
+  let layoutsThisFrame = 0;
+  function layoutForRead(el) {
+    if (!layoutPending()) return;
+    try { ensureStyle(); } catch (e) { reportFrameError(e); }
+    if (boxOf(el)) {
+      // Changes confined to other panels cannot move this element: its box is exact.
+      const roots = dirtyRoots();
+      if (roots && ![...roots].some((r) => contains(r.el, el))) { timing.exactReads++; return; }
+      // A full layout already ran this frame and nothing near this element changed since.
+      if (layoutsThisFrame > 0 && !touchesDirty(el)) { timing.staleReads++; return; }
+    }
+    layoutsThisFrame++;
+    timing.forcedLayouts++;
+    ensureLayout();
+  }
+  // Inline elements have no box of their own: union of their text lines.
+  function inlineRect(el) {
+    if (!el || !el.isConnected) return null;
+    let holder = null;
+    for (let n = el.parentNode; n && n.nodeType === 1; n = n.parentNode) { holder = boxOf(n); if (holder) break; }
+    if (!holder || !holder.frags) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const f of holder.frags) {
+      if (!f.el || !contains(el, f.el)) continue;
+      x0 = Math.min(x0, f.x); y0 = Math.min(y0, f.y); x1 = Math.max(x1, f.x + f.w); y1 = Math.max(y1, f.y + f.h);
+    }
+    if (x0 === Infinity) return null;
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0, bl: 0, br: 0, bt: 0, bb: 0, pl: 0, pt: 0, pr: 0, pb: 0 };
+  }
+  let reported = { style: 0, layout: 0, paint: 0, forcedLayouts: 0, fullLayouts: 0, partialLayouts: 0 };
+  function reportTiming() {
+    if (typeof nt.reportUi !== 'function') return;
+    const d = (k) => timing[k] - reported[k];
+    if (!d('style') && !d('layout') && !d('paint') && !d('forcedLayouts') && !d('fullLayouts') && !d('partialLayouts')) return;
+    try { nt.reportUi(d('style'), d('layout'), d('paint'), d('forcedLayouts'), d('fullLayouts'), d('partialLayouts')); } catch { /* optional */ }
+    reported = { style: timing.style, layout: timing.layout, paint: timing.paint, forcedLayouts: timing.forcedLayouts, fullLayouts: timing.fullLayouts, partialLayouts: timing.partialLayouts };
+  }
+
   const api = {
     invalidate(kind, node, name) {
       switch (kind) {
-        case 'tree':
-          if (node && node.nodeType === 1 && node.isConnected) { styleRoots.add(node); needLayout = true; }
-          else if (node && node.nodeType === 9) { needStyle = true; needLayout = true; }
+        case 'tree': {
+          if (node && node.nodeType === 9) { needStyle = true; sheetsDirty = true; break; }
+          if (!node || node.nodeType !== 1 || !node.isConnected) break;
+          if (touchesSheets(node)) sheetsDirty = true;
+          requestRestyle(node, 'self'); // :empty
+          for (const c of node.childNodes) {
+            if (c.nodeType !== 1) continue;
+            if (!c._ntStyle || c._ntStyledParent !== node) requestRestyle(c, 'subtree');
+            else if (deps.structural) requestRestyle(c, 'self');
+          }
+          if (deps.sibling) for (const c of node.childNodes) if (c.nodeType === 1) requestRestyle(c, 'subtree');
+          // name = the inserted/removed child (null: textContent/innerHTML replaced everything)
+          if (deps.hasSubjects.length) {
+            const child = name && name.nodeType === 1 ? name : null;
+            const relevant = deps.hasKeys.any || (child ? subtreeRelevant(child) : name === null && node.childNodes.some((c) => c.nodeType === 1 && subtreeRelevant(c)));
+            if (relevant) requestHasRestyle();
+          }
+          layoutDirty.add(node);
           break;
-        case 'text': if (!node || node.isConnected) needLayout = true; break;
+        }
+        case 'text':
+          if (node && node.isConnected) {
+            if (isSheetNode(node.parentNode)) sheetsDirty = true;
+            layoutDirty.add(node.parentNode || node);
+          }
+          break;
         case 'attr':
           if (node && node.isConnected) {
+            if (isSheetNode(node)) sheetsDirty = true;
+            const oldClasses = name === 'class' ? node._ntClassSet : null;
             if (name === 'class') node._ntClassSet = null;
-            const p = node.parentNode;
-            styleRoots.add(siblingRules && p && p.nodeType === 1 && name !== 'style' ? p : node);
-            needLayout = true;
+            // descendant selectors can depend on any attribute of an ancestor
+            requestRestyle(node, name === 'style' ? 'self' : 'subtree');
+            if (deps.sibling && name !== 'style') requestSiblings(node, 'subtree');
+            if (name !== 'style' && hasRelevant(node, name, oldClasses)) requestHasRestyle();
+            // attributes that change content size without changing style
+            if (!/^(class|style|id|title|tabindex|role)$|^(data|aria)-/.test(name || '')) layoutDirty.add(node);
           } else if (node && name === 'class') node._ntClassSet = null;
           break;
-        case 'style': if (node && node.isConnected) { styleRoots.add(node); needLayout = true; } break;
-        case 'layout': needLayout = true; break;
-        default: needStyle = true; needLayout = true;
+        case 'style': if (node && node.isConnected) requestRestyle(node, 'self'); break;
+        case 'layout': if (node && node.nodeType === 1) layoutDirty.add(node); else needLayout = true; break;
+        default: needStyle = true; sheetsDirty = true;
       }
     },
     frame() {
+      layoutsThisFrame = 0;
       // Adaptive rate: when restyle/layout gets expensive (DOM changing every
       // frame), the overlay refreshes less often instead of costing FPS.
       // Input hit tests still force an up-to-date layout.
       const t = now();
-      if (t - lastFrameUpdate < minInterval && (needLayout || styleRoots.size || needStyle)) return;
+      if (t - lastFrameUpdate < minInterval && layoutPending()) { reportTiming(); return; }
       try {
         const t0 = now();
-        const changed = needLayout || styleRoots.size > 0 || needStyle || needPaint;
+        const changed = layoutPending() || needPaint;
         ensurePaint();
         if (changed) {
           const cost = now() - t0;
           minInterval = cost < 4 ? 0 : Math.min(100, cost * 2);
           lastFrameUpdate = t;
         }
-        if (lastSubmittedGen !== layoutGen || needSubmit) {
+        if (lastSubmittedGen !== paintGen || needSubmit) {
           const { floats, joined } = encode();
           submit(floats, joined);
-          lastSubmittedGen = layoutGen; needSubmit = false;
+          lastSubmittedGen = paintGen; needSubmit = false;
         }
         timing.frames++;
       } catch (e) { reportFrameError(e); }
+      reportTiming();
     },
     hitTest,
     // Border box of an element in window px, or null when it has no box.
     rect(el) {
-      try { ensureLayout(); } catch (e) { reportFrameError(e); }
+      try { layoutForRead(el); } catch (e) { reportFrameError(e); }
       const b = boxOf(el);
-      if (!b) return null;
+      if (!b) return inlineRect(el);
       return { x: b.x, y: b.y, w: b.w, h: b.h, bl: b.bl, br: b.br, bt: b.bt, bb: b.bb, scrollW: b.scrollW, scrollH: b.scrollH, pl: b.pl, pt: b.pt, pr: b.pr, pb: b.pb };
     },
+    // getComputedStyle needs styles only, never a layout.
     computed(el) {
-      try { ensureLayout(); } catch (e) { reportFrameError(e); }
+      try { ensureStyle(); } catch (e) { reportFrameError(e); }
       return el && el._ntStyle ? el._ntStyle : null;
     },
     matchMedia: mediaMatches,
@@ -3261,7 +3577,7 @@ center{text-align:center}
       if (interact.hover === el) return;
       const old = interact.hover;
       interact.hover = el;
-      if (hoverRules) markInteraction(old, el);
+      if (deps.interact) markInteraction(old, el);
       const cursor = el ? api.cursorAt(el) : 'auto';
       if (cursor !== lastCursor && typeof nt.setCursor === 'function') {
         lastCursor = cursor;
@@ -3272,9 +3588,9 @@ center{text-align:center}
       if (interact.active === el) return;
       const old = interact.active;
       interact.active = el;
-      if (hoverRules) markInteraction(old, el);
+      if (deps.interact) markInteraction(old, el);
     },
-    focusChanged(oldEl, newEl) { if (hoverRules) markInteraction(oldEl, newEl); },
+    focusChanged(oldEl, newEl) { if (deps.interact) markInteraction(oldEl, newEl); },
     // Default action of a wheel event: scrolls the nearest scrollable box.
     wheel(target, dx, dy) {
       const b = scrollableAncestor(target);
@@ -3285,7 +3601,7 @@ center{text-align:center}
       const nx = clamp((el._ntScrollLeft || 0) + dx, 0, Math.max(0, b.scrollW - pbw));
       if (ny === (el._ntScrollTop || 0) && nx === (el._ntScrollLeft || 0)) return null;
       el._ntScrollTop = ny; el._ntScrollLeft = nx;
-      needLayout = true;
+      layoutDirty.add(el);
       return el;
     },
     cursorAt(el) {
@@ -3301,20 +3617,25 @@ center{text-align:center}
       return { boxes: boxSeq, prims: prims.length, visible: prims.filter((p, i) => !(i < holeAt && coveredByCanvas(p.d[1], p.d[2], p.d[3], p.d[4]))).length, hits: hits.length, submitted, sheets: sheets.length, rules: sheets.reduce((s, x) => s + x.sheet.rules.length, 0), timing: { ...timing }, hole: holeAt >= 0 };
     },
     // test hooks
-    _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList },
+    _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList, deps },
   };
   let lastSubmittedGen = -1, needSubmit = false;
   let lastFrameUpdate = -1e9, minInterval = 0, lastCursor = 'auto';
-  // Restyle the topmost element that entered or left the hover/active chain.
+  // Hover/active/focus moved from a to b: restyle only the elements that
+  // entered or left the chain (their subtree only when a selector such as
+  // `.card:hover .title` reaches into it).
   function markInteraction(a, b) {
     const chainA = [], chainB = [];
-    for (let n = a; n && n.nodeType === 1; n = n.parentNode) chainA.unshift(n);
-    for (let n = b; n && n.nodeType === 1; n = n.parentNode) chainB.unshift(n);
-    let i = 0;
-    while (i < chainA.length && i < chainB.length && chainA[i] === chainB[i]) i++;
-    const roots = [chainA[i], chainB[i]].filter(Boolean);
-    for (const r of roots) { const p = r.parentNode; styleRoots.add(siblingRules && p && p.nodeType === 1 ? p : r); }
-    if (roots.length) needLayout = true;
+    for (let n = a; n && n.nodeType === 1; n = n.parentNode) chainA.push(n);
+    for (let n = b; n && n.nodeType === 1; n = n.parentNode) chainB.push(n);
+    const inA = new Set(chainA), inB = new Set(chainB);
+    const changed = [...chainA.filter((n) => !inB.has(n)), ...chainB.filter((n) => !inA.has(n))];
+    for (const el of changed) {
+      if (!el.isConnected) continue;
+      const reachesDown = deps.interactAncestor.some((c) => matchCompound(el, c));
+      requestRestyle(el, reachesDown ? 'subtree' : 'self');
+      if (deps.interactSibling) requestSiblings(el, 'subtree');
+    }
   }
   host.ui = api;
 })(globalThis);

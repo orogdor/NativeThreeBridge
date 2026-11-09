@@ -37,6 +37,10 @@ public:
     virtual void submitUi(const float* data, std::size_t floats, const std::string& strings) {
         (void)data; (void)floats; (void)strings;
     }
+    // UI layer timings since the last call (ms) and layout counts.
+    virtual void reportUi(double styleMs, double layoutMs, double paintMs, int forced, int full, int partial) {
+        (void)styleMs; (void)layoutMs; (void)paintMs; (void)forced; (void)full; (void)partial;
+    }
     // CSS cursor name under the pointer ("pointer", "text", "auto" ...).
     virtual void setCursor(const std::string& cursor) { (void)cursor; }
     // Width in px of `text` in the first installed family of the comma

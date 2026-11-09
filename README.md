@@ -1,3 +1,19 @@
+# NativeThreeBridge v0.31.1 — faster HTML/CSS UI updates
+
+v0.31.0 re-styled and re-laid out the whole page for every small change, which cost Kuningriigid most of its frame rate. v0.31.1 keeps the result identical but does only the work a change needs (measured on Kuningriigid's real HTML and 39 stylesheets):
+
+| Change | v0.31.0 | v0.31.1 |
+|---|---|---|
+| Text in a HUD panel (e.g. turn counter) | ~12–26 ms | ~4.5 ms |
+| Mouse over a button (`:hover`) | ~55 ms | ~5 ms (repaint only when only colours change) |
+| Class change on a HUD element | ~55 ms | ~0.6 ms |
+| Write + `getBoundingClientRect()` ×10 in one frame | ~190 ms | ~13 ms |
+
+- **Selective restyle.** A change restyles only what selectors can reach: the element, its subtree (descendant selectors), following siblings only if the CSS uses `+`/`~`, the subjects of `:has()` rules only when the changed element is named in a `:has()` argument, and for `:hover`/`:active`/`:focus` only the elements entering or leaving the chain. Children are re-cascaded only when what they inherit changed.
+- **Partial layout.** A change inside an absolutely/fixed positioned panel (HUD bars, menus, dialogs) lays out only that panel; colour-only changes skip layout entirely.
+- **Exact geometry reads without layout thrashing.** `getBoundingClientRect()`/`offsetWidth` of an element outside the changed panel is answered from the current layout; `getComputedStyle()` never triggers layout. Inline elements (`<b>`, `<span>` in text) now report the rectangle of their text.
+- **Frame timings for webapps:** `NativeThreeBridge-webapp-frames.csv` beside the EXE, one row per second (FPS, JS, UI style/layout/paint, full vs partial layouts, raster, render, GPU wait, draws).
+
 # NativeThreeBridge v0.31.0 — the game's HTML/CSS UI drawn by the engine
 
 Webapp games (Game2, e.g. Kuningriigid) keep their menus, HUD, buttons, panels and images in HTML and CSS. Until now that DOM existed only inside the JavaScript shim and nothing of it reached the screen. **v0.31.0 adds an HTML/CSS UI layer**: the engine reads the game's stylesheets, lays the page out and draws it natively on top of the 3D scene. There is still no browser, WebView or Chromium.
