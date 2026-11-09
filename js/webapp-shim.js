@@ -2322,14 +2322,23 @@
     frame(timeMs) {
       state.now = timeMs;
       state.frame++;
+      const t0 = performance.now();
       runTimers();
+      const tTimers = performance.now();
       const callbacks = rafCallbacks;
       rafCallbacks = new Map();
       for (const cb of callbacks.values()) {
         try { cb(timeMs); } catch (e) { reportError('requestAnimationFrame', e); }
       }
+      const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
+      const tCanvas = performance.now();
       if (uiLayer) uiLayer.frame();
+      const tUi = performance.now();
+      if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
+        state.lastSlowFrameReport = timeMs;
+        nt.log('warn', `[js-perf] ${(tUi - t0).toFixed(1)} ms; timers ${(tTimers - t0).toFixed(1)} ms; rAF ${(tRaf - tTimers).toFixed(1)} ms; canvas ${(tCanvas - tRaf).toFixed(1)} ms; UI ${(tUi - tCanvas).toFixed(1)} ms`);
+      }
     },
     key(down, key, code, repeat, alt, ctrl, shift, meta) {
       modifiers = { altKey: !!alt, ctrlKey: !!ctrl, shiftKey: !!shift, metaKey: !!meta };
