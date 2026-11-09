@@ -62,6 +62,16 @@ const floor = new THREE.Mesh(new THREE.PlaneGeometry(4, 4), new THREE.MeshLamber
 floor.position.y = -2;
 scene.add(floor);
 
+// 4a) ShaderMaterial with one direct texture sampler and unchanged UVs.
+const shaderTextured = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+  uniforms: { uSurface: { value: glbMap } },
+  vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: 'uniform sampler2D uSurface; varying vec2 vUv; void main() { gl_FragColor = texture2D(uSurface, vUv); }',
+}));
+shaderTextured.name = 'shaderTextured';
+shaderTextured.position.set(0, 1, 0);
+scene.add(shaderTextured);
+
 // 5) onBeforeCompile sea: the patch writes diffuseColor from two colour uniforms
 const sea = new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, depthWrite: false, roughness: 0.14 });
 sea.onBeforeCompile = (shader) => {
