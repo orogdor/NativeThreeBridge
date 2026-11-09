@@ -21,6 +21,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <iterator>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -115,6 +116,7 @@ struct WebappUiRenderer::Impl {
     ComPtr<ID2D1Layer> layer;
     unsigned w = 0, h = 0;
     std::vector<std::uint8_t> pixels;
+    WebappUiRenderer::PixelRegion pixelRegion{};
     unsigned stride = 0;
 
     struct Image {
@@ -1007,36 +1009,52 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
         s.w = width;
         s.h = height;
     }
-    s.dirty = false;
-    s.fullRedraw = false;
+    // Align the raster clip and CPU/GPU copy to the same integer pixels.
+    WICRect rect{0, 0, INT(width), INT(height)};
+    if (!full && s.dirtyRect[2] > 0 && s.dirtyRect[3] > 0) {
+        const auto edge = [](float value, unsigned limit) {
+            return INT(std::clamp(value, 0.0f, float(limit)));
+        };
+        if (std::all_of(std::begin(s.dirtyRect), std::end(s.dirtyRect), [](float v) { return std::isfinite(v); })) {
+            const INT left = edge(std::floor(s.dirtyRect[0]), width);
+            const INT top = edge(std::floor(s.dirtyRect[1]), height);
+            const INT right = edge(std::ceil(s.dirtyRect[0] + s.dirtyRect[2]), width);
+            const INT bottom = edge(std::ceil(s.dirtyRect[1] + s.dirtyRect[3]), height);
+            if (right > left && bottom > top) rect = {left, top, right - left, bottom - top};
+        }
+    }
+    const bool partial = rect.X || rect.Y || rect.Width != INT(width) || rect.Height != INT(height);
     s.rt->BeginDraw();
     s.rt->SetTransform(D2D1::IdentityMatrix());
     s.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     s.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    // Partial redraw: only the changed rectangle is cleared and re-drawn.
-    const bool partial = !full && s.dirtyRect[2] > 0 && s.dirtyRect[3] > 0;
     if (partial) {
-        s.rt->PushAxisAlignedClip(D2D1::RectF(s.dirtyRect[0], s.dirtyRect[1], s.dirtyRect[0] + s.dirtyRect[2], s.dirtyRect[1] + s.dirtyRect[3]),
+        s.rt->PushAxisAlignedClip(D2D1::RectF(float(rect.X), float(rect.Y), float(rect.X + rect.Width), float(rect.Y + rect.Height)),
                                   D2D1_ANTIALIAS_MODE_ALIASED);
     }
     s.rt->Clear(D2D1::ColorF(0, 0, 0, 0));
     s.clip = Impl::Clip::None;
     s.execute();
     if (partial) s.rt->PopAxisAlignedClip();
-    if (partial) s.partialRenders++;
     const HRESULT hr = s.rt->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) { s.rt.Reset(); s.dirty = true; return false; }
+    // Leave a full retry pending until pixels have been captured successfully.
+    s.dirty = s.fullRedraw = true;
+    if (hr == D2DERR_RECREATE_TARGET) s.rt.Reset();
     if (FAILED(hr)) return false;
     ComPtr<IWICBitmapLock> lock;
-    const WICRect rect{0, 0, INT(width), INT(height)};
     if (FAILED(s.target->Lock(&rect, WICBitmapLockRead, &lock))) return false;
     UINT stride = 0, bytes = 0;
     BYTE* data = nullptr;
-    lock->GetStride(&stride);
-    lock->GetDataPointer(&bytes, &data);
-    if (!data) return false;
-    s.stride = stride;
-    s.pixels.assign(data, data + std::size_t(stride) * height);
+    if (FAILED(lock->GetStride(&stride)) || FAILED(lock->GetDataPointer(&bytes, &data)) || !data) return false;
+    const unsigned rowBytes = unsigned(rect.Width) * 4;
+    if (stride < rowBytes || std::size_t(rect.Height - 1) * stride + rowBytes > bytes) return false;
+    s.stride = rowBytes;
+    s.pixels.resize(std::size_t(rowBytes) * rect.Height);
+    for (INT row = 0; row < rect.Height; ++row)
+        std::memcpy(s.pixels.data() + std::size_t(row) * rowBytes, data + std::size_t(row) * stride, rowBytes);
+    s.pixelRegion = {unsigned(rect.X), unsigned(rect.Y), unsigned(rect.Width), unsigned(rect.Height)};
+    s.dirty = s.fullRedraw = false;
+    if (partial) s.partialRenders++;
     s.lastMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     s.renders++;
     if (s.firstMs < 0) s.firstMs = s.lastMs;
@@ -1069,6 +1087,7 @@ void WebappUiRenderer::registerImage(const std::string& key, const std::uint8_t*
 }
 
 const std::uint8_t* WebappUiRenderer::pixels() const { return impl_->pixels.empty() ? nullptr : impl_->pixels.data(); }
+WebappUiRenderer::PixelRegion WebappUiRenderer::pixelRegion() const { return impl_->pixelRegion; }
 unsigned WebappUiRenderer::stride() const { return impl_->stride; }
 unsigned WebappUiRenderer::width() const { return impl_->w; }
 unsigned WebappUiRenderer::height() const { return impl_->h; }

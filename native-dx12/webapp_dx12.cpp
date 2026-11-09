@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <share.h>
 #include <fstream>
 #include <map>
 #include <regex>
@@ -47,7 +48,8 @@ constexpr UINT kFrameCount = 2;
 constexpr UINT kVertexFloats = 12;                    // position, normal, colour rgba, uv
 constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
-constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
+constexpr UINT kInstanceFloats = 19;
+constexpr UINT kInstanceStride = kInstanceFloats * sizeof(float); // 4x4 matrix + colour
 constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
@@ -89,12 +91,18 @@ struct Geometry {
     UINT vertexCount = 0, indexCount = 0;
 };
 struct InstanceSet {
-    std::vector<float> cpu;   // count * 19 floats
+    std::vector<float> cpu;
+    std::vector<UINT64> changed; // last change for each instance
     UINT count = 0;
     UINT64 version = 0;
     ComPtr<ID3D12Resource> gpu[kFrameCount];
     UINT capacity[kFrameCount] = {};
     UINT64 uploaded[kFrameCount] = {};
+};
+struct PendingBufferCopy {
+    ComPtr<ID3D12Resource> buffer, staging;
+    UINT64 bytes;
+    D3D12_RESOURCE_STATES finalState;
 };
 struct Retired {
     ComPtr<ID3D12Resource> resource;
@@ -163,7 +171,7 @@ public:
     void releaseTexture(std::uint32_t id) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
-    void releaseInstances(std::uint32_t id) override { instances_.erase(id); }
+    void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
         pendingPasses_.emplace_back(data, data + floats);
@@ -222,6 +230,9 @@ private:
     void resize(UINT width, UINT height);
     void waitForGpu();
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
+    ComPtr<ID3D12Resource> geometryBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state);
+    void recordGeometryCopies();
+    void updateInstanceBuffer(InstanceSet& set, UINT frame);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
@@ -274,6 +285,7 @@ private:
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<PendingBufferCopy> pendingGeometry_;
     std::vector<UINT> freeSlots_;
     std::vector<RetiredSlot> retiredSlots_;
     ComPtr<ID3D12DescriptorHeap> texHeap_;
@@ -292,6 +304,7 @@ private:
         double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
         int forced = 0, full = 0, partial = 0, rasters = 0;
+        UINT64 uiBytes = 0, geometryBytes = 0, instanceBytes = 0;
     } perf_;
     std::FILE* perfCsv_ = nullptr;
     std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
@@ -767,8 +780,9 @@ void WebappWindow::uploadUi(UINT frame) {
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         cmd_->ResourceBarrier(1, &barrier);
     }
-    const UINT pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    const UINT64 bytes = UINT64(pitch) * h;
+    const auto region = ui_.pixelRegion();
+    const UINT pitch = (region.width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 bytes = UINT64(pitch) * region.height;
     if (uiStagingBytes_[frame] < bytes || !uiStaging_[frame]) {
         retire(uiStaging_[frame]);
         uiStaging_[frame] = uploadBuffer(nullptr, bytes);
@@ -778,7 +792,7 @@ void WebappWindow::uploadUi(UINT frame) {
     D3D12_RANGE none{0, 0};
     check(uiStaging_[frame]->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map UI staging buffer");
     const UINT srcStride = ui_.stride();
-    for (UINT y = 0; y < h; y++) std::memcpy(mapped + std::size_t(y) * pitch, px + std::size_t(y) * srcStride, std::size_t(w) * 4);
+    for (UINT y = 0; y < region.height; y++) std::memcpy(mapped + std::size_t(y) * pitch, px + std::size_t(y) * srcStride, std::size_t(region.width) * 4);
     uiStaging_[frame]->Unmap(0, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
     dst.pResource = uiTexture_.Get();
@@ -788,11 +802,12 @@ void WebappWindow::uploadUi(UINT frame) {
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Offset = 0;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = w;
-    src.PlacedFootprint.Footprint.Height = h;
+    src.PlacedFootprint.Footprint.Width = region.width;
+    src.PlacedFootprint.Footprint.Height = region.height;
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = pitch;
-    cmd_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    cmd_->CopyTextureRegion(&dst, region.x, region.y, 0, &src, nullptr);
+    perf_.uiBytes += UINT64(region.width) * region.height * 4;
     barrier.Transition.pResource = uiTexture_.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -895,6 +910,36 @@ ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes
     return buffer;
 }
 
+ComPtr<ID3D12Resource> WebappWindow::geometryBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state) {
+    if (!bytes) return uploadBuffer(nullptr, 0);
+    ComPtr<ID3D12Resource> buffer;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = bufferDesc(bytes);
+    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                           nullptr, IID_PPV_ARGS(&buffer)), "Geometry buffer");
+    pendingGeometry_.push_back({buffer, uploadBuffer(data, bytes), bytes, state});
+    return buffer;
+}
+
+void WebappWindow::recordGeometryCopies() {
+    if (pendingGeometry_.empty()) return;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(pendingGeometry_.size());
+    for (auto& copy : pendingGeometry_) {
+        cmd_->CopyBufferRegion(copy.buffer.Get(), 0, copy.staging.Get(), 0, copy.bytes);
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {copy.buffer.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, copy.finalState};
+        barriers.push_back(barrier);
+        perf_.geometryBytes += copy.bytes;
+        retire(copy.staging);
+        retire(copy.buffer);
+    }
+    cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+    pendingGeometry_.clear();
+}
+
 void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
     if (resource) retired_.push_back({resource, fenceValue_ + kFrameCount});
     resource.Reset();
@@ -928,12 +973,12 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
     retire(g.indices);
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
-    g.vertices = uploadBuffer(interleaved.data(), interleaved.size() * sizeof(float));
+    g.vertices = geometryBuffer(interleaved.data(), interleaved.size() * sizeof(float), D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
     g.vbv.SizeInBytes = UINT(interleaved.size() * sizeof(float));
     g.vbv.StrideInBytes = kVertexStride;
     if (idx && indexCount) {
-        g.indices = uploadBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t));
+        g.indices = geometryBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t), D3D12_RESOURCE_STATE_INDEX_BUFFER);
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);
         g.ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -950,16 +995,60 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
     InstanceSet& set = instances_[id];
+    const UINT oldCount = set.count;
     set.count = count;
-    set.cpu.resize(size_t(count) * 19);
-    for (std::uint32_t i = 0; i < count; i++) {
-        float* o = &set.cpu[size_t(i) * 19];
-        std::memcpy(o, m + size_t(i) * 16, 16 * sizeof(float));
-        o[16] = c ? c[i * 3] : 1;
-        o[17] = c ? c[i * 3 + 1] : 1;
-        o[18] = c ? c[i * 3 + 2] : 1;
+    set.cpu.resize(size_t(count) * kInstanceFloats);
+    set.changed.resize(count);
+    const UINT64 revision = set.version + 1;
+    constexpr float white[] = {1, 1, 1};
+    for (UINT i = 0; i < count; ++i) {
+        float* out = &set.cpu[size_t(i) * kInstanceFloats];
+        const float* matrix = m + size_t(i) * 16;
+        const float* color = c ? c + size_t(i) * 3 : white;
+        if (i < oldCount && std::memcmp(out, matrix, 16 * sizeof(float)) == 0 &&
+            std::memcmp(out + 16, color, sizeof(white)) == 0) continue;
+        std::memcpy(out, matrix, 16 * sizeof(float));
+        std::memcpy(out + 16, color, sizeof(white));
+        set.changed[i] = revision;
+        set.version = revision;
     }
-    set.version++;
+}
+
+void WebappWindow::releaseInstances(std::uint32_t id) {
+    auto it = instances_.find(id);
+    if (it == instances_.end()) return;
+    for (auto& buffer : it->second.gpu) retire(buffer);
+    instances_.erase(it);
+}
+
+void WebappWindow::updateInstanceBuffer(InstanceSet& set, UINT frame) {
+    const bool full = !set.gpu[frame] || set.capacity[frame] < set.count;
+    const UINT64 uploaded = set.uploaded[frame];
+    if (!full && uploaded == set.version) return;
+    if (full) {
+        retire(set.gpu[frame]);
+        set.capacity[frame] = set.count;
+        set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.count) * kInstanceStride);
+    }
+    std::uint8_t* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    check(set.gpu[frame]->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map instances");
+    UINT firstWrite = set.count, endWrite = 0;
+    for (UINT first = 0; first < set.count;) {
+        if (!full && set.changed[first] <= uploaded) { ++first; continue; }
+        UINT end = full ? set.count : first + 1;
+        while (end < set.count && set.changed[end] > uploaded) ++end;
+        const auto offset = size_t(first) * kInstanceStride;
+        const auto bytes = size_t(end - first) * kInstanceStride;
+        std::memcpy(mapped + offset, set.cpu.data() + size_t(first) * kInstanceFloats, bytes);
+        perf_.instanceBytes += bytes;
+        firstWrite = std::min(firstWrite, first);
+        endWrite = end;
+        first = end;
+    }
+    const D3D12_RANGE written{size_t(endWrite ? firstWrite : 0) * kInstanceStride, size_t(endWrite) * kInstanceStride};
+    set.gpu[frame]->Unmap(0, &written);
+    set.uploaded[frame] = set.version;
 }
 
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
@@ -1083,6 +1172,7 @@ void WebappWindow::renderFrame() {
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
     recordTextureCopies();
+    recordGeometryCopies();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = targets_[frame].Get();
@@ -1144,24 +1234,16 @@ void WebappWindow::renderFrame() {
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
+            UINT firstInstance = 0;
             D3D12_VERTEX_BUFFER_VIEW views[2] = {g->second.vbv, identityView_};
             if (d[1] > 0) {
                 auto it = instances_.find(std::uint32_t(d[1]));
                 if (it == instances_.end() || it->second.count == 0) continue;
                 InstanceSet& set = it->second;
-                instanceCount = std::min(instanceCount, set.count);
-                if (set.uploaded[frame] != set.version || !set.gpu[frame]) {
-                    if (set.capacity[frame] < set.count || !set.gpu[frame]) {
-                        retire(set.gpu[frame]);
-                        set.capacity[frame] = set.count;
-                        set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.count) * kInstanceStride);
-                    }
-                    void* mapped = nullptr;
-                    check(set.gpu[frame]->Map(0, &none, &mapped), "Map instances");
-                    std::memcpy(mapped, set.cpu.data(), set.cpu.size() * sizeof(float));
-                    set.gpu[frame]->Unmap(0, nullptr);
-                    set.uploaded[frame] = set.version;
-                }
+                if (!(d[53] >= 0 && d[53] < float(set.count))) continue;
+                firstInstance = UINT(d[53]);
+                instanceCount = std::min(instanceCount, set.count - firstInstance);
+                updateInstanceBuffer(set, frame);
                 views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
                 views[1].SizeInBytes = set.count * kInstanceStride;
                 views[1].StrideInBytes = kInstanceStride;
@@ -1194,11 +1276,11 @@ void WebappWindow::renderFrame() {
                 const UINT n = std::min(count, g->second.indexCount > start ? g->second.indexCount - start : 0u);
                 if (!n) continue;
                 cmd_->IASetIndexBuffer(&g->second.ibv);
-                cmd_->DrawIndexedInstanced(n, instanceCount, start, 0, 0);
+                cmd_->DrawIndexedInstanced(n, instanceCount, start, 0, firstInstance);
             } else {
                 const UINT n = std::min(count, g->second.vertexCount > start ? g->second.vertexCount - start : 0u);
                 if (!n) continue;
-                cmd_->DrawInstanced(n, instanceCount, start, 0);
+                cmd_->DrawInstanced(n, instanceCount, start, firstInstance);
             }
             drawsThisFrame++;
         }
@@ -1334,9 +1416,10 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%llu,%llu,%llu\n",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
-                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_);
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_,
+                     p.uiBytes, p.geometryBytes, p.instanceBytes);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1349,10 +1432,10 @@ int WebappWindow::run(HINSTANCE instance) {
     _wfopen_s(&log_, logPath.c_str(), L"wb");
     gCrashLog = log_;
     const std::filesystem::path perfPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-frames.csv";
-    _wfopen_s(&perfCsv_, perfPath.c_str(), L"wb");
+    perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,ui_upload_bytes,geometry_upload_bytes,instance_upload_bytes\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
