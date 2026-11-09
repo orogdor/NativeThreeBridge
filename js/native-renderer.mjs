@@ -339,7 +339,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     _patchInfo(m) {
       let info = this._patches.get(m);
       if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
-      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null };
+      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false };
       this._patches.set(m, info);
       const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
       const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
@@ -352,6 +352,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (added.length && /diffuseColor\.rgb\s*=/.test(shader.fragmentShader)) info.colors = colorWeights(added, shader.fragmentShader);
         const a = /diffuseColor\.a\s*=\s*([0-9]*\.?[0-9]+)/.exec(shader.fragmentShader);
         if (a) info.alpha = parseFloat(a[1]);
+        // Alpha cut out by a texture of the patch's own (fog-of-war masks, reveal effects):
+        // drawing the surface whole would cover the scene, so it is left out.
+        const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
+        if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
       } catch (e) { warnOnce(`patch-${m.uuid}`, `material.onBeforeCompile could not be inspected: ${e && e.message || e}`); }
       return info;
     }
@@ -591,6 +595,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) {
         const patch = this._patchInfo(m);
+        if (patch.hide) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
         if (patch.colors) {
           color = mixColors(_color, patch.colors);
           flags &= ~(DrawFlags.VERTEX_COLORS | DrawFlags.INSTANCE_COLORS);

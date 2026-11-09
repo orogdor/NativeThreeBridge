@@ -76,6 +76,18 @@ water.rotation.x = -Math.PI / 2;
 water.position.y = -1;
 scene.add(water);
 
+// 5b) fog-of-war parchment: alpha cut out by its own 'seen' texture (cannot run here: left out)
+const seen = new THREE.DataTexture(new Uint8Array(16), 4, 4, THREE.RedFormat);
+seen.needsUpdate = true;
+const fogMat = new THREE.MeshBasicMaterial({ color: 0xd7c195, transparent: true, depthTest: false });
+fogMat.onBeforeCompile = (shader) => {
+  shader.uniforms.uSeen = { value: seen };
+  shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', '#include <map_fragment>\n diffuseColor.a *= 1.0 - texture2D(uSeen, vec2(0.5)).r;');
+};
+const fog = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), fogMat);
+fog.name = 'fog';
+scene.add(fog);
+
 // 6) gradient sky dome (custom GLSL)
 const sky = new THREE.Mesh(new THREE.SphereGeometry(50, 16, 8), new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false,

@@ -87,6 +87,7 @@ test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { ski
   assert.ok(!(sea.flags & DrawFlags.VERTEX_COLORS));
   const deep = [lin(0x1f), lin(0x4b), lin(0x55)], shallow = [lin(0x5e), lin(0x84), lin(0x66)];
   for (let i = 0; i < 3; i++) assert.ok(near(sea.color[i], deep[i] * 0.65 + shallow[i] * 0.35, 0.005), `sea channel ${i}`);
+  assert.ok(!pass.draws.some((d) => near(d.color[0], lin(0xd7), 0.002) && near(d.color[1], lin(0xc1), 0.002)), 'fog plane with a texture alpha mask is left out');
   const sky = pass.draws.find((d) => d.flags & DrawFlags.FAR_DEPTH);
   assert.ok(sky && (sky.flags & DrawFlags.UNLIT) && (sky.flags & DrawFlags.NO_TONE_MAP), 'sky: unlit, at the far plane, not tone mapped');
   // mix(horizon, top, h) and mix(horizon, ground, -h): mostly the horizon colour
