@@ -38,6 +38,7 @@ test('menu keeps its grid scroll offset through measurement and reaches its last
   host.ui.hitTest(x, y);
   assert.ok(controls.scrollTop > 300);
   assert.equal(host.ui.hitTest(...center(last)), last, 'bottom setting is visible and clickable');
+  assert.equal(context.getComputedStyle(controls).boxSizing, 'border-box', 'the rule after an import URL with a semicolon still applies');
   host.resize(700, 650);
   const card = doc.getElementById('card');
   host.wheel(...center(card), 0, 2400);

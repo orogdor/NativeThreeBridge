@@ -207,6 +207,21 @@
     parseBlock(stripComments(css), baseDir, media || null, sheet);
     return sheet;
   }
+  // At-rule preludes can contain delimiters inside url(), strings and
+  // conditions. Only a top-level semicolon or opening brace ends the prelude.
+  function atRuleEnd(text, start) {
+    let quote = null, depth = 0;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '\\') { i++; continue; }
+      if (quote) { if (ch === quote) quote = null; continue; }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === '(' || ch === '[') depth++;
+      else if (ch === ')' || ch === ']') depth--;
+      else if (depth === 0 && (ch === ';' || ch === '{')) return i;
+    }
+    return -1;
+  }
   function parseBlock(text, baseDir, media, sheet) {
     let i = 0;
     while (i < text.length) {
@@ -215,19 +230,20 @@
       if (text[i] === '@') {
         const nameMatch = /^@([\w-]+)/.exec(text.slice(i, i + 40));
         const name = nameMatch ? nameMatch[1].toLowerCase() : '';
-        const brace = text.indexOf('{', i), semi = text.indexOf(';', i);
-        if (semi >= 0 && (brace < 0 || semi < brace)) {
+        const end = atRuleEnd(text, i);
+        if (end < 0) break;
+        if (text[end] === ';') {
           if (name === 'import') {
-            const rest = text.slice(i + 7, semi).trim();
+            const rest = text.slice(i + 7, end).trim();
             const m = /^(?:url\(\s*)?["']?([^"')\s]+)["']?\s*\)?\s*(.*)$/.exec(rest);
             if (m) {
               const path = resolveRef(baseDir, m[1]);
               if (path && !path.startsWith('data:')) sheet.imports.push({ path, media: joinMedia(media, m[2].trim() || null), order: ruleOrder++ });
             }
           }
-          i = semi + 1; continue;
+          i = end + 1; continue;
         }
-        if (brace < 0) break;
+        const brace = end;
         const close = matchBrace(text, brace);
         const prelude = text.slice(i + 1 + name.length, brace).trim();
         const inner = text.slice(brace + 1, close);
