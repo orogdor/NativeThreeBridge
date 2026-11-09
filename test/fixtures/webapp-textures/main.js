@@ -76,6 +76,24 @@ water.rotation.x = -Math.PI / 2;
 water.position.y = -1;
 scene.add(water);
 
+// 5a) Generic onBeforeCompile coast fade: a custom float attribute drives
+// smoothstep alpha in the fragment shader (without the engine running GLSL).
+const coastGeo = new THREE.PlaneGeometry(1, 1);
+coastGeo.setAttribute('aCoastFade', new THREE.Float32BufferAttribute([-0.3, -0.1, 0.1, 0.5], 1));
+const coastMat = new THREE.MeshStandardMaterial({ color: 0x56789a, transparent: true, opacity: 0.72, depthWrite: false });
+coastMat.onBeforeCompile = (shader) => {
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nattribute float aCoastFade; varying float vFade;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\nvFade=aCoastFade;');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nvarying float vFade;')
+    .replace('#include <opaque_fragment>', 'float fade=smoothstep(-.12,.20,vFade);if(fade<.008)discard;diffuseColor.a*=fade;\n#include <opaque_fragment>');
+};
+const coast = new THREE.Mesh(coastGeo, coastMat);
+coast.name = 'coastFade';
+coast.position.set(1, 0, 0);
+scene.add(coast);
+
 // 5b) fog-of-war parchment: alpha cut out by its own 'seen' texture (cannot run here: left out)
 const seen = new THREE.DataTexture(new Uint8Array(16), 4, 4, THREE.RedFormat);
 seen.needsUpdate = true;
