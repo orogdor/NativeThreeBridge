@@ -2104,8 +2104,17 @@
   }
   function fire(target, event) {
     event.isTrusted = true;
-    if (target === window) return window.dispatchEvent(event);
-    return target.dispatchEvent(event);
+    const start = performance.now();
+    try {
+      if (target === window) return window.dispatchEvent(event);
+      return target.dispatchEvent(event);
+    } finally {
+      // Report long synchronous input listeners without changing event order.
+      // The native window can appear hung while game pathfinding runs here.
+      const ms = performance.now() - start;
+      if (ms >= 35 && /^(?:pointerdown|pointerup|mousedown|mouseup|click|contextmenu)$/.test(event.type))
+        nt.log('warn', `[input-perf] ${event.type} handler ${ms.toFixed(1)} ms`);
+    }
   }
   const PTR = { bubbles: true, cancelable: true, composed: true };
   const chainOf = (n) => { const out = []; for (; n && n.nodeType === 1; n = n.parentNode) out.push(n); return out; };
