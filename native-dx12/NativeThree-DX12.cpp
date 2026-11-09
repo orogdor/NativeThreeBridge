@@ -77,6 +77,7 @@ static bool gRestartRequested=false;
 static bool gForceBattleCameraSnap=false;
 static UINT gSceneEpoch=0;
 static native_three::NativeCssRestartButton gRestartButton;
+static native_three::NativeCssRestartButton gCameraButton;
 static HWND gBattleHud=nullptr;
 static HBRUSH gBattleHudBrush=nullptr;
 static HFONT gBattleHudFont=nullptr;
@@ -1662,11 +1663,18 @@ static LRESULT CALLBACK WindowProc(HWND win,UINT msg,WPARAM wp,LPARAM lp) {
             break;
         case WM_SIZE:
             gRestartButton.layout();
+            gCameraButton.layout();
             return 0;
         case WM_DRAWITEM:
             if(gRestartButton.draw((const DRAWITEMSTRUCT*)lp))return TRUE;
+            if(gCameraButton.draw((const DRAWITEMSTRUCT*)lp))return TRUE;
             break;
         case WM_COMMAND:
+            if(gCameraButton.isClick(wp)){
+                gCameraMode=(gCameraMode+1)%3;
+                gDistance=gCameraMode==0?780.f:92.f;
+                return 0;
+            }
             if(gRestartButton.isClick(wp)){
                 gRestartRequested=true;
                 return 0;
@@ -1811,6 +1819,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
     // CSS is interpreted into a native owner-drawn child HWND. No browser.
     if(!gRestartButton.create(gWindow))
         fatal("Create native CSS Restart button",E_FAIL);
+    if(!gCameraButton.create(gWindow,"camera-button",2302))
+        fatal("Create native CSS Camera button",E_FAIL);
     // Always-visible native score panel; unlike the long DX12 title it is
     // readable at 1152px and requires no HTML/WebView.
     gBattleHudBrush=CreateSolidBrush(RGB(14,27,39));

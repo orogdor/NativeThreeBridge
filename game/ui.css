@@ -1,16 +1,12 @@
-/* NativeThreeBridge CSS-to-Win32 experiment.
-   Supported native subset: right, top, width, height, background-color,
-   color, border-color, border-radius, font-size, font-weight. */
+/* NativeThreeBridge CSS-to-Win32 experiment. */
 #restart-button {
-  position: absolute;
-  right: 18px;
-  top: 18px;
-  width: 156px;
-  height: 44px;
-  background-color: #18374b;
-  color: #f4fbff;
-  border-color: #79d5e8;
-  border-radius: 11px;
-  font-size: 16px;
-  font-weight: bold;
+  position: absolute; right: 18px; top: 18px; width: 156px; height: 44px;
+  background-color: #18374b; color: #f4fbff; border-color: #79d5e8;
+  border-radius: 11px; font-size: 16px; font-weight: bold;
+}
+/* Tests an image background and a text label on a second control. */
+#camera-button {
+  position: absolute; right: 18px; top: 72px; width: 156px; height: 44px;
+  background-color: #18374b; color: #ffffff; font-size: 16px; font-weight: bold;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='156' height='44'%3E%3Crect width='156' height='44' rx='10' fill='%23264c66'/%3E%3Ccircle cx='22' cy='22' r='10' fill='%2379d5e8'/%3E%3Ccircle cx='22' cy='22' r='5' fill='%2318374b'/%3E%3C/svg%3E");
 }

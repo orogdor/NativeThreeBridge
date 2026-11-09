@@ -1,0 +1,208 @@
+name: Build native Three.js Windows Game and separate Updater
+on:
+  push:
+    branches: [experiment/camera-image-button-test]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  native-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build official Three.js core separately from game/scene.js
+        shell: pwsh
+        run: |
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+          npm install --no-save --no-package-lock --no-audit --no-fund esbuild@0.25.12
+          if ($LASTEXITCODE -ne 0) { throw "esbuild install failed" }
+          New-Item -ItemType Directory -Force generated,third_party | Out-Null
+          npx esbuild threejs-native/three-runtime-entry.mjs --bundle --platform=neutral --format=iife --target=es2020 --outfile=generated/three-runtime.bundle.js
+          if ($LASTEXITCODE -ne 0) { throw "Three.js runtime bundle failed" }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw "JavaScript tests failed" }
+      - name: Convert original Kuningriigid spearman and pine GLBs
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check Pillow
+          if ($LASTEXITCODE -ne 0) { throw "Pillow install failed" }
+          python tools/test_spearman_rig.py
+          if ($LASTEXITCODE -ne 0) { throw "Eight-bone GLB skin unit tests failed" }
+          python tools/pack_kuningriigid.py
+          if ($LASTEXITCODE -ne 0) { throw "GLB conversion failed" }
+          if (!(Test-Path generated/soldier-rigged.glb) -or !(Test-Path generated/skin0.bin)) { throw "Skeleton asset packing failed" }
+      - name: Generate editable native PCM16 audio test samples
+        shell: pwsh
+        run: |
+          python tools/generate_native_audio_samples.py
+          if ($LASTEXITCODE -ne 0) { throw "Native audio WAV generation failed" }
+          foreach ($name in @('signal','step','restart','swing','hit','death')) {
+            if (!(Test-Path "game/audio/$name.wav")) { throw "Missing $name WAV" }
+          }
+      - name: Acquire pinned QuickJS-NG native JavaScript engine
+        shell: pwsh
+        run: |
+          git clone --branch v0.13.0 --depth 1 https://github.com/quickjs-ng/quickjs.git third_party/quickjs
+          if ($LASTEXITCODE -ne 0) { throw "QuickJS-NG checkout failed" }
+      - name: Acquire prebuilt V8 13.0 for webapp JavaScript (pmed/v8-nuget)
+        shell: pwsh
+        run: |
+          nuget install v8-v143-x64 -Version 13.0.245.25 -OutputDirectory third_party/v8pkg -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "V8 NuGet download failed" }
+          Get-ChildItem third_party/v8pkg/v8.redist-v143-x64.13.0.245.25/lib/Release | Format-Table Name, Length
+      - name: Compile native game engine and runtime smoke test
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DNTB_WEBAPP_V8=ON -DV8_PACKAGE_DIR="$PWD/third_party/v8pkg/v8-v143-x64.13.0.245.25" -DV8_REDIST_DIR="$PWD/third_party/v8pkg/v8.redist-v143-x64.13.0.245.25"
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          cmake --build build --config Release --target NativeCoreSmoke ThreeSceneSmoke WebappSmoke WebappSmokeV8 NativeThreeJS --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw "Native game EXE failed to compile" }
+      - name: Verify generic scene registry, spatial index and async path worker pool
+        shell: pwsh
+        run: |
+          & .\\build\\Release\\NativeCoreSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Native core subsystem tests failed" }
+      - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
+        shell: pwsh
+        run: |
+          cl /nologo /O2 /W3 /EHsc /std:c++17 tools/shader_smoke.cpp /Fe:build/shader_smoke.exe /link d3dcompiler.lib
+          if ($LASTEXITCODE -ne 0) { throw "Shader compiler smoke executable failed to build" }
+          & .\build\shader_smoke.exe native-dx12/NativeThree-DX12.cpp
+          if ($LASTEXITCODE -ne 0) { throw "DX12 lighting/shadow HLSL failed to compile" }
+      - name: Execute actual Three.js runtime smoke test in Windows
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          if (!(Test-Path build/Release/game/scene.js)) { throw "External scene.js missing" }
+          & .\build\Release\ThreeSceneSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Embedded Three.js JavaScript execution failed" }
+      - name: Run Three.js webapp folders through the embedded webapp runtime (headless)
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          & .\build\Release\WebappSmoke.exe samples/hello-webapp 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "hello-webapp failed in the native webapp runtime" }
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-edge 3
+          if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed in the native webapp runtime" }
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-bad-import 0 expect-boot-error
+          if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly" }
+          # Same folders on the V8 backend the game EXE now uses.
+          & .\build\Release\WebappSmokeV8.exe samples/hello-webapp 6 expect-resize
+          if ($LASTEXITCODE -ne 0) { throw "hello-webapp failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-edge 3
+          if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-bad-import 0 expect-boot-error
+          if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly on V8" }
+      - name: Real game check - Kuningriigid through the embedded webapp runtime (informational)
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CI: '1'
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git clone --depth 1 https://github.com/orogdor/Kuningriigid.git kuningriigid-check
+          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid checkout failed" }
+          & .\build\Release\WebappSmokeV8.exe kuningriigid-check 1
+          if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly on V8 (exit $LASTEXITCODE)" }
+      - name: Set up .NET 8 for the updaters
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Build Game1/Game2 launchers, updaters and package the two-game layout
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
+          New-Item -ItemType Directory -Force dist, dist/game1/audio, dist/game2, dist/webapps/hello-webapp, release | Out-Null
+          # Shared engine (forest battle + webapp mode, V8 for webapps)
+          Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Engine.exe
+          Copy-Item third_party/v8pkg/v8.redist-v143-x64.13.0.245.25/lib/Release/* dist/
+          # game1: forest battle test (scene.js); game2: empty until UpdateKuningriigid.exe
+          Copy-Item game/scene.js dist/game1/scene.js
+          Copy-Item game/ui.html dist/game1/ui.html
+          Copy-Item game/ui.css dist/game1/ui.css
+          Copy-Item game/audio/*.wav dist/game1/audio/
+          Copy-Item generated/soldier-rigged.glb dist/game1/odamees-rigged.glb
+          Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
+          Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
+          foreach ($n in 1, 2) {
+            cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=$n launcher/Game-Launcher.c /Fe:dist/Game$n.exe /link /SUBSYSTEM:WINDOWS user32.lib
+            if ($LASTEXITCODE -ne 0) { throw "Game$n launcher failed to compile" }
+          }
+          Remove-Item dist/*.obj -ErrorAction SilentlyContinue
+          Remove-Item *.obj -ErrorAction SilentlyContinue
+          foreach ($u in 'UpdateEngine', 'UpdateKuningriigid') {
+            dotnet publish launcher/$u.csproj -c Release -o build/$u
+            if ($LASTEXITCODE -ne 0) { throw "$u failed to build" }
+            Copy-Item build/$u/$u.exe dist/$u.exe
+            $p = Start-Process -FilePath (Resolve-Path dist/$u.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
+            if ($p.ExitCode -ne 0) { throw "$u self-test failed" }
+          }
+          # Game2 with an empty game2 folder must stop with a message, not start the engine.
+          $g2 = Start-Process -FilePath (Resolve-Path dist/Game2.exe) -Wait -PassThru
+          if ($g2.ExitCode -ne 42) { throw "Game2.exe did not detect the empty game2 folder (exit $($g2.ExitCode))" }
+          Set-Content dist/engine-version.txt -Value "v$v" -Encoding ascii -NoNewline
+          Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
+          Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
+          Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
+          # Engine-only package for UpdateEngine.exe (never contains game folders or updaters)
+          New-Item -ItemType Directory -Force engine-package | Out-Null
+          Get-ChildItem dist -File | Where-Object { $_.Name -notin @('UpdateEngine.exe','UpdateKuningriigid.exe','engine-version.txt','Run-Hello-Webapp.bat') } | Copy-Item -Destination engine-package
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path engine-package), (Join-Path (Get-Location) 'release/NativeThreeBridge-Engine-x64.zip'))
+          $engineZip = Get-Item release/NativeThreeBridge-Engine-x64.zip
+          $engineHash = (Get-FileHash $engineZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          @{ tag = "v$v"; package = 'NativeThreeBridge-Engine-x64.zip'; sha256 = $engineHash; size = $engineZip.Length } | ConvertTo-Json -Compress | Set-Content release/engine-update-v2.json -Encoding utf8
+          # Full download (ZipFile keeps the empty game2 folder)
+          [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path dist), (Join-Path (Get-Location) 'release/NativeThreeBridge-Windows-x64.zip'))
+          Copy-Item dist/UpdateEngine.exe, dist/UpdateKuningriigid.exe release/
+          New-Item -ItemType Directory -Force verify | Out-Null
+          Expand-Archive release/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
+          foreach ($f in 'Game1.exe','Game2.exe','NativeThree-Engine.exe','UpdateEngine.exe','UpdateKuningriigid.exe','engine-version.txt','v8.dll','v8_libplatform.dll','game1/scene.js','game1/ui.css','game1/ui.html','game1/odamees-rigged.glb','game1/audio/signal.wav','game1/audio/step.wav','game1/audio/restart.wav','game1/audio/swing.wav','game1/audio/hit.wav','game1/audio/death.wav','webapps/hello-webapp/index.html','Run-Hello-Webapp.bat') {
+            if (!(Test-Path "verify/$f")) { throw "Incomplete ZIP structure: $f" }
+          }
+          if (!(Test-Path verify/game2 -PathType Container)) { throw "Empty game2 folder missing from ZIP" }
+          if ((Get-ChildItem verify/game2 -Force | Measure-Object).Count -ne 0) { throw "game2 must be empty in the ZIP" }
+          Get-ChildItem release | Format-Table Name, Length
+          Write-Host "Two-game package verified: v$v"
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: NativeThreeBridge-Windows-x64
+          path: |
+            release/NativeThreeBridge-Windows-x64.zip
+            release/NativeThreeBridge-Engine-x64.zip
+            release/engine-update-v2.json
+      - name: Capture forest battle test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath (Resolve-Path dist/Game1.exe) -WorkingDirectory (Resolve-Path dist) -PassThru
+          Start-Sleep -Seconds 20
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width,$bounds.Height
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $bmp.Save((Join-Path (Get-Location) 'battle-screenshot.png'))
+          $g.Dispose(); $bmp.Dispose()
+          if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
+      - name: Upload screenshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: battle-screenshot
+          path: battle-screenshot.png

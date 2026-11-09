@@ -38,15 +38,16 @@ inline bool cssPixels(const std::string& value,int& out) {
 }
 inline bool cssHexColor(const std::string& value,unsigned& out) {
     const auto s=trimCss(value);
-    if(s.size()!=7 || s[0]!='#')return false;
+    if((s.size()!=7 && s.size()!=4) || s[0]!='#')return false;
     unsigned rgb=0;
-    for(std::size_t i=1;i<7;i++){
+    for(std::size_t i=1;i<s.size();i++){
         const char c=s[i];
         const int d=c>='0' && c<='9'?c-'0':
             c>='a' && c<='f'?c-'a'+10:
             c>='A' && c<='F'?c-'A'+10:-1;
         if(d<0)return false;
-        rgb=(rgb<<4)|(unsigned)d;
+        if(s.size()==4) rgb=(rgb<<8)|(unsigned)(d*17);
+        else rgb=(rgb<<4)|(unsigned)d;
     }
     out=rgb;return true;
 }
@@ -68,7 +69,13 @@ inline NativeButtonStyle parseNativeButton(const std::string& markup,
     style.id=target;
     // Narrow intentionally supported HTML subset: <button id="x">Text</button>.
     const std::string token=std::string("id=\"")+target+"\"";
-    const auto start=markup.find("<button");
+    auto start=markup.find("<button");
+    while(start!=std::string::npos) {
+        const auto end=markup.find('>',start);
+        if(end==std::string::npos) { start=std::string::npos; break; }
+        if(markup.substr(start,end-start).find(token)!=std::string::npos) break;
+        start=markup.find("<button",end+1);
+    }
     if(start!=std::string::npos) {
         const auto openEnd=markup.find('>',start);
         if(openEnd!=std::string::npos &&

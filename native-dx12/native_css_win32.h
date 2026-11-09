@@ -15,7 +15,8 @@ public:
     ~NativeCssRestartButton() {
         if(font_)DeleteObject(font_);
     }
-    bool create(HWND parent) {
+    bool create(HWND parent, const char* elementId="restart-button", int controlId=kControlId) {
+        controlId_=controlId;
         wchar_t module[MAX_PATH]={};
         const DWORD length=GetModuleFileNameW(nullptr,module,MAX_PATH);
         if(length==0||length>=MAX_PATH)return false;
@@ -23,12 +24,13 @@ public:
             std::filesystem::path(module).parent_path() / NativeThree_SceneFolder();
         const std::string html=read(base/L"ui.html");
         const std::string css=read(base/L"ui.css");
-        style_=parseNativeButton(html,css,"restart-button");
-        label_=std::wstring(style_.text.begin(),style_.text.end());
+        style_=parseNativeButton(html,css,elementId);
+        int chars=MultiByteToWideChar(CP_UTF8,0,style_.text.c_str(),-1,nullptr,0);
+        if(chars>0){ label_.resize(chars); MultiByteToWideChar(CP_UTF8,0,style_.text.c_str(),-1,&label_[0],chars); label_.pop_back(); }
         parent_=parent;
         button_=CreateWindowExW(0,L"BUTTON",label_.c_str(),
             WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
-            0,0,1,1,parent,(HMENU)(INT_PTR)kControlId,
+            0,0,1,1,parent,(HMENU)(INT_PTR)controlId_,
             GetModuleHandleW(nullptr),nullptr);
         if(!button_)return false;
         const UINT dpi=GetDpiForWindow(parent);
@@ -51,7 +53,7 @@ public:
         MoveWindow(button_,x,y,w,h,TRUE);
     }
     bool draw(const DRAWITEMSTRUCT* info){
-        if(!info||info->CtlID!=kControlId)return false;
+        if(!info||info->CtlID!=(UINT)controlId_)return false;
         HDC dc=info->hDC;
         RECT r=info->rcItem;
         HBRUSH backdrop=CreateSolidBrush(RGB(8,13,22));
@@ -79,7 +81,7 @@ public:
         return true;
     }
     bool isClick(WPARAM wp) const {
-        return button_ && LOWORD(wp)==kControlId && HIWORD(wp)==BN_CLICKED;
+        return button_ && LOWORD(wp)==controlId_ && HIWORD(wp)==BN_CLICKED;
     }
     const NativeButtonStyle& style()const{return style_;}
 private:
@@ -91,6 +93,7 @@ private:
         return f?std::string(std::istreambuf_iterator<char>(f),
                             std::istreambuf_iterator<char>()):"";
     }
+    int controlId_=kControlId;
     HWND parent_{},button_{};
     HFONT font_{};
     std::wstring label_;
