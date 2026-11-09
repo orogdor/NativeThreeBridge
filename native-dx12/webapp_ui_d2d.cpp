@@ -124,8 +124,8 @@ struct WebappUiRenderer::Impl {
     std::unordered_map<std::string, Image> images;
     std::unordered_map<std::string, std::wstring> families;
     std::map<std::tuple<std::wstring, int, int, bool>, ComPtr<IDWriteTextFormat>> formats;
-    int lastCommands = 0, failedImages = 0;
-    double lastMs = 0;
+    int lastCommands = 0, failedImages = 0, renders = 0;
+    double lastMs = 0, totalMs = 0, maxMs = 0, firstMs = -1;
     std::string lastFailure;
 
     enum class Clip { None, Axis, Layer } clip = Clip::None;
@@ -548,6 +548,9 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
     s.stride = stride;
     s.pixels.assign(data, data + std::size_t(stride) * height);
     s.lastMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    s.renders++;
+    if (s.firstMs < 0) s.firstMs = s.lastMs;
+    else { s.totalMs += s.lastMs; s.maxMs = std::max(s.maxMs, s.lastMs); }
     return true;
 }
 
@@ -558,9 +561,10 @@ unsigned WebappUiRenderer::height() const { return impl_->h; }
 
 std::string WebappUiRenderer::stats() const {
     const Impl& s = *impl_;
-    char line[256];
-    std::snprintf(line, sizeof line, "UI layer: %d commands, %zu images (%d failed), %.1f ms raster%s",
-                  s.lastCommands, s.images.size(), s.failedImages, s.lastMs, s.dc5 ? "" : ", no SVG support");
+    char line[320];
+    std::snprintf(line, sizeof line, "UI layer: %d commands, %zu images (%d failed), %d rasters: first %.1f ms, later avg %.1f / max %.1f ms (%ux%u)%s",
+                  s.lastCommands, s.images.size(), s.failedImages, s.renders, s.firstMs < 0 ? 0.0 : s.firstMs,
+                  s.renders > 1 ? s.totalMs / (s.renders - 1) : 0.0, s.maxMs, s.w, s.h, s.dc5 ? "" : ", no SVG support");
     std::string out = line;
     if (!s.lastFailure.empty()) out += " | last image problem: " + s.lastFailure;
     return out;

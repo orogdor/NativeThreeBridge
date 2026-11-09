@@ -202,6 +202,20 @@ jobs:
             $bmp.Save($file)
             $g.Dispose(); $bmp.Dispose()
           }
+          # Also printed into the log (base64 JPEG between BEGIN-SHOT/END-SHOT) for tools without artifact access.
+          function Print-Shot($file, $name) {
+            $img = [System.Drawing.Image]::FromFile($file)
+            $ms = New-Object System.IO.MemoryStream
+            $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+            $ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+            $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), 88L
+            $img.Save($ms, $codec, $ep)
+            $img.Dispose()
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            Write-Host "BEGIN-SHOT $name"
+            for ($i = 0; $i -lt $b64.Length; $i += 4000) { Write-Host ("SHOT " + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i))) }
+            Write-Host "END-SHOT $name"
+          }
           New-Item -ItemType Directory -Force shots | Out-Null
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
           $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 })
@@ -211,12 +225,13 @@ jobs:
             $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $folder -WorkingDirectory (Resolve-Path dist).Path -PassThru
             Start-Sleep -Seconds $r.wait
             Save-Screen (Join-Path (Get-Location) "shots/$($r.name).png")
+            Print-Shot (Join-Path (Get-Location) "shots/$($r.name).png") $r.name
             if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
             Start-Sleep -Seconds 1
             if (Test-Path dist/NativeThreeBridge-webapp-log.txt) {
               Copy-Item dist/NativeThreeBridge-webapp-log.txt "shots/$($r.name)-log.txt"
               Write-Host "---- $($r.name) log ----"
-              Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-Object -First 80
+              Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-String -Pattern 'UI layer|frame \d+:|error|crash' | Select-Object -First 40
             }
           }
       - name: Upload UI screenshots

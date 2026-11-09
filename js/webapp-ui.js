@@ -2493,7 +2493,7 @@ center{text-align:center}
   // --------------------------------------------------------------- paint
   // Display list ops (same numbers in native-dx12/webapp_ui.h).
   const OP = { CLIP: 1, RECT: 2, BORDER: 3, IMAGE: 4, TEXT: 5, LGRAD: 6, RGRAD: 7, SHADOW: 8 };
-  let prims = [], hits = [], holeAt = -1, hitHoleAt = -1;
+  let prims = [], hits = [], holeAt = -1, hitHoleAt = -1, holeRect = null;
   let strings = new Map();
   const str = (s) => { let i = strings.get(s); if (i === undefined) { i = strings.size; strings.set(s, i); } return i; };
 
@@ -2548,7 +2548,7 @@ center{text-align:center}
     return out;
   }
   function paintAll(root) {
-    prims = []; hits = []; holeAt = -1; hitHoleAt = -1; strings = new Map();
+    prims = []; hits = []; holeAt = -1; hitHoleAt = -1; holeRect = null; strings = new Map();
     // body background propagates to the root (and so sits behind the 3D canvas)
     const body = document.body && document.body._ntBox;
     root._propagatedBg = null;
@@ -2878,7 +2878,7 @@ center{text-align:center}
         return;
       }
       case 'canvas':
-        if (el && el._ntRendererCanvas) { holeAt = prims.length; hitHoleAt = hits.length; }
+        if (el && el._ntRendererCanvas) { holeAt = prims.length; hitHoleAt = hits.length; holeRect = clipIntersect(clip, { x: b.x, y: b.y, w: b.w, h: b.h, r: 0 }); }
         return;
       case 'input': {
         const type = lower(el.getAttribute('type') || 'text');
@@ -2947,11 +2947,11 @@ center{text-align:center}
   // Encodes visible display-list entries (from the 3D canvas upward).
   let lastFloats = null, lastStrings = '', submitted = 0;
   function encode() {
-    const start = holeAt >= 0 ? holeAt : 0;
     const out = [1, state.width, state.height, 0];
     let count = 0, curClip;
-    for (let i = start; i < prims.length; i++) {
+    for (let i = 0; i < prims.length; i++) {
       const p = prims[i];
+      if (i < holeAt && coveredByCanvas(p.d[1], p.d[2], p.d[3], p.d[4])) continue;
       if (p.clip !== curClip) {
         const c = p.clip;
         out.push(OP.CLIP, c ? c.x : 0, c ? c.y : 0, c ? c.w : -1, c ? c.h : -1, c ? c.r || 0 : 0);
@@ -2964,6 +2964,11 @@ center{text-align:center}
     const floats = Float32Array.from(out);
     const joined = [...strings.keys()].join('\u001f');
     return { floats, joined };
+  }
+  // Painted before the 3D canvas and completely under it: hidden, like in a browser.
+  function coveredByCanvas(x, y, w, h) {
+    const r = holeRect;
+    return !!r && x >= r.x - 0.5 && y >= r.y - 0.5 && x + w <= r.x + r.w + 0.5 && y + h <= r.y + r.h + 0.5;
   }
   function submit(floats, joined) {
     let same = lastFloats && lastFloats.length === floats.length && joined === lastStrings;
@@ -3068,7 +3073,7 @@ center{text-align:center}
     ensureLayout();
     if (!needPaint) return false;
     needPaint = false;
-    if (!viewportRoot) { prims = []; hits = []; holeAt = -1; hitHoleAt = -1; strings = new Map(); return true; }
+    if (!viewportRoot) { prims = []; hits = []; holeAt = -1; hitHoleAt = -1; holeRect = null; strings = new Map(); return true; }
     const t0 = now();
     paintAll(viewportRoot);
     timing.paint += now() - t0;
@@ -3078,9 +3083,9 @@ center{text-align:center}
   // ---- hit testing
   function hitTest(x, y) {
     try { ensurePaint(); } catch (e) { reportFrameError(e); return null; }
-    const stop = hitHoleAt >= 0 ? hitHoleAt : 0;
-    for (let i = hits.length - 1; i >= stop; i--) {
+    for (let i = hits.length - 1; i >= 0; i--) {
       const h = hits[i];
+      if (i < hitHoleAt && coveredByCanvas(h.x, h.y, h.w, h.h)) continue;
       if (x < h.x || y < h.y || x >= h.x + h.w || y >= h.y + h.h) continue;
       const c = h.clip;
       if (c && (x < c.x || y < c.y || x >= c.x + c.w || y >= c.y + c.h)) continue;
@@ -3194,7 +3199,7 @@ center{text-align:center}
       return 'auto';
     },
     stats() {
-      return { boxes: boxSeq, prims: prims.length, visible: holeAt >= 0 ? prims.length - holeAt : prims.length, hits: hits.length, submitted, sheets: sheets.length, rules: sheets.reduce((s, x) => s + x.sheet.rules.length, 0), timing: { ...timing }, hole: holeAt >= 0 };
+      return { boxes: boxSeq, prims: prims.length, visible: prims.filter((p, i) => !(i < holeAt && coveredByCanvas(p.d[1], p.d[2], p.d[3], p.d[4]))).length, hits: hits.length, submitted, sheets: sheets.length, rules: sheets.reduce((s, x) => s + x.sheet.rules.length, 0), timing: { ...timing }, hole: holeAt >= 0 };
     },
     // test hooks
     _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList },

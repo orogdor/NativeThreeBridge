@@ -27,5 +27,8 @@ for (let i = 1; i <= 12; i++) {
 
 let gold = 120;
 window.addGold = (n) => { gold += n; document.querySelector('#gold b').textContent = String(gold); };
+// A HUD value that changes every few seconds (measures steady-state UI redraws).
+const clock = document.getElementById('clock');
+setInterval(() => { clock.setAttribute('value', String((Number(clock.getAttribute('value')) + 5) % 60)); }, 2000);
 
 renderer.setAnimationLoop(() => renderer.render(scene, camera));
