@@ -256,26 +256,105 @@ JSValue jsEvalModule(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 }
 JSValue jsUploadGeometry(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
-    if (argc < 5) return JS_ThrowTypeError(ctx, "uploadGeometry(id, positions, normals, colors, indices)");
+    if (argc < 5) return JS_ThrowTypeError(ctx, "uploadGeometry(id, positions, normals, colors, indices, uvs)");
     std::uint32_t id = 0;
     if (JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
-    const float *positions = nullptr, *normals = nullptr, *colors = nullptr;
+    const float *positions = nullptr, *normals = nullptr, *colors = nullptr, *uvs = nullptr;
     const std::uint32_t* indices = nullptr;
-    std::size_t nPositions = 0, nNormals = 0, nColors = 0, nIndices = 0;
+    std::size_t nPositions = 0, nNormals = 0, nColors = 0, nIndices = 0, nUvs = 0;
     if (!typedView(ctx, argv[1], positions, nPositions, false, "positions") ||
         !typedView(ctx, argv[2], normals, nNormals, true, "normals") ||
         !typedView(ctx, argv[3], colors, nColors, true, "colors") ||
-        !typedView(ctx, argv[4], indices, nIndices, true, "indices"))
+        !typedView(ctx, argv[4], indices, nIndices, true, "indices") ||
+        (argc >= 6 && !typedView(ctx, argv[5], uvs, nUvs, true, "uvs")))
         return JS_EXCEPTION;
     if (nPositions % 3 || (normals && nNormals != nPositions) || (colors && nColors != nPositions))
         return JS_ThrowRangeError(ctx, "Geometry attributes must be 3 floats per vertex and equal length");
     const std::uint32_t vertexCount = static_cast<std::uint32_t>(nPositions / 3);
+    if (uvs && nUvs != std::size_t(vertexCount) * 2) return JS_ThrowRangeError(ctx, "Geometry uvs must be 2 floats per vertex");
     for (std::size_t i = 0; i < nIndices; i++)
         if (indices[i] >= vertexCount) return JS_ThrowRangeError(ctx, "Geometry index out of range");
     if (self->sink)
         self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices,
-                                   static_cast<std::uint32_t>(nIndices));
+                                   static_cast<std::uint32_t>(nIndices), uvs);
     return JS_UNDEFINED;
+}
+JSValue jsUploadTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 5) return JS_ThrowTypeError(ctx, "uploadTexture(id, bytes, width, height, flags)");
+    std::uint32_t id = 0, width = 0, height = 0, flags = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &width, argv[2]) < 0 ||
+        JS_ToUint32(ctx, &height, argv[3]) < 0 || JS_ToUint32(ctx, &flags, argv[4]) < 0)
+        return JS_EXCEPTION;
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+    if (!typedView(ctx, argv[1], data, bytes, false, "texture data")) return JS_EXCEPTION;
+    if (width && (height == 0 || bytes < std::size_t(width) * height * 4))
+        return JS_ThrowRangeError(ctx, "uploadTexture: pixel data smaller than width*height*4");
+    return JS_NewBool(ctx, self->sink && self->sink->uploadTexture(id, data, bytes, width, height, flags));
+}
+JSValue jsCanvasCommands(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 6) return JS_ThrowTypeError(ctx, "canvasCommands(id, width, height, ops, floats, strings)");
+    std::uint32_t id = 0, width = 0, height = 0, floats = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &width, argv[1]) < 0 || JS_ToUint32(ctx, &height, argv[2]) < 0 ||
+        JS_ToUint32(ctx, &floats, argv[4]) < 0)
+        return JS_EXCEPTION;
+    const float* ops = nullptr;
+    std::size_t available = 0;
+    if (!typedView(ctx, argv[3], ops, available, false, "canvas commands")) return JS_EXCEPTION;
+    if (floats > available) return JS_ThrowRangeError(ctx, "canvasCommands: floats > array length");
+    if (self->sink) self->sink->canvasCommands(id, width, height, ops, floats, argString(ctx, argv[5]));
+    return JS_UNDEFINED;
+}
+JSValue jsCanvasRead(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0, w = 0, h = 0;
+    std::int32_t x = 0, y = 0;
+    if (argc < 5 || JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToInt32(ctx, &x, argv[1]) < 0 || JS_ToInt32(ctx, &y, argv[2]) < 0 ||
+        JS_ToUint32(ctx, &w, argv[3]) < 0 || JS_ToUint32(ctx, &h, argv[4]) < 0)
+        return JS_ThrowTypeError(ctx, "canvasRead(id, x, y, w, h)");
+    if (w > 16384 || h > 16384) return JS_ThrowRangeError(ctx, "canvasRead: rectangle too large");
+    std::vector<std::uint8_t> rgba;
+    if (!self->sink || !self->sink->canvasRead(id, x, y, w, h, rgba)) return JS_NULL;
+    return JS_NewArrayBufferCopy(ctx, rgba.data(), rgba.size());
+}
+JSValue jsCanvasWrite(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0, cw = 0, ch = 0, w = 0, h = 0;
+    std::int32_t x = 0, y = 0;
+    if (argc < 8 || JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &cw, argv[1]) < 0 || JS_ToUint32(ctx, &ch, argv[2]) < 0 ||
+        JS_ToInt32(ctx, &x, argv[3]) < 0 || JS_ToInt32(ctx, &y, argv[4]) < 0 || JS_ToUint32(ctx, &w, argv[5]) < 0 ||
+        JS_ToUint32(ctx, &h, argv[6]) < 0)
+        return JS_ThrowTypeError(ctx, "canvasWrite(id, canvasW, canvasH, x, y, w, h, rgba)");
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+    if (!typedView(ctx, argv[7], data, bytes, false, "pixels")) return JS_EXCEPTION;
+    if (bytes < std::size_t(w) * h * 4) return JS_ThrowRangeError(ctx, "canvasWrite: pixel data smaller than w*h*4");
+    if (self->sink) self->sink->canvasWrite(id, cw, ch, x, y, w, h, data);
+    return JS_UNDEFINED;
+}
+JSValue jsRegisterImage(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 2) return JS_ThrowTypeError(ctx, "registerImage(key, bytes)");
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+    if (!typedView(ctx, argv[1], data, bytes, false, "image bytes")) return JS_EXCEPTION;
+    if (self->sink) self->sink->registerImage(argString(ctx, argv[0]), data, bytes);
+    return JS_UNDEFINED;
+}
+JSValue jsReleaseTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0;
+    if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseTexture(id);
+    return JS_UNDEFINED;
+}
+JSValue jsUploadCanvasTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0, canvas = 0, flags = 0;
+    if (argc < 3 || JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &canvas, argv[1]) < 0 || JS_ToUint32(ctx, &flags, argv[2]) < 0)
+        return JS_ThrowTypeError(ctx, "uploadCanvasTexture(id, canvasId, flags)");
+    return JS_NewBool(ctx, self->sink && self->sink->uploadCanvasTexture(id, canvas, flags));
 }
 JSValue jsReleaseGeometry(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
@@ -472,8 +551,12 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"readText", jsReadText, 1}, {"readBinary", jsReadBinary, 1},
         {"setImportMap", jsSetImportMap, 1},
         {"evalScript", jsEvalScript, 2}, {"evalModule", jsEvalModule, 2},
-        {"uploadGeometry", jsUploadGeometry, 5}, {"releaseGeometry", jsReleaseGeometry, 1},
+        {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
+        {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
+        {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
+        {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
+        {"registerImage", jsRegisterImage, 2},
         {"submitPass", jsSubmitPass, 2},
         {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1}, {"reportUi", jsReportUi, 6},
     };

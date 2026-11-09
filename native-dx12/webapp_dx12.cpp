@@ -9,6 +9,7 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +34,8 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 using Microsoft::WRL::ComPtr;
 using native_three::WebappHost;
@@ -40,13 +43,15 @@ using native_three::WebappHost;
 namespace {
 
 constexpr UINT kFrameCount = 2;
-constexpr UINT kVertexStride = 9 * sizeof(float);    // position, normal, colour
+constexpr UINT kVertexFloats = 11;                    // position, normal, colour, uv
+constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
+constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
 constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
-               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256;
+               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 
 std::wstring widen(const std::string& s) {
@@ -94,6 +99,53 @@ struct Retired {
     ComPtr<ID3D12Resource> resource;
     UINT64 fence;
 };
+struct Texture {
+    ComPtr<ID3D12Resource> resource;
+    UINT slot = 0;
+    UINT width = 0, height = 0;
+};
+// A texture whose pixels still have to be copied on the GPU timeline.
+struct PendingTextureCopy {
+    ComPtr<ID3D12Resource> texture, staging;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+};
+struct RetiredSlot {
+    UINT slot;
+    UINT64 fence;
+};
+
+// RGBA8 mip chain built on the CPU (box filter, like glGenerateMipmap).
+std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base, UINT w, UINT h, bool mips) {
+    std::vector<std::vector<std::uint8_t>> levels;
+    levels.push_back(std::move(base));
+    while (mips && (w > 1 || h > 1)) {
+        const UINT nw = std::max(1u, w / 2), nh = std::max(1u, h / 2);
+        const std::vector<std::uint8_t>& src = levels.back();
+        std::vector<std::uint8_t> dst(std::size_t(nw) * nh * 4);
+        for (UINT y = 0; y < nh; y++) {
+            const UINT y0 = std::min(h - 1, y * 2), y1 = std::min(h - 1, y * 2 + 1);
+            for (UINT x = 0; x < nw; x++) {
+                const UINT x0 = std::min(w - 1, x * 2), x1 = std::min(w - 1, x * 2 + 1);
+                const std::uint8_t* a = &src[(std::size_t(y0) * w + x0) * 4];
+                const std::uint8_t* b = &src[(std::size_t(y0) * w + x1) * 4];
+                const std::uint8_t* c = &src[(std::size_t(y1) * w + x0) * 4];
+                const std::uint8_t* d = &src[(std::size_t(y1) * w + x1) * 4];
+                std::uint8_t* o = &dst[(std::size_t(y) * nw + x) * 4];
+                // colour weighted by alpha so transparent texels do not darken edges
+                const UINT aw = UINT(a[3]) + b[3] + c[3] + d[3];
+                for (int k = 0; k < 3; k++) {
+                    o[k] = aw ? std::uint8_t((UINT(a[k]) * a[3] + UINT(b[k]) * b[3] + UINT(c[k]) * c[3] + UINT(d[k]) * d[3] + aw / 2) / aw)
+                              : std::uint8_t((UINT(a[k]) + b[k] + c[k] + d[k] + 2) / 4);
+                }
+                o[3] = std::uint8_t((aw + 2) / 4);
+            }
+        }
+        levels.push_back(std::move(dst));
+        w = nw;
+        h = nh;
+    }
+    return levels;
+}
 
 class WebappWindow final : public native_three::WebappRenderSink {
 public:
@@ -102,8 +154,12 @@ public:
 
     // ---- WebappRenderSink
     void uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
-                        std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount) override;
+                        std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv) override;
     void releaseGeometry(std::uint32_t id) override;
+    bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
+                       std::uint32_t height, std::uint32_t flags) override;
+    void releaseTexture(std::uint32_t id) override;
+    bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
     void releaseInstances(std::uint32_t id) override { instances_.erase(id); }
     void submitPass(const float* data, std::size_t floats) override {
@@ -134,6 +190,21 @@ public:
         cursor_ = LoadCursorW(nullptr, id);
         SetCursor(cursorHidden_ ? nullptr : cursor_);
     }
+    void canvasCommands(std::uint32_t id, std::uint32_t w, std::uint32_t h, const float* ops, std::size_t floats,
+                        const std::string& strings) override {
+        if (uiReady_) ui_.canvasCommands(id, w, h, ops, floats, strings);
+    }
+    bool canvasRead(std::uint32_t id, std::int32_t x, std::int32_t y, std::uint32_t w, std::uint32_t h,
+                    std::vector<std::uint8_t>& rgba) override {
+        return uiReady_ && ui_.canvasRead(id, x, y, w, h, rgba);
+    }
+    void canvasWrite(std::uint32_t id, std::uint32_t cw, std::uint32_t ch, std::int32_t x, std::int32_t y, std::uint32_t w,
+                     std::uint32_t h, const std::uint8_t* rgba) override {
+        if (uiReady_) ui_.canvasWrite(id, cw, ch, x, y, w, h, rgba);
+    }
+    void registerImage(const std::string& key, const std::uint8_t* bytes, std::size_t n) override {
+        if (uiReady_) ui_.registerImage(key, bytes, n);
+    }
     double measureText(const std::string& families, double size, int weight, bool italic, const std::string& text) override {
         return uiReady_ ? ui_.measureText(families, size, weight, italic, text) : -1.0;
     }
@@ -155,6 +226,11 @@ private:
     void updateTitle(double fps);
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
     void initUi();
+    void initTextures();
+    bool decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h);
+    bool createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags);
+    void recordTextureCopies();
+    D3D12_GPU_DESCRIPTOR_HANDLE textureHandle(std::uint32_t id) const;
     void uploadUi(UINT frame);
     void drawUi(UINT frame);
 
@@ -192,6 +268,15 @@ private:
 
     std::unordered_map<std::uint32_t, Geometry> geometries_;
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
+    std::unordered_map<std::uint32_t, Texture> textures_;
+    std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<UINT> freeSlots_;
+    std::vector<RetiredSlot> retiredSlots_;
+    ComPtr<ID3D12DescriptorHeap> texHeap_;
+    UINT texStep_ = 0;
+    ComPtr<IWICImagingFactory> wic_;
+    std::size_t textureBytes_ = 0;
+    int textureFailures_ = 0;
     std::vector<Retired> retired_;
     std::vector<std::vector<float>> pendingPasses_, passes_;
     UINT lastDraws_ = 0;
@@ -343,16 +428,38 @@ void WebappWindow::initDevice() {
     check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "Fence");
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
-    // Root signature: b0 = frame constants, b1 = per-draw constants.
-    D3D12_ROOT_PARAMETER params[2]{};
+    // Root signature: b0 = frame constants, b1 = per-draw constants,
+    // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
+    D3D12_ROOT_PARAMETER params[3]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
         params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
+    D3D12_DESCRIPTOR_RANGE texRange{};
+    texRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    texRange.NumDescriptors = 1;
+    texRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &texRange;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[3]{};
+    const D3D12_TEXTURE_ADDRESS_MODE modes[3] = {D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                                                  D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
+    for (UINT i = 0; i < 3; i++) {
+        samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
+        samplers[i].MaxAnisotropy = 4;
+        samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
+        samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[i].ShaderRegister = i;
+        samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 2;
+    rs.NumParameters = 3;
     rs.pParameters = params;
+    rs.NumStaticSamplers = 3;
+    rs.pStaticSamplers = samplers;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> blob, error;
     check(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error), "Serialize root signature");
@@ -374,7 +481,180 @@ void WebappWindow::initDevice() {
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
     createSizeDependent();
+    initTextures();
     initUi();
+}
+
+// ------------------------------------------------------------- textures
+void WebappWindow::initTextures() {
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.NumDescriptors = kMaxTextures;
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&texHeap_)), "Texture descriptor heap");
+    texStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (UINT slot = kMaxTextures - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
+    // slot 0: 1x1 white, bound for untextured draws
+    std::vector<std::uint8_t> white(4, 255);
+    createTexture(0, std::move(white), 1, 1, 0);
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    (void)co; // S_FALSE / RPC_E_CHANGED_MODE: COM is already usable on this thread
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_))))
+        log("warn", "WIC is not available: image textures cannot be decoded");
+}
+
+bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h) {
+    if (!wic_ || !data || !bytes || bytes > 0x7fffffff) return false;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wic_->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(data), DWORD(bytes))) ||
+        FAILED(wic_->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(wic_->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
+                                     WICBitmapPaletteTypeCustom)))
+        return false;
+    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 16384 || h > 16384) return false;
+    rgba.resize(std::size_t(w) * h * 4);
+    return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
+}
+
+bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags) {
+    UINT slot = 0;
+    if (id != 0) {
+        if (freeSlots_.empty()) {
+            collectRetired();
+            if (freeSlots_.empty()) {
+                if (textureFailures_++ < 3) log("warn", "Too many textures at once (" + std::to_string(kMaxTextures) + "): some draws stay untextured");
+                return false;
+            }
+        }
+        slot = freeSlots_.back();
+        freeSlots_.pop_back();
+    }
+    const bool srgb = (flags & native_three::kWebappTextureSrgb) != 0;
+    std::vector<std::vector<std::uint8_t>> levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w;
+    td.Height = h;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = UINT16(levels.size());
+    td.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    PendingTextureCopy copy;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                           IID_PPV_ARGS(&copy.texture)), "Texture");
+    copy.layouts.resize(levels.size());
+    std::vector<UINT> rows(levels.size());
+    std::vector<UINT64> rowBytes(levels.size());
+    UINT64 total = 0;
+    device_->GetCopyableFootprints(&td, 0, UINT(levels.size()), 0, copy.layouts.data(), rows.data(), rowBytes.data(), &total);
+    copy.staging = uploadBuffer(nullptr, total);
+    std::uint8_t* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    check(copy.staging->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map texture staging");
+    for (std::size_t m = 0; m < levels.size(); m++) {
+        const auto& L = copy.layouts[m];
+        const UINT lw = L.Footprint.Width;
+        for (UINT y = 0; y < rows[m]; y++)
+            std::memcpy(mapped + L.Offset + std::size_t(y) * L.Footprint.RowPitch, levels[m].data() + std::size_t(y) * lw * 4, std::size_t(lw) * 4);
+    }
+    copy.staging->Unmap(0, nullptr);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = td.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = td.MipLevels;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(slot) * texStep_;
+    device_->CreateShaderResourceView(copy.texture.Get(), &srv, cpu);
+
+    if (id != 0) releaseTexture(id);
+    Texture& t = textures_[id];
+    t.resource = copy.texture;
+    t.slot = slot;
+    t.width = w;
+    t.height = h;
+    textureBytes_ += std::size_t(total);
+    pendingCopies_.push_back(std::move(copy));
+    return true;
+}
+
+void WebappWindow::releaseTexture(std::uint32_t id) {
+    auto it = textures_.find(id);
+    if (it == textures_.end() || id == 0) return;
+    retire(it->second.resource);
+    retiredSlots_.push_back({it->second.slot, fenceValue_ + kFrameCount});
+    textures_.erase(it);
+}
+
+bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
+                                 std::uint32_t height, std::uint32_t flags) {
+    if (id == 0) return false;
+    std::vector<std::uint8_t> rgba;
+    UINT w = width, h = height;
+    if (width) {
+        if (width > 16384 || height > 16384 || bytes < std::size_t(width) * height * 4) return false;
+        rgba.assign(data, data + std::size_t(width) * height * 4);
+    } else if (!decodeImage(data, bytes, rgba, w, h)) {
+        if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes) + " bytes; WebP needs the Windows WebP Image Extension)");
+        return false;
+    }
+    return createTexture(id, std::move(rgba), w, h, flags);
+}
+
+bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
+    if (id == 0 || !uiReady_) return false;
+    std::vector<std::uint8_t> rgba;
+    UINT w = 0, h = 0;
+    if (!ui_.canvasPixelsRgba(canvasId, rgba, w, h)) return false;
+    return createTexture(id, std::move(rgba), w, h, flags);
+}
+
+// Copies queued texture pixels; runs at the start of a frame's command list.
+void WebappWindow::recordTextureCopies() {
+    if (pendingCopies_.empty()) return;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    for (auto& c : pendingCopies_) {
+        for (UINT m = 0; m < UINT(c.layouts.size()); m++) {
+            D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+            dst.pResource = c.texture.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = m;
+            src.pResource = c.staging.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint = c.layouts[m];
+            cmd_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = c.texture.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barriers.push_back(b);
+    }
+    cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+    for (auto& c : pendingCopies_) {
+        retire(c.staging);
+        // the texture itself stays referenced by textures_ (or is retired there)
+        ComPtr<ID3D12Resource> keep = c.texture;
+        retire(keep);
+    }
+    pendingCopies_.clear();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE WebappWindow::textureHandle(std::uint32_t id) const {
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = texHeap_->GetGPUDescriptorHandleForHeapStart();
+    auto it = textures_.find(id);
+    const UINT slot = it == textures_.end() ? textures_.at(0).slot : it->second.slot;
+    gpu.ptr += UINT64(slot) * texStep_;
+    return gpu;
 }
 
 void WebappWindow::initUi() {
@@ -620,16 +900,21 @@ void WebappWindow::collectRetired() {
     retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
                                   [done](const Retired& r) { return r.fence <= done; }),
                    retired_.end());
+    for (auto it = retiredSlots_.begin(); it != retiredSlots_.end();) {
+        if (it->fence <= done) { freeSlots_.push_back(it->slot); it = retiredSlots_.erase(it); }
+        else ++it;
+    }
 }
 
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
-                                  std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount) {
-    std::vector<float> interleaved(size_t(vertexCount) * 9);
+                                  std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv) {
+    std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
-        float* o = &interleaved[size_t(v) * 9];
+        float* o = &interleaved[size_t(v) * kVertexFloats];
         o[0] = p[v * 3]; o[1] = p[v * 3 + 1]; o[2] = p[v * 3 + 2];
         o[3] = n ? n[v * 3] : 0; o[4] = n ? n[v * 3 + 1] : 1; o[5] = n ? n[v * 3 + 2] : 0;
         o[6] = c ? c[v * 3] : 1; o[7] = c ? c[v * 3 + 1] : 1; o[8] = c ? c[v * 3 + 2] : 1;
+        o[9] = uv ? uv[v * 2] : 0; o[10] = uv ? uv[v * 2 + 1] : 0;
     }
     Geometry& g = geometries_[id];
     retire(g.vertices);
@@ -682,6 +967,7 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"IROW", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
@@ -759,6 +1045,7 @@ void WebappWindow::renderFrame() {
 
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
+    recordTextureCopies();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = targets_[frame].Get();
@@ -779,6 +1066,10 @@ void WebappWindow::renderFrame() {
     cmd_->RSSetViewports(1, &viewport);
     cmd_->RSSetScissorRects(1, &scissor);
     cmd_->SetGraphicsRootSignature(root_sig_.Get());
+    ID3D12DescriptorHeap* texHeaps[] = {texHeap_.Get()};
+    cmd_->SetDescriptorHeaps(1, texHeaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = textureHandle(0);
+    UINT64 boundTexture = ~0ull;
 
     UINT drawsThisFrame = 0;
     for (const auto& pass : passes_) {
@@ -800,6 +1091,7 @@ void WebappWindow::renderFrame() {
         fcb[36] = p[40]; fcb[37] = p[41]; fcb[38] = p[42]; fcb[39] = p[47] > 0 ? p[47] : 1.0f;
         std::memcpy(fcb + 40, p + native_three::kWebappPassHeaderFloats,
                     lightCount * native_three::kWebappLightFloats * sizeof(float));
+        fcb[296] = p[48]; fcb[297] = p[47] > 0 ? p[47] : 1.0f; // tone mapping curve, exposure
         cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
         ringOffset += kFrameCBBytes;
 
@@ -848,8 +1140,13 @@ void WebappWindow::renderFrame() {
             dcb[16] = d[8]; dcb[17] = d[9]; dcb[18] = d[10]; dcb[19] = d[11];
             dcb[20] = d[12]; dcb[21] = d[13]; dcb[22] = d[14]; dcb[23] = d[15];
             dcb[24] = d[6]; dcb[25] = d[7]; dcb[26] = float(drawFlags); dcb[27] = 0;
+            // uv transform rows (a c e | b d f) and alphaTest
+            dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
+            dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
             cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
             ringOffset += kDrawCBBytes;
+            const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;
+            if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
 
             cmd_->IASetVertexBuffers(0, 2, views);
             if (g->second.indexCount) {

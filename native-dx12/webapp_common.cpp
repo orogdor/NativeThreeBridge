@@ -166,8 +166,9 @@ const char* webappThreeModuleSource() {
     return
         "export * from 'nt:three.module.min.js';\n"
         "import * as THREE_CORE from 'nt:three.core.min.js';\n"
+        "import { ShaderLib, UniformsUtils } from 'nt:three.module.min.js';\n"
         "import { createNativeRendererClasses } from 'nt:native-renderer.mjs';\n"
-        "const { NativeRenderer } = createNativeRendererClasses(THREE_CORE, globalThis.__nt, globalThis.__ntHost);\n"
+        "const { NativeRenderer } = createNativeRendererClasses(THREE_CORE, globalThis.__nt, globalThis.__ntHost, { ShaderLib, UniformsUtils });\n"
         "export { NativeRenderer, NativeRenderer as WebGLRenderer };\n";
 }
 

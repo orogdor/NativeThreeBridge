@@ -48,5 +48,5 @@ test('full Windows ZIP includes CSS/HTML input and preserves old v0.22',()=>{
   assert.match(ci,/Copy-Item game\/ui\.html dist\/game1\/ui\.html/);
   assert.match(ci,/'game1\/ui\.css'/);
   assert.match(ci,/'game1\/ui\.html'/);
-  assert.equal(read('version.txt').trim(),'0.31.1');
+  assert.equal(read('version.txt').trim(),'0.32.0');
 });

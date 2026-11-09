@@ -263,7 +263,8 @@ bool typedView(Impl* self, v8::Local<v8::Value> value, const T*& data, std::size
     if (optional && (value->IsNull() || value->IsUndefined())) return true;
     if (!value->IsTypedArray()) { self->throwError("type", std::string(what) + ": typed array expected"); return false; }
     v8::Local<v8::TypedArray> array = value.As<v8::TypedArray>();
-    const bool ok = sizeof(T) == 4 && (std::is_same_v<T, float> ? array->IsFloat32Array() : array->IsUint32Array());
+    const bool ok = std::is_same_v<T, std::uint8_t> ? (array->IsUint8Array() || array->IsUint8ClampedArray())
+                  : sizeof(T) == 4 && (std::is_same_v<T, float> ? array->IsFloat32Array() : array->IsUint32Array());
     if (!ok) { self->throwError("type", std::string(what) + ": wrong typed array type"); return false; }
     v8::Local<v8::ArrayBuffer> buffer = array->Buffer();
     data = reinterpret_cast<const T*>(static_cast<const std::uint8_t*>(buffer->Data()) + array->ByteOffset());
@@ -329,21 +330,97 @@ void ntEvalModule(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }
 void ntUploadGeometry(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
-    if (info.Length() < 5) return self->throwError("type", "uploadGeometry(id, positions, normals, colors, indices)");
+    if (info.Length() < 5) return self->throwError("type", "uploadGeometry(id, positions, normals, colors, indices, uvs)");
     v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
     const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0);
-    const float *positions, *normals, *colors;
+    const float *positions, *normals, *colors, *uvs = nullptr;
     const std::uint32_t* indices;
-    std::size_t nP, nN, nC, nI;
+    std::size_t nP, nN, nC, nI, nU = 0;
     if (!typedView(self, info[1], positions, nP, false, "positions") || !typedView(self, info[2], normals, nN, true, "normals") ||
-        !typedView(self, info[3], colors, nC, true, "colors") || !typedView(self, info[4], indices, nI, true, "indices"))
+        !typedView(self, info[3], colors, nC, true, "colors") || !typedView(self, info[4], indices, nI, true, "indices") ||
+        (info.Length() >= 6 && !typedView(self, info[5], uvs, nU, true, "uvs")))
         return;
     if (nP % 3 || (normals && nN != nP) || (colors && nC != nP))
         return self->throwError("range", "Geometry attributes must be 3 floats per vertex and equal length");
     const std::uint32_t vertexCount = std::uint32_t(nP / 3);
+    if (uvs && nU != std::size_t(vertexCount) * 2) return self->throwError("range", "Geometry uvs must be 2 floats per vertex");
     for (std::size_t i = 0; i < nI; i++)
         if (indices[i] >= vertexCount) return self->throwError("range", "Geometry index out of range");
-    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI));
+    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI), uvs);
+}
+void ntUploadTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 5) return self->throwError("type", "uploadTexture(id, bytes, width, height, flags)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), width = info[2]->Uint32Value(ctx).FromMaybe(0),
+                        height = info[3]->Uint32Value(ctx).FromMaybe(0), flags = info[4]->Uint32Value(ctx).FromMaybe(0);
+    const std::uint8_t* data;
+    std::size_t bytes;
+    if (!typedView(self, info[1], data, bytes, false, "texture data")) return;
+    if (width && (height == 0 || bytes < std::size_t(width) * height * 4))
+        return self->throwError("range", "uploadTexture: pixel data smaller than width*height*4");
+    info.GetReturnValue().Set(bool(self->sink && self->sink->uploadTexture(id, data, bytes, width, height, flags)));
+}
+void ntCanvasCommands(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 6) return self->throwError("type", "canvasCommands(id, width, height, ops, floats, strings)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), width = info[1]->Uint32Value(ctx).FromMaybe(0),
+                        height = info[2]->Uint32Value(ctx).FromMaybe(0), floats = info[4]->Uint32Value(ctx).FromMaybe(0);
+    const float* ops;
+    std::size_t available;
+    if (!typedView(self, info[3], ops, available, false, "canvas commands")) return;
+    if (floats > available) return self->throwError("range", "canvasCommands: floats > array length");
+    if (self->sink) self->sink->canvasCommands(id, width, height, ops, floats, self->utf8(info[5]));
+}
+void ntCanvasRead(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 5) return self->throwError("type", "canvasRead(id, x, y, w, h)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), w = info[3]->Uint32Value(ctx).FromMaybe(0),
+                        h = info[4]->Uint32Value(ctx).FromMaybe(0);
+    const std::int32_t x = info[1]->Int32Value(ctx).FromMaybe(0), y = info[2]->Int32Value(ctx).FromMaybe(0);
+    if (w > 16384 || h > 16384) return self->throwError("range", "canvasRead: rectangle too large");
+    std::vector<std::uint8_t> rgba;
+    if (!self->sink || !self->sink->canvasRead(id, x, y, w, h, rgba)) { info.GetReturnValue().SetNull(); return; }
+    std::unique_ptr<v8::BackingStore> store = v8::ArrayBuffer::NewBackingStore(self->isolate, rgba.size());
+    if (!rgba.empty()) std::memcpy(store->Data(), rgba.data(), rgba.size());
+    info.GetReturnValue().Set(v8::ArrayBuffer::New(self->isolate, std::move(store)));
+}
+void ntCanvasWrite(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 8) return self->throwError("type", "canvasWrite(id, canvasW, canvasH, x, y, w, h, rgba)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), cw = info[1]->Uint32Value(ctx).FromMaybe(0),
+                        ch = info[2]->Uint32Value(ctx).FromMaybe(0), w = info[5]->Uint32Value(ctx).FromMaybe(0),
+                        h = info[6]->Uint32Value(ctx).FromMaybe(0);
+    const std::int32_t x = info[3]->Int32Value(ctx).FromMaybe(0), y = info[4]->Int32Value(ctx).FromMaybe(0);
+    const std::uint8_t* data;
+    std::size_t bytes;
+    if (!typedView(self, info[7], data, bytes, false, "pixels")) return;
+    if (bytes < std::size_t(w) * h * 4) return self->throwError("range", "canvasWrite: pixel data smaller than w*h*4");
+    if (self->sink) self->sink->canvasWrite(id, cw, ch, x, y, w, h, data);
+}
+void ntRegisterImage(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 2) return self->throwError("type", "registerImage(key, bytes)");
+    const std::uint8_t* data;
+    std::size_t bytes;
+    if (!typedView(self, info[1], data, bytes, false, "image bytes")) return;
+    if (self->sink) self->sink->registerImage(self->utf8(info[0]), data, bytes);
+}
+void ntReleaseTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() >= 1 && self->sink)
+        self->sink->releaseTexture(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
+}
+void ntUploadCanvasTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "uploadCanvasTexture(id, canvasId, flags)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), canvas = info[1]->Uint32Value(ctx).FromMaybe(0),
+                        flags = info[2]->Uint32Value(ctx).FromMaybe(0);
+    info.GetReturnValue().Set(bool(self->sink && self->sink->uploadCanvasTexture(id, canvas, flags)));
 }
 void ntReleaseGeometry(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
@@ -472,6 +549,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
+        {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
+        {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
         {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor}, {"reportUi", ntReportUi},
     };
     for (const Fn& f : functions) {

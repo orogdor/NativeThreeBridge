@@ -1,3 +1,16 @@
+# NativeThreeBridge v0.32.0 — textures, Canvas 2D, sprites, tone mapping
+
+Kuningriigid in the engine had no trees (its GLB trees could not be loaded), a white-ish sea, an empty minimap and no city icons. v0.32.0 adds what those need:
+
+- **3D textures.** `material.map` from `TextureLoader`, `createImageBitmap(blob)` (GLB/GLTF loaders), `DataTexture` and `CanvasTexture`. Encoded images (PNG, JPEG, GIF, BMP, WebP with the Windows WebP extension) are decoded natively with WIC, mipmapped on the CPU (alpha-weighted box filter) and sampled in sRGB when `colorSpace` is sRGB. UVs, `flipY`, `offset/repeat/rotation`, repeat/clamp/mirror wrapping and `alphaTest` (cut-out foliage) are honoured. Images upload once per `THREE.Source`, again only after `needsUpdate`.
+- **Canvas 2D.** `canvas.getContext('2d')` records paths (arcs/ellipses/curves become Béziers in device space), rectangles, gradients, text, `drawImage` (images and other canvases), clipping, `save/restore`, line styles/dashes and `getImageData/putImageData`; `native-dx12/webapp_ui_d2d.cpp` executes them with Direct2D on a persistent bitmap per canvas. Canvases inside the HTML UI are drawn by the UI layer (only their rectangle is re-rasterised when they change) and can be used as `CanvasTexture`. Not yet: shadows, patterns, most composite modes (`destination-out` erases).
+- **THREE.Sprite** as camera-facing unlit quads (`center`, `rotation`, `sizeAttenuation`).
+- **Tone mapping** (Linear, Reinhard, Cineon, ACES filmic, Neutral; AgX uses ACES) with `toneMappingExposure`, per material `toneMapped`.
+- **Custom shaders, approximately.** GLSL still cannot run. A `ShaderMaterial` is drawn in the colour of its colour uniforms (unlit unless `lights: true`; a vertex shader writing `gl_Position.z = gl_Position.w` puts a sky dome at the far plane). For `material.onBeforeCompile` the patch is run once against Three.js' own shader source: colour uniforms it mixes into `diffuseColor` and a constant `diffuseColor.a` become the surface colour and opacity (Kuningriigid's sea: deep/shallow colours instead of white).
+- **UI layout:** showing/hiding a fixed or absolute panel (`hidden`, `display`) lays out only that panel, toggling an attribute back in the same frame costs nothing, and changes inside hidden subtrees need no layout. Kuningriigid's build hint caused ~38 whole-page layouts per second in v0.31.1.
+
+Draw records grew from 32 to 40 floats (texture id, alphaTest, uv transform); `uploadGeometry` takes an optional uv array. Tests: `test/webapp-textures.test.mjs` with `test/fixtures/webapp-textures`.
+
 # NativeThreeBridge v0.31.1 — faster HTML/CSS UI updates
 
 v0.31.0 re-styled and re-laid out the whole page for every small change, which cost Kuningriigid most of its frame rate. v0.31.1 keeps the result identical but does only the work a change needs (measured on Kuningriigid's real HTML and 39 stylesheets):

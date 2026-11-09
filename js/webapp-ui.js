@@ -2906,6 +2906,11 @@ center{text-align:center}
       }
       case 'canvas':
         if (el && el._ntRendererCanvas) { holeAt = prims.length; hitHoleAt = hits.length; holeRect = clipIntersect(clip, { x: b.x, y: b.y, w: b.w, h: b.h, r: 0 }); }
+        else if (el && el._ntCanvasId && el._ntCanvasVersion > 0 && el.width > 0 && el.height > 0 && cw > 0 && ch > 0) {
+          // Canvas 2D bitmap (native); the version makes a redrawn canvas a changed primitive
+          const fit = objectFit(b, cx, cy, cw, ch, el.width, el.height);
+          if (fit.dw > 0 && fit.dh > 0) prim(contentClip, [OP.IMAGE, fit.dx, fit.dy, fit.dw, fit.dh, str(`nt-canvas:${el._ntCanvasId}:${el._ntCanvasVersion}`), fit.sx, fit.sy, fit.sw, fit.sh, alpha, 0, lower(b.cs['image-rendering']) === 'pixelated' ? 0 : 1]);
+        }
         return;
       case 'input': {
         const type = lower(el.getAttribute('type') || 'text');
@@ -3336,11 +3341,86 @@ center{text-align:center}
       retag(c, skip, oldGen);
     }
   }
-  function relayoutPartial(roots) {
+  const currentBox = (el) => { const b = el && el._ntBox; return b && b._gen === layoutGen && b.el === el ? b : null; };
+  // Changes inside a subtree that is display:none (and was not drawn before)
+  // cannot move anything.
+  function inHiddenSubtree(node) {
+    for (let e = node && node.nodeType === 1 ? node : node && node.parentNode; e && e.nodeType === 1; e = e.parentNode) {
+      if (currentBox(e)) return false;
+      const cs = e._ntStyle;
+      if (cs && displayOf(cs, e) === 'none') return true;
+    }
+    return false;
+  }
+  // Containing block an out-of-flow box of `el` would get (registerAbs rules).
+  function cbFor(el, pos, parentBox) {
+    for (let p = parentBox; p; p = p.parent) if (pos === 'fixed' ? hasTransform(p.cs || {}) : p.isCB) return p;
+    return viewportBox;
+  }
+  const insetsSet = (cs, a, b) => (cs[a] !== undefined && lower(cs[a]) !== 'auto') || (cs[b] !== undefined && lower(cs[b]) !== 'auto');
+  // A fixed/absolute panel that was shown or hidden (display/hidden toggled):
+  // only that panel changes. Returns an op for relayoutPartial or null.
+  function toggleOpFor(node) {
+    const el = node && node.nodeType === 1 ? node : null;
+    if (!el || !el.parentNode || el.parentNode.nodeType !== 1) return null;
+    const cs = el._ntStyle;
+    if (!cs) return null;
+    const old = el._ntBox;
+    const hadBox = old && old.el === el && old._gen === layoutGen;
+    const shown = displayOf(cs, el) !== 'none';
+    if (hadBox && !shown) {
+      if (old.pos !== 'absolute' && old.pos !== 'fixed') return null;
+      if (!old.parent || !old.cbBox || (old.cbBox !== viewportBox && old.cbBox.clips)) return null;
+      if (old.parent.children.indexOf(old) < 0) return null;
+      return { kind: 'remove', box: old, el };
+    }
+    if (!hadBox && shown) {
+      if (!isOutOfFlow(cs) || el._ntPseudo) return null;
+      const pb = currentBox(el.parentNode);
+      if (!pb || pb.replaced || pb.contents) return null;
+      if (!insetsSet(cs, 'top', 'bottom') || !insetsSet(cs, 'left', 'right')) return null; // static position needed
+      const cb = cbFor(el, lower(cs.position), pb);
+      if (cb !== viewportBox && cb.clips) return null;
+      return { kind: 'add', el, parentBox: pb, cb };
+    }
+    return null;
+  }
+  function applyToggle(op) {
+    if (op.kind === 'remove') {
+      const b = op.box, parent = b.parent;
+      const i = parent.children.indexOf(b);
+      if (i < 0) return false;
+      parent.children.splice(i, 1);
+      const cb = b.cbBox;
+      const ai = cb.abs.indexOf(b);
+      if (ai >= 0) cb.abs.splice(ai, 1);
+      for (let p = parent; p && p !== cb; p = p.parent) if (p._escapes) { const k = p._escapes.indexOf(b); if (k >= 0) p._escapes.splice(k, 1); }
+      return true;
+    }
+    const pb = op.parentBox;
+    const nb = buildBoxes(op.el, pb);
+    if (!nb || (nb.pos !== 'absolute' && nb.pos !== 'fixed')) return false;
+    // paint order: before the next sibling element that has a box here
+    let at = pb.children.length;
+    for (let s = op.el.nextSibling; s; s = s.nextSibling) {
+      if (s.nodeType !== 1) continue;
+      const k = pb.children.indexOf(s._ntBox);
+      if (k >= 0) { at = k; break; }
+    }
+    pb.children.splice(at, 0, nb);
+    nb.staticX = pb.x; nb.staticY = pb.y;
+    nb.cbBox = op.cb;
+    for (let p = pb; p && p !== op.cb; p = p.parent) if (p._escapes) p._escapes.push(nb);
+    op.cb.abs.push(nb);
+    op.newBox = nb;
+    return true;
+  }
+  function relayoutPartial(roots, toggles = []) {
     // nested roots: keep only the outermost
     const list = [...roots].filter((r) => ![...roots].some((o) => o !== r && isAncestorBox(o, r)));
     const oldGen = layoutGen;
     const replaced = [];
+    for (const op of toggles) if (!applyToggle(op)) return false;
     for (const oldB of list) {
       const parent = oldB.parent;
       const idx = parent.children.indexOf(oldB);
@@ -3352,6 +3432,11 @@ center{text-align:center}
     layoutGen++;
     for (const r of replaced) r.parent.children[r.idx] = r.nb;
     retag(viewportRoot, null, oldGen);
+    for (const op of toggles) {
+      if (op.kind !== 'add') continue;
+      layoutAbs(op.newBox, op.cb);
+      if (op.newBox._escapes && op.newBox._escapes.length) return false;
+    }
     for (const { oldB, nb } of replaced) {
       // boxes of the old subtree were retagged through the parent: drop them
       const cb = oldB.cbBox;
@@ -3368,16 +3453,49 @@ center{text-align:center}
   const isAncestorBox = (anc, b) => { for (let p = b.parent; p; p = p.parent) if (p === anc) return true; return false; };
   // Out-of-flow panels that contain every pending change; null when the
   // change can move things outside them (then the whole page is laid out).
-  function dirtyRoots() {
-    if (fullLayoutNeeded || needLayout || !viewportRoot) return null;
+  function dirtyRoots(record) {
+    if (fullLayoutNeeded || needLayout || !viewportRoot) { if (record) noteFull(fullLayoutNeeded ? 'style/size/sheets' : needLayout ? 'layout flag' : 'first layout'); return null; }
     const roots = new Set();
+    pendingToggles = [];
     for (const n of layoutDirty) {
       if (!n || !n.isConnected) continue;
+      const toggle = toggleOpFor(n);
+      if (toggle) { pendingToggles.push(toggle); continue; }
+      if (inHiddenSubtree(n)) continue;
       const r = layoutRootFor(n);
-      if (!r) return null;
+      if (!r) { if (record) noteFull(describe(n)); return null; }
       roots.add(r);
     }
+    // a panel being shown/hidden must not also be inside a re-laid-out root
+    // a toggled panel inside a panel that is rebuilt anyway: the rebuild covers it;
+    // changes inside a panel that is being removed do not matter
+    pendingToggles = pendingToggles.filter((t) => ![...roots].some((r) => r.el !== t.el && contains(r.el, t.el)));
+    for (const r of [...roots]) if (pendingToggles.some((t) => t.kind === 'remove' && contains(t.el, r.el))) roots.delete(r);
     return roots;
+  }
+  let pendingToggles = [];
+  // Why whole-page layouts happen (logged every 10 s when frequent).
+  const fullReasons = new Map();
+  let fullReasonsAt = 0;
+  function noteFull(why) { fullReasons.set(why, (fullReasons.get(why) || 0) + 1); }
+  function describe(n) {
+    const parts = [];
+    for (let e = n && n.nodeType === 1 ? n : n && n.parentNode; e && e.nodeType === 1 && parts.length < 4; e = e.parentNode) {
+      const id = e.getAttribute('id'), cls = (e.getAttribute('class') || '').trim().split(/\s+/)[0];
+      parts.push(e.localName + (id ? '#' + id : cls ? '.' + cls : ''));
+    }
+    return parts.join(' < ');
+  }
+  function reportFullReasons() {
+    const t = now();
+    if (t - fullReasonsAt < 10000) return;
+    fullReasonsAt = t;
+    const total = [...fullReasons.values()].reduce((a, b) => a + b, 0);
+    if (total >= 50) {
+      const top = [...fullReasons].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${v}× ${k}`).join(' | ');
+      nt.log('info', `[NativeThreeBridge UI] whole-page layouts in 10 s: ${total} — caused by: ${top}`);
+    }
+    fullReasons.clear();
   }
   const contains = (a, b) => { for (let n = b; n; n = n.parentNode) if (n === a) return true; return false; };
   // Does a pending change touch this element (itself, an ancestor or a descendant)?
@@ -3392,9 +3510,10 @@ center{text-align:center}
     if (!needLayout && !fullLayoutNeeded && !layoutDirty.size) return false;
     const t1 = now();
     let done = false;
-    const roots = dirtyRoots();
-    if (roots && roots.size) done = relayoutPartial(roots);
+    const roots = dirtyRoots(true);
+    if (roots && (roots.size || pendingToggles.length)) { done = relayoutPartial(roots, pendingToggles); if (!done) noteFull("partial layout refused (nested fixed / moved panel)"); }
     else if (roots && !roots.size) done = true;
+    pendingToggles = [];
     if (!done) layoutAll();
     layoutDirty.clear();
     fullLayoutNeeded = false;
@@ -3454,7 +3573,8 @@ center{text-align:center}
     if (boxOf(el)) {
       // Changes confined to other panels cannot move this element: its box is exact.
       const roots = dirtyRoots();
-      if (roots && ![...roots].some((r) => contains(r.el, el))) { timing.exactReads++; return; }
+      if (roots && ![...roots].some((r) => contains(r.el, el)) && !pendingToggles.some((t) => contains(t.el, el))) { pendingToggles = []; timing.exactReads++; return; }
+      pendingToggles = [];
       // A full layout already ran this frame and nothing near this element changed since.
       if (layoutsThisFrame > 0 && !touchesDirty(el)) { timing.staleReads++; return; }
     }
@@ -3524,11 +3644,13 @@ center{text-align:center}
             if (deps.sibling && name !== 'style') requestSiblings(node, 'subtree');
             if (name !== 'style' && hasRelevant(node, name, oldClasses)) requestHasRestyle();
             // attributes that change content size without changing style
-            if (!/^(class|style|id|title|tabindex|role)$|^(data|aria)-/.test(name || '')) layoutDirty.add(node);
+            // (`hidden` works through the UA style sheet: the restyle diff decides)
+            if (!/^(class|style|id|title|tabindex|role|hidden|lang|dir|draggable|translate)$|^(data|aria)-/.test(name || '')) layoutDirty.add(node);
           } else if (node && name === 'class') node._ntClassSet = null;
           break;
         case 'style': if (node && node.isConnected) requestRestyle(node, 'self'); break;
         case 'layout': if (node && node.nodeType === 1) layoutDirty.add(node); else needLayout = true; break;
+        case 'paint': if (node && node.isConnected) needPaint = true; break; // pixels only (canvas redrawn)
         default: needStyle = true; sheetsDirty = true;
       }
     },
@@ -3556,6 +3678,7 @@ center{text-align:center}
         timing.frames++;
       } catch (e) { reportFrameError(e); }
       reportTiming();
+      reportFullReasons();
     },
     hitTest,
     // Border box of an element in window px, or null when it has no box.
@@ -3572,6 +3695,8 @@ center{text-align:center}
     },
     matchMedia: mediaMatches,
     imageSize(src) { return imageSize(src); },
+    parseColor(text) { const c = parseColor(text); return c ? c.slice() : null; },
+    sniffImage(bytes) { try { return bytes ? sniffImage(bytes) : null; } catch { return null; } },
     resolve(base, ref) { return resolveRef(base, ref); },
     setHover(el) {
       if (interact.hover === el) return;
@@ -3617,7 +3742,7 @@ center{text-align:center}
       return { boxes: boxSeq, prims: prims.length, visible: prims.filter((p, i) => !(i < holeAt && coveredByCanvas(p.d[1], p.d[2], p.d[3], p.d[4]))).length, hits: hits.length, submitted, sheets: sheets.length, rules: sheets.reduce((s, x) => s + x.sheet.rules.length, 0), timing: { ...timing }, hole: holeAt >= 0 };
     },
     // test hooks
-    _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList, deps },
+    _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList, deps, fullReasons },
   };
   let lastSubmittedGen = -1, needSubmit = false;
   let lastFrameUpdate = -1e9, minInterval = 0, lastCursor = 'auto';
