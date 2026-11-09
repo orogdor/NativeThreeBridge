@@ -76,7 +76,7 @@ test('Canvas 2D drawing is recorded for native Direct2D and shown in the HTML UI
 });
 
 test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { skip }, async () => {
-  const { pass } = await run();
+  const { pass, rec } = await run();
   assert.equal(pass.toneMapping, ToneMapping.ACES);
   assert.ok(near(pass.exposure, 1.02));
   const sprite = pass.draws.find((d) => (d.flags & DrawFlags.UNLIT) && (d.flags & DrawFlags.MAP) && (d.flags & DrawFlags.NO_DEPTH_TEST));
@@ -92,8 +92,7 @@ test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { ski
   const coast = pass.draws.find((d) => near(d.opacity, 0.72));
   assert.ok(coast, 'attribute-driven coast fade remains visible');
   assert.ok(coast.flags & DrawFlags.VERTEX_COLORS, 'alpha ramp is sent as vertex colour alpha');
-  const { rec: fadeRec } = await run();
-  const faded = fadeRec.geometries.get(coast.geometryId);
+  const faded = rec.geometries.get(coast.geometryId);
   assert.ok(faded && faded.colorChannels === 4, 'coast geometry has RGBA colours');
   assert.ok(near(faded.alphaMin, 0) && near(faded.alphaMax, 1), 'smoothstep alpha spans transparent and opaque vertices');
   const sky = pass.draws.find((d) => d.flags & DrawFlags.FAR_DEPTH);
