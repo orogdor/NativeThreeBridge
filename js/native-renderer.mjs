@@ -112,6 +112,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._instances = new WeakMap();
       this._textures = new WeakMap();   // THREE.Source -> { id, version, ok }
       this._patches = new WeakMap();    // material -> what its shader patch does to colours
+      this._maskedGeometries = new WeakMap(); // geometry -> cached RGBA attribute-mask variants
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
       this._opaque = [];
       this._transparent = [];
@@ -250,6 +251,60 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return record;
     }
 
+    // A common onBeforeCompile pattern passes a float vertex attribute through a
+    // varying and uses smoothstep() to fade its alpha (coasts, decals, foliage).
+    // Approximate that ramp at vertices rather than drawing an opaque rectangle.
+    // This works for arbitrary float attributes; it is not tied to game names.
+    _maskedGeometryRecord(geometry, base, material, ramp, preserveRgb) {
+      const mask = geometry.attributes[ramp.attribute];
+      const vertexCount = base.vertexCount;
+      if (!mask || mask.itemSize !== 1 || mask.count !== vertexCount) return null;
+      let variants = this._maskedGeometries.get(geometry);
+      if (!variants) {
+        variants = new Map();
+        this._maskedGeometries.set(geometry, variants);
+        const onDispose = () => {
+          for (const variant of variants.values()) {
+            nt.releaseGeometry(variant.id);
+            this.info.memory.geometries--;
+          }
+          variants.clear();
+          this._maskedGeometries.delete(geometry);
+          geometry.removeEventListener('dispose', onDispose);
+        };
+        geometry.addEventListener('dispose', onDispose);
+      }
+      let record = variants.get(material);
+      if (!record) {
+        record = { id: nextGeometryId++, key: '' };
+        variants.set(material, record);
+        this.info.memory.geometries++;
+      }
+      const original = geometry.attributes.color;
+      const key = `${base.key}:${mask.version}:${ramp.lo}:${ramp.hi}:${preserveRgb}:${original ? original.version : -1}`;
+      if (key === record.key && record.mask === mask && record.colorAttribute === original) return record;
+      const colors = new Float32Array(vertexCount * 4);
+      for (let i = 0; i < vertexCount; i++) {
+        const o = i * 4;
+        colors[o] = preserveRgb && original ? original.getX(i) : 1;
+        colors[o + 1] = preserveRgb && original && original.itemSize > 1 ? original.getY(i) : 1;
+        colors[o + 2] = preserveRgb && original && original.itemSize > 2 ? original.getZ(i) : 1;
+        const t = Math.max(0, Math.min(1, (mask.getX(i) - ramp.lo) / (ramp.hi - ramp.lo)));
+        const alpha = t * t * (3 - 2 * t);
+        colors[o + 3] = (preserveRgb && original && original.itemSize > 3 ? original.getW(i) : 1) * alpha;
+      }
+      const positions = toFloat3(geometry.attributes.position);
+      const normals = geometry.attributes.normal ? toFloat3(geometry.attributes.normal)
+        : computeNormals(THREE, geometry.attributes.position, geometry.index);
+      const indices = geometry.index
+        ? (geometry.index.array instanceof Uint32Array ? geometry.index.array : Uint32Array.from(geometry.index.array)) : null;
+      const uvs = geometry.attributes.uv ? toFloat2(geometry.attributes.uv) : null;
+      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
+      Object.assign(record, { key, mask, colorAttribute: original, hasColors: true, hasUvs: !!uvs,
+        vertexCount, indexCount: base.indexCount });
+      return record;
+    }
+
     _instanceRecord(mesh) {
       let record = this._instances.get(mesh);
       const im = mesh.instanceMatrix, ic = mesh.instanceColor;
@@ -339,7 +394,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     _patchInfo(m) {
       let info = this._patches.get(m);
       if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
-      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false };
+      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false, alphaRamp: null };
       this._patches.set(m, info);
       const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
       const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
@@ -356,6 +411,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         // drawing the surface whole would cover the scene, so it is left out.
         const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
         if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
+        info.alphaRamp = attributeAlphaRamp(shader.vertexShader, shader.fragmentShader);
       } catch (e) { warnOnce(`patch-${m.uuid}`, `material.onBeforeCompile could not be inspected: ${e && e.message || e}`); }
       return info;
     }
@@ -602,6 +658,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           unsupported('material.onBeforeCompile shader patches', 'patched surfaces use the colours the patch mixes');
         } else unsupported('material.onBeforeCompile shader patches');
         if (patch.alpha !== null && m.transparent) opacity = patch.alpha * (m.opacity ?? 1);
+        if (patch.alphaRamp && mesh.geometry) {
+          const masked = this._maskedGeometryRecord(mesh.geometry, base.record, m, patch.alphaRamp, !!(m.vertexColors && !patch.colors));
+          if (masked) {
+            base = { ...base, record: masked };
+            flags |= DrawFlags.VERTEX_COLORS;
+          }
+        }
       }
       if (m.clippingPlanes && m.clippingPlanes.length) unsupported('Clipping planes');
       if (m.blending === THREE.AdditiveBlending) unsupported('AdditiveBlending', 'drawn with normal alpha blending');
@@ -682,6 +745,22 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     }
     const total = w.reduce((a, b) => a + b, 0) || 1;
     return entries.map(([, u], i) => [u, w[i] / total]);
+  }
+  // Conservative GLSL subset: float attribute -> varying -> smoothstep alpha
+  // mask. Any more complicated fragment logic keeps its existing fallback.
+  function attributeAlphaRamp(vertex, fragment) {
+    const re = /\\bfloat\\s+([A-Za-z_]\\w*)\\s*=\\s*smoothstep\\s*\\(\\s*([+\\-\\d.eE]+)\\s*,\\s*([+\\-\\d.eE]+)\\s*,\\s*([A-Za-z_]\\w*)\\s*\\)\\s*;/g;
+    for (const match of fragment.matchAll(re)) {
+      const [, name, lower, upper, varying] = match;
+      if (!new RegExp(`\\bdiffuseColor\\.a\\s*\\*=\\s*${name}\\b`).test(fragment)) continue;
+      const assignment = new RegExp(`\\b${varying}\\s*=\\s*([A-Za-z_]\\w*)\\s*;`).exec(vertex);
+      if (!assignment) continue;
+      const attribute = assignment[1];
+      if (!new RegExp(`\\b(?:attribute|in)\\s+float\\s+${attribute}\\b`).test(vertex)) continue;
+      const lo = Number(lower), hi = Number(upper);
+      if (Number.isFinite(lo) && Number.isFinite(hi) && lo < hi) return { attribute, lo, hi };
+    }
+    return null;
   }
   function mixColors(target, weighted) {
     target.setRGB(0, 0, 0, THREE.LinearSRGBColorSpace);
