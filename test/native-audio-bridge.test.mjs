@@ -62,7 +62,7 @@ test('release includes editable WAVs synthesized from original sources',()=>{
   assert.match(generator,/make\("step"/);
   assert.match(generator,/make\("restart"/);
   assert.match(workflow,/python tools\/generate_native_audio_samples\.py/);
-  assert.match(workflow,/Copy-Item game\/audio\/\*\.wav dist\/game\/audio\//);
-  assert.match(workflow,/Test-Path verify\/game\/audio\/signal\.wav/);
-  assert.equal(read('version.txt').trim(),'0.27.1');
+  assert.match(workflow,/Copy-Item game\/audio\/\*\.wav dist\/game1\/audio\//);
+  assert.match(workflow,/'game1\/audio\/signal\.wav'/);
+  assert.equal(read('version.txt').trim(),'0.30.0');
 });

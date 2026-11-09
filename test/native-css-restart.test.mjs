@@ -44,9 +44,9 @@ test('click dispatches to native C++ reset, preserving GPU forest cache',()=>{
   assert.match(smoke,/reset\.moved!=0 \|\| reset\.planned!=0/);
 });
 test('full Windows ZIP includes CSS/HTML input and preserves old v0.22',()=>{
-  assert.match(ci,/Copy-Item game\/ui\.css dist\/game\/ui\.css/);
-  assert.match(ci,/Copy-Item game\/ui\.html dist\/game\/ui\.html/);
-  assert.match(ci,/Test-Path verify\/game\/ui\.css/);
-  assert.match(ci,/Test-Path verify\/game\/ui\.html/);
-  assert.equal(read('version.txt').trim(),'0.27.1');
+  assert.match(ci,/Copy-Item game\/ui\.css dist\/game1\/ui\.css/);
+  assert.match(ci,/Copy-Item game\/ui\.html dist\/game1\/ui\.html/);
+  assert.match(ci,/'game1\/ui\.css'/);
+  assert.match(ci,/'game1\/ui\.html'/);
+  assert.equal(read('version.txt').trim(),'0.30.0');
 });
