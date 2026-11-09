@@ -624,6 +624,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
       let roughness = 1, metalness = 0, shininess = -1;
       let color = m.color || null, opacity = m.opacity ?? 1;
+      let shaderMap = null;
       if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.isLineDashedMaterial) flags |= DrawFlags.UNLIT;
       else if (m.isSpriteMaterial) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
       else if (m.isMeshNormalMaterial) flags |= DrawFlags.NORMAL_COLOR;
@@ -632,6 +633,17 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       else if (m.isMeshLambertMaterial || m.isMeshToonMaterial) { roughness = 1; }
       else if (m.isShadowMaterial) return;
       else if (m.isShaderMaterial || m.isRawShaderMaterial) {
+        // Single directly sampled sampler2D with unmodified vUv can use the
+        // native colour-map path. Complex UVs and multi-texture GLSL still need
+        // full shader support; do not silently select an arbitrary uniform.
+        const fragment = m.fragmentShader || '';
+        const samplers = [...fragment.matchAll(/\b(?:texture2D|texture)\s*\(\s*([A-Za-z_]\w*)\s*,\s*vUv\s*\)/g)];
+        if (samplers.length === 1 && m.uniforms && m.uniforms[samplers[0][1]]?.value?.isTexture &&
+            /\bvarying\s+vec2\s+vUv\b/.test(fragment) &&
+            /\bvUv\s*=\s*uv\s*;/.test(m.vertexShader || '')) {
+          shaderMap = m.uniforms[samplers[0][1]].value;
+          if (!m.lights) flags |= DrawFlags.UNLIT;
+        }
         // Custom GLSL cannot run here: use its colour uniforms, unlit unless it uses lights.
         const shaderColors = m.uniforms ? Object.entries(m.uniforms).filter(([, u]) => u && u.value && u.value.isColor) : [];
         if (shaderColors.length) {
@@ -672,10 +684,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       let textureId = 0;
       const uvt = _uvIdentity;
       uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
-      if (m.map && base.record.hasUvs) {
-        const tex = this._textureRecord(m.map);
+      const colorMap = m.map || shaderMap;
+      if (colorMap && base.record.hasUvs) {
+        const tex = this._textureRecord(colorMap);
         if (tex) {
-          const map = m.map;
+          const map = colorMap;
           textureId = tex.id;
           flags |= DrawFlags.MAP;
           if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
@@ -705,7 +718,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         globalThis.__ntDebugDraws.push({
           mesh: mesh.name || mesh.type, material: m.type, matName: m.name || '', color: color && color.isColor ? color.getHexString() : null,
           vertexColors: !!m.vertexColors, colorAttr: c ? `${c.itemSize}/${c.array.constructor.name}/${c.normalized}` : null,
-          map: !!m.map, onBeforeCompile: m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString(),
+          map: !!colorMap, onBeforeCompile: m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString(),
           uniforms: m.uniforms ? Object.keys(m.uniforms).slice(0, 12) : null, emissive: emissive ? emissive.getHexString() : null,
           transparent: !!m.transparent, opacity: m.opacity, count, instances: draw.instanceCount, defines: m.defines ? Object.keys(m.defines) : null,
         });
