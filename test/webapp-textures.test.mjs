@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { runWebapp, decodePass, threeBuildDir } from './helpers/webapp-node-host.mjs';
 import { decodeUi } from '../tools/ui-preview.mjs';
-import { DrawFlags, ToneMapping } from '../js/native-renderer.mjs';
+import { DrawFlags, LightType, ToneMapping } from '../js/native-renderer.mjs';
 
 const fixture = fileURLToPath(new URL('./fixtures/webapp-textures', import.meta.url));
 const skip = threeBuildDir() ? false : 'three is not installed (npm install)';
@@ -122,6 +122,22 @@ test('lit water keeps its vertex palette while sky reflection follows a live uni
   await settle();
   const changed = reflective(decodePass(rec.framePasses.at(-1) || rec.passes.at(-1)));
   assert.ok(near(changed.reflection[2], lin(0x30), .0001), 'new sky RGB reaches the next draw');
+});
+
+test('light RGB and hemisphere or spotlight parameters occupy separate packet fields', { skip }, async () => {
+  const { context, host, rec } = await run();
+  context.addColorTestLights();
+  host.frame(3000);
+  await settle();
+  const { lights } = decodePass(rec.framePasses.at(-1) || rec.passes.at(-1));
+  const sun = lights.find((light) => light.type === LightType.DIRECTIONAL);
+  const hemi = lights.find((light) => light.type === LightType.HEMISPHERE);
+  const spot = lights.find((light) => light.type === LightType.SPOT);
+  assert.ok(near(sun.color[2], lin(0xc0) * 2, .0001));
+  assert.ok(near(hemi.color[2], lin(0xe0) * .5, .0001));
+  assert.ok(near(hemi.extra[1], lin(0x70) * .5, .0001));
+  assert.ok(near(spot.color[2], lin(0x90), .0001));
+  assert.ok(near(spot.extra[1], Math.cos(Math.PI / 5 * .75), .0001));
 });
 
 test('terrain color stage translates local position, normals, GLSL math and live uniforms', { skip }, async () => {

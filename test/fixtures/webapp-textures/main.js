@@ -8,6 +8,12 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
 camera.position.set(0, 0, 6);
 scene.add(new THREE.AmbientLight(0xffffff, 1));
+window.addColorTestLights = () => {
+  const sun = new THREE.DirectionalLight('#2030c0', 2);
+  const hemi = new THREE.HemisphereLight('#4050e0', '#607020', .5);
+  const spot = new THREE.SpotLight('#303090', 1, 0, Math.PI / 5, .25);
+  scene.add(sun, hemi, spot);
+};
 
 // 1) GLB-style texture: image bytes -> Blob -> createImageBitmap -> THREE.Texture
 const bytes = await (await fetch('icon.png')).arrayBuffer();

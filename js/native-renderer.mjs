@@ -544,14 +544,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
       if (light.castShadow) unsupported('Shadow maps in webapps', 'lights work, shadows are not rendered yet');
-      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, a: 0, b: 0, c: 0 };
+      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
       if (light.isHemisphereLight) {
         rec.type = LightType.HEMISPHERE;
         _vec2.copy(_vec).normalize();
         rec.dx = _vec2.x; rec.dy = _vec2.y; rec.dz = _vec2.z;
-        const g = light.groundColor; rec.a = g.r * k; rec.b = g.g * k; rec.c = g.b * k;
+        const g = light.groundColor; rec.extra0 = g.r * k; rec.extra1 = g.g * k; rec.extra2 = g.b * k;
       } else if (light.isDirectionalLight || light.isSpotLight) {
         _vec2.setFromMatrixPosition(light.target.matrixWorld).sub(_vec);
         if (_vec2.lengthSq() < 1e-12) _vec2.set(0, -1, 0);
@@ -560,7 +560,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (light.isDirectionalLight) rec.type = LightType.DIRECTIONAL;
         else {
           rec.type = LightType.SPOT; rec.distance = light.distance; rec.decay = light.decay;
-          rec.a = Math.cos(light.angle); rec.b = Math.cos(light.angle * (1 - light.penumbra));
+          rec.extra0 = Math.cos(light.angle); rec.extra1 = Math.cos(light.angle * (1 - light.penumbra));
           if (light.map) unsupported('SpotLight.map');
         }
       } else if (light.isPointLight) {
@@ -775,7 +775,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o] = l.type; p[o + 1] = l.r; p[o + 2] = l.g; p[o + 3] = l.b;
     p[o + 4] = l.px; p[o + 5] = l.py; p[o + 6] = l.pz; p[o + 7] = l.distance;
     p[o + 8] = l.dx; p[o + 9] = l.dy; p[o + 10] = l.dz; p[o + 11] = l.decay;
-    p[o + 12] = l.a; p[o + 13] = l.b; p[o + 14] = l.c; p[o + 15] = 0;
+    p[o + 12] = l.extra0; p[o + 13] = l.extra1; p[o + 14] = l.extra2; p[o + 15] = 0;
   }
   function writeDraw(p, o, d) {
     p[o] = d.geometryId; p[o + 1] = d.instanceId; p[o + 2] = d.instanceCount; p[o + 3] = d.flags;
