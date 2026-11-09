@@ -1686,26 +1686,29 @@ center{text-align:center}
     finishBox(box);
   }
   // Scrolling, relative offsets and translate() after the box has its size.
+  const scrollLayout = new Map();
   function finishBox(box) {
     const cs = box.cs;
     const ox = lower(get(cs, 'overflow-x')), oy = lower(get(cs, 'overflow-y'));
     box.clips = (ox !== 'visible' && ox !== '') || (oy !== 'visible' && oy !== '');
     if (box.clips && box.el && !box.replaced) {
       const pbx = box.x + box.bl, pby = box.y + box.bt, pbw = box.w - box.bl - box.br, pbh = box.h - box.bt - box.bb;
-      let maxX = pbx + pbw, maxY = pby + pbh;
+      let maxX = pbx, maxY = pby;
       const extent = (b) => {
         if (b.isText || b.isBr) return;
         maxX = Math.max(maxX, b.x + b.w + (b.mr || 0)); maxY = Math.max(maxY, b.y + b.h + (b.mb || 0));
       };
       for (const c of box.children) if (!c.isText && !c.isBr && c.pos !== 'fixed' && c._gen === layoutGen) extent(c);
-      for (const a of box.abs) extent(a);
+      for (const a of box.abs) if (a.pos !== 'fixed') extent(a);
       if (box.frags) for (const f of box.frags) { maxX = Math.max(maxX, f.x + f.w); maxY = Math.max(maxY, f.y + f.h); }
       maxY += box.pb; maxX += box.pr;
-      box.scrollW = maxX - pbx; box.scrollH = maxY - pby;
+      box.scrollW = Math.max(pbw, maxX - pbx); box.scrollH = Math.max(pbh, maxY - pby);
       const el = box.el;
       const sx = clamp(el._ntScrollLeft || 0, 0, Math.max(0, box.scrollW - pbw));
       const sy = clamp(el._ntScrollTop || 0, 0, Math.max(0, box.scrollH - pbh));
-      el._ntScrollLeft = sx; el._ntScrollTop = sy;
+      // Grid and flex can measure an item without its final height first.
+      // Only the final pass may commit its clamped scroll offset.
+      scrollLayout.set(el, { sx, sy });
       box.scrollable = (oy === 'auto' || oy === 'scroll') && box.scrollH > pbh + 0.5 || (ox === 'auto' || ox === 'scroll') && box.scrollW > pbw + 0.5;
       if (sx || sy) {
         for (const c of box.children) if (!c.isText && !c.isBr && c.pos !== 'fixed' && c._gen === layoutGen) shiftBox(c, -sx, -sy);
@@ -2567,6 +2570,72 @@ center{text-align:center}
       applyRemap(c);
     }
   }
+  let selectPopup = null;
+  function closeSelect() {
+    if (!selectPopup) return;
+    selectPopup = null;
+    needPaint = true;
+  }
+  const optionDisabled = (o) => o.hasAttribute('disabled') ||
+    (o.parentNode?.localName === 'optgroup' && o.parentNode.hasAttribute('disabled'));
+  const insideRect = (r, x, y) => r && x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
+
+  function paintSelectPopup() {
+    const p = selectPopup;
+    if (!p) return;
+    const hit = hits.find((h) => h.el === p.el && h.box?.replaced === 'select');
+    const anchor = hit && clipIntersect({ x: 0, y: 0, w: state.width, h: state.height }, clipIntersect(hit, hit.clip));
+    if (!p.el.isConnected || isDisabled(p.el) || !anchor || anchor.w <= 0 || anchor.h <= 0) {
+      closeSelect();
+      return;
+    }
+    const box = hit.box, font = fontOf(box.cs);
+    const row = Math.max(24, lineHeightOf(box.cs) + 10);
+    const below = state.height - anchor.y - anchor.h, above = anchor.y;
+    const ideal = Math.min(8, p.options.length) * row;
+    const down = below >= ideal || below >= above;
+    const count = Math.min(p.options.length, Math.floor((down ? below : above) / row));
+    if (count < 1) { closeSelect(); return; }
+    const height = count * row;
+    const width = Math.min(state.width, Math.max(anchor.w, 100,
+      p.options.reduce((w, o) => Math.max(w, measureText(o.textContent.trim(), font, box.cs) + 32), 0)));
+    const rect = { x: clamp(anchor.x, 0, state.width - width), y: down ? anchor.y + anchor.h : anchor.y - height, w: width, h: height };
+    p.first = clamp(p.first, 0, p.options.length - count);
+    if (p.reveal) {
+      if (p.active < p.first) p.first = p.active;
+      if (p.active >= p.first + count) p.first = p.active - count + 1;
+      p.first = Math.max(0, p.first);
+      p.reveal = false;
+    }
+    Object.assign(p, { rect, anchor, row, count });
+    const background = parseColor(box.cs['background-color']);
+    const bg = background && background[3] > .5 ? background : [0.12, 0.15, 0.19, 1];
+    const fg = parseColor(box.cs.color) || [0.95, 0.95, 0.95, 1];
+    prim(null, [OP.RECT, rect.x, rect.y, rect.w, rect.h, 3, 3, 3, 3, ...bg]);
+    const selected = p.el.selectedIndex;
+    for (let n = 0; n < count; n++) {
+      const i = p.first + n, option = p.options[i], y = rect.y + n * row;
+      const highlighted = i === p.active && !optionDisabled(option);
+      if (highlighted) prim(rect, [OP.RECT, rect.x, y, rect.w, row, 0, 0, 0, 0, 0.15, 0.36, 0.65, 1]);
+      const color = highlighted ? [1, 1, 1, 1] : fg;
+      const alpha = optionDisabled(option) ? color[3] * .45 : color[3];
+      const label = (i === selected ? '✓  ' : '     ') + option.textContent.trim();
+      prim(rect, [OP.TEXT, rect.x + 8, y + (row - font.size * 1.25) / 2, rect.w - 16, row,
+        str(label), str(font.family), font.size, font.weight, font.italic, color[0], color[1], color[2], alpha, 0, 0]);
+    }
+  }
+  function commitSelect(index) {
+    const p = selectPopup, option = p.options[index];
+    if (!option || optionDisabled(option) || !p.el.contains(option) || isDisabled(p.el)) return;
+    const current = p.el.options.indexOf(option);
+    if (current < 0) return;
+    closeSelect();
+    if (p.el.selectedIndex === current) return;
+    p.el.selectedIndex = current;
+    p.el.dispatchEvent(new Event('input', { bubbles: true }));
+    p.el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
   function paintAll(root) {
     if (csRemap.size) {
       // chains: a -> b -> c when a value changed twice before a paint
@@ -2581,6 +2650,7 @@ center{text-align:center}
     root._propagatedBg = null;
     if (body && !hasBackground(root.cs) && hasBackground(body.cs)) { root._propagatedBg = body.cs; body._bgOnRoot = true; }
     paintContext(root, null);
+    paintSelectPopup();
   }
   function hasBackground(cs) {
     const c = parseColor(cs['background-color']);
@@ -2952,7 +3022,7 @@ center{text-align:center}
         return;
       }
       case 'select': {
-        const opts = el.childNodes.filter((n) => n.nodeType === 1 && n.localName === 'option');
+        const opts = el.options;
         let sel = opts.find((o) => o.hasAttribute('selected')) || opts[0];
         if (el._value !== undefined) sel = opts.find((o) => (o.getAttribute('value') ?? o.textContent) === el._value) || sel;
         if (sel) text(sel.textContent.trim(), cx, cy, cw - 14, ch, current, false);
@@ -3510,11 +3580,20 @@ center{text-align:center}
     if (!needLayout && !fullLayoutNeeded && !layoutDirty.size) return false;
     const t1 = now();
     let done = false;
+    scrollLayout.clear();
     const roots = dirtyRoots(true);
     if (roots && (roots.size || pendingToggles.length)) { done = relayoutPartial(roots, pendingToggles); if (!done) noteFull("partial layout refused (nested fixed / moved panel)"); }
     else if (roots && !roots.size) done = true;
     pendingToggles = [];
-    if (!done) layoutAll();
+    if (!done) {
+      scrollLayout.clear();
+      layoutAll();
+    }
+    for (const [el, { sx, sy }] of scrollLayout) {
+      el._ntScrollLeft = sx;
+      el._ntScrollTop = sy;
+    }
+    scrollLayout.clear();
     layoutDirty.clear();
     fullLayoutNeeded = false;
     timing.layout += now() - t1;
@@ -3550,13 +3629,6 @@ center{text-align:center}
   function boxOf(el) {
     const b = el && el._ntBox;
     return b && b._gen === layoutGen ? b : null;
-  }
-  function scrollableAncestor(el) {
-    for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
-      const b = boxOf(n);
-      if (b && b.scrollable) return b;
-    }
-    return null;
   }
   function reportFrameError(e) {
     frameErrors++;
@@ -3681,6 +3753,67 @@ center{text-align:center}
       reportFullReasons();
     },
     hitTest,
+    openSelect(el) {
+      if (selectPopup?.el === el) { closeSelect(); return; }
+      const options = el.options;
+      if (!options.length || el.hasAttribute('multiple') || Number(el.getAttribute('size')) > 1 || isDisabled(el)) return;
+      const active = el.selectedIndex;
+      selectPopup = { el, options, active, first: Math.max(0, active), reveal: true, pressed: -1, wheel: 0 };
+      needPaint = true;
+    },
+    closeSelect,
+    selectPointer(kind, x, y, button) {
+      if (!selectPopup) return false;
+      ensurePaint();
+      const p = selectPopup;
+      if (!p) return false;
+      if (!insideRect(p.rect, x, y)) {
+        if (button === 0 && kind === 'down' && insideRect(p.anchor, x, y)) { p.pressed = -2; return true; }
+        if (kind === 'up' && p.pressed !== -1) { closeSelect(); return true; }
+        if (kind === 'down') closeSelect();
+        return kind === 'move';
+      }
+      const index = p.first + Math.floor((y - p.rect.y) / p.row);
+      if (kind === 'move' && p.active !== index) { p.active = index; needPaint = true; }
+      if (button === 0 && kind === 'down') p.pressed = index;
+      if (button === 0 && kind === 'up') {
+        if (p.pressed === index) commitSelect(index);
+        if (selectPopup) selectPopup.pressed = -1;
+      }
+      return true;
+    },
+    selectWheel(x, y, dy) {
+      if (!selectPopup) return false;
+      ensurePaint();
+      const p = selectPopup;
+      if (!p) return false;
+      if (!insideRect(p.rect, x, y) && !insideRect(p.anchor, x, y)) { closeSelect(); return false; }
+      p.wheel += dy;
+      const rows = Math.trunc(p.wheel / p.row);
+      p.wheel -= rows * p.row;
+      const first = clamp(p.first + rows, 0, p.options.length - p.count);
+      if (first !== p.first) { p.first = first; needPaint = true; }
+      return true;
+    },
+    selectKey(key) {
+      const p = selectPopup;
+      if (!p) return false;
+      if (key === 'Tab') { closeSelect(); return false; }
+      if (key === 'Escape') closeSelect();
+      else if (key === 'Enter' || key === ' ') commitSelect(p.active);
+      else if (['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(key)) {
+        const step = key === 'ArrowUp' || key === 'End' ? -1 : 1;
+        let i = key === 'Home' ? 0 : key === 'End' ? p.options.length - 1 : p.active + step;
+        for (; i >= 0 && i < p.options.length; i += step) {
+          if (optionDisabled(p.options[i])) continue;
+          p.active = i;
+          p.reveal = true;
+          needPaint = true;
+          break;
+        }
+      } else return false;
+      return true;
+    },
     // Border box of an element in window px, or null when it has no box.
     rect(el) {
       try { layoutForRead(el); } catch (e) { reportFrameError(e); }
@@ -3718,16 +3851,27 @@ center{text-align:center}
     focusChanged(oldEl, newEl) { if (deps.interact) markInteraction(oldEl, newEl); },
     // Default action of a wheel event: scrolls the nearest scrollable box.
     wheel(target, dx, dy) {
-      const b = scrollableAncestor(target);
-      if (!b) return null;
-      const el = b.el;
-      const pbw = b.w - b.bl - b.br, pbh = b.h - b.bt - b.bb;
-      const ny = clamp((el._ntScrollTop || 0) + dy, 0, Math.max(0, b.scrollH - pbh));
-      const nx = clamp((el._ntScrollLeft || 0) + dx, 0, Math.max(0, b.scrollW - pbw));
-      if (ny === (el._ntScrollTop || 0) && nx === (el._ntScrollLeft || 0)) return null;
-      el._ntScrollTop = ny; el._ntScrollLeft = nx;
-      layoutDirty.add(el);
-      return el;
+      const allowsWheel = (overflow) => overflow === 'auto' || overflow === 'scroll';
+      for (let el = target; el && el.nodeType === 1; el = el.parentNode) {
+        const b = boxOf(el);
+        if (!b?.scrollable) continue;
+        const pbw = b.w - b.bl - b.br, pbh = b.h - b.bt - b.bb;
+        const sx = el._ntScrollLeft || 0, sy = el._ntScrollTop || 0;
+        const ox = lower(get(b.cs, 'overflow-x')), oy = lower(get(b.cs, 'overflow-y'));
+        const ny = allowsWheel(oy) ? clamp(sy + dy, 0, Math.max(0, b.scrollH - pbh)) : sy;
+        const nx = allowsWheel(ox) ? clamp(sx + dx, 0, Math.max(0, b.scrollW - pbw)) : sx;
+        if (ny !== sy || nx !== sx) {
+          el._ntScrollTop = ny; el._ntScrollLeft = nx;
+          layoutDirty.add(el);
+          return el;
+        }
+        const over = splitTop(lower(b.cs['overscroll-behavior']), ' ');
+        const contain = (axis, fallback) => /^(contain|none)$/.test(lower(b.cs[`overscroll-behavior-${axis}`] || fallback));
+        if (dx && allowsWheel(ox) && contain('x', over[0])) dx = 0;
+        if (dy && allowsWheel(oy) && contain('y', over[1] || over[0])) dy = 0;
+        if (!dx && !dy) break;
+      }
+      return null;
     },
     cursorAt(el) {
       for (let n = el; n && n.nodeType === 1; n = n.parentNode) {

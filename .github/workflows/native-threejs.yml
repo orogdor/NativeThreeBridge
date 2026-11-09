@@ -152,6 +152,47 @@ jobs:
             $out | Write-Host
             if ($code -ne 0 -or !($out -match "title: $status")) { throw "$status check failed" }
           }
+      - name: Verify scroll and selection in the Windows webapp runtime
+        shell: pwsh
+        run: |
+          Copy-Item test/fixtures/webapp-menu build/menu-smoke -Recurse
+          $script = @'
+          <script type="module">
+          import * as THREE from 'three';
+          const renderer = new THREE.WebGLRenderer();
+          const scene = new THREE.Scene();
+          const camera = new THREE.PerspectiveCamera(45, 1, .1, 100);
+          camera.position.z = 5;
+          scene.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()));
+          renderer.setAnimationLoop(() => renderer.render(scene, camera));
+          requestAnimationFrame(() => {
+            const host = globalThis.__ntHost;
+            const controls = document.getElementById('controls');
+            const select = document.getElementById('quality');
+            const b = select.getBoundingClientRect();
+            const x = b.x + b.width / 2, y = b.y + b.height / 2;
+            host.pointer('down', x, y, 0);
+            host.pointer('up', x, y, 0);
+            if (select.value !== 'low') throw Error('Opening select changed the value');
+            host.key(true, 'ArrowDown', 'ArrowDown', false, false, false, false, false);
+            host.key(true, 'Enter', 'Enter', false, false, false, false, false);
+            if (select.value !== 'high') throw Error('Unable to select the enabled option');
+            const r = controls.getBoundingClientRect();
+            host.wheel(r.x + r.width / 2, r.y + 12, 0, 2400);
+            host.ui.hitTest(r.x + r.width / 2, r.y + 12);
+            const last = document.getElementById('last');
+            const z = last.getBoundingClientRect();
+            if (host.ui.hitTest(z.x + z.width / 2, z.y + z.height / 2) !== last) throw Error('Bottom control cannot be reached');
+            document.title = 'Menu verified';
+          });
+          </script>
+          '@
+          $menu = Get-Content build/menu-smoke/index.html -Raw
+          $menu.Replace('</body>', ($script + '</body>')) | Set-Content build/menu-smoke/index.html -Encoding utf8
+          $out = & .\build\Release\WebappSmokeV8.exe build/menu-smoke 1
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          if ($code -ne 0 -or !($out -match 'title: Menu verified')) { throw "Menu interaction check failed" }
       - name: Real game check - Kuningriigid through the embedded webapp runtime (informational)
         continue-on-error: true
         shell: pwsh

@@ -2307,13 +2307,7 @@
         return;
       }
       if (tag === 'select') {
-        const opts = n.querySelectorAll('option');
-        if (opts.length > 1) {
-          const i = (n.selectedIndex + 1) % opts.length;
-          n.selectedIndex = i;
-          n.dispatchEvent(new Event('input', { bubbles: true }));
-          n.dispatchEvent(new Event('change', { bubbles: true }));
-        }
+        uiLayer?.openSelect?.(n);
         return;
       }
       if (tag === 'label') {
@@ -2339,6 +2333,7 @@
     }
   }
   function pointer(kind, x, y, button, mods) {
+    if (uiLayer?.selectPointer?.(kind, x, y, button)) return;
     const movementX = x - lastPointer.x, movementY = y - lastPointer.y;
     lastPointer = { x, y };
     if (kind === 'down') pointerButtons |= BUTTON_BIT[button] || 0;
@@ -2481,8 +2476,15 @@
     },
     key(down, key, code, repeat, alt, ctrl, shift, meta) {
       modifiers = { altKey: !!alt, ctrlKey: !!ctrl, shiftKey: !!shift, metaKey: !!meta };
+      if (down && uiLayer?.selectKey?.(key)) return;
       const keyCode = key.length === 1 ? key.toUpperCase().charCodeAt(0) : ({ Enter: 13, Escape: 27, ' ': 32, Tab: 9, Backspace: 8, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Shift: 16, Control: 17, Alt: 18, Delete: 46 }[key] || 0);
       const proceed = fire(eventTarget(), new KeyboardEvent(down ? 'keydown' : 'keyup', { bubbles: true, cancelable: true, key, code, repeat: !!repeat, keyCode, ...modifiers }));
+      const focused = document.activeElement;
+      if (down && proceed && !ctrl && !meta && focused?.localName === 'select' &&
+          !disabledControl(focused) && ['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(key)) {
+        uiLayer?.openSelect?.(focused);
+        return;
+      }
       const edit = down && proceed && !ctrl && !meta ? editableTarget() : null;
       if (edit && (key.length === 1 || key === 'Backspace' || (key === 'Enter' && edit.localName === 'textarea'))) {
         const v = edit.value;
@@ -2492,6 +2494,7 @@
     },
     pointer(kind, x, y, button) { pointer(kind, x, y, button | 0, modifiers); },
     wheel(x, y, deltaX, deltaY) {
+      if (uiLayer?.selectWheel?.(x, y, deltaY)) return;
       const target = hitTarget(x, y);
       const proceed = fire(target, new WheelEvent('wheel', { ...PTR, ...modifiers, clientX: x, clientY: y, deltaX, deltaY, deltaMode: 0, buttons: pointerButtons }));
       if (proceed && uiLayer && target && target.nodeType === 1) {
@@ -2502,7 +2505,7 @@
     // Cursor name (CSS `cursor`) for the element under the pointer.
     cursor() { return uiLayer && hoverTarget ? uiLayer.cursorAt(hoverTarget) : 'auto'; },
     focus(focused) {
-      if (!focused) pointerButtons = 0;
+      if (!focused) { pointerButtons = 0; uiLayer?.closeSelect?.(); }
       document.hidden = false;
       window.dispatchEvent(new FocusEvent(focused ? 'focus' : 'blur'));
     },

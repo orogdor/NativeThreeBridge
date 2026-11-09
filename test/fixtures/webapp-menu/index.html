@@ -1,0 +1,26 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Menu interaction test</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; }
+#menu { position: fixed; inset: 0; display: flex; justify-content: center; align-items: center; overflow: auto; padding: 24px; background: #172637; }
+#card { display: grid; grid-template-columns: 1fr 1fr; width: min(980px, 96vw); max-height: calc(100dvh - 48px); overflow: hidden; }
+#cover { min-height: 580px; background: #0e1d2e; }
+#controls { min-height: 0; overflow-y: auto; padding: 30px 28px; background: #e8edf0; }
+#controls > section { height: 180px; }
+#nested { height: 100px; overflow-y: auto; }
+#nested > div { height: 225px; }
+#last { display: block; width: 100%; height: 45px; }
+#quality { width: 210px; height: 35px; }
+@media (max-width: 800px) {
+  #card { display: block; overflow-y: auto; }
+  #cover { min-height: 180px; }
+  #controls { overflow: visible; }
+}
+</style></head>
+<body><main id="menu"><article id="card"><aside id="cover"></aside><div id="controls">
+<select id="quality" aria-label="Quality">
+<option value="low">Low</option><optgroup label="Quality levels"><option value="disabled" disabled>Unavailable</option><option value="high">High detail</option></optgroup>
+<option>Extra 1</option><option>Extra 2</option><option>Extra 3</option><option>Extra 4</option><option>Extra 5</option><option>Extra 6</option><option>Extra 7</option><option value="last">Final choice</option>
+</select>
+<section></section><div id="nested"><div>Nested settings</div></div><section></section><section></section><section></section><section></section><button id="last">Bottom setting</button>
+</div></article></main></body></html>
