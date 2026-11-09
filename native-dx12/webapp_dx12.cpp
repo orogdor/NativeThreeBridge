@@ -1414,6 +1414,16 @@ int WebappWindow::run(HINSTANCE instance) {
             perf_.rasterMs += msd(tRaster - tJs).count();
             perf_.renderMs += msd(tEnd - tRaster).count();
             perf_.fenceMs += fenceWaitMs_;
+            // Attribute visible stalls to JavaScript, UI rasterisation or DX12.
+            // Throttle warnings so an already slow scene cannot flood the log.
+            static auto lastSlowFrameLog = std::chrono::steady_clock::time_point{};
+            if (frameMs >= 120.0 && tEnd - lastSlowFrameLog >= std::chrono::seconds(1)) {
+                log("warn", "[frame-perf] total " + std::to_string(frameMs) +
+                    " ms; JS " + std::to_string(msd(tJs - now).count()) +
+                    " ms; UI " + std::to_string(msd(tRaster - tJs).count()) +
+                    " ms; DX12 " + std::to_string(msd(tEnd - tRaster).count()) + " ms");
+                lastSlowFrameLog = tEnd;
+            }
             fenceWaitMs_ = 0;
             const double since = std::chrono::duration<double>(tEnd - perfAt_).count();
             if (since >= 1.0) {
