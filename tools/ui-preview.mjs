@@ -11,7 +11,7 @@ export const OP_SIZE = { 1: 6, 2: 13, 3: 29, 4: 13, 5: 16, 8: 14 };
 // Walks the command stream; `visit(op, args)` receives the raw floats.
 export function decodeUi(floats, visit) {
   const count = floats[3];
-  let o = 4;
+  let o = floats[0] >= 2 ? 8 : 4;
   for (let i = 0; i < count; i++) {
     const op = floats[o];
     let size = OP_SIZE[op];

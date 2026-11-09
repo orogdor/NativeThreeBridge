@@ -387,8 +387,12 @@ void ntSubmitUi(const v8::FunctionCallbackInfo<v8::Value>& info) {
     std::size_t available;
     if (!typedView(self, info[0], data, available, false, "packet")) return;
     const std::uint32_t floats = info[1]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0);
-    if (floats > available || floats < 4 || data[0] != 1.0f) return self->throwError("range", "submitUi: bad packet");
+    if (floats > available || webappUiHeaderFloats(data[0]) == 0 || floats < webappUiHeaderFloats(data[0])) return self->throwError("range", "submitUi: bad packet");
     if (self->sink) self->sink->submitUi(data, floats, self->utf8(info[2]));
+}
+void ntSetCursor(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() >= 1 && self->sink) self->sink->setCursor(self->utf8(info[0]));
 }
 void ntMeasureText(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
@@ -460,7 +464,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
-        {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText},
+        {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor},
     };
     for (const Fn& f : functions) {
         v8::Local<v8::Function> fn = v8::Function::New(ctx, f.fn, self).ToLocalChecked();

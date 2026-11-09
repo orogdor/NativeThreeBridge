@@ -37,6 +37,8 @@ public:
     virtual void submitUi(const float* data, std::size_t floats, const std::string& strings) {
         (void)data; (void)floats; (void)strings;
     }
+    // CSS cursor name under the pointer ("pointer", "text", "auto" ...).
+    virtual void setCursor(const std::string& cursor) { (void)cursor; }
     // Width in px of `text` in the first installed family of the comma
     // separated `families`; negative when the sink cannot measure text.
     virtual double measureText(const std::string& families, double sizePx, int weight, bool italic,
@@ -45,6 +47,11 @@ public:
         return -1.0;
     }
 };
+
+// UI display-list header size for a version (webapp_ui.h); 0 = unknown.
+inline std::size_t webappUiHeaderFloats(float version) {
+    return version == 1.0f ? 4 : version == 2.0f ? 8 : 0;
+}
 
 // Same numbers as js/native-renderer.mjs.
 constexpr std::size_t kWebappPassHeaderFloats = 64;

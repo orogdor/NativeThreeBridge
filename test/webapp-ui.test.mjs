@@ -124,12 +124,18 @@ test('wheel scrolls overflow:auto boxes; DOM changes re-layout', { skip }, async
   host.wheel(...center(rectOf(doc, 'scroller')), 0, 40);
   assert.equal(scroller.scrollTop, 40);
   assert.equal(scroller.firstChild.getBoundingClientRect().y, firstRow - 40);
+  await new Promise((r) => setTimeout(r, 150));
+  await step(host); // flush the scrolled list
   const submits = rec.uiSubmits;
   context.addGold(5);
   await new Promise((r) => setTimeout(r, 150)); // past the adaptive refresh interval
   await step(host);
   assert.ok(rec.uiSubmits > submits, 'text change re-submits the UI');
   assert.ok(decoded(rec).texts.some((t) => t.text === '125'));
+  const [, , , , dx, dy, dw, dh] = rec.ui.floats;
+  const gold = rectOf(doc, 'gold');
+  assert.ok(dw > 0 && dw < 200 && dh > 0 && dh < 60, `only the changed text is re-rasterised (${dw}x${dh})`);
+  assert.ok(dx <= gold.right && dx + dw >= gold.x + 40 && dy <= gold.y + 10, 'dirty rectangle covers the gold value');
   const idle = rec.uiSubmits;
   await step(host, 3);
   assert.equal(rec.uiSubmits, idle, 'unchanged UI is not re-sent');

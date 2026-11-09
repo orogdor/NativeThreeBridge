@@ -231,7 +231,7 @@ jobs:
             if (Test-Path dist/NativeThreeBridge-webapp-log.txt) {
               Copy-Item dist/NativeThreeBridge-webapp-log.txt "shots/$($r.name)-log.txt"
               Write-Host "---- $($r.name) log ----"
-              Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-String -Pattern 'UI layer|frame \d+:|error|crash' | Select-Object -First 40
+              Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-String -Pattern 'UI layer|frame \d+:|\[error\]|crash' | Select-Object -First 40
             }
           }
       - name: Upload UI screenshots

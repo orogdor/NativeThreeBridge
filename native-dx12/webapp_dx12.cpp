@@ -114,6 +114,22 @@ public:
     void submitUi(const float* data, std::size_t floats, const std::string& strings) override {
         if (uiReady_) ui_.setDisplayList(data, floats, strings);
     }
+    void setCursor(const std::string& css) override {
+        LPCWSTR id = IDC_ARROW;
+        if (css == "pointer") id = IDC_HAND;
+        else if (css == "text" || css == "vertical-text") id = IDC_IBEAM;
+        else if (css == "move" || css == "all-scroll" || css == "grab" || css == "grabbing") id = IDC_SIZEALL;
+        else if (css == "not-allowed" || css == "no-drop") id = IDC_NO;
+        else if (css == "wait") id = IDC_WAIT;
+        else if (css == "progress") id = IDC_APPSTARTING;
+        else if (css == "crosshair" || css == "cell") id = IDC_CROSS;
+        else if (css == "help") id = IDC_HELP;
+        else if (css == "ew-resize" || css == "col-resize" || css == "e-resize" || css == "w-resize") id = IDC_SIZEWE;
+        else if (css == "ns-resize" || css == "row-resize" || css == "n-resize" || css == "s-resize") id = IDC_SIZENS;
+        cursorHidden_ = css == "none";
+        cursor_ = LoadCursorW(nullptr, id);
+        SetCursor(cursorHidden_ ? nullptr : cursor_);
+    }
     double measureText(const std::string& families, double size, int weight, bool italic, const std::string& text) override {
         return uiReady_ ? ui_.measureText(families, size, weight, italic, text) : -1.0;
     }
@@ -176,6 +192,8 @@ private:
     std::vector<std::vector<float>> pendingPasses_, passes_;
     UINT lastDraws_ = 0;
 
+    HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
+    bool cursorHidden_ = false;
     // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
     native_three::WebappUiRenderer ui_;
     bool uiReady_ = false, uiUpload_ = false, uiVisible_ = false;
@@ -935,6 +953,9 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CONTEXTMENU:
         return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ ? nullptr : cursor_); return TRUE; }
+        break;
     case WM_SETFOCUS: host_.focus(true); return 0;
     case WM_KILLFOCUS: host_.focus(false); return 0;
     case WM_DESTROY:

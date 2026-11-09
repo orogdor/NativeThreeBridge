@@ -1585,7 +1585,11 @@ center{text-align:center}
     resolveEdges(box, 0);
     let content;
     const sw = specSize(box, 'width', NaN);
+    const pct = (v) => typeof v === 'string' && v.includes('%');
     if (!Number.isNaN(sw)) content = sw;
+    // Percentage-sized replaced elements and form controls do not force
+    // their container wider (min-content contribution is zero).
+    else if (box.replaced && kind === 'min' && (pct(box.cs.width) || pct(box.cs['max-width']))) content = hEdges(box);
     else if (box.replaced) content = replacedSize(box, NaN, NaN)[0];
     else {
       let inner = 0;
@@ -2947,23 +2951,70 @@ center{text-align:center}
   // Encodes visible display-list entries (from the 3D canvas upward).
   let lastFloats = null, lastStrings = '', submitted = 0;
   function encode() {
-    const out = [1, state.width, state.height, 0];
+    // header v2: [2, width, height, count, dirtyX, dirtyY, dirtyW, dirtyH]
+    const out = [2, state.width, state.height, 0, 0, 0, -1, -1];
+    const keys = [];   // per command: identity string + painted bounds (dirty rects)
+    const table = [...strings.keys()];
     let count = 0, curClip;
     for (let i = 0; i < prims.length; i++) {
       const p = prims[i];
       if (i < holeAt && coveredByCanvas(p.d[1], p.d[2], p.d[3], p.d[4])) continue;
       if (p.clip !== curClip) {
         const c = p.clip;
-        out.push(OP.CLIP, c ? c.x : 0, c ? c.y : 0, c ? c.w : -1, c ? c.h : -1, c ? c.r || 0 : 0);
+        const cmd = [OP.CLIP, c ? c.x : 0, c ? c.y : 0, c ? c.w : -1, c ? c.h : -1, c ? c.r || 0 : 0];
+        for (const v of cmd) out.push(v);
+        keys.push({ k: cmd.join(','), b: c ? [c.x, c.y, c.w, c.h] : null, clip: true });
         curClip = c; count++;
       }
       for (const v of p.d) out.push(v);
+      keys.push({ k: commandKey(p.d, table), b: commandBounds(p.d, curClip) });
       count++;
     }
     out[3] = count;
+    const dirty = dirtyRect(lastKeys, keys);
+    if (dirty) { out[4] = dirty[0]; out[5] = dirty[1]; out[6] = dirty[2]; out[7] = dirty[3]; }
+    pendingKeys = keys;
     const floats = Float32Array.from(out);
-    const joined = [...strings.keys()].join('\u001f');
+    const joined = table.join('\u001f');
     return { floats, joined };
+  }
+  let lastKeys = null, pendingKeys = null;
+  // Text and image commands reference strings; compare by content.
+  function commandKey(d, table) {
+    const parts = Array.from(d, (v) => Math.round(v * 64) / 64);
+    if (d[0] === OP.TEXT) { parts[5] = table[d[5]]; parts[6] = table[d[6]]; }
+    else if (d[0] === OP.IMAGE) parts[5] = table[d[5]];
+    return parts.join(',');
+  }
+  // Pixels a command can touch (generous for text and shadows), within its clip.
+  function commandBounds(d, clip) {
+    let x = d[1], y = d[2], w = d[3], h = d[4];
+    if (d[0] === OP.SHADOW) { const b = d[9] + 2; x -= b; y -= b; w += 2 * b; h += 2 * b; }
+    else if (d[0] === OP.TEXT) { const extra = d[7] * 0.6 + 4; x -= 2; y -= 2; w += extra; h += 4; }
+    else { x -= 1; y -= 1; w += 2; h += 2; }
+    if (clip) { const c = clipIntersect(clip, { x, y, w, h, r: 0 }); return [c.x, c.y, c.w, c.h]; }
+    return [x, y, w, h];
+  }
+  // Union of changed commands when the list keeps its shape; null = redraw all.
+  function dirtyRect(prev, next) {
+    if (!prev || prev.length !== next.length) return null;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, n = 0;
+    const add = (b) => {
+      if (!b) { x0 = 0; y0 = 0; x1 = state.width; y1 = state.height; return; }
+      x0 = Math.min(x0, b[0]); y0 = Math.min(y0, b[1]); x1 = Math.max(x1, b[0] + b[2]); y1 = Math.max(y1, b[1] + b[3]);
+    };
+    for (let i = 0; i < next.length; i++) {
+      if (prev[i].k === next[i].k) continue;
+      n++;
+      add(prev[i].b); add(next[i].b);
+    }
+    if (!n) return [0, 0, 0, 0];
+    x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+    x1 = Math.min(state.width, Math.ceil(x1)); y1 = Math.min(state.height, Math.ceil(y1));
+    if (x1 <= x0 || y1 <= y0) return [0, 0, 0, 0];
+    // big changes: just redraw everything
+    if ((x1 - x0) * (y1 - y0) > 0.6 * state.width * state.height) return null;
+    return [x0, y0, x1 - x0, y1 - y0];
   }
   // Painted before the 3D canvas and completely under it: hidden, like in a browser.
   function coveredByCanvas(x, y, w, h) {
@@ -2972,9 +3023,9 @@ center{text-align:center}
   }
   function submit(floats, joined) {
     let same = lastFloats && lastFloats.length === floats.length && joined === lastStrings;
-    if (same) for (let i = 0; i < floats.length; i++) if (floats[i] !== lastFloats[i]) { same = false; break; }
+    if (same) for (let i = 8; i < floats.length; i++) if (floats[i] !== lastFloats[i]) { same = false; break; }
     if (same) return false;
-    lastFloats = floats; lastStrings = joined;
+    lastFloats = floats; lastStrings = joined; lastKeys = pendingKeys;
     if (typeof nt.submitUi === 'function') {
       try { nt.submitUi(floats, floats.length, joined); submitted++; } catch (e) { host.warnOnce('ui-submit', `UI submit failed: ${e && e.message}`); }
     }
@@ -3173,6 +3224,11 @@ center{text-align:center}
       const old = interact.hover;
       interact.hover = el;
       if (hoverRules) markInteraction(old, el);
+      const cursor = el ? api.cursorAt(el) : 'auto';
+      if (cursor !== lastCursor && typeof nt.setCursor === 'function') {
+        lastCursor = cursor;
+        try { nt.setCursor(cursor); } catch { /* optional */ }
+      }
     },
     setActive(el) {
       if (interact.active === el) return;
@@ -3195,7 +3251,12 @@ center{text-align:center}
       return el;
     },
     cursorAt(el) {
-      for (let n = el; n && n.nodeType === 1; n = n.parentNode) if (n._ntStyle) return lower(n._ntStyle.cursor) || 'auto';
+      for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
+        if (!n._ntStyle) continue;
+        const c = lower(splitTop(String(n._ntStyle.cursor || 'auto'), ',').pop());
+        if (c === 'auto' && (n.localName === 'input' || n.localName === 'textarea') && !/^(button|submit|reset|checkbox|radio|range|color|file)$/.test(lower(n.getAttribute('type')))) return 'text';
+        return c || 'auto';
+      }
       return 'auto';
     },
     stats() {
@@ -3205,7 +3266,7 @@ center{text-align:center}
     _debug: { get prims() { return prims; }, get holeAt() { return holeAt; }, get strings() { return strings; }, encode, parseColor, px, parseSheet, parseSelectorList },
   };
   let lastSubmittedGen = -1, needSubmit = false;
-  let lastFrameUpdate = -1e9, minInterval = 0;
+  let lastFrameUpdate = -1e9, minInterval = 0, lastCursor = 'auto';
   // Restyle the topmost element that entered or left the hover/active chain.
   function markInteraction(a, b) {
     const chainA = [], chainB = [];

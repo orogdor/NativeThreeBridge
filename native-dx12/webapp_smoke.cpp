@@ -60,8 +60,9 @@ struct RecordingSink final : native_three::WebappRenderSink {
     void submitUi(const float* data, std::size_t floats, const std::string& strings) override {
         uiSubmits++;
         const auto table = native_three::webappUiSplitStrings(strings);
-        const float* p = data + 4;
-        std::size_t remaining = floats - 4, count = std::size_t(data[3]), texts = 0, images = 0, n = 0;
+        const std::size_t header = native_three::webappUiHeaderFloats(data[0]);
+        const float* p = data + header;
+        std::size_t remaining = floats - header, count = std::size_t(data[3]), texts = 0, images = 0, n = 0;
         for (; n < count; n++) {
             const std::size_t size = native_three::webappUiCommandSize(p, remaining);
             if (!size) { uiValid = false; break; }

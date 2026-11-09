@@ -104,6 +104,8 @@ struct WebappUiRenderer::Impl {
     std::vector<float> list;
     std::vector<std::string> strings;
     bool dirty = true;
+    bool fullRedraw = true;            // else only dirtyRect is re-rasterised
+    float dirtyRect[4] = {0, 0, 0, 0};
 
     ComPtr<IWICBitmap> target;
     ComPtr<ID2D1RenderTarget> rt;
@@ -124,7 +126,7 @@ struct WebappUiRenderer::Impl {
     std::unordered_map<std::string, Image> images;
     std::unordered_map<std::string, std::wstring> families;
     std::map<std::tuple<std::wstring, int, int, bool>, ComPtr<IDWriteTextFormat>> formats;
-    int lastCommands = 0, failedImages = 0, renders = 0;
+    int lastCommands = 0, failedImages = 0, renders = 0, partialRenders = 0;
     double lastMs = 0, totalMs = 0, maxMs = 0, firstMs = -1;
     std::string lastFailure;
 
@@ -285,10 +287,11 @@ struct WebappUiRenderer::Impl {
 
     // ---- commands
     void execute() {
-        if (list.size() < 4) return;
+        const std::size_t header = list.empty() ? 0 : webappUiHeaderFloats(list[0]);
+        if (!header || list.size() < header) return;
         const std::size_t count = std::size_t(std::max(0.0f, list[3]));
-        const float* p = list.data() + 4;
-        std::size_t remaining = list.size() - 4;
+        const float* p = list.data() + header;
+        std::size_t remaining = list.size() - header;
         auto str = [&](float idx) -> const std::string& {
             static const std::string empty;
             const std::size_t i = std::size_t(std::max(0.0f, idx));
@@ -484,11 +487,23 @@ bool WebappUiRenderer::ready() const { return impl_->d2d && impl_->dwrite; }
 
 void WebappUiRenderer::setDisplayList(const float* data, std::size_t floats, const std::string& strings) {
     Impl& s = *impl_;
+    const bool unrendered = s.dirty;
     s.list.assign(data, data + floats);
     s.strings = webappUiSplitStrings(strings);
+    // v2 header carries the rectangle that changed since the previous list.
+    const bool partial = floats >= 8 && data[0] == 2.0f && data[6] >= 0 && data[7] >= 0;
+    if (partial && data[6] == 0 && data[7] == 0 && !unrendered) return; // nothing visible changed
+    if (!partial || unrendered) s.fullRedraw = true;
+    else {
+        s.fullRedraw = false;
+        for (int i = 0; i < 4; i++) s.dirtyRect[i] = data[4 + i];
+    }
     s.dirty = true;
 }
-bool WebappUiRenderer::empty() const { return impl_->list.size() < 4 || impl_->list[3] <= 0; }
+bool WebappUiRenderer::empty() const {
+    const auto& l = impl_->list;
+    return l.empty() || l.size() < webappUiHeaderFloats(l[0]) || webappUiHeaderFloats(l[0]) == 0 || l[3] <= 0;
+}
 
 double WebappUiRenderer::measureText(const std::string& families, double sizePx, int weight, bool italic, const std::string& text) {
     Impl& s = *impl_;
@@ -509,7 +524,9 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
     if (!s.d2d || !s.wic || width == 0 || height == 0) return false;
     if (!s.dirty && width == s.w && height == s.h && s.rt) return false;
     const auto start = std::chrono::steady_clock::now();
+    bool full = s.fullRedraw;
     if (!s.rt || width != s.w || height != s.h) {
+        full = true;
         s.rt.Reset();
         s.dc5.Reset();
         s.brush.Reset();
@@ -527,13 +544,22 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
         s.h = height;
     }
     s.dirty = false;
+    s.fullRedraw = false;
     s.rt->BeginDraw();
     s.rt->SetTransform(D2D1::IdentityMatrix());
-    s.rt->Clear(D2D1::ColorF(0, 0, 0, 0));
     s.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     s.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    // Partial redraw: only the changed rectangle is cleared and re-drawn.
+    const bool partial = !full && s.dirtyRect[2] > 0 && s.dirtyRect[3] > 0;
+    if (partial) {
+        s.rt->PushAxisAlignedClip(D2D1::RectF(s.dirtyRect[0], s.dirtyRect[1], s.dirtyRect[0] + s.dirtyRect[2], s.dirtyRect[1] + s.dirtyRect[3]),
+                                  D2D1_ANTIALIAS_MODE_ALIASED);
+    }
+    s.rt->Clear(D2D1::ColorF(0, 0, 0, 0));
     s.clip = Impl::Clip::None;
     s.execute();
+    if (partial) s.rt->PopAxisAlignedClip();
+    if (partial) s.partialRenders++;
     const HRESULT hr = s.rt->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) { s.rt.Reset(); s.dirty = true; return false; }
     if (FAILED(hr)) return false;
@@ -562,8 +588,8 @@ unsigned WebappUiRenderer::height() const { return impl_->h; }
 std::string WebappUiRenderer::stats() const {
     const Impl& s = *impl_;
     char line[320];
-    std::snprintf(line, sizeof line, "UI layer: %d commands, %zu images (%d failed), %d rasters: first %.1f ms, later avg %.1f / max %.1f ms (%ux%u)%s",
-                  s.lastCommands, s.images.size(), s.failedImages, s.renders, s.firstMs < 0 ? 0.0 : s.firstMs,
+    std::snprintf(line, sizeof line, "UI layer: %d commands, %zu images (%d failed), %d rasters (%d partial): first %.1f ms, later avg %.1f / max %.1f ms (%ux%u)%s",
+                  s.lastCommands, s.images.size(), s.failedImages, s.renders, s.partialRenders, s.firstMs < 0 ? 0.0 : s.firstMs,
                   s.renders > 1 ? s.totalMs / (s.renders - 1) : 0.0, s.maxMs, s.w, s.h, s.dc5 ? "" : ", no SVG support");
     std::string out = line;
     if (!s.lastFailure.empty()) out += " | last image problem: " + s.lastFailure;

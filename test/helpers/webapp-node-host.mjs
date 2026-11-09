@@ -197,7 +197,7 @@ export async function runWebapp(root, options = {}) {
     },
     releaseInstances(id) { rec.instances.delete(id); },
     submitUi(packet, floats, strings) {
-      if (floats > packet.length || packet[0] !== 1) throw new RangeError('submitUi: bad packet');
+      if (floats > packet.length || (packet[0] !== 1 && packet[0] !== 2)) throw new RangeError('submitUi: bad packet');
       rec.uiSubmits = (rec.uiSubmits || 0) + 1;
       rec.ui = { floats: Float32Array.from(packet.subarray(0, floats)), strings: String(strings).split('\u001f') };
     },

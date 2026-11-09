@@ -2,7 +2,9 @@
 // Native side of the HTML/CSS UI layer (js/webapp-ui.js).
 //
 // The JS layer sends a display list: Float32Array
-//   [1 (version), width, height, commandCount, commands...]
+//   [2 (version), width, height, commandCount, dirtyX, dirtyY, dirtyW, dirtyH, commands...]
+// (dirtyW < 0: redraw everything; version 1 has a 4-float header and no
+// dirty rectangle)
 // and a string table (UTF-8, joined with U+001F) for text, font families and
 // image sources. WebappUiRenderer rasterises it with Direct2D, DirectWrite
 // and WIC into a premultiplied BGRA bitmap that the DX12 webapp window
