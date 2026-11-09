@@ -749,7 +749,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   // Conservative GLSL subset: float attribute -> varying -> smoothstep alpha
   // mask. Any more complicated fragment logic keeps its existing fallback.
   function attributeAlphaRamp(vertex, fragment) {
-    const re = /\\bfloat\\s+([A-Za-z_]\\w*)\\s*=\\s*smoothstep\\s*\\(\\s*([+\\-\\d.eE]+)\\s*,\\s*([+\\-\\d.eE]+)\\s*,\\s*([A-Za-z_]\\w*)\\s*\\)\\s*;/g;
+    const re = /\bfloat\s+([A-Za-z_]\w*)\s*=\s*smoothstep\s*\(\s*([+\-\d.eE]+)\s*,\s*([+\-\d.eE]+)\s*,\s*([A-Za-z_]\w*)\s*\)\s*;/g;
     for (const match of fragment.matchAll(re)) {
       const [, name, lower, upper, varying] = match;
       if (!new RegExp(`\\bdiffuseColor\\.a\\s*\\*=\\s*${name}\\b`).test(fragment)) continue;
