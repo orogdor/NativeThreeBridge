@@ -1,4 +1,4 @@
-NativeThreeBridge v0.32.0 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.32.1 - KAKS MÄNGU, ÜKS ENGINE
 ==================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -13,7 +13,7 @@ Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
 
-v0.32.0 UUS: 3D tekstuurid (PNG/JPEG/WebP pildid, GLB mudelite tekstuurid,
+v0.32.1 PARANDUS: onBeforeCompile materjalides, mille tipuatribuut juhib\nsmoothstep-läbipaistvust, tõlgitakse mask nüüd RGBA tipuvärvideks.\nNäiteks rannajoone servad ei kata enam maastikku ühtlase pinnana.\nKeerukad maastiku ja vee GLSL-efektid vajavad veel eraldi tuge.\n\nv0.32.0 UUS: 3D tekstuurid (PNG/JPEG/WebP pildid, GLB mudelite tekstuurid,
 alphaTest lehestik - nt Kuningriigide puud), Canvas 2D joonistamine (minikaart,
 ikoonid, CanvasTexture), THREE.Sprite, tone mapping (ACES jt), taeva ja
 onBeforeCompile veepinna värvid. Paneeli näitamine/peitmine ei paiguta enam
