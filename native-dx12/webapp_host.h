@@ -21,10 +21,26 @@ struct WebappBuiltin {
 class WebappRenderSink {
 public:
     virtual ~WebappRenderSink() = default;
+    // colors: colorChannels (3 rgb or 4 rgba) floats per vertex or nullptr; uvs: 2 floats per vertex or nullptr.
     virtual void uploadGeometry(std::uint32_t id, const float* positions, const float* normals,
                                 const float* colors, std::uint32_t vertexCount,
-                                const std::uint32_t* indices, std::uint32_t indexCount) = 0;
+                                const std::uint32_t* indices, std::uint32_t indexCount, const float* uvs,
+                                std::uint32_t colorChannels) = 0;
     virtual void releaseGeometry(std::uint32_t id) = 0;
+    // Texture `id` from encoded image bytes (width == 0: PNG/JPEG/WebP/...)
+    // or tightly packed RGBA8 pixels. flags: kWebappTexture*. Returns false
+    // when the image cannot be decoded (the draw stays untextured).
+    virtual bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes,
+                               std::uint32_t width, std::uint32_t height, std::uint32_t flags) {
+        (void)id; (void)data; (void)bytes; (void)width; (void)height; (void)flags;
+        return false;
+    }
+    virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // Texture `id` from the current pixels of Canvas 2D surface `canvasId`.
+    virtual bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
+        (void)id; (void)canvasId; (void)flags;
+        return false;
+    }
     virtual void uploadInstances(std::uint32_t id, const float* matrices, const float* colors,
                                  std::uint32_t count) = 0;
     virtual void releaseInstances(std::uint32_t id) = 0;
@@ -36,6 +52,31 @@ public:
     // native-dx12/webapp_ui.h. `strings` are joined with U+001F.
     virtual void submitUi(const float* data, std::size_t floats, const std::string& strings) {
         (void)data; (void)floats; (void)strings;
+    }
+    // UI layer timings since the last call (ms) and layout counts.
+    virtual void reportUi(double styleMs, double layoutMs, double paintMs, int forced, int full, int partial) {
+        (void)styleMs; (void)layoutMs; (void)paintMs; (void)forced; (void)full; (void)partial;
+    }
+    // Canvas 2D (js/webapp-shim.js): one batch of drawing commands for canvas
+    // `id`, see WebappUiRenderer::canvasCommands. `strings` joined with U+001F.
+    virtual void canvasCommands(std::uint32_t id, std::uint32_t width, std::uint32_t height, const float* ops,
+                                std::size_t floats, const std::string& strings) {
+        (void)id; (void)width; (void)height; (void)ops; (void)floats; (void)strings;
+    }
+    // getImageData: straight RGBA8 of a rectangle. false = not available.
+    virtual bool canvasRead(std::uint32_t id, std::int32_t x, std::int32_t y, std::uint32_t w, std::uint32_t h,
+                            std::vector<std::uint8_t>& rgba) {
+        (void)id; (void)x; (void)y; (void)w; (void)h; (void)rgba;
+        return false;
+    }
+    // putImageData: straight RGBA8 written into a canvas of canvasW x canvasH.
+    virtual void canvasWrite(std::uint32_t id, std::uint32_t canvasW, std::uint32_t canvasH, std::int32_t x, std::int32_t y,
+                             std::uint32_t w, std::uint32_t h, const std::uint8_t* rgba) {
+        (void)id; (void)canvasW; (void)canvasH; (void)x; (void)y; (void)w; (void)h; (void)rgba;
+    }
+    // Encoded image bytes (Blob images) usable as an image source named `key`.
+    virtual void registerImage(const std::string& key, const std::uint8_t* bytes, std::size_t n) {
+        (void)key; (void)bytes; (void)n;
     }
     // CSS cursor name under the pointer ("pointer", "text", "auto" ...).
     virtual void setCursor(const std::string& cursor) { (void)cursor; }
@@ -56,7 +97,8 @@ inline std::size_t webappUiHeaderFloats(float version) {
 // Same numbers as js/native-renderer.mjs.
 constexpr std::size_t kWebappPassHeaderFloats = 64;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 32;
+constexpr std::size_t kWebappDrawFloats = 40;
+constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 
 // Game-folder path checks shared by the module loader and file reads.

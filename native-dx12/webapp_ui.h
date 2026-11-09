@@ -96,6 +96,20 @@ public:
     unsigned width() const;
     unsigned height() const;
 
+    // ---- Canvas 2D (js/webapp-shim.js CanvasRenderingContext2D)
+    // Executes one batch of commands on canvas `id` (created/resized as needed).
+    // Each command: [op, argCount, args...]; strings joined with U+001F.
+    void canvasCommands(std::uint32_t id, unsigned width, unsigned height, const float* ops, std::size_t floats,
+                        const std::string& strings);
+    // Straight RGBA8 pixels (getImageData / textures).
+    bool canvasRead(std::uint32_t id, int x, int y, unsigned w, unsigned h, std::vector<std::uint8_t>& rgba);
+    void canvasWrite(std::uint32_t id, unsigned canvasW, unsigned canvasH, int x, int y, unsigned w, unsigned h,
+                     const std::uint8_t* rgba);
+    bool canvasPixelsRgba(std::uint32_t id, std::vector<std::uint8_t>& rgba, unsigned& w, unsigned& h);
+    void releaseCanvas(std::uint32_t id);
+    // Encoded image bytes addressable as an image source (`key`, e.g. "nt-bytes:3").
+    void registerImage(const std::string& key, const std::uint8_t* bytes, std::size_t n);
+
     // Diagnostics for the log: commands drawn, images failed, last ms.
     std::string stats() const;
 

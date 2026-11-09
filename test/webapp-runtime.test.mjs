@@ -92,7 +92,7 @@ test('edge webapp: importmap prefixes, classic scripts, built-in OrbitControls, 
   assert.equal(w.inflatedOk, true, 'deflate-raw DecompressionStream');
   assert.equal(w.dynamicTint, 0x3366ff, 'dynamic import()');
   assert.equal(w.fileLoaderValue, 'loaded from game folder', 'THREE.FileLoader streaming path');
-  for (const feature of ['ShaderMaterial / custom GLSL', 'THREE.Points', 'Image/texture decoding']) assert.ok(status.unsupported.includes(feature), feature);
+  for (const feature of ['ShaderMaterial / custom GLSL', 'THREE.Points']) assert.ok(status.unsupported.includes(feature), feature);
   const pass = decodePass(rec.passes[0]);
   assert.ok(pass.draws.some((d) => d.flags & DrawFlags.NORMAL_COLOR));
   assert.ok(pass.draws.some((d) => (d.flags & DrawFlags.LINES) && (d.flags & DrawFlags.VERTEX_COLORS)), 'GridHelper lines');

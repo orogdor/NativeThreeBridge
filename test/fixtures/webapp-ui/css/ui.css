@@ -51,3 +51,6 @@ details summary { cursor: pointer; color: var(--accent); }
 @media (max-width: 700px) {
   #tools { flex-direction: column; left: auto; right: 8px; transform: none; }
 }
+
+/* :has() + attribute change elsewhere in the page */
+body:has(#panel:not([hidden])) #toast { background: #6b2c2c; }

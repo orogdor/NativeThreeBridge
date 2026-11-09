@@ -6,13 +6,14 @@
 // Three.js scene graph and sends the engine:
 //   * geometry buffers once (again only when an attribute version changes),
 //   * InstancedMesh matrices/colours only when they change,
+//   * textures once per image (encoded bytes are decoded natively),
 //   * one compact Float32Array "pass" per render() call: camera, lights and
-//     a 32-float record per visible draw.
+//     a 40-float record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
 export const PASS_HEADER_FLOATS = 64;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 32;
+export const DRAW_FLOATS = 40;
 export const MAX_LIGHTS = 16;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
@@ -20,10 +21,16 @@ export const DrawFlags = {
   TRANSPARENT: 1, DOUBLE_SIDED: 2, BACK_SIDE: 4, VERTEX_COLORS: 8, UNLIT: 16,
   NO_DEPTH_WRITE: 32, NO_DEPTH_TEST: 64, LINES: 128, LINE_STRIP: 256,
   NORMAL_COLOR: 512, INSTANCE_COLORS: 1024, FLAT: 2048,
+  MAP: 4096, MAP_REPEAT: 8192, MAP_MIRROR: 16384, FAR_DEPTH: 32768, NO_TONE_MAP: 65536,
 };
+// nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
+export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
+// Pass header [48]: tone mapping curve (same numbers as THREE.*ToneMapping).
+export const ToneMapping = { NONE: 0, LINEAR: 1, REINHARD: 2, CINEON: 3, ACES: 4, AGX: 6, NEUTRAL: 7 };
 export const PassFlags = { CLEAR_COLOR: 1, CLEAR_DEPTH: 2 };
 
-export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHost) {
+// `shaders`: { ShaderLib, UniformsUtils } from three.module.js (not in three.core.js).
+export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHost, shaders = {}) {
   const warnOnce = (key, text) => (host && host.warnOnce ? host.warnOnce(key, text) : undefined);
   const unsupported = (feature, detail) => (host && host.unsupported ? host.unsupported(feature, detail) : undefined);
 
@@ -33,9 +40,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _vec2 = new THREE.Vector3();
   const _color = new THREE.Color();
   const _srgb = { r: 0, g: 0, b: 0 };
+  const _uvIdentity = new Float32Array(6);
+  const _spriteScale = new THREE.Vector3();
+  const _spriteQuat = new THREE.Quaternion();
+  const _spriteTmp = new THREE.Matrix4();
 
   let nextGeometryId = 1;
   let nextInstanceId = 1;
+  let nextTextureId = 1;
+  const SHADER_IDS = { MeshStandardMaterial: 'standard', MeshPhysicalMaterial: 'physical', MeshLambertMaterial: 'lambert', MeshPhongMaterial: 'phong', MeshBasicMaterial: 'basic', MeshToonMaterial: 'toon', MeshMatcapMaterial: 'matcap' };
 
   class NativeRenderer {
     constructor(parameters = {}) {
@@ -97,6 +110,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._animationHandle = 0;
       this._geometries = new WeakMap();
       this._instances = new WeakMap();
+      this._textures = new WeakMap();   // THREE.Source -> { id, version, ok }
+      this._patches = new WeakMap();    // material -> what its shader patch does to colours
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
       this._opaque = [];
       this._transparent = [];
@@ -207,11 +222,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!position) return null;
       const normal = geometry.attributes.normal;
       const color = geometry.attributes.color;
+      const uv = geometry.attributes.uv;
       const index = geometry.index;
-      const key = `${position.version}:${normal ? normal.version : -1}:${color ? color.version : -1}:${index ? index.version : -1}:${position.count}:${index ? index.count : 0}`;
-      if (record && record.key === key && record.position === position && record.normal === normal && record.index === index && record.color === color) return record;
+      const key = `${position.version}:${normal ? normal.version : -1}:${color ? color.version : -1}:${uv ? uv.version : -1}:${index ? index.version : -1}:${position.count}:${index ? index.count : 0}`;
+      if (record && record.key === key && record.position === position && record.normal === normal && record.index === index && record.color === color && record.uv === uv) return record;
       if (!record) {
-        record = { id: nextGeometryId++, key: '', position: null, normal: null, color: null, index: null, hasColors: false, vertexCount: 0, indexCount: 0 };
+        record = { id: nextGeometryId++, key: '', position: null, normal: null, color: null, uv: null, index: null, hasColors: false, hasUvs: false, vertexCount: 0, indexCount: 0 };
         this._geometries.set(geometry, record);
         this.info.memory.geometries++;
         const onDispose = () => {
@@ -225,11 +241,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const positions = toFloat3(position);
       let normals = normal ? toFloat3(normal) : null;
       if (!normals) normals = computeNormals(THREE, position, index);
-      const colors = color ? toFloat3(color) : null;
+      const colors = color ? (color.itemSize === 4 ? toFloat4(color) : toFloat3(color)) : null;
+      const uvs = uv ? toFloat2(uv) : null;
       let indices = null;
       if (index) indices = index.array instanceof Uint32Array ? index.array : Uint32Array.from(index.array);
-      nt.uploadGeometry(record.id, positions, normals, colors, indices);
-      Object.assign(record, { key, position, normal, color, index, hasColors: !!colors, vertexCount: position.count, indexCount: index ? index.count : 0 });
+      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
+      Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
       return record;
     }
 
@@ -259,8 +276,94 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return record;
     }
 
+    // One native texture per image (THREE.Source), re-sent when needsUpdate.
+    _textureRecord(texture) {
+      if (!texture || !texture.isTexture || texture.isCubeTexture || texture.isCompressedTexture || texture.isData3DTexture || texture.isDataArrayTexture || texture.isRenderTargetTexture || texture.isVideoTexture) return null;
+      const source = texture.source || texture;
+      const image = source.data !== undefined ? source.data : texture.image;
+      if (!image) return null;
+      let record = this._textures.get(source);
+      if (!record) {
+        record = { id: nextTextureId++, version: -1, srgb: null, ok: false };
+        this._textures.set(source, record);
+        this.info.memory.textures++;
+        const onDispose = () => {
+          texture.removeEventListener('dispose', onDispose);
+          if (this._textures.get(source) !== record) return;
+          this._textures.delete(source);
+          this.info.memory.textures--;
+          if (nt.releaseTexture) nt.releaseTexture(record.id);
+        };
+        texture.addEventListener('dispose', onDispose);
+      }
+      const srgb = texture.colorSpace === THREE.SRGBColorSpace;
+      const version = source.version !== undefined ? source.version : texture.version;
+      if (record.version !== version || record.srgb !== srgb || (image.isCanvasNative && record.canvasVersion !== image._ntCanvasVersion)) {
+        record.version = version; record.srgb = srgb;
+        let flags = srgb ? TextureFlags.SRGB : 0;
+        const mips = texture.generateMipmaps !== false && texture.minFilter !== THREE.NearestFilter && texture.minFilter !== THREE.LinearFilter;
+        if (mips) flags |= TextureFlags.MIPMAPS;
+        record.ok = false;
+        try { record.ok = !!this._sendTexture(record, image, texture, flags); } catch (e) { warnOnce(`texture-${record.id}`, `Texture upload failed: ${e && e.message || e}`); }
+      }
+      return record.ok ? record : null;
+    }
+    _sendTexture(record, image, texture, flags) {
+      if (!nt.uploadTexture) { unsupported('Textures', 'this engine build has no texture upload'); return false; }
+      const src = image._ntSource;
+      if (src) {
+        if (src.bytes) return nt.uploadTexture(record.id, src.bytes, 0, 0, flags);
+        if (src.path) return nt.uploadTexture(record.id, new Uint8Array(nt.readBinary(src.path)), 0, 0, flags);
+        if (src.rgba) return nt.uploadTexture(record.id, rgba8(src.rgba), src.w, src.h, flags);
+        if (src.canvas) return this._sendCanvas(record, src.canvas, flags);
+      }
+      if (image._ntCanvas !== undefined || (typeof image.getContext === 'function' && image.localName === 'canvas')) return this._sendCanvas(record, image, flags);
+      if (image.data && image.width > 0 && image.height > 0) { // DataTexture
+        const px = dataTexturePixels(THREE, image, texture);
+        if (!px) { unsupported(`DataTexture format ${texture.format}/${texture.type}`, 'drawn untextured'); return false; }
+        return nt.uploadTexture(record.id, px, image.width, image.height, flags);
+      }
+      return false;
+    }
+    _sendCanvas(record, canvas, flags) {
+      // Canvas 2D drawings live natively (js/webapp-shim.js canvas commands).
+      if (!canvas._ntCanvasId || !nt.uploadCanvasTexture) { unsupported('Canvas textures', 'canvas textures stay blank'); return false; }
+      if (canvas._ntFlushCanvas) canvas._ntFlushCanvas();
+      record.canvasVersion = canvas._ntCanvasVersion;
+      return nt.uploadCanvasTexture(record.id, canvas._ntCanvasId, flags);
+    }
+    // material.onBeforeCompile patches GLSL the engine cannot run. Run the
+    // patch once against Three.js' own shader source and remember which
+    // colour uniforms it writes into diffuseColor, so the surface at least
+    // gets the intended colour (e.g. a sea that mixes deep/shallow colours).
+    _patchInfo(m) {
+      let info = this._patches.get(m);
+      if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
+      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false };
+      this._patches.set(m, info);
+      const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
+      const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
+      if (!lib) return info;
+      try {
+        const shader = { shaderName: m.type, uniforms: UniformsUtils.clone(lib.uniforms), vertexShader: lib.vertexShader, fragmentShader: lib.fragmentShader, defines: Object.assign({}, m.defines) };
+        const before = new Set(Object.keys(shader.uniforms));
+        m.onBeforeCompile(shader, this);
+        const added = Object.entries(shader.uniforms).filter(([k, u]) => !before.has(k) && u && u.value && u.value.isColor);
+        if (added.length && /diffuseColor\.rgb\s*=/.test(shader.fragmentShader)) info.colors = colorWeights(added, shader.fragmentShader);
+        const a = /diffuseColor\.a\s*=\s*([0-9]*\.?[0-9]+)/.exec(shader.fragmentShader);
+        if (a) info.alpha = parseFloat(a[1]);
+        // Alpha cut out by a texture of the patch's own (fog-of-war masks, reveal effects):
+        // drawing the surface whole would cover the scene, so it is left out.
+        const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
+        if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
+      } catch (e) { warnOnce(`patch-${m.uuid}`, `material.onBeforeCompile could not be inspected: ${e && e.message || e}`); }
+      return info;
+    }
+
     // ---------------------------------------------------------------- render
     render(scene, camera) {
+      // Debug aid: tests and tools inspect what the game drew last.
+      globalThis.__ntLastRender = { scene, camera, renderer: this };
       if (this._disposed) return;
       if (!camera || !camera.isCamera) { warnOnce('render-no-camera', 'render() called without a camera'); return; }
       if (this._renderTarget) return; // render-to-texture is not supported yet: skip, do not draw to screen
@@ -277,6 +380,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const opaque = this._opaque, transparent = this._transparent, lights = this._lights;
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
+      this._spriteCount = 0;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
 
       if (this.sortObjects) {
@@ -314,8 +418,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._pendingClear = 0;
       p[44] = flags;
       p[45] = this._width; p[46] = this._height;
-      p[47] = this.toneMapping === THREE.NoToneMapping ? 1 : this.toneMappingExposure;
-      if (this.toneMapping !== THREE.NoToneMapping) unsupported('Tone mapping curves (ACES, AgX …)', 'only toneMappingExposure is applied');
+      p[47] = this.toneMappingExposure;
+      const tm = this.toneMapping;
+      p[48] = tm === THREE.LinearToneMapping ? ToneMapping.LINEAR : tm === THREE.ReinhardToneMapping ? ToneMapping.REINHARD
+        : tm === THREE.CineonToneMapping ? ToneMapping.CINEON : tm === THREE.ACESFilmicToneMapping ? ToneMapping.ACES
+          : tm === THREE.AgXToneMapping ? ToneMapping.AGX : tm === THREE.NeutralToneMapping ? ToneMapping.NEUTRAL : ToneMapping.NONE;
+      if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
       if (scene.fog) unsupported('Fog', 'scenes render without fog');
 
       let o = PASS_HEADER_FLOATS;
@@ -335,7 +443,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (object.isLight) this._addLight(object, lights, ambient);
         else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
         else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
-        else if (object.isSprite) unsupported('THREE.Sprite', 'sprites are not drawn yet');
+        else if (object.isSprite) this._addSprite(object, camera, opaque, transparent);
       }
       const children = object.children;
       for (let i = 0; i < children.length; i++) this._collect(children[i], camera, opaque, transparent, lights, ambient);
@@ -370,6 +478,44 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         rec.type = LightType.POINT; rec.distance = light.distance; rec.decay = light.decay;
       } else return;
       lights.push(rec);
+    }
+
+    // THREE.Sprite: a camera-facing textured quad (SpriteMaterial is unlit).
+    _addSprite(sprite, camera, opaque, transparent) {
+      const m = sprite.material;
+      if (!m || !m.visible) return;
+      if (sprite.frustumCulled && !_frustum.intersectsSprite(sprite)) return;
+      if (!this._spriteGeometry) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
+        g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
+        g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+        g.setIndex([0, 1, 2, 0, 2, 3]);
+        this._spriteGeometry = g;
+      }
+      const record = this._geometryRecord(this._spriteGeometry);
+      if (!record) return;
+      _vec.setFromMatrixPosition(sprite.matrixWorld);
+      _spriteScale.setFromMatrixScale(sprite.matrixWorld);
+      if (m.sizeAttenuation === false && camera.isPerspectiveCamera) {
+        _vec2.copy(_vec).applyMatrix4(camera.matrixWorldInverse);
+        _spriteScale.multiplyScalar(-_vec2.z);
+      }
+      _spriteQuat.setFromRotationMatrix(camera.matrixWorld);
+      // model = T(position) * R(camera) * Rz(rotation) * S(scale) * T(0.5 - center)
+      const matrix = this._spriteMatrix(this._spriteCount++);
+      matrix.makeTranslation(0.5 - sprite.center.x, 0.5 - sprite.center.y, 0);
+      _spriteTmp.makeScale(_spriteScale.x, _spriteScale.y, 1); matrix.premultiply(_spriteTmp);
+      if (m.rotation) { _spriteTmp.makeRotationZ(m.rotation); matrix.premultiply(_spriteTmp); }
+      _spriteTmp.makeRotationFromQuaternion(_spriteQuat); matrix.premultiply(_spriteTmp);
+      _spriteTmp.makeTranslation(_vec.x, _vec.y, _vec.z); matrix.premultiply(_spriteTmp);
+      _vec.applyMatrix4(_projScreen);
+      const proxy = { isSprite: true, matrixWorld: matrix, renderOrder: sprite.renderOrder || 0, name: sprite.name, type: 'Sprite', geometry: this._spriteGeometry };
+      this._queue({ mesh: proxy, record, instances: null, z: _vec.z }, m, 0, 6, opaque, transparent);
+    }
+    _spriteMatrix(i) {
+      if (!this._spriteMatrices) this._spriteMatrices = [];
+      return this._spriteMatrices[i] || (this._spriteMatrices[i] = new THREE.Matrix4());
     }
 
     _addMesh(mesh, camera, opaque, transparent) {
@@ -421,31 +567,73 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.flatShading) flags |= DrawFlags.FLAT;
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
       let roughness = 1, metalness = 0, shininess = -1;
+      let color = m.color || null, opacity = m.opacity ?? 1;
       if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.isLineDashedMaterial) flags |= DrawFlags.UNLIT;
+      else if (m.isSpriteMaterial) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
       else if (m.isMeshNormalMaterial) flags |= DrawFlags.NORMAL_COLOR;
       else if (m.isMeshStandardMaterial) { roughness = m.roughness; metalness = m.metalness; }
       else if (m.isMeshPhongMaterial) { shininess = m.shininess; roughness = Math.sqrt(2 / (m.shininess + 2)); }
       else if (m.isMeshLambertMaterial || m.isMeshToonMaterial) { roughness = 1; }
       else if (m.isShadowMaterial) return;
-      else if (m.isShaderMaterial || m.isRawShaderMaterial) unsupported('ShaderMaterial / custom GLSL', `drawn as a plain lit surface (${m.type})`);
+      else if (m.isShaderMaterial || m.isRawShaderMaterial) {
+        // Custom GLSL cannot run here: use its colour uniforms, unlit unless it uses lights.
+        const shaderColors = m.uniforms ? Object.entries(m.uniforms).filter(([, u]) => u && u.value && u.value.isColor) : [];
+        if (shaderColors.length) {
+          color = mixColors(_color, colorWeights(shaderColors, m.fragmentShader || ''));
+          if (!m.lights) flags |= DrawFlags.UNLIT;
+          unsupported('ShaderMaterial / custom GLSL', 'drawn in the colour of its colour uniforms');
+        } else unsupported('ShaderMaterial / custom GLSL', `drawn as a plain lit surface (${m.type})`);
+        if (/gl_Position\.z\s*=\s*gl_Position\.w/.test(m.vertexShader || '')) flags |= DrawFlags.FAR_DEPTH;
+        if (!/tonemapping_fragment/.test(m.fragmentShader || '')) flags |= DrawFlags.NO_TONE_MAP;
+      }
       else if (m.isMeshMatcapMaterial) unsupported('MeshMatcapMaterial', 'drawn as lit colour');
       else if (m.isMeshDepthMaterial || m.isMeshDistanceMaterial) return;
-      if (m.map || m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
-        unsupported('Textures (map, normalMap, envMap …)', 'materials use their base colour (planned for v0.30)');
+      if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
+      if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
+        unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
-      if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) unsupported('material.onBeforeCompile shader patches');
+      if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) {
+        const patch = this._patchInfo(m);
+        if (patch.hide) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
+        if (patch.colors) {
+          color = mixColors(_color, patch.colors);
+          flags &= ~(DrawFlags.VERTEX_COLORS | DrawFlags.INSTANCE_COLORS);
+          unsupported('material.onBeforeCompile shader patches', 'patched surfaces use the colours the patch mixes');
+        } else unsupported('material.onBeforeCompile shader patches');
+        if (patch.alpha !== null && m.transparent) opacity = patch.alpha * (m.opacity ?? 1);
+      }
       if (m.clippingPlanes && m.clippingPlanes.length) unsupported('Clipping planes');
       if (m.blending === THREE.AdditiveBlending) unsupported('AdditiveBlending', 'drawn with normal alpha blending');
-      const color = m.color || (m.uniforms && m.uniforms.color && m.uniforms.color.value) || null;
+      // colour map
+      let textureId = 0;
+      const uvt = _uvIdentity;
+      uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
+      if (m.map && base.record.hasUvs) {
+        const tex = this._textureRecord(m.map);
+        if (tex) {
+          const map = m.map;
+          textureId = tex.id;
+          flags |= DrawFlags.MAP;
+          if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
+          else if (map.wrapS === THREE.MirroredRepeatWrapping || map.wrapT === THREE.MirroredRepeatWrapping) flags |= DrawFlags.MAP_MIRROR;
+          if (map.matrixAutoUpdate) map.updateMatrix();
+          const e = map.matrix.elements;
+          // u' = a u + c v + e ; v' = b u + d v + f  (D3D rows run top-down: flipY mirrors v)
+          let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
+          if (map.flipY) { b = -b; d = -d; ty = 1 - ty; }
+          uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
+        }
+      }
       const emissive = m.emissive || null;
       const ei = m.emissiveIntensity ?? 1;
       const draw = {
         geometryId: base.record.id, instanceId: base.instances ? base.instances.id : 0,
         instanceCount: base.instances ? mesh.count : 1, flags, start, count,
-        roughness, metalness, shininess,
+        roughness, metalness, shininess, textureId, alphaTest: m.alphaTest || 0,
+        ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
-        opacity: m.opacity ?? 1,
+        opacity,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
@@ -477,6 +665,28 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o + 8] = d.r; p[o + 9] = d.g; p[o + 10] = d.b; p[o + 11] = d.opacity;
     p[o + 12] = d.er; p[o + 13] = d.eg; p[o + 14] = d.eb; p[o + 15] = d.shininess;
     p.set(d.matrix, o + 16);
+    p[o + 32] = d.textureId; p[o + 33] = d.alphaTest;
+    p[o + 34] = d.ua; p[o + 35] = d.ub; p[o + 36] = d.uc; p[o + 37] = d.ud; p[o + 38] = d.ue; p[o + 39] = d.uf;
+  }
+  // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
+  function colorWeights(entries, glsl) {
+    const names = entries.map(([k]) => k);
+    const w = names.map(() => 1);
+    const mix = /mix\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,/g;
+    let found = false;
+    for (let mm; (mm = mix.exec(glsl));) {
+      const i = names.indexOf(mm[1]), j = names.indexOf(mm[2]);
+      if (i < 0 || j < 0) continue;
+      if (!found) { w.fill(0); found = true; }
+      w[i] += 0.65; w[j] += 0.35;
+    }
+    const total = w.reduce((a, b) => a + b, 0) || 1;
+    return entries.map(([, u], i) => [u, w[i] / total]);
+  }
+  function mixColors(target, weighted) {
+    target.setRGB(0, 0, 0, THREE.LinearSRGBColorSpace);
+    for (const [u, k] of weighted) { const c = u.value; target.r += c.r * k; target.g += c.g * k; target.b += c.b * k; }
+    return target.clone();
   }
 
   return { NativeRenderer };
@@ -494,6 +704,52 @@ export function toFloat3(attribute) {
     out[i * 3] = attribute.getX(i);
     out[i * 3 + 1] = attribute.itemSize > 1 ? attribute.getY(i) : 0;
     out[i * 3 + 2] = attribute.itemSize > 2 ? attribute.getZ(i) : 0;
+  }
+  return out;
+}
+
+export function toFloat4(attribute) {
+  const count = attribute.count;
+  if (!attribute.isInterleavedBufferAttribute && attribute.itemSize === 4 && attribute.array instanceof Float32Array && !attribute.normalized) {
+    return attribute.array.length === count * 4 ? attribute.array : attribute.array.subarray(0, count * 4);
+  }
+  const out = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) { out[i * 4] = attribute.getX(i); out[i * 4 + 1] = attribute.getY(i); out[i * 4 + 2] = attribute.getZ(i); out[i * 4 + 3] = attribute.getW(i); }
+  return out;
+}
+export function toFloat2(attribute) {
+  const count = attribute.count;
+  if (!attribute.isInterleavedBufferAttribute && attribute.itemSize === 2 && attribute.array instanceof Float32Array && !attribute.normalized) {
+    return attribute.array.length === count * 2 ? attribute.array : attribute.array.subarray(0, count * 2);
+  }
+  const out = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) { out[i * 2] = attribute.getX(i); out[i * 2 + 1] = attribute.itemSize > 1 ? attribute.getY(i) : 0; }
+  return out;
+}
+function rgba8(data) {
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof Uint8ClampedArray) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return Uint8Array.from(data);
+}
+// DataTexture pixels -> tightly packed RGBA8 (null = format not handled).
+function dataTexturePixels(THREE, image, texture) {
+  const n = image.width * image.height, src = image.data;
+  const channels = texture.format === THREE.RGBAFormat ? 4 : texture.format === THREE.RGFormat ? 2 : texture.format === THREE.RedFormat ? 1 : 0;
+  if (!channels || src.length < n * channels) return null;
+  const isFloat = texture.type === THREE.FloatType || src instanceof Float32Array;
+  const isHalf = texture.type === THREE.HalfFloatType;
+  if (!isFloat && !isHalf && texture.type !== THREE.UnsignedByteType) return null;
+  if (channels === 4 && !isFloat && !isHalf) return rgba8(src);
+  const out = new Uint8Array(n * 4);
+  const get = (i) => (isHalf ? THREE.DataUtils.fromHalfFloat(src[i]) * 255 : isFloat ? src[i] * 255 : src[i]);
+  for (let i = 0; i < n; i++) {
+    for (let c = 0; c < 4; c++) {
+      let v;
+      if (c < channels) v = get(i * channels + c);
+      else if (c === 3) v = 255;
+      else v = channels === 1 ? get(i) : 0;
+      out[i * 4 + c] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
   }
   return out;
 }

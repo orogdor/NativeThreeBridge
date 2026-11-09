@@ -35,7 +35,7 @@ struct RecordingSink final : native_three::WebappRenderSink {
     int uploads = 0, passes = 0, badDraws = 0, errors = 0;
     std::string title;
     void uploadGeometry(std::uint32_t id, const float* p, const float*, const float*, std::uint32_t vertexCount,
-                        const std::uint32_t*, std::uint32_t) override {
+                        const std::uint32_t*, std::uint32_t, const float*, std::uint32_t) override {
         if (!p || !vertexCount) badDraws++;
         geometryVertices[id] = vertexCount;
         uploads++;

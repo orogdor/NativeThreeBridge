@@ -144,3 +144,49 @@ test('wheel scrolls overflow:auto boxes; DOM changes re-layout', { skip }, async
   doc.getElementById('toast').style.display = 'none';
   assert.equal(rectOf(doc, 'toast').width, 0, 'inline style change');
 });
+
+test('incremental updates: only the changed panel is laid out, hover repaints only', { skip }, async () => {
+  const { context, host } = await runWebapp(fixture, { frames: 3, width: 1280, height: 720 });
+  const doc = context.document;
+  const ui = context.__ntHost.ui;
+  const t0 = { ...ui.stats().timing };
+  // text in the fixed HUD: partial layout of #hud only
+  context.addGold(1);
+  assert.equal(rectOf(doc, 'gold').height > 0, true);
+  const t1 = { ...ui.stats().timing };
+  assert.equal(t1.fullLayouts, t0.fullLayouts, 'no whole-page layout for a HUD text change');
+  assert.ok(t1.partialLayouts > t0.partialLayouts, 'HUD text change uses a partial layout');
+  // reading an element in another panel needs no layout at all
+  context.addGold(1);
+  const before = rectOf(doc, 'start');
+  const t2 = { ...ui.stats().timing };
+  assert.equal(t2.partialLayouts, t1.partialLayouts, 'untouched panel: exact box without layout');
+  assert.ok(before.width > 0);
+  // :hover that changes only colours: restyle + repaint, no layout
+  const buildCenter = center(rectOf(doc, 'build'));
+  rectOf(doc, 'gold'); // flush the pending HUD change
+  host.pointer('move', 5, 300, 0); // hover chain starts on the canvas
+  rectOf(doc, 'gold');
+  const t3 = { ...ui.stats().timing };
+  host.pointer('move', ...buildCenter, 0);
+  assert.equal(context.getComputedStyle(doc.getElementById('build')).backgroundColor, '#5a4c34');
+  rectOf(doc, 'build');
+  const t4 = { ...ui.stats().timing };
+  assert.equal(t4.fullLayouts + t4.partialLayouts, t3.fullLayouts + t3.partialLayouts, 'colour-only hover needs no layout');
+  assert.ok(t4.restyled - t3.restyled <= 4, `hover restyles only the button chain (${t4.restyled - t3.restyled})`);
+  // :has(): showing #panel restyles #toast elsewhere in the page
+  assert.notEqual(context.getComputedStyle(doc.getElementById('toast')).backgroundColor, '#6b2c2c');
+  doc.getElementById('panel').hidden = false;
+  assert.equal(context.getComputedStyle(doc.getElementById('toast')).backgroundColor, '#6b2c2c');
+  doc.getElementById('panel').hidden = true;
+  assert.equal(context.getComputedStyle(doc.getElementById('toast')).backgroundColor, '#2c6e2c');
+  // write/read in a loop stays exact (the span is a flex item, so it has a box)
+  const goldEl = doc.getElementById('gold');
+  const gold = doc.querySelector('#gold b');
+  const widths = [];
+  for (let i = 1; i <= 5; i++) { gold.textContent = '1'.repeat(i); widths.push(goldEl.getBoundingClientRect().width); }
+  for (let i = 1; i < widths.length; i++) assert.ok(widths[i] > widths[i - 1], `geometry reads see the latest text (${widths.join(', ')})`);
+  gold.textContent = '123';
+  const inline = gold.getBoundingClientRect();
+  assert.ok(inline.width > 10 && inline.height > 10 && inline.x > goldEl.getBoundingClientRect().x, 'inline <b> has the box of its text');
+});

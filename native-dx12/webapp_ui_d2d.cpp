@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <tuple>
@@ -124,6 +125,7 @@ struct WebappUiRenderer::Impl {
         ComPtr<ID2D1SvgDocument> svgDoc; // per render target
     };
     std::unordered_map<std::string, Image> images;
+    std::unordered_map<std::string, std::string> registered; // "nt-bytes:N" -> encoded image (Blob images)
     std::unordered_map<std::string, std::wstring> families;
     std::map<std::tuple<std::wstring, int, int, bool>, ComPtr<IDWriteTextFormat>> formats;
     int lastCommands = 0, failedImages = 0, renders = 0, partialRenders = 0;
@@ -179,7 +181,10 @@ struct WebappUiRenderer::Impl {
         Image& img = images[src];
         std::string bytes, error;
         bool isSvg = false;
-        if (src.rfind("data:", 0) == 0) {
+        auto reg = registered.find(src);
+        if (reg != registered.end()) {
+            bytes = reg->second;
+        } else if (src.rfind("data:", 0) == 0) {
             const std::size_t comma = src.find(',');
             const std::string meta = comma == std::string::npos ? "" : src.substr(5, comma - 5);
             const std::string payload = comma == std::string::npos ? "" : src.substr(comma + 1);
@@ -285,6 +290,445 @@ struct WebappUiRenderer::Impl {
         return c;
     }
 
+
+    // ---------------------------------------------------------- Canvas 2D
+    // One persistent premultiplied bitmap per <canvas>; commands from
+    // js/webapp-shim.js (CanvasRenderingContext2D). Paths arrive in device
+    // space; TRANSFORM is used for text, images and gradient brushes.
+    struct Canvas {
+        unsigned w = 0, h = 0;
+        ComPtr<IWICBitmap> bitmap;
+        ComPtr<ID2D1RenderTarget> rt;
+        ComPtr<ID2D1DeviceContext> dc;
+        ComPtr<ID2D1SolidColorBrush> solid;
+        std::uint64_t version = 0;
+        std::vector<float> fill{0, 0, 0, 0, 1}, stroke{0, 0, 0, 0, 1};
+        D2D1_MATRIX_3X2_F m = D2D1::IdentityMatrix();
+        float lineWidth = 1, miter = 10, dashOffset = 0;
+        int cap = 0, join = 0;
+        std::vector<float> dash;
+        ComPtr<ID2D1StrokeStyle> strokeStyle;
+        bool strokeDirty = true;
+        float alpha = 1;
+        int comp = 0;
+        std::string family = "sans-serif";
+        float fontSize = 10;
+        int weight = 400;
+        bool italic = false;
+        int align = 0, baseline = 0;
+        struct Seg { int op; float a[6]; };
+        std::vector<Seg> path;
+        ComPtr<ID2D1Geometry> pathGeometry;
+        int pathRule = -1;
+        struct ClipEntry { ComPtr<ID2D1Geometry> geometry; ComPtr<ID2D1Layer> layer; };
+        std::vector<std::vector<ClipEntry>> clips = std::vector<std::vector<ClipEntry>>(1);
+        int pushed = 0;
+        std::unordered_map<std::string, ComPtr<ID2D1Bitmap>> bitmaps;           // images drawn into this canvas
+        std::unordered_map<std::uint32_t, std::pair<std::uint64_t, ComPtr<ID2D1Bitmap>>> canvasBitmaps; // other canvases
+        ComPtr<ID2D1Bitmap> uiBitmap;      // for the UI render target
+        std::uint64_t uiVersion = ~0ull;
+    };
+    std::unordered_map<std::uint32_t, Canvas> canvases;
+    int canvasBatches = 0;
+    double canvasMs = 0;
+
+    void resetCanvasState(Canvas& c) {
+        c.fill = {0, 0, 0, 0, 1};
+        c.stroke = {0, 0, 0, 0, 1};
+        c.m = D2D1::IdentityMatrix();
+        c.lineWidth = 1; c.miter = 10; c.dashOffset = 0; c.cap = 0; c.join = 0; c.dash.clear();
+        c.strokeDirty = true; c.alpha = 1; c.comp = 0;
+        c.family = "sans-serif"; c.fontSize = 10; c.weight = 400; c.italic = false; c.align = 0; c.baseline = 0;
+        c.path.clear(); c.pathGeometry.Reset();
+        c.clips.assign(1, {});
+    }
+    bool ensureCanvas(Canvas& c, unsigned w, unsigned h) {
+        w = std::max(1u, std::min(w, 16384u));
+        h = std::max(1u, std::min(h, 16384u));
+        if (c.rt && c.w == w && c.h == h) return true;
+        c.rt.Reset(); c.dc.Reset(); c.solid.Reset(); c.bitmap.Reset();
+        c.bitmaps.clear(); c.canvasBitmaps.clear(); c.uiBitmap.Reset();
+        if (!wic || FAILED(wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &c.bitmap))) return false;
+        const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        if (FAILED(d2d->CreateWicBitmapRenderTarget(c.bitmap.Get(), props, &c.rt))) { c.bitmap.Reset(); return false; }
+        c.rt.As(&c.dc);
+        c.rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 1), &c.solid);
+        c.w = w;
+        c.h = h;
+        resetCanvasState(c);
+        return true;
+    }
+    ComPtr<ID2D1Brush> canvasBrush(Canvas& c, const std::vector<float>& st) {
+        ComPtr<ID2D1Brush> out;
+        if (st.empty()) return out;
+        const int kind = int(st[0]);
+        if (kind == 0 && st.size() >= 5) {
+            c.solid->SetColor(colorOf(st.data() + 1));
+            c.solid->SetOpacity(clamp01(c.alpha));
+            out = c.solid;
+            return out;
+        }
+        if ((kind != 1 && kind != 2) || st.size() < 8) return out;
+        const int n = int(st[7]);
+        if (n < 1 || st.size() < std::size_t(8 + n * 5)) return out;
+        const float* g = st.data() + 1; // x0 y0 (r0) x1 y1 (r1)
+        std::vector<D2D1_GRADIENT_STOP> v;
+        float inner = 0;
+        if (kind == 2 && g[5] > 0) inner = clamp01(g[2] / g[5]);
+        for (int i = 0; i < n; i++) {
+            const float* sp = st.data() + 8 + i * 5;
+            v.push_back({inner + clamp01(sp[0]) * (1 - inner), colorOf(sp + 1)});
+        }
+        ComPtr<ID2D1GradientStopCollection> coll;
+        if (FAILED(c.rt->CreateGradientStopCollection(v.data(), UINT32(v.size()), D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &coll))) return out;
+        const D2D1_BRUSH_PROPERTIES bp = D2D1::BrushProperties(clamp01(c.alpha), c.m);
+        if (kind == 1) {
+            ComPtr<ID2D1LinearGradientBrush> b;
+            if (SUCCEEDED(c.rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(g[0], g[1]), D2D1::Point2F(g[2], g[3])), bp, coll.Get(), &b))) out = b;
+        } else {
+            ComPtr<ID2D1RadialGradientBrush> b;
+            const float r = std::max(0.5f, g[5]);
+            if (SUCCEEDED(c.rt->CreateRadialGradientBrush(D2D1::RadialGradientBrushProperties(D2D1::Point2F(g[3], g[4]), D2D1::Point2F(g[0] - g[3], g[1] - g[4]), r, r), bp, coll.Get(), &b))) out = b;
+        }
+        return out;
+    }
+    ComPtr<ID2D1Geometry> canvasPath(Canvas& c, int rule) {
+        if (c.pathGeometry && c.pathRule == rule) return c.pathGeometry;
+        ComPtr<ID2D1PathGeometry> path;
+        ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1Geometry> out;
+        if (FAILED(d2d->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return out;
+        sink->SetFillMode(rule == 1 ? D2D1_FILL_MODE_ALTERNATE : D2D1_FILL_MODE_WINDING);
+        bool open = false, haveStart = false;
+        D2D1_POINT_2F start{0, 0};
+        for (const auto& sg : c.path) {
+            if (sg.op == 11) {
+                if (open) sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                open = false;
+                start = D2D1::Point2F(sg.a[0], sg.a[1]);
+                haveStart = true;
+                continue;
+            }
+            if (!haveStart) continue;
+            if (sg.op == 14) {
+                if (open) sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                open = false; // the next segment starts again at the closed figure's first point
+                continue;
+            }
+            if (!open) { sink->BeginFigure(start, D2D1_FIGURE_BEGIN_FILLED); open = true; }
+            if (sg.op == 12) sink->AddLine(D2D1::Point2F(sg.a[0], sg.a[1]));
+            else if (sg.op == 13)
+                sink->AddBezier(D2D1::BezierSegment(D2D1::Point2F(sg.a[0], sg.a[1]), D2D1::Point2F(sg.a[2], sg.a[3]), D2D1::Point2F(sg.a[4], sg.a[5])));
+        }
+        if (open) sink->EndFigure(D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        out = path;
+        c.pathGeometry = out;
+        c.pathRule = rule;
+        return out;
+    }
+    ComPtr<ID2D1Geometry> quadGeometry(const float* q, bool closed = true) {
+        ComPtr<ID2D1PathGeometry> path;
+        ComPtr<ID2D1GeometrySink> sink;
+        ComPtr<ID2D1Geometry> out;
+        if (FAILED(d2d->CreatePathGeometry(&path)) || FAILED(path->Open(&sink))) return out;
+        sink->BeginFigure(D2D1::Point2F(q[0], q[1]), D2D1_FIGURE_BEGIN_FILLED);
+        for (int i = 1; i < 4; i++) sink->AddLine(D2D1::Point2F(q[i * 2], q[i * 2 + 1]));
+        sink->EndFigure(closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+        sink->Close();
+        out = path;
+        return out;
+    }
+    ID2D1StrokeStyle* canvasStroke(Canvas& c) {
+        if (!c.strokeDirty) return c.strokeStyle.Get();
+        c.strokeDirty = false;
+        c.strokeStyle.Reset();
+        const D2D1_CAP_STYLE caps[3] = {D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_SQUARE};
+        const D2D1_LINE_JOIN joins[3] = {D2D1_LINE_JOIN_MITER_OR_BEVEL, D2D1_LINE_JOIN_ROUND, D2D1_LINE_JOIN_BEVEL};
+        const D2D1_CAP_STYLE cap = caps[std::clamp(c.cap, 0, 2)];
+        std::vector<float> dashes;
+        const float w = std::max(0.001f, c.lineWidth);
+        for (float d : c.dash) dashes.push_back(d / w); // Direct2D dashes are in stroke widths
+        const D2D1_STROKE_STYLE_PROPERTIES props = D2D1::StrokeStyleProperties(
+            cap, cap, cap, joins[std::clamp(c.join, 0, 2)], c.miter, dashes.empty() ? D2D1_DASH_STYLE_SOLID : D2D1_DASH_STYLE_CUSTOM, c.dashOffset / w);
+        static_cast<ID2D1Factory*>(d2d.Get())->CreateStrokeStyle(props, dashes.empty() ? nullptr : dashes.data(), UINT32(dashes.size()), &c.strokeStyle);
+        return c.strokeStyle.Get();
+    }
+    void pushCanvasClip(Canvas& c, Canvas::ClipEntry& e) {
+        if (!e.layer) c.rt->CreateLayer(nullptr, &e.layer);
+        if (!e.layer || !e.geometry) return;
+        c.rt->SetTransform(D2D1::IdentityMatrix());
+        c.rt->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), e.geometry.Get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE), e.layer.Get());
+        c.pushed++;
+    }
+    void popCanvasClips(Canvas& c, int n) {
+        for (int i = 0; i < n && c.pushed > 0; i++) { c.rt->PopLayer(); c.pushed--; }
+    }
+    void setBlend(Canvas& c) {
+        if (!c.dc) return;
+        const D2D1_PRIMITIVE_BLEND blend = c.comp == 1 || c.comp == 3 ? D2D1_PRIMITIVE_BLEND_COPY
+                                         : c.comp == 2 ? D2D1_PRIMITIVE_BLEND_ADD : D2D1_PRIMITIVE_BLEND_SOURCE_OVER;
+        c.dc->SetPrimitiveBlend(blend);
+    }
+    // destination-out is approximated by erasing (COPY of transparent black).
+    ComPtr<ID2D1Brush> paintBrush(Canvas& c, const std::vector<float>& st) {
+        if (c.comp == 3) {
+            c.solid->SetColor(D2D1::ColorF(0, 0, 0, 0));
+            c.solid->SetOpacity(1);
+            ComPtr<ID2D1Brush> b = c.solid;
+            return b;
+        }
+        return canvasBrush(c, st);
+    }
+    ID2D1Bitmap* canvasImage(Canvas& c, int kind, std::uint32_t ref, const std::string& src) {
+        if (kind == 1) {
+            auto other = canvases.find(ref);
+            if (other == canvases.end() || !other->second.bitmap || &other->second == &c) return nullptr;
+            auto& slot = c.canvasBitmaps[ref];
+            if (!slot.second || slot.first != other->second.version) {
+                slot.second.Reset();
+                if (FAILED(c.rt->CreateBitmapFromWicBitmap(other->second.bitmap.Get(), nullptr, &slot.second))) return nullptr;
+                slot.first = other->second.version;
+            }
+            return slot.second.Get();
+        }
+        auto it = c.bitmaps.find(src);
+        if (it != c.bitmaps.end()) return it->second.Get();
+        Image& img = image(src);
+        ComPtr<ID2D1Bitmap> bmp;
+        if (!img.failed && img.source) c.rt->CreateBitmapFromWicBitmap(img.source.Get(), nullptr, &bmp);
+        if (c.bitmaps.size() > 256) c.bitmaps.clear();
+        return (c.bitmaps[src] = bmp).Get();
+    }
+    void canvasText(Canvas& c, const float* a, const std::string& text, ID2D1Brush* brush) {
+        const std::wstring wtext = wide(text);
+        if (wtext.empty() || !brush) return;
+        IDWriteTextFormat* f = format(c.family, c.fontSize, c.weight, c.italic);
+        if (!f) return;
+        ComPtr<IDWriteTextLayout> layout;
+        if (FAILED(dwrite->CreateTextLayout(wtext.c_str(), UINT32(wtext.size()), f, 100000.0f, 1000.0f, &layout))) return;
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        DWRITE_TEXT_METRICS tm{};
+        DWRITE_LINE_METRICS lm{};
+        UINT32 lines = 0;
+        layout->GetMetrics(&tm);
+        layout->GetLineMetrics(&lm, 1, &lines);
+        const float width = tm.widthIncludingTrailingWhitespace, height = lm.height > 0 ? lm.height : tm.height;
+        const float base = lm.baseline > 0 ? lm.baseline : height * 0.8f;
+        float x = a[2], y = a[3];
+        float sx = 1;
+        if (a[4] > 0 && width > a[4]) sx = a[4] / width;
+        const float drawnW = width * sx;
+        if (c.align == 1) x -= drawnW / 2;
+        else if (c.align == 2) x -= drawnW;
+        switch (c.baseline) {
+        case 1: break;                                    // top
+        case 2: y -= height / 2; break;                   // middle
+        case 3: case 5: y -= height; break;               // bottom, ideographic
+        case 4: y -= base * 0.2f; break;                  // hanging
+        default: y -= base; break;                        // alphabetic
+        }
+        c.rt->SetTransform(D2D1::Matrix3x2F::Scale(sx, 1, D2D1::Point2F(x, y)) * D2D1::Matrix3x2F(c.m._11, c.m._12, c.m._21, c.m._22, c.m._31, c.m._32));
+        c.rt->DrawTextLayout(D2D1::Point2F(x, y), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        c.rt->SetTransform(D2D1::IdentityMatrix());
+    }
+    void runCanvas(std::uint32_t id, unsigned w, unsigned h, const float* ops, std::size_t floats, const std::vector<std::string>& strs) {
+        Canvas& c = canvases[id];
+        if (!ensureCanvas(c, w, h)) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto str = [&](float i) -> const std::string& {
+            static const std::string empty;
+            const std::size_t k = std::size_t(std::max(0.0f, i));
+            return k < strs.size() ? strs[k] : empty;
+        };
+        auto begin = [&]() {
+            c.rt->BeginDraw();
+            c.rt->SetTransform(D2D1::IdentityMatrix());
+            c.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            c.rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            c.pushed = 0;
+            for (auto& level : c.clips) for (auto& e : level) pushCanvasClip(c, e);
+            setBlend(c);
+        };
+        auto end = [&]() {
+            popCanvasClips(c, c.pushed);
+            if (c.dc) c.dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+            const HRESULT hr = c.rt->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) c.rt.Reset();
+        };
+        begin();
+        for (std::size_t o = 0; o + 2 <= floats;) {
+            const int op = int(ops[o]);
+            const std::size_t n = std::size_t(std::max(0.0f, ops[o + 1]));
+            if (o + 2 + n > floats) break;
+            const float* a = ops + o + 2;
+            o += 2 + n;
+            bool finiteArgs = true;
+            for (std::size_t k = 0; k < n && k < 16; k++) if (!finite(a[k])) { finiteArgs = false; break; }
+            if (!finiteArgs) continue;
+            switch (op) {
+            case 1: { // RESET w h
+                popCanvasClips(c, c.pushed);
+                const unsigned nw = std::max(1u, unsigned(a[0])), nh = std::max(1u, unsigned(a[1]));
+                if (nw != c.w || nh != c.h) {
+                    end();
+                    c.rt.Reset();
+                    if (!ensureCanvas(c, nw, nh)) return;
+                    begin();
+                }
+                resetCanvasState(c);
+                setBlend(c);
+                c.rt->Clear(D2D1::ColorF(0, 0, 0, 0));
+                break;
+            }
+            case 2: if (n >= 6) c.m = D2D1::Matrix3x2F(a[0], a[1], a[2], a[3], a[4], a[5]); break;
+            case 3: c.fill.assign(a, a + n); break;
+            case 4: c.stroke.assign(a, a + n); break;
+            case 5: if (n >= 4) { c.lineWidth = a[0]; c.cap = int(a[1]); c.join = int(a[2]); c.miter = std::max(1.0f, a[3]); c.strokeDirty = true; } break;
+            case 6: if (n >= 2) { c.dashOffset = a[0]; c.dash.assign(a + 2, a + std::min<std::size_t>(n, 2 + std::size_t(std::max(0.0f, a[1])))); c.strokeDirty = true; } break;
+            case 7: if (n >= 2) { c.alpha = a[0]; c.comp = int(a[1]); setBlend(c); } break;
+            case 10: c.path.clear(); c.pathGeometry.Reset(); break;
+            case 11: case 12: case 13: case 14: {
+                Canvas::Seg sg{op, {0, 0, 0, 0, 0, 0}};
+                for (std::size_t k = 0; k < n && k < 6; k++) sg.a[k] = a[k];
+                c.path.push_back(sg);
+                c.pathGeometry.Reset();
+                break;
+            }
+            case 20: case 21: case 22: {
+                ComPtr<ID2D1Geometry> g = canvasPath(c, n >= 1 ? int(a[0]) : 0);
+                if (!g) break;
+                if (op == 22) {
+                    c.clips.back().push_back({g, nullptr});
+                    pushCanvasClip(c, c.clips.back().back());
+                    c.pathGeometry.Reset(); // the clip keeps this geometry; later edits need a new one
+                    break;
+                }
+                ComPtr<ID2D1Brush> b = paintBrush(c, op == 20 ? c.fill : c.stroke);
+                if (!b) break;
+                if (op == 20) c.rt->FillGeometry(g.Get(), b.Get());
+                else c.rt->DrawGeometry(g.Get(), b.Get(), c.lineWidth, canvasStroke(c));
+                break;
+            }
+            case 23: { // FILL_RECT device x y w h
+                if (n < 4) break;
+                ComPtr<ID2D1Brush> b = paintBrush(c, c.fill);
+                if (b) c.rt->FillRectangle(D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]), b.Get());
+                break;
+            }
+            case 24: case 25: { // FILL_QUAD / STROKE_QUAD
+                if (n < 8) break;
+                ComPtr<ID2D1Geometry> g = quadGeometry(a);
+                ComPtr<ID2D1Brush> b = paintBrush(c, op == 24 ? c.fill : c.stroke);
+                if (!g || !b) break;
+                if (op == 24) c.rt->FillGeometry(g.Get(), b.Get());
+                else c.rt->DrawGeometry(g.Get(), b.Get(), c.lineWidth, canvasStroke(c));
+                break;
+            }
+            case 26: { // CLEAR_RECT device
+                if (n < 4) break;
+                c.rt->PushAxisAlignedClip(D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]), D2D1_ANTIALIAS_MODE_ALIASED);
+                c.rt->Clear(D2D1::ColorF(0, 0, 0, 0));
+                c.rt->PopAxisAlignedClip();
+                break;
+            }
+            case 30: { // TEXT stroke strIdx x y maxWidth
+                if (n < 5) break;
+                ComPtr<ID2D1Brush> b = paintBrush(c, a[0] > 0.5f ? c.stroke : c.fill);
+                canvasText(c, a, str(a[1]), b.Get());
+                break;
+            }
+            case 31: if (n >= 4) { c.family = str(a[0]); c.fontSize = std::max(1.0f, a[1]); c.weight = int(a[2]); c.italic = a[3] > 0.5f; } break;
+            case 32: if (n >= 2) { c.align = int(a[0]); c.baseline = int(a[1]); } break;
+            case 40: { // IMAGE kind ref sx sy sw sh dx dy dw dh smooth
+                if (n < 11) break;
+                ID2D1Bitmap* bmp = canvasImage(c, int(a[0]), std::uint32_t(a[1]), int(a[0]) == 0 ? str(a[1]) : std::string());
+                if (!bmp) break;
+                const D2D1_RECT_F src = D2D1::RectF(a[2], a[3], a[2] + a[4], a[3] + a[5]);
+                const D2D1_RECT_F dst = D2D1::RectF(a[6], a[7], a[6] + a[8], a[7] + a[9]);
+                c.rt->SetTransform(c.m);
+                c.rt->DrawBitmap(bmp, dst, clamp01(c.alpha), a[10] > 0.5f ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+                c.rt->SetTransform(D2D1::IdentityMatrix());
+                break;
+            }
+            case 41: c.clips.emplace_back(); break;
+            case 42:
+                if (c.clips.size() > 1) {
+                    popCanvasClips(c, int(c.clips.back().size()));
+                    c.clips.pop_back();
+                }
+                break;
+            default: break;
+            }
+        }
+        end();
+        c.version++;
+        canvasBatches++;
+        canvasMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // Straight RGBA8 copy of a canvas rectangle (outside: transparent).
+    bool readCanvas(std::uint32_t id, int x, int y, unsigned w, unsigned h, std::vector<std::uint8_t>& out) {
+        auto it = canvases.find(id);
+        out.assign(std::size_t(w) * h * 4, 0);
+        if (it == canvases.end() || !it->second.bitmap) return false;
+        Canvas& c = it->second;
+        const int x0 = std::max(0, x), y0 = std::max(0, y);
+        const int x1 = std::min(int(c.w), x + int(w)), y1 = std::min(int(c.h), y + int(h));
+        if (x1 <= x0 || y1 <= y0) return true;
+        ComPtr<IWICBitmapLock> lock;
+        const WICRect rect{x0, y0, x1 - x0, y1 - y0};
+        if (FAILED(c.bitmap->Lock(&rect, WICBitmapLockRead, &lock))) return false;
+        UINT stride = 0, bytes = 0;
+        BYTE* data = nullptr;
+        lock->GetStride(&stride);
+        lock->GetDataPointer(&bytes, &data);
+        if (!data) return false;
+        for (int row = 0; row < y1 - y0; row++) {
+            const BYTE* src = data + std::size_t(row) * stride;
+            std::uint8_t* dst = &out[(std::size_t(row + y0 - y) * w + (x0 - x)) * 4];
+            for (int col = 0; col < x1 - x0; col++, src += 4, dst += 4) {
+                const unsigned a = src[3];
+                if (a == 0) { dst[0] = dst[1] = dst[2] = dst[3] = 0; continue; }
+                dst[0] = std::uint8_t(std::min(255u, (unsigned(src[2]) * 255 + a / 2) / a));
+                dst[1] = std::uint8_t(std::min(255u, (unsigned(src[1]) * 255 + a / 2) / a));
+                dst[2] = std::uint8_t(std::min(255u, (unsigned(src[0]) * 255 + a / 2) / a));
+                dst[3] = std::uint8_t(a);
+            }
+        }
+        return true;
+    }
+    void writeCanvas(std::uint32_t id, unsigned cw, unsigned ch, int x, int y, unsigned w, unsigned h, const std::uint8_t* rgba) {
+        Canvas& c = canvases[id];
+        if (!c.rt && !ensureCanvas(c, cw, ch)) return;
+        if (c.w != std::max(1u, cw) || c.h != std::max(1u, ch)) { c.rt.Reset(); if (!ensureCanvas(c, cw, ch)) return; }
+        const int x0 = std::max(0, x), y0 = std::max(0, y);
+        const int x1 = std::min(int(c.w), x + int(w)), y1 = std::min(int(c.h), y + int(h));
+        if (x1 <= x0 || y1 <= y0) return;
+        ComPtr<IWICBitmapLock> lock;
+        const WICRect rect{x0, y0, x1 - x0, y1 - y0};
+        if (FAILED(c.bitmap->Lock(&rect, WICBitmapLockWrite, &lock))) return;
+        UINT stride = 0, bytes = 0;
+        BYTE* data = nullptr;
+        lock->GetStride(&stride);
+        lock->GetDataPointer(&bytes, &data);
+        if (!data) return;
+        for (int row = 0; row < y1 - y0; row++) {
+            BYTE* dst = data + std::size_t(row) * stride;
+            const std::uint8_t* src = rgba + (std::size_t(row + y0 - y) * w + (x0 - x)) * 4;
+            for (int col = 0; col < x1 - x0; col++, src += 4, dst += 4) {
+                const unsigned a = src[3];
+                dst[0] = std::uint8_t((unsigned(src[2]) * a + 127) / 255);
+                dst[1] = std::uint8_t((unsigned(src[1]) * a + 127) / 255);
+                dst[2] = std::uint8_t((unsigned(src[0]) * a + 127) / 255);
+                dst[3] = std::uint8_t(a);
+            }
+        }
+        lock.Reset();
+        c.version++;
+    }
+
     // ---- commands
     void execute() {
         const std::size_t header = list.empty() ? 0 : webappUiHeaderFloats(list[0]);
@@ -380,6 +824,25 @@ struct WebappUiRenderer::Impl {
         }
         case kUiImage: {
             if (a[2] <= 0 || a[3] <= 0 || a[9] <= 0) break;
+            if (str(a[4]).rfind("nt-canvas:", 0) == 0) { // Canvas 2D bitmap: "nt-canvas:<id>:<version>"
+                const std::uint32_t cid = std::uint32_t(std::strtoul(str(a[4]).c_str() + 10, nullptr, 10));
+                auto it = canvases.find(cid);
+                if (it == canvases.end() || !it->second.bitmap) break;
+                Canvas& cv = it->second;
+                if (!cv.uiBitmap || cv.uiVersion != cv.version) {
+                    cv.uiBitmap.Reset();
+                    if (FAILED(rt->CreateBitmapFromWicBitmap(cv.bitmap.Get(), nullptr, &cv.uiBitmap))) break;
+                    cv.uiVersion = cv.version;
+                }
+                const D2D1_RECT_F dst = D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]);
+                D2D1_RECT_F src{};
+                const bool crop = a[7] > 0 && a[8] > 0;
+                if (crop) src = D2D1::RectF(a[5], a[6], a[5] + a[7], a[6] + a[8]);
+                rt->DrawBitmap(cv.uiBitmap.Get(), dst, clamp01(a[9]),
+                               a[11] > 0.5f ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                               crop ? &src : nullptr);
+                break;
+            }
             Image& img = image(str(a[4]));
             if (img.failed) break;
             const D2D1_RECT_F dst = D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]);
@@ -533,6 +996,7 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
         s.layer.Reset();
         s.target.Reset();
         for (auto& kv : s.images) { kv.second.bitmap.Reset(); kv.second.svgDoc.Reset(); }
+        for (auto& kv : s.canvases) { kv.second.uiBitmap.Reset(); kv.second.uiVersion = ~0ull; }
         if (FAILED(s.wic->CreateBitmap(width, height, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &s.target))) return false;
         const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
@@ -580,6 +1044,30 @@ bool WebappUiRenderer::render(unsigned width, unsigned height) {
     return true;
 }
 
+void WebappUiRenderer::canvasCommands(std::uint32_t id, unsigned width, unsigned height, const float* ops, std::size_t floats,
+                                      const std::string& strings) {
+    if (!impl_->d2d || !impl_->wic) return;
+    impl_->runCanvas(id, width, height, ops, floats, webappUiSplitStrings(strings));
+}
+bool WebappUiRenderer::canvasRead(std::uint32_t id, int x, int y, unsigned w, unsigned h, std::vector<std::uint8_t>& rgba) {
+    return impl_->readCanvas(id, x, y, w, h, rgba);
+}
+void WebappUiRenderer::canvasWrite(std::uint32_t id, unsigned cw, unsigned ch, int x, int y, unsigned w, unsigned h, const std::uint8_t* rgba) {
+    if (impl_->d2d && impl_->wic) impl_->writeCanvas(id, cw, ch, x, y, w, h, rgba);
+}
+bool WebappUiRenderer::canvasPixelsRgba(std::uint32_t id, std::vector<std::uint8_t>& rgba, unsigned& w, unsigned& h) {
+    auto it = impl_->canvases.find(id);
+    if (it == impl_->canvases.end() || !it->second.bitmap) return false;
+    w = it->second.w;
+    h = it->second.h;
+    return impl_->readCanvas(id, 0, 0, w, h, rgba);
+}
+void WebappUiRenderer::releaseCanvas(std::uint32_t id) { impl_->canvases.erase(id); }
+void WebappUiRenderer::registerImage(const std::string& key, const std::uint8_t* bytes, std::size_t n) {
+    impl_->registered[key].assign(reinterpret_cast<const char*>(bytes), n);
+    impl_->images.erase(key);
+}
+
 const std::uint8_t* WebappUiRenderer::pixels() const { return impl_->pixels.empty() ? nullptr : impl_->pixels.data(); }
 unsigned WebappUiRenderer::stride() const { return impl_->stride; }
 unsigned WebappUiRenderer::width() const { return impl_->w; }
@@ -592,6 +1080,11 @@ std::string WebappUiRenderer::stats() const {
                   s.lastCommands, s.images.size(), s.failedImages, s.renders, s.partialRenders, s.firstMs < 0 ? 0.0 : s.firstMs,
                   s.renders > 1 ? s.totalMs / (s.renders - 1) : 0.0, s.maxMs, s.w, s.h, s.dc5 ? "" : ", no SVG support");
     std::string out = line;
+    if (!s.canvases.empty()) {
+        char cv[160];
+        std::snprintf(cv, sizeof cv, " | Canvas 2D: %zu canvases, %d batches, %.1f ms", s.canvases.size(), s.canvasBatches, s.canvasMs);
+        out += cv;
+    }
     if (!s.lastFailure.empty()) out += " | last image problem: " + s.lastFailure;
     return out;
 }

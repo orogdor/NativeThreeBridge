@@ -10,23 +10,31 @@ cbuffer Frame : register(b0) {
     float4 gCamera;   // xyz position, w light count
     float4 gAmbient;  // rgb ambient irradiance, w exposure
     float4 gLights[64];
+    float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
     float4 gColor;    // linear rgb, opacity
     float4 gEmissive; // linear rgb, w shininess (<0: physical)
     float4 gParams;   // roughness, metalness, flags, unused
+    float4 gUvU;      // u' = dot(xyz, (u, v, 1)); w alphaTest
+    float4 gUvV;      // v' = dot(xyz, (u, v, 1))
 };
-static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048;
+Texture2D gMap : register(t0);
+SamplerState gRepeat : register(s0);
+SamplerState gClamp : register(s1);
+SamplerState gMirror : register(s2);
+static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
+                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536;
 static const float PI = 3.14159265;
 
 struct VSIn {
-    float3 pos : POSITION; float3 nrm : NORMAL; float3 col : COLOR;
+    float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
     float4 r0 : IROW0; float4 r1 : IROW1; float4 r2 : IROW2; float4 r3 : IROW3;
     float3 icol : ICOLOR;
 };
 struct VSOut {
-    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float3 col : COLOR;
+    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
 };
 
 float3 cofactorNormal(float3x3 m, float3 n) {
@@ -45,12 +53,15 @@ VSOut VSMain(VSIn i) {
     float4 world = mul(gModel, local);
     float4 clip = mul(gProj, mul(gView, world));
     clip.z = 0.5 * (clip.z + clip.w);                       // OpenGL depth range -> D3D
+    if (flags & F_FAR_DEPTH) clip.z = clip.w;               // sky domes: gl_Position.z = gl_Position.w
     o.pos = clip;
+    float3 uv1 = float3(i.uv, 1);
+    o.uv = float2(dot(gUvU.xyz, uv1), dot(gUvV.xyz, uv1));
     o.world = world.xyz;
     float3x3 w = mul((float3x3)gModel, transpose((float3x3)instT));
     o.nrm = cofactorNormal(w, i.nrm);
-    float3 c = (flags & F_VERTEX_COLORS) ? i.col : float3(1, 1, 1);
-    if (flags & F_INSTANCE_COLORS) c *= i.icol;
+    float4 c = (flags & F_VERTEX_COLORS) ? i.col : float4(1, 1, 1, 1);   // rgba vertex colours: alpha too
+    if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;
     return o;
 }
@@ -61,10 +72,48 @@ float3 toSRGB(float3 c) {
 }
 float3 fresnel(float3 f0, float vh) { return f0 + (1 - f0) * pow(1 - vh, 5); }
 
+// Three.js r181 tone mapping curves (tonemapping_pars_fragment).
+float3 rrtOdt(float3 v) { return (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081); }
+float3 toneMap(float3 c, uint flags) {
+    uint curve = (uint)gTone.x;
+    if (curve == 0 || (flags & F_NO_TONE_MAP)) return c;
+    float e = gTone.y;
+    if (curve == 1) return saturate(e * c);
+    if (curve == 2) { c *= e; return saturate(c / (1 + c)); }
+    if (curve == 3) { c = max(0, c * e - 0.004); return pow((c * (6.2 * c + 0.5)) / (c * (6.2 * c + 1.7) + 0.06), 2.2); }
+    if (curve == 7) { // Khronos PBR neutral
+        c *= e;
+        float x = min(c.r, min(c.g, c.b));
+        float off = x < 0.08 ? x - 6.25 * x * x : 0.04;
+        c -= off;
+        float peak = max(c.r, max(c.g, c.b));
+        if (peak < 0.76) return c;
+        float d = 1 - 0.76, np = 1 - d * d / (peak + d - 0.76);
+        c *= np / peak;
+        float g = 1 - 1 / (0.15 * (peak - np) + 1);
+        return lerp(c, np * float3(1, 1, 1), g);
+    }
+    // ACES filmic (AgX is approximated with the same curve)
+    c *= e / 0.6;
+    c = float3(0.59719, 0.07600, 0.02840) * c.r + float3(0.35458, 0.90834, 0.13383) * c.g + float3(0.04823, 0.01566, 0.83777) * c.b;
+    c = rrtOdt(c);
+    c = float3(1.60475, -0.10208, -0.00327) * c.r + float3(-0.53108, 1.10813, -0.07276) * c.g + float3(-0.07367, -0.00605, 1.07602) * c.b;
+    return saturate(c);
+}
+
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
-    float3 albedo = gColor.rgb * i.col;
-    if (flags & F_UNLIT) return float4(toSRGB(albedo), gColor.a);
+    float3 albedo = gColor.rgb * i.col.rgb;
+    float alphaOut = gColor.a * i.col.a;
+    float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
+    if (flags & F_MAP) {
+        float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
+                 : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
+        albedo *= t.rgb;
+        alphaOut *= t.a;
+    }
+    if (alphaOut < gUvU.w) discard;   // material.alphaTest
+    if (flags & F_UNLIT) return float4(toSRGB(toneMap(albedo, flags)), alphaOut);
     float3 V = normalize(gCamera.xyz - i.world);
     float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
     if (dot(flatN, V) < 0) flatN = -flatN;
@@ -73,7 +122,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     if (flags & F_FLAT) N = flatN;
     if (flags & F_NORMAL_COLOR) {
         float3 vn = normalize(mul((float3x3)gView, N));
-        return float4(vn * 0.5 + 0.5, gColor.a);
+        return float4(vn * 0.5 + 0.5, alphaOut);
     }
     float metal = saturate(gParams.y);
     float rough = clamp(gParams.x, 0.04, 1.0);
@@ -126,6 +175,6 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         direct += irradiance * (diffuse / PI + spec);
     }
     float3 lit = indirect * diffuse / PI + direct + gEmissive.rgb;
-    return float4(toSRGB(lit * gAmbient.w), gColor.a);
+    return float4(toSRGB(toneMap(lit, flags)), alphaOut);
 }
 )HLSL";

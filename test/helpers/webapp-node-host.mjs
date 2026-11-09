@@ -18,8 +18,9 @@ export function threeBuildDir() {
 export const THREE_MODULE_SOURCE =
   "export * from 'nt:three.module.min.js';\n" +
   "import * as THREE_CORE from 'nt:three.core.min.js';\n" +
+  "import { ShaderLib, UniformsUtils } from 'nt:three.module.min.js';\n" +
   "import { createNativeRendererClasses } from 'nt:native-renderer.mjs';\n" +
-  "const { NativeRenderer } = createNativeRendererClasses(THREE_CORE, globalThis.__nt, globalThis.__ntHost);\n" +
+  "const { NativeRenderer } = createNativeRendererClasses(THREE_CORE, globalThis.__nt, globalThis.__ntHost, { ShaderLib, UniformsUtils });\n" +
   "export { NativeRenderer, NativeRenderer as WebGLRenderer };\n";
 
 export function loadBuiltins(threeDir = threeBuildDir()) {
@@ -105,7 +106,7 @@ function normalizeGamePath(p) {
 // Recording sink with the same validation as the C++ __nt functions.
 export function createRecorder() {
   return {
-    geometries: new Map(), instances: new Map(), passes: [], framePasses: [], titles: [], logs: [],
+    geometries: new Map(), instances: new Map(), textures: new Map(), canvases: new Map(), passes: [], framePasses: [], titles: [], logs: [],
     uploads: 0, instanceUploads: 0,
   };
 }
@@ -178,15 +179,57 @@ export async function runWebapp(root, options = {}) {
       await m.link(linker);
       await m.evaluate();
     },
-    uploadGeometry(id, positions, normals, colors, indices) {
+    uploadGeometry(id, positions, normals, colors, indices, uvs) {
       view(positions, 'positions');
       if (positions.length % 3) throw new RangeError('positions not 3 per vertex');
       if (normals && normals.length !== positions.length) throw new RangeError('normals length');
-      if (colors && colors.length !== positions.length) throw new RangeError('colors length');
+      if (colors && colors.length !== positions.length && colors.length !== positions.length / 3 * 4) throw new RangeError('colors length');
       const vertexCount = positions.length / 3;
+      if (uvs && uvs.length !== vertexCount * 2) throw new RangeError('uvs length');
       if (indices) for (const i of indices) if (i >= vertexCount) throw new RangeError('Geometry index out of range');
       rec.uploads++;
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors });
+      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs });
+    },
+    // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
+    // natively with WIC; here only the header is checked.
+    uploadTexture(id, data, width, height, flags) {
+      view(data, 'texture data');
+      let info;
+      if (width > 0) {
+        if (data.length < width * height * 4) throw new RangeError('uploadTexture: pixel data too short');
+        info = { w: width, h: height, type: 'rgba' };
+      } else info = context.__ntHost.ui.sniffImage(data);
+      if (!info) return false;
+      rec.textures.set(id, { ...info, flags, bytes: data.length });
+      rec.textureUploads = (rec.textureUploads || 0) + 1;
+      return true;
+    },
+    releaseTexture(id) { rec.textures.delete(id); },
+    // Canvas 2D command batches (executed by Direct2D in the engine).
+    canvasCommands(id, width, height, ops, floats, strings) {
+      view(ops, 'canvas commands');
+      if (floats > ops.length) throw new RangeError('canvasCommands: floats > length');
+      const c = rec.canvases.get(id) || { width, height, batches: 0, ops: [], strings: [] };
+      c.width = width; c.height = height; c.batches++;
+      const list = String(strings).split('\u001f');
+      for (let o = 0; o < floats;) {
+        const op = ops[o], n = ops[o + 1];
+        if (!(n >= 0) || o + 2 + n > floats) throw new RangeError('canvasCommands: truncated command');
+        c.ops.push([op, ...ops.subarray(o + 2, o + 2 + n)]);
+        if (op === 30) c.strings.push(list[ops[o + 3]]);
+        o += 2 + n;
+      }
+      if (c.ops.length > 50000) c.ops.splice(0, c.ops.length - 50000);
+      rec.canvases.set(id, c);
+    },
+    canvasRead(id, x, y, w, h) { return null; },
+    canvasWrite(id, cw, ch, x, y, w, h, bytes) { view(bytes, 'pixels'); if (bytes.length < w * h * 4) throw new RangeError('canvasWrite: too few bytes'); },
+    registerImage(key, bytes) { view(bytes, 'image bytes'); (rec.registeredImages ||= new Map()).set(String(key), bytes.length); },
+    uploadCanvasTexture(id, canvasId, flags) {
+      if (!rec.canvases.has(canvasId)) return false;
+      rec.textures.set(id, { canvas: canvasId, flags });
+      rec.textureUploads = (rec.textureUploads || 0) + 1;
+      return true;
     },
     releaseGeometry(id) { rec.geometries.delete(id); },
     uploadInstances(id, matrices, colors, count) {
@@ -203,7 +246,7 @@ export async function runWebapp(root, options = {}) {
     },
     submitPass(packet, floats) {
       const lights = packet[35], draws = packet[43];
-      if (64 + lights * 16 + draws * 32 !== floats) throw new RangeError('submitPass: header counts do not match packet size');
+      if (64 + lights * 16 + draws * 40 !== floats) throw new RangeError('submitPass: header counts do not match packet size');
       rec.framePasses.push(Float32Array.from(packet.subarray(0, floats)));
     },
   };
@@ -234,10 +277,10 @@ export function decodePass(p) {
   const pass = {
     view: Array.from(p.subarray(0, 16)), projection: Array.from(p.subarray(16, 32)),
     cameraPosition: [p[32], p[33], p[34]], clear: [p[36], p[37], p[38], p[39]],
-    ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], lights: [], draws: [],
+    ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], exposure: p[47], toneMapping: p[48], lights: [], draws: [],
   };
   let o = 64;
   for (let i = 0; i < lightCount; i++, o += 16) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]] });
-  for (let i = 0; i < drawCount; i++, o += 32) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)) });
+  for (let i = 0; i < drawCount; i++, o += 40) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)) });
   return pass;
 }
