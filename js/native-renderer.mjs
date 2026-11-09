@@ -759,6 +759,17 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!found) { w.fill(0); found = true; }
       w[i] += 1 - t; w[j] += t;
     }
+    if (!found) {
+      // Keep the legacy approximation for non-constant blend factors such as
+      // mix(horizon, top, height) until shader execution is available.
+      const dynamicMix = /\bmix\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,/g;
+      for (let mm; (mm = dynamicMix.exec(glsl));) {
+        const i = names.indexOf(mm[1]), j = names.indexOf(mm[2]);
+        if (i < 0 || j < 0) continue;
+        if (!found) { w.fill(0); found = true; }
+        w[i] += 0.65; w[j] += 0.35;
+      }
+    }
     const total = w.reduce((a, b) => a + b, 0) || 1;
     return entries.map(([, u], i) => [u, w[i] / total]);
   }
