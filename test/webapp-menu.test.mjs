@@ -65,10 +65,14 @@ test('opening an offscreen graphics panel can scroll its controls into view', { 
     const { context, host } = await runWebapp(fixture, { frames: 1, width, height });
     const doc = context.document;
     const last = doc.getElementById('last');
+    const wrapper = doc.createElement('div');
+    wrapper.style.height = '30px';
+    wrapper.style.overflow = 'visible';
     const panel = doc.createElement('details');
     const summary = doc.createElement('summary');
     summary.textContent = 'Graphics settings';
-    last.before(panel);
+    last.before(wrapper);
+    wrapper.append(panel);
     panel.append(summary, last);
     panel.open = true;
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });

@@ -1710,13 +1710,26 @@ center{text-align:center}
     if (box.clips && box.el && !box.replaced) {
       const pbx = box.x + box.bl, pby = box.y + box.bt, pbw = box.w - box.bl - box.br, pbh = box.h - box.bt - box.bb;
       let maxX = pbx, maxY = pby;
-      const extent = (b) => {
-        if (b.isText || b.isBr) return;
-        maxX = Math.max(maxX, b.x + b.w + (b.mr || 0)); maxY = Math.max(maxY, b.y + b.h + (b.mb || 0));
+      const fragments = (b) => {
+        if (b.frags) for (const f of b.frags) {
+          maxX = Math.max(maxX, f.x + f.w);
+          maxY = Math.max(maxY, f.y + f.h);
+        }
       };
-      for (const c of box.children) if (!c.isText && !c.isBr && c.pos !== 'fixed' && c._gen === layoutGen) extent(c);
-      for (const a of box.abs) if (a.pos !== 'fixed') extent(a);
-      if (box.frags) for (const f of box.frags) { maxX = Math.max(maxX, f.x + f.w); maxY = Math.max(maxY, f.y + f.h); }
+      const extent = (b) => {
+        if (b.isText || b.isBr || b.pos === 'fixed' || b._gen !== layoutGen) return;
+        maxX = Math.max(maxX, b.x + b.w + (b.mr || 0)); maxY = Math.max(maxY, b.y + b.h + (b.mb || 0));
+        // Descendants can extend beyond a visible wrapper's assigned size.
+        // A nested clipping box contributes its own bounds to this scroller.
+        if (!b.clips && !b.replaced) {
+          fragments(b);
+          for (const c of b.children) extent(c);
+          for (const a of b.abs) extent(a);
+        }
+      };
+      for (const c of box.children) extent(c);
+      for (const a of box.abs) extent(a);
+      fragments(box);
       maxY += box.pb; maxX += box.pr;
       box.scrollW = Math.max(pbw, maxX - pbx); box.scrollH = Math.max(pbh, maxY - pby);
       const el = box.el;

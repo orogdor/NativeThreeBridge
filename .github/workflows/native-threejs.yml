@@ -185,6 +185,11 @@ jobs:
             if (host.ui.hitTest(z.x + z.width / 2, z.y + z.height / 2) !== last) throw Error('Bottom control cannot be reached');
             controls.scrollTop = 0;
             host.ui.hitTest(r.x + r.width / 2, r.y + 12);
+            const wrapper = document.createElement('div');
+            wrapper.style.height = '10px';
+            wrapper.style.overflow = 'visible';
+            last.before(wrapper);
+            wrapper.append(last);
             last.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
             const visible = last.getBoundingClientRect();
             if (host.ui.hitTest(visible.x + visible.width / 2, visible.y + visible.height / 2) !== last) throw Error('scrollIntoView did not reveal the bottom setting');
