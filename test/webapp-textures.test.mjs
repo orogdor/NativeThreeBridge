@@ -40,6 +40,12 @@ test('image textures: Blob -> createImageBitmap, TextureLoader and DataTexture u
   assert.deepEqual(Array.from(loaded.uvTransform, (v) => Math.round(v * 100) / 100 + 0), [2, 0, 0, -2, 0, 1], 'repeat(2,2) and flipY fold into the uv transform');
   const floor = pass.draws.find((d) => d.textureId && !(d.flags & DrawFlags.UNLIT) && d.alphaTest === 0 && d !== leaf);
   assert.ok(floor, 'DataTexture draw');
+  const texturedShader = pass.draws.find((d) => (d.flags & DrawFlags.UNLIT) &&
+    (d.flags & DrawFlags.MAP) && (d.flags & DrawFlags.NO_TONE_MAP) &&
+    near(d.matrix[12], 0) && near(d.matrix[13], 1) && near(d.matrix[14], 0));
+  assert.ok(texturedShader && texturedShader.textureId === leaf.textureId,
+    'direct sampler2D(uSurface, vUv) uses native texture without material.map');
+
   assert.equal(rec.textureUploads, uploads, 'no re-upload while nothing changed');
   assert.ok([...rec.geometries.values()].some((g) => g.colorChannels === 4), 'RGBA vertex colours keep their alpha');
   assert.ok(!status.unsupported.includes('Textures other than map (normalMap, envMap …)'));
