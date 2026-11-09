@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="et">
+<head>
+  <meta charset="utf-8">
+  <title>HTML UI over the engine</title>
+  <link rel="stylesheet" href="css/ui.css?v=31a">
+  <style>
+    .inline-style { color: #ff3300; }
+    #gold b::after { content: " ⛀"; color: var(--accent); }
+  </style>
+</head>
+<body>
+  <canvas id="world"></canvas>
+  <header id="hud">
+    <div class="brand">♜</div>
+    <span id="gold" class="inline-style">Kuld: <b>120</b></span>
+    <progress id="clock" max="60" value="30"></progress>
+    <button id="pause" class="btn" type="button">Ⅱ</button>
+  </header>
+  <nav id="tools">
+    <button class="btn" data-tab="build" id="build">⚒ Ehita</button>
+    <button class="btn" id="off" disabled>Keelatud</button>
+    <img id="icon" src="img/icon.png" alt="">
+    <img id="photo" src="img/photo.jpg" alt="">
+  </nav>
+  <section id="panel" hidden><p>Peidetud paneel</p></section>
+  <div id="menu" role="dialog">
+    <div class="card">
+      <h1 id="title">Kuningriigid</h1>
+      <p class="sub">Üks maa. <em>Sinu</em> kuningriik.</p>
+      <button id="start" class="btn big">Alusta mängu</button>
+      <details id="more"><summary id="more-summary">Rohkem</summary><p id="more-text">Lisainfo</p></details>
+      <div class="grid"><div class="cell">1</div><div class="cell wide">2</div><div class="cell">3</div><div class="cell">4</div><div class="cell">5</div></div>
+      <div id="scroller"></div>
+      <label class="check"><input type="checkbox" id="sound"> Heli</label>
+    </div>
+  </div>
+  <div id="toast" class="toast">Salvestatud</div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

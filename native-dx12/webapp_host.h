@@ -32,7 +32,26 @@ public:
     virtual void submitPass(const float* data, std::size_t floatCount) = 0;
     virtual void setTitle(const std::string& title) = 0;
     virtual void log(const std::string& level, const std::string& text) = 0;
+    // HTML/CSS UI layer (js/webapp-ui.js). Display-list layout: see
+    // native-dx12/webapp_ui.h. `strings` are joined with U+001F.
+    virtual void submitUi(const float* data, std::size_t floats, const std::string& strings) {
+        (void)data; (void)floats; (void)strings;
+    }
+    // CSS cursor name under the pointer ("pointer", "text", "auto" ...).
+    virtual void setCursor(const std::string& cursor) { (void)cursor; }
+    // Width in px of `text` in the first installed family of the comma
+    // separated `families`; negative when the sink cannot measure text.
+    virtual double measureText(const std::string& families, double sizePx, int weight, bool italic,
+                               const std::string& text) {
+        (void)families; (void)sizePx; (void)weight; (void)italic; (void)text;
+        return -1.0;
+    }
 };
+
+// UI display-list header size for a version (webapp_ui.h); 0 = unknown.
+inline std::size_t webappUiHeaderFloats(float version) {
+    return version == 1.0f ? 4 : version == 2.0f ? 8 : 0;
+}
 
 // Same numbers as js/native-renderer.mjs.
 constexpr std::size_t kWebappPassHeaderFloats = 64;

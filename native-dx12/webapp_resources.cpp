@@ -41,5 +41,13 @@ bool NativeWebapp_LoadBuiltins(std::string& shimSource,
         error = "Missing embedded webapp shim (resource 403)";
         return false;
     }
+    // The HTML/CSS UI layer runs right after the shim, in the same script.
+    std::string ui;
+    if (!loadResource(407, ui)) {
+        error = "Missing embedded HTML/CSS UI layer (resource 407)";
+        return false;
+    }
+    shimSource += "\n;\n";
+    shimSource += ui;
     return true;
 }

@@ -380,6 +380,31 @@ void ntSubmitPass(const v8::FunctionCallbackInfo<v8::Value>& info) {
         return self->throwError("range", "submitPass: header counts do not match packet size");
     if (self->sink) self->sink->submitPass(data, floats);
 }
+void ntSubmitUi(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "submitUi(packet, floats, strings)");
+    const float* data;
+    std::size_t available;
+    if (!typedView(self, info[0], data, available, false, "packet")) return;
+    const std::uint32_t floats = info[1]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0);
+    if (floats > available || webappUiHeaderFloats(data[0]) == 0 || floats < webappUiHeaderFloats(data[0])) return self->throwError("range", "submitUi: bad packet");
+    if (self->sink) self->sink->submitUi(data, floats, self->utf8(info[2]));
+}
+void ntSetCursor(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() >= 1 && self->sink) self->sink->setCursor(self->utf8(info[0]));
+}
+void ntMeasureText(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    double width = -1.0;
+    if (info.Length() >= 5 && self->sink) {
+        v8::Local<v8::Context> c = self->isolate->GetCurrentContext();
+        width = self->sink->measureText(self->utf8(info[0]), info[1]->NumberValue(c).FromMaybe(16.0),
+                                        int(info[2]->NumberValue(c).FromMaybe(400.0)), info[3]->BooleanValue(self->isolate),
+                                        self->utf8(info[4]));
+    }
+    info.GetReturnValue().Set(v8::Number::New(self->isolate, width));
+}
 
 } // namespace
 
@@ -439,6 +464,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
+        {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor},
     };
     for (const Fn& f : functions) {
         v8::Local<v8::Function> fn = v8::Function::New(ctx, f.fn, self).ToLocalChecked();

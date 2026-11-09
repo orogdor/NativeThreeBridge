@@ -78,13 +78,14 @@ add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
   native-dx12/three_js_host.cpp
   native-dx12/webapp_dx12.cpp
+  native-dx12/webapp_ui_d2d.cpp
   ${WEBAPP_RUNTIME}
   ${ASSETS}
 )
 target_link_libraries(NativeThreeJS PRIVATE ${WEBAPP_BACKEND})
 set_target_properties(NativeThreeJS PROPERTIES OUTPUT_NAME "NativeThree-Diagnostics")
 target_include_directories(NativeThreeJS PRIVATE native-dx12)
-target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32 shell32)
+target_link_libraries(NativeThreeJS PRIVATE qjs d3d12 dxgi d3dcompiler user32 xaudio2 ole32 shell32 d2d1 dwrite windowscodecs shlwapi)
 target_compile_definitions(NativeThreeJS PRIVATE UNICODE _UNICODE)
 # Webapp JavaScript can recurse deeply; Windows' default 1 MB stack crashed silently.
 target_link_options(NativeThreeJS PRIVATE /STACK:67108864)

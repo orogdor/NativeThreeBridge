@@ -196,6 +196,11 @@ export async function runWebapp(root, options = {}) {
       rec.instances.set(id, { count, hasColors: !!colors, first: Array.from(matrices.slice(0, 16)) });
     },
     releaseInstances(id) { rec.instances.delete(id); },
+    submitUi(packet, floats, strings) {
+      if (floats > packet.length || (packet[0] !== 1 && packet[0] !== 2)) throw new RangeError('submitUi: bad packet');
+      rec.uiSubmits = (rec.uiSubmits || 0) + 1;
+      rec.ui = { floats: Float32Array.from(packet.subarray(0, floats)), strings: String(strings).split('\u001f') };
+    },
     submitPass(packet, floats) {
       const lights = packet[35], draws = packet[43];
       if (64 + lights * 16 + draws * 32 !== floats) throw new RangeError('submitPass: header counts do not match packet size');
@@ -204,6 +209,7 @@ export async function runWebapp(root, options = {}) {
   };
   context.__nt = nt;
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-shim.js'), 'utf8'), context, { filename: 'nt:webapp-shim.js' });
+  vm.runInContext(readFileSync(path.join(repo, 'js/webapp-ui.js'), 'utf8'), context, { filename: 'nt:webapp-ui.js' });
   const host = context.__ntHost;
   const settle = () => new Promise((r) => setImmediate(r));
 

@@ -1,4 +1,4 @@
-NativeThreeBridge v0.30.0 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.31.0 - KAKS MÄNGU, ÜKS ENGINE
 ==================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -12,6 +12,13 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.31.0 UUS: mängu HTML/CSS kasutajaliides (menüüd, nupud, paneelid, pildid,
+tekst) joonistatakse nüüd engine'i poolt 3D-stseeni peale - ilma brauserita.
+Klikid jõuavad õigetele nuppudele, rullik kerib paneele, hiir üle nupu
+muudab :hover stiili. Pole veel: CSS animatsioonid, filter/blur, veebifondid,
+<select> rippmenüü (klõps vahetab valikut). WebP pildid vajavad Windowsi
+"WebP Image Extension" laiendust. Info: NativeThreeBridge-webapp-log.txt.
 
 NativeThreeBridge v0.28.0 - THREE.JS WEBAPPS IN THE ENGINE (TEST)
 =================================================================
