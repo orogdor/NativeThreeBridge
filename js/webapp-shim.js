@@ -749,7 +749,7 @@
     focus() { const old = document.activeElement; document.activeElement = this; if (uiLayer && old !== this) uiLayer.focusChanged(old, this); }
     blur() { if (document.activeElement === this) { document.activeElement = document.body; if (uiLayer) uiLayer.focusChanged(this, document.body); } }
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
-    scrollIntoView() {}
+    scrollIntoView(options) { uiLayer?.scrollIntoView(this, options); }
     scrollTo(x, y) { if (typeof x === 'object' && x) { if (x.top !== undefined) this.scrollTop = x.top; if (x.left !== undefined) this.scrollLeft = x.left; } else { if (x !== undefined) this.scrollLeft = x; if (y !== undefined) this.scrollTop = y; } }
     scrollBy(x, y) { if (typeof x === 'object' && x) { this.scrollTop += x.top || 0; this.scrollLeft += x.left || 0; } else { this.scrollLeft += x || 0; this.scrollTop += y || 0; } }
     animate() { unsupported('Element.animate'); return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; }

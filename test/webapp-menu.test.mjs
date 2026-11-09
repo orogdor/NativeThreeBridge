@@ -60,6 +60,22 @@ test('nested wheel input continues to the parent at the inner boundary', { skip 
   assert.equal(controls.scrollTop, 70);
 });
 
+test('opening an offscreen graphics panel can scroll its controls into view', { skip }, async () => {
+  for (const [width, height] of [[1280, 720], [700, 650]]) {
+    const { context, host } = await runWebapp(fixture, { frames: 1, width, height });
+    const doc = context.document;
+    const last = doc.getElementById('last');
+    const panel = doc.createElement('details');
+    const summary = doc.createElement('summary');
+    summary.textContent = 'Graphics settings';
+    last.before(panel);
+    panel.append(summary, last);
+    panel.open = true;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    assert.equal(host.ui.hitTest(...center(last)), last, 'the opened settings are in view');
+  }
+});
+
 test('select opens a list, commits only an enabled choice and fires change once', { skip }, async () => {
   const { context, host } = await runWebapp(fixture, { frames: 1, width: 1280, height: 720 });
   const select = context.document.getElementById('quality');

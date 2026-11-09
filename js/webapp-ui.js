@@ -3646,6 +3646,16 @@ center{text-align:center}
     const b = el && el._ntBox;
     return b && b._gen === layoutGen ? b : null;
   }
+  function scrollAlignment(start, size, edge, viewport, align) {
+    const near = start - edge, far = near + size - viewport;
+    if (align === 'start') return near;
+    if (align === 'end') return far;
+    if (align === 'center') return (near + far) / 2;
+    if (near < 0 && far > 0) return 0;
+    if ((near < 0 && size <= viewport) || (far > 0 && size > viewport)) return near;
+    if ((far > 0 && size <= viewport) || (near < 0 && size > viewport)) return far;
+    return 0;
+  }
   function reportFrameError(e) {
     frameErrors++;
     if (frameErrors <= 3) nt.log('error', `[NativeThreeBridge UI] ${e && e.stack ? e.stack : e}`);
@@ -3865,6 +3875,37 @@ center{text-align:center}
       if (deps.interact) markInteraction(old, el);
     },
     focusChanged(oldEl, newEl) { if (deps.interact) markInteraction(oldEl, newEl); },
+    scrollIntoView(target, options) {
+      ensureLayout();
+      const bounds = boxOf(target) || inlineRect(target);
+      if (!bounds || bounds.pos === 'fixed') return;
+      const block = options === false ? 'end' : (options?.block ?? 'start');
+      const inline = options?.inline ?? 'nearest';
+      const allowsScroll = (overflow) => /^(auto|scroll|hidden)$/.test(overflow);
+      let { x, y } = bounds;
+      for (let el = target.parentElement; el; el = el.parentElement) {
+        const b = boxOf(el);
+        if (!b) continue;
+        if (b.clips) {
+          const width = b.w - b.bl - b.br, height = b.h - b.bt - b.bb;
+          const sx = el.scrollLeft, sy = el.scrollTop;
+          const canX = allowsScroll(lower(get(b.cs, 'overflow-x')));
+          const canY = allowsScroll(lower(get(b.cs, 'overflow-y')));
+          const dx = scrollAlignment(x, bounds.w, b.x + b.bl, width, inline);
+          const dy = scrollAlignment(y, bounds.h, b.y + b.bt, height, block);
+          const nx = canX ? clamp(sx + dx, 0, Math.max(0, b.scrollW - width)) : sx;
+          const ny = canY ? clamp(sy + dy, 0, Math.max(0, b.scrollH - height)) : sy;
+          if (nx !== sx || ny !== sy) {
+            el._ntScrollLeft = nx; el._ntScrollTop = ny;
+            layoutDirty.add(el);
+            x -= nx - sx; y -= ny - sy;
+            requestAnimationFrame(() => el.dispatchEvent(new Event('scroll')));
+          }
+          if (options?.container === 'nearest' && (canX || canY)) break;
+        }
+        if (b.pos === 'fixed') break;
+      }
+    },
     // Default action of a wheel event: scrolls the nearest scrollable box.
     wheel(target, dx, dy) {
       const allowsWheel = (overflow) => overflow === 'auto' || overflow === 'scroll';
