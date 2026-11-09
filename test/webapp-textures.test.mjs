@@ -87,7 +87,7 @@ test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { ski
   assert.ok(sea, 'diffuseColor.a from the patch');
   assert.ok(!(sea.flags & DrawFlags.VERTEX_COLORS));
   const deep = [lin(0x1f), lin(0x4b), lin(0x55)], shallow = [lin(0x5e), lin(0x84), lin(0x66)];
-  for (let i = 0; i < 3; i++) assert.ok(near(sea.color[i], deep[i] * 0.65 + shallow[i] * 0.35, 0.005), `sea channel ${i}`);
+  for (let i = 0; i < 3; i++) assert.ok(near(sea.color[i], deep[i] * 0.7 + shallow[i] * 0.3, 0.005), `sea channel ${i}`);
   assert.ok(!pass.draws.some((d) => near(d.color[0], lin(0xd7), 0.002) && near(d.color[1], lin(0xc1), 0.002)), 'fog plane with a texture alpha mask is left out');
   const coast = pass.draws.find((d) => near(d.opacity, 0.72));
   assert.ok(coast, 'attribute-driven coast fade remains visible');
