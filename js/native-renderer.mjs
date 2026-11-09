@@ -735,13 +735,16 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   function colorWeights(entries, glsl) {
     const names = entries.map(([k]) => k);
     const w = names.map(() => 1);
-    const mix = /mix\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,/g;
+    // Preserve constant GLSL mix ratios instead of imposing a 65/35 tint.
+    // Dynamic blend factors remain an approximation until native GLSL support.
+    const mix = /\bmix\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)\s*\)/g;
     let found = false;
     for (let mm; (mm = mix.exec(glsl));) {
       const i = names.indexOf(mm[1]), j = names.indexOf(mm[2]);
       if (i < 0 || j < 0) continue;
+      const t = Math.max(0, Math.min(1, Number(mm[3])));
       if (!found) { w.fill(0); found = true; }
-      w[i] += 0.65; w[j] += 0.35;
+      w[i] += 1 - t; w[j] += t;
     }
     const total = w.reduce((a, b) => a + b, 0) || 1;
     return entries.map(([, u], i) => [u, w[i] / total]);
