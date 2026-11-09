@@ -19,6 +19,9 @@
   if (!nt) throw new Error('NativeThreeBridge: __nt native bridge missing');
 
   const GAME_ORIGIN = 'nt://game';
+  // HTML/CSS UI layer (js/webapp-ui.js) installs itself as __ntHost.ui.
+  let uiLayer = null;
+  const uiNotify = (kind, node, name) => { if (uiLayer) uiLayer.invalidate(kind, node, name); };
   const state = {
     width: 1280, height: 720, pixelRatio: 1,
     now: 0, frame: 0,
@@ -378,17 +381,18 @@
       if (i < 0) this.childNodes.push(child); else this.childNodes.splice(i, 0, child);
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
+      uiNotify('tree', this);
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
-      if (i >= 0) { this.childNodes.splice(i, 1); child.parentNode = null; }
+      if (i >= 0) { this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this); }
       return child;
     }
     replaceChild(newChild, oldChild) { this.insertBefore(newChild, oldChild); return this.removeChild(oldChild); }
     contains(node) { for (let n = node; n; n = n.parentNode) if (n === this) return true; return false; }
     get textContent() { return this.childNodes.map((c) => c.textContent).join(''); }
-    set textContent(v) { for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
+    set textContent(v) { for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; uiNotify('tree', this); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
     cloneNode(deep) {
       const copy = this._shallowClone();
       if (deep) for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
@@ -532,7 +536,9 @@
   }
 
   class Text extends Node {
-    constructor(data = '') { super(3, '#text'); this.data = String(data); }
+    constructor(data = '') { super(3, '#text'); this._data = String(data); }
+    get data() { return this._data; }
+    set data(v) { v = String(v); if (v === this._data) return; this._data = v; uiNotify('text', this); }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
     get nodeValue() { return this.data; }
@@ -574,19 +580,61 @@
     [Symbol.iterator]() { return this._get()[Symbol.iterator](); }
   }
   function camelToKebab(s) { return s.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase()); }
-  function makeStyle() {
+  // Inline style; changes notify the UI layer. Values keep !important.
+  function makeStyle(owner) {
     const props = new Map();
+    const changed = () => { if (owner) uiNotify('style', owner); };
+    const parse = (text) => {
+      props.clear();
+      for (const decl of splitDeclarations(String(text))) {
+        const i = decl.indexOf(':');
+        if (i > 0) props.set(decl.slice(0, i).trim().replace(/^[A-Z-]+$/, (m) => m.toLowerCase()), decl.slice(i + 1).trim());
+      }
+    };
+    const setOne = (k, v, priority) => {
+      const key = k.startsWith('--') ? k : camelToKebab(k).toLowerCase().replace(/^(webkit|moz|ms)-/, '-$1-');
+      if (v === null || v === undefined || v === '') props.delete(key);
+      else props.set(key, String(v) + (priority === 'important' ? ' !important' : ''));
+      changed();
+    };
     const target = {
-      setProperty(k, v) { props.set(k, String(v)); },
-      getPropertyValue(k) { return props.get(k) || ''; },
-      removeProperty(k) { const v = props.get(k) || ''; props.delete(k); return v; },
+      setProperty(k, v, priority) { setOne(String(k), v, priority); },
+      getPropertyValue(k) { return (props.get(k) || '').replace(/\s*!important$/, ''); },
+      getPropertyPriority(k) { return /!important$/.test(props.get(k) || '') ? 'important' : ''; },
+      removeProperty(k) { const v = props.get(k) || ''; props.delete(k); changed(); return v; },
+      item(i) { return [...props.keys()][i] || ''; },
+      get length() { return props.size; },
       get cssText() { return [...props].map(([k, v]) => `${k}: ${v}`).join('; '); },
-      set cssText(text) { props.clear(); for (const decl of String(text).split(';')) { const i = decl.indexOf(':'); if (i > 0) props.set(decl.slice(0, i).trim(), decl.slice(i + 1).trim()); } },
+      set cssText(text) { parse(text); changed(); },
+      _setSilently(text) { parse(text); },
     };
     return new Proxy(target, {
-      get(t, k) { if (k in t) return t[k]; if (typeof k !== 'string') return undefined; return props.get(camelToKebab(k)) || ''; },
-      set(t, k, v) { if (k === 'cssText') { t.cssText = v; return true; } if (typeof k === 'string') props.set(camelToKebab(k), String(v)); return true; },
+      get(t, k) {
+        if (k in t) return t[k];
+        if (typeof k !== 'string') return undefined;
+        if (/^\d+$/.test(k)) return t.item(Number(k));
+        return (props.get(k.startsWith('--') ? k : camelToKebab(k)) || '').replace(/\s*!important$/, '');
+      },
+      set(t, k, v) {
+        if (k === 'cssText') { t.cssText = v; return true; }
+        if (typeof k === 'string') setOne(k, v);
+        return true;
+      },
     });
+  }
+  function splitDeclarations(text) {
+    const out = [];
+    let depth = 0, quote = null, start = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quote) { if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") quote = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth--;
+      else if (c === ';' && depth === 0) { out.push(text.slice(start, i)); start = i + 1; }
+    }
+    out.push(text.slice(start));
+    return out;
   }
 
   class Element extends Node {
@@ -595,10 +643,9 @@
       super(1, lower.toUpperCase());
       this.localName = lower; this.tagName = lower.toUpperCase(); this.namespaceURI = namespaceURI;
       this._attrs = new Map();
-      this.style = makeStyle();
+      this.style = makeStyle(this);
       this.classList = new DOMTokenList(this);
       this.dataset = {};
-      this.scrollTop = 0; this.scrollLeft = 0;
     }
     get id() { return this.getAttribute('id') || ''; }
     set id(v) { this.setAttribute('id', v); }
@@ -609,12 +656,19 @@
     setAttribute(n, v) {
       n = String(n).toLowerCase(); v = String(v); this._attrs.set(n, v);
       if (n.startsWith('data-')) this.dataset[n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
-      if (n === 'style') this.style.cssText = v;
+      if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
+      uiNotify('attr', this, n);
     }
     _attributeChanged() {}
     hasAttribute(n) { return this._attrs.has(String(n).toLowerCase()); }
-    removeAttribute(n) { this._attrs.delete(String(n).toLowerCase()); }
+    removeAttribute(n) {
+      n = String(n).toLowerCase();
+      if (!this._attrs.has(n)) return;
+      this._attrs.delete(n);
+      if (n === 'style') this.style._setSilently('');
+      uiNotify('attr', this, n);
+    }
     toggleAttribute(n, force) { const has = this.hasAttribute(n); const want = force === undefined ? !has : !!force; if (want) this.setAttribute(n, ''); else this.removeAttribute(n); return want; }
     get children() { return this.childNodes.filter((c) => c.nodeType === 1); }
     get childElementCount() { return this.children.length; }
@@ -655,25 +709,49 @@
     matches(s) { return parseSelectorGroups(s).some((g) => matchComplex(this, g)); }
     closest(s) { for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (n.matches(s)) return n; return null; }
     _fullView() { return this.localName === 'canvas' || this.localName === 'body' || this.localName === 'html'; }
-    getBoundingClientRect() {
-      const w = this._fullView() ? state.width : 0, h = this._fullView() ? state.height : 0;
-      return { x: 0, y: 0, left: 0, top: 0, right: w, bottom: h, width: w, height: h, toJSON() { return this; } };
+    // Real layout boxes from the UI layer; full-window fallback without it.
+    _layoutRect() {
+      if (uiLayer && this.isConnected) {
+        const r = uiLayer.rect(this);
+        if (r) return r;
+        if (this.localName !== 'html' && this.localName !== 'body') return { x: 0, y: 0, w: 0, h: 0, bl: 0, br: 0, bt: 0, bb: 0 };
+      }
+      const full = this._fullView();
+      return { x: 0, y: 0, w: full ? state.width : 0, h: full ? state.height : 0, bl: 0, br: 0, bt: 0, bb: 0 };
     }
-    getClientRects() { return [this.getBoundingClientRect()]; }
-    get clientWidth() { return this._fullView() ? state.width : 0; }
-    get clientHeight() { return this._fullView() ? state.height : 0; }
-    get offsetWidth() { return this.clientWidth; }
-    get offsetHeight() { return this.clientHeight; }
-    get offsetLeft() { return 0; }
-    get offsetTop() { return 0; }
-    get offsetParent() { return this.parentElement; }
-    get scrollWidth() { return this.clientWidth; }
-    get scrollHeight() { return this.clientHeight; }
-    focus() { document.activeElement = this; }
-    blur() { if (document.activeElement === this) document.activeElement = document.body; }
+    getBoundingClientRect() {
+      const r = this._layoutRect();
+      return { x: r.x, y: r.y, left: r.x, top: r.y, right: r.x + r.w, bottom: r.y + r.h, width: r.w, height: r.h, toJSON() { return this; } };
+    }
+    getClientRects() { const r = this.getBoundingClientRect(); return r.width || r.height ? [r] : []; }
+    get clientWidth() { if (this.localName === 'html') return state.width; const r = this._layoutRect(); return Math.round(Math.max(0, r.w - r.bl - r.br)); }
+    get clientHeight() { if (this.localName === 'html') return state.height; const r = this._layoutRect(); return Math.round(Math.max(0, r.h - r.bt - r.bb)); }
+    get clientLeft() { return Math.round(this._layoutRect().bl || 0); }
+    get clientTop() { return Math.round(this._layoutRect().bt || 0); }
+    get offsetWidth() { return Math.round(this._layoutRect().w); }
+    get offsetHeight() { return Math.round(this._layoutRect().h); }
+    get offsetLeft() { const p = this.offsetParent; return Math.round(this._layoutRect().x - (p ? p._layoutRect().x + (p._layoutRect().bl || 0) : 0)); }
+    get offsetTop() { const p = this.offsetParent; return Math.round(this._layoutRect().y - (p ? p._layoutRect().y + (p._layoutRect().bt || 0) : 0)); }
+    get offsetParent() {
+      for (let n = this.parentElement; n; n = n.parentElement) {
+        if (n.localName === 'body') return n;
+        const cs = uiLayer && uiLayer.computed(n);
+        if (cs && cs.position && cs.position !== 'static') return n;
+      }
+      return this.parentElement;
+    }
+    get scrollWidth() { const r = this._layoutRect(); return Math.round(r.scrollW || Math.max(0, r.w - r.bl - r.br)); }
+    get scrollHeight() { const r = this._layoutRect(); return Math.round(r.scrollH || Math.max(0, r.h - r.bt - r.bb)); }
+    get scrollTop() { return this._ntScrollTop || 0; }
+    set scrollTop(v) { const n = Math.max(0, Number(v) || 0); if (n === (this._ntScrollTop || 0)) return; this._ntScrollTop = n; uiNotify('layout', this); }
+    get scrollLeft() { return this._ntScrollLeft || 0; }
+    set scrollLeft(v) { const n = Math.max(0, Number(v) || 0); if (n === (this._ntScrollLeft || 0)) return; this._ntScrollLeft = n; uiNotify('layout', this); }
+    focus() { const old = document.activeElement; document.activeElement = this; if (uiLayer && old !== this) uiLayer.focusChanged(old, this); }
+    blur() { if (document.activeElement === this) { document.activeElement = document.body; if (uiLayer) uiLayer.focusChanged(this, document.body); } }
     click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
     scrollIntoView() {}
-    scrollTo() {}
+    scrollTo(x, y) { if (typeof x === 'object' && x) { if (x.top !== undefined) this.scrollTop = x.top; if (x.left !== undefined) this.scrollLeft = x.left; } else { if (x !== undefined) this.scrollLeft = x; if (y !== undefined) this.scrollTop = y; } }
+    scrollBy(x, y) { if (typeof x === 'object' && x) { this.scrollTop += x.top || 0; this.scrollLeft += x.left || 0; } else { this.scrollLeft += x || 0; this.scrollTop += y || 0; } }
     animate() { unsupported('Element.animate'); return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; }
     requestPointerLock() { unsupported('Pointer Lock', 'cursor stays free'); return Promise.resolve(); }
     requestFullscreen() { unsupported('Fullscreen API'); return Promise.resolve(); }
@@ -702,8 +780,14 @@
     get dir() { return this.getAttribute('dir') || ''; }
     set dir(v) { this.setAttribute('dir', v); }
     get disabled() { return this._disabled ?? this.hasAttribute('disabled'); }
-    set disabled(v) { this._disabled = !!v; }
+    set disabled(v) { this._disabled = !!v; uiNotify('attr', this, 'disabled'); }
     get sheet() { return null; }
+    // <details>/<dialog>
+    get open() { return this.hasAttribute('open'); }
+    set open(v) { this.toggleAttribute('open', !!v); }
+    show() { this.open = true; }
+    showModal() { this.open = true; }
+    close(value) { if (!this.open) return; this.open = false; if (value !== undefined) this.returnValue = String(value); this.dispatchEvent(new Event('close')); }
     get hidden() { return this.hasAttribute('hidden'); }
     set hidden(v) { this.toggleAttribute('hidden', !!v); }
     get title() { return this.getAttribute('title') || ''; }
@@ -712,10 +796,20 @@
     set tabIndex(v) { this.setAttribute('tabindex', v); }
   }
   class HTMLInputElement extends HTMLElement {
-    get value() { return this._value ?? this.getAttribute('value') ?? ''; }
-    set value(v) { this._value = String(v); }
+    get value() {
+      if (this.localName === 'select' && this._value === undefined) {
+        const opts = this.querySelectorAll('option');
+        const sel = opts.find((o) => o.hasAttribute('selected')) || opts[0];
+        return sel ? (sel.getAttribute('value') ?? sel.textContent) : '';
+      }
+      return this._value ?? this.getAttribute('value') ?? '';
+    }
+    set value(v) { this._value = String(v); uiNotify('attr', this, 'value'); }
     get checked() { return this._checked ?? this.hasAttribute('checked'); }
-    set checked(v) { this._checked = !!v; }
+    set checked(v) { this._checked = !!v; uiNotify('attr', this, 'checked'); }
+    get selectedIndex() { const opts = this.querySelectorAll('option'); const i = opts.findIndex((o) => (o.getAttribute('value') ?? o.textContent) === this.value); return i; }
+    set selectedIndex(i) { const o = this.querySelectorAll('option')[i]; if (o) this.value = o.getAttribute('value') ?? o.textContent; }
+    get options() { return this.querySelectorAll('option'); }
     get type() { return this.getAttribute('type') || 'text'; }
     set type(v) { this.setAttribute('type', v); }
     get disabled() { return this.hasAttribute('disabled'); }
@@ -736,9 +830,9 @@
   class HTMLCanvasElement extends HTMLElement {
     constructor(tag = 'canvas', ns) { super(tag, ns); this._width = 300; this._height = 150; }
     get width() { return this._width; }
-    set width(v) { this._width = Math.max(0, v | 0); }
+    set width(v) { const n = Math.max(0, v | 0); if (n !== this._width) { this._width = n; uiNotify('layout', this); } }
     get height() { return this._height; }
-    set height(v) { this._height = Math.max(0, v | 0); }
+    set height(v) { const n = Math.max(0, v | 0); if (n !== this._height) { this._height = n; uiNotify('layout', this); } }
     _attributeChanged(n, v) { if (n === 'width') this._width = v | 0; if (n === 'height') this._height = v | 0; }
     getContext(kind) {
       if (kind === '2d') {
@@ -771,12 +865,23 @@
     set src(v) {
       this._src = String(v);
       this.setAttribute('src', this._src);
-      // Image decoding arrives in a later engine version. Fail like a broken
-      // image so THREE.TextureLoader calls onError and the game keeps running.
-      unsupported('Image/texture decoding', 'textures stay untextured (planned for v0.30)');
-      setTimeout(() => { this.complete = true; this.dispatchEvent(new Event('error')); }, 0);
+      // Images in the game folder load (the UI layer draws them natively;
+      // 3D textures stay untextured). Anything else fails like a broken image
+      // so THREE.TextureLoader calls onError and the game keeps running.
+      const path = /^data:/i.test(this._src) ? this._src : toGamePath(this._src);
+      const info = path && uiLayer ? uiLayer.imageSize(path) : null;
+      if (!info) unsupported('Image/texture decoding', '3D textures stay untextured; HTML/CSS images are drawn by the UI layer');
+      setTimeout(() => {
+        this.complete = true;
+        if (info) {
+          this.naturalWidth = info.w; this.naturalHeight = info.h;
+          if (!this.width) this.width = info.w;
+          if (!this.height) this.height = info.h;
+          this.dispatchEvent(new Event('load'));
+        } else this.dispatchEvent(new Event('error'));
+      }, 0);
     }
-    decode() { return Promise.reject(new Error('Image decoding not supported yet')); }
+    decode() { return this.naturalWidth ? Promise.resolve() : Promise.reject(new Error('Image could not be decoded')); }
   }
   class HTMLMediaElement extends HTMLElement {
     play() { unsupported(`<${this.localName}> playback`); return Promise.resolve(); }
@@ -841,7 +946,8 @@
     hasFocus() { return true; }
     exitPointerLock() {}
     exitFullscreen() { return Promise.resolve(); }
-    elementFromPoint() { return this.querySelector('canvas') || this.body; }
+    elementFromPoint(x, y) { return (uiLayer && uiLayer.hitTest(x, y)) || this.querySelector('canvas') || this.body; }
+    elementsFromPoint(x, y) { const e = this.elementFromPoint(x, y); const out = []; for (let n = e; n && n.nodeType === 1; n = n.parentNode) out.push(n); return out; }
     execCommand() { return false; }
     _shallowClone() { return new Document(); }
   }
@@ -1361,7 +1467,38 @@
     observe(el) { setTimeout(() => this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1 }], this), 0); }
     unobserve() {} disconnect() {}
   }
-  const mediaQueries = (q) => ({ matches: /prefers-color-scheme:\s*dark/.test(q), media: q, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
+  // matchMedia evaluates against the window size (UI layer) and re-checks on resize.
+  const mediaLists = new Set();
+  const mediaMatch = (q) => (uiLayer ? uiLayer.matchMedia(q) : /prefers-color-scheme:\s*dark/.test(q));
+  const mediaQueries = (q) => {
+    const list = new EventTarget();
+    Object.assign(list, { media: String(q), onchange: null, _last: mediaMatch(q) });
+    Object.defineProperty(list, 'matches', { get: () => mediaMatch(q) });
+    list.addListener = (fn) => list.addEventListener('change', fn);
+    list.removeListener = (fn) => list.removeEventListener('change', fn);
+    mediaLists.add(list);
+    return list;
+  };
+
+  // getComputedStyle: cascaded values from the UI layer; sizes from layout.
+  function computedStyle(el) {
+    const cs = uiLayer && el && el.nodeType === 1 ? uiLayer.computed(el) : null;
+    const read = (prop) => {
+      if (!cs) return prop === 'display' ? (el && el.hasAttribute && el.hasAttribute('hidden') ? 'none' : 'block') : el && el.style ? el.style.getPropertyValue(prop) : '';
+      if (prop === 'width' || prop === 'height') {
+        const r = el._layoutRect();
+        const v = prop === 'width' ? r.w - (r.bl || 0) - (r.br || 0) - (r.pl || 0) - (r.pr || 0) : r.h - (r.bt || 0) - (r.bb || 0) - (r.pt || 0) - (r.pb || 0);
+        return `${Math.max(0, v)}px`;
+      }
+      if (prop === 'font-size') return `${cs.__fs}px`;
+      const v = cs[prop];
+      if (v !== undefined) return String(v);
+      return ({ display: 'inline', position: 'static', opacity: '1', visibility: 'visible', 'pointer-events': 'auto', 'z-index': 'auto', color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)', 'box-sizing': 'content-box', overflow: 'visible', transform: 'none' })[prop] ?? (/^(margin|padding|border-.*-width|top|left|right|bottom)/.test(prop) ? '0px' : '');
+    };
+    return new Proxy({ getPropertyValue: read, getPropertyPriority: () => '', item: () => '', length: 0 }, {
+      get(t, k) { if (k in t) return t[k]; if (typeof k !== 'string') return undefined; return read(k.startsWith('--') ? k : camelToKebab(k)); },
+    });
+  }
 
   // ------------------------------------------------------------ globals
   const document = new Document();
@@ -1398,7 +1535,7 @@
     removeEventListener: (...a) => windowEvents.removeEventListener(...a),
     dispatchEvent: (e) => { e.target = window; e.eventPhase = 2; windowEvents._invoke(e, false); e.currentTarget = null; return !e.defaultPrevented; },
     _invoke: (e, capture) => { windowEvents._invoke(e, capture); e.currentTarget = window; },
-    getComputedStyle: (el) => new Proxy(el.style, { get: (t, k) => (k === 'getPropertyValue' ? (p) => t.getPropertyValue(p) : t[k] || (k === 'display' ? 'block' : '')) }),
+    getComputedStyle: (el, pseudo) => computedStyle(el, pseudo),
     matchMedia: mediaQueries,
     scrollTo() {}, scrollBy() {}, scroll() {}, focus() {}, blur() {}, close() {}, print() {}, stop() {}, postMessage() {},
     open() { warnOnce('open', 'window.open() is ignored'); return null; },
@@ -1451,6 +1588,7 @@
 
   // ------------------------------------------------------- input mapping
   let pointerButtons = 0, lastPointer = { x: 0, y: 0 }, modifiers = {};
+  let captureTarget = null, downTarget = null, hoverTarget = null;
   const BUTTON_BIT = [1, 4, 2, 8, 16];
   function eventTarget() {
     return (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) ? document.activeElement : (document.body || document);
@@ -1459,27 +1597,140 @@
     const canvas = document.querySelector('canvas');
     return canvas && canvas.isConnected ? canvas : (document.body || document);
   }
+  // Element under the pointer: hit-tested HTML UI, else the 3D canvas.
+  function hitTarget(x, y) {
+    const hit = uiLayer ? uiLayer.hitTest(x, y) : null;
+    if (hit && hit.isConnected) return hit;
+    return pointerTarget();
+  }
   function fire(target, event) {
     event.isTrusted = true;
     if (target === window) return window.dispatchEvent(event);
     return target.dispatchEvent(event);
   }
   const PTR = { bubbles: true, cancelable: true, composed: true };
+  const chainOf = (n) => { const out = []; for (; n && n.nodeType === 1; n = n.parentNode) out.push(n); return out; };
+  function commonAncestor(a, b) {
+    if (!a || !b) return a || b;
+    const set = new Set(chainOf(a));
+    for (let n = b; n; n = n.parentNode) if (set.has(n)) return n;
+    return document.body || document;
+  }
+  function disabledControl(el) {
+    for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
+      if (/^(button|input|select|textarea|fieldset)$/.test(n.localName) && (n.hasAttribute('disabled') || n._disabled)) return true;
+    }
+    return false;
+  }
+  function updateHover(target, init) {
+    if (target === hoverTarget) return;
+    const old = hoverTarget;
+    hoverTarget = target;
+    const oldChain = chainOf(old), newChain = chainOf(target);
+    if (old && old.isConnected) {
+      fire(old, new PointerEvent('pointerout', { ...init, relatedTarget: target }));
+      fire(old, new MouseEvent('mouseout', { ...init, relatedTarget: target }));
+      for (const n of oldChain) if (!newChain.includes(n)) { fire(n, new PointerEvent('pointerleave', { ...init, bubbles: false, relatedTarget: target })); fire(n, new MouseEvent('mouseleave', { ...init, bubbles: false, relatedTarget: target })); }
+    }
+    if (target) {
+      fire(target, new PointerEvent('pointerover', { ...init, relatedTarget: old }));
+      fire(target, new MouseEvent('mouseover', { ...init, relatedTarget: old }));
+      for (const n of newChain.slice().reverse()) if (!oldChain.includes(n)) { fire(n, new PointerEvent('pointerenter', { ...init, bubbles: false, relatedTarget: old })); fire(n, new MouseEvent('mouseenter', { ...init, bubbles: false, relatedTarget: old })); }
+    }
+    if (uiLayer) uiLayer.setHover(target && target.nodeType === 1 ? target : null);
+  }
+  // Browser default actions after an unprevented click.
+  function clickDefault(target) {
+    for (let n = target; n && n.nodeType === 1; n = n.parentNode) {
+      const tag = n.localName;
+      if (tag === 'summary' && n.parentNode && n.parentNode.localName === 'details') {
+        const d = n.parentNode;
+        d.toggleAttribute('open', !d.hasAttribute('open'));
+        d.dispatchEvent(new Event('toggle'));
+        return;
+      }
+      if (tag === 'input') {
+        const type = (n.getAttribute('type') || 'text').toLowerCase();
+        if (type === 'checkbox') { n.checked = !n.checked; n.dispatchEvent(new Event('input', { bubbles: true })); n.dispatchEvent(new Event('change', { bubbles: true })); }
+        else if (type === 'radio' && !n.checked) {
+          const name = n.getAttribute('name');
+          if (name) for (const r of document.querySelectorAll(`input[name="${name}"]`)) if (r !== n) r.checked = false;
+          n.checked = true; n.dispatchEvent(new Event('input', { bubbles: true })); n.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return;
+      }
+      if (tag === 'select') {
+        const opts = n.querySelectorAll('option');
+        if (opts.length > 1) {
+          const i = (n.selectedIndex + 1) % opts.length;
+          n.selectedIndex = i;
+          n.dispatchEvent(new Event('input', { bubbles: true }));
+          n.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return;
+      }
+      if (tag === 'label') {
+        const id = n.getAttribute('for');
+        const control = id ? document.getElementById(id) : n.querySelector('input,select,textarea,button');
+        if (control && control !== target && !control.contains(target)) control.click();
+        return;
+      }
+      if (tag === 'button' || tag === 'a') return;
+    }
+  }
+  function focusFor(target) {
+    for (let n = target; n && n.nodeType === 1; n = n.parentNode) {
+      if (/^(button|input|select|textarea|a|summary)$/.test(n.localName) || n.hasAttribute('tabindex') || n.hasAttribute('contenteditable')) {
+        if (document.activeElement !== n) { const old = document.activeElement; n.focus(); if (old && old !== n && old.isConnected) old.dispatchEvent(new FocusEvent('blur')); n.dispatchEvent(new FocusEvent('focus')); }
+        return;
+      }
+    }
+    if (document.activeElement && document.activeElement !== document.body) {
+      const old = document.activeElement;
+      old.blur();
+      if (old.isConnected) old.dispatchEvent(new FocusEvent('blur'));
+    }
+  }
   function pointer(kind, x, y, button, mods) {
     const movementX = x - lastPointer.x, movementY = y - lastPointer.y;
     lastPointer = { x, y };
     if (kind === 'down') pointerButtons |= BUTTON_BIT[button] || 0;
     if (kind === 'up') pointerButtons &= ~(BUTTON_BIT[button] || 0);
-    const init = { ...PTR, ...mods, clientX: x, clientY: y, offsetX: x, offsetY: y, movementX, movementY, button: kind === 'move' ? -1 : button, buttons: pointerButtons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-    const target = pointerTarget();
+    const init = { ...PTR, ...mods, clientX: x, clientY: y, offsetX: x, offsetY: y, pageX: x, pageY: y, screenX: x, screenY: y, movementX, movementY, button: kind === 'move' ? -1 : button, buttons: pointerButtons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    const under = hitTarget(x, y);
+    // Implicit capture: a drag that starts on the canvas stays with it.
+    const target = captureTarget && captureTarget.isConnected ? captureTarget : under;
+    if (kind === 'move' && !captureTarget) updateHover(under, init);
+    if (kind === 'down') {
+      if (!captureTarget) { captureTarget = under; downTarget = under; }
+      if (uiLayer) uiLayer.setActive(under && under.nodeType === 1 ? under : null);
+    }
     const pType = { down: 'pointerdown', up: 'pointerup', move: 'pointermove' }[kind];
     const mType = { down: 'mousedown', up: 'mouseup', move: 'mousemove' }[kind];
     const proceed = fire(target, new PointerEvent(pType, init));
     if (proceed) fire(target, new MouseEvent(mType, init));
+    if (kind === 'down' && proceed && button === 0) focusFor(target);
     if (kind === 'up') {
-      if (button === 0) fire(target, new MouseEvent('click', init));
-      if (button === 2) fire(target, new MouseEvent('contextmenu', init));
+      const clickTarget = commonAncestor(downTarget || target, under);
+      if (!pointerButtons) {
+        captureTarget = null; downTarget = null;
+        if (uiLayer) uiLayer.setActive(null);
+        updateHover(under, init);
+      }
+      if (button === 0 && clickTarget && !disabledControl(clickTarget)) {
+        const notPrevented = fire(clickTarget, new MouseEvent('click', init));
+        if (notPrevented) clickDefault(clickTarget);
+      }
+      if (button === 2) fire(clickTarget || target, new MouseEvent('contextmenu', init));
     }
+  }
+  // Typing into focused <input>/<textarea> (no IME, no selection).
+  function editableTarget() {
+    const el = document.activeElement;
+    if (!el || !el.isConnected) return null;
+    if (el.localName === 'textarea') return el;
+    if (el.localName === 'input' && /^(text|search|email|url|tel|password|number|)$/.test((el.getAttribute('type') || '').toLowerCase())) return el;
+    return null;
   }
 
   // --------------------------------------------- engine -> JS entry points
@@ -1491,6 +1742,15 @@
       if (changed && state.booted) {
         window.dispatchEvent(new UIEvent('resize'));
         for (const o of resizeObservers) o._notify();
+        for (const list of mediaLists) {
+          const m = list.matches;
+          if (m !== list._last) {
+            list._last = m;
+            const ev = new Event('change'); ev.matches = m; ev.media = list.media;
+            list.dispatchEvent(ev);
+            if (typeof list.onchange === 'function') try { list.onchange(ev); } catch (e) { reportError('matchMedia change', e); }
+          }
+        }
       }
     },
     // Called once by the engine with the text of index.html.
@@ -1560,16 +1820,30 @@
       for (const cb of callbacks.values()) {
         try { cb(timeMs); } catch (e) { reportError('requestAnimationFrame', e); }
       }
+      if (uiLayer) uiLayer.frame();
     },
     key(down, key, code, repeat, alt, ctrl, shift, meta) {
       modifiers = { altKey: !!alt, ctrlKey: !!ctrl, shiftKey: !!shift, metaKey: !!meta };
       const keyCode = key.length === 1 ? key.toUpperCase().charCodeAt(0) : ({ Enter: 13, Escape: 27, ' ': 32, Tab: 9, Backspace: 8, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Shift: 16, Control: 17, Alt: 18, Delete: 46 }[key] || 0);
-      fire(eventTarget(), new KeyboardEvent(down ? 'keydown' : 'keyup', { bubbles: true, cancelable: true, key, code, repeat: !!repeat, keyCode, ...modifiers }));
+      const proceed = fire(eventTarget(), new KeyboardEvent(down ? 'keydown' : 'keyup', { bubbles: true, cancelable: true, key, code, repeat: !!repeat, keyCode, ...modifiers }));
+      const edit = down && proceed && !ctrl && !meta ? editableTarget() : null;
+      if (edit && (key.length === 1 || key === 'Backspace' || (key === 'Enter' && edit.localName === 'textarea'))) {
+        const v = edit.value;
+        edit.value = key === 'Backspace' ? v.slice(0, -1) : v + (key === 'Enter' ? '\n' : key);
+        edit.dispatchEvent(new Event('input', { bubbles: true }));
+      } else if (edit && key === 'Enter') edit.dispatchEvent(new Event('change', { bubbles: true }));
     },
     pointer(kind, x, y, button) { pointer(kind, x, y, button | 0, modifiers); },
     wheel(x, y, deltaX, deltaY) {
-      fire(pointerTarget(), new WheelEvent('wheel', { ...PTR, ...modifiers, clientX: x, clientY: y, deltaX, deltaY, deltaMode: 0, buttons: pointerButtons }));
+      const target = hitTarget(x, y);
+      const proceed = fire(target, new WheelEvent('wheel', { ...PTR, ...modifiers, clientX: x, clientY: y, deltaX, deltaY, deltaMode: 0, buttons: pointerButtons }));
+      if (proceed && uiLayer && target && target.nodeType === 1) {
+        const scrolled = uiLayer.wheel(target, deltaX, deltaY);
+        if (scrolled) scrolled.dispatchEvent(new Event('scroll'));
+      }
     },
+    // Cursor name (CSS `cursor`) for the element under the pointer.
+    cursor() { return uiLayer && hoverTarget ? uiLayer.cursorAt(hoverTarget) : 'auto'; },
     focus(focused) {
       if (!focused) pointerButtons = 0;
       document.hidden = false;
@@ -1585,6 +1859,8 @@
     },
     unsupported,
     warnOnce,
+    get ui() { return uiLayer; },
+    set ui(layer) { uiLayer = layer || null; },
   };
   Object.defineProperty(global, '__ntHost', { value: host, writable: false, configurable: false });
 })(globalThis);

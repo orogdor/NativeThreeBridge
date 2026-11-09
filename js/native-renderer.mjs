@@ -43,6 +43,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this.isNativeRenderer = true;
       const canvas = parameters.canvas || (typeof document !== 'undefined' ? document.createElement('canvas') : { width: 300, height: 150, style: {} });
       this.domElement = canvas;
+      // The HTML UI layer composites everything painted above this canvas.
+      try { canvas._ntRendererCanvas = true; } catch { /* plain object */ }
       this.parameters = parameters;
       this.autoClear = true;
       this.autoClearColor = true;

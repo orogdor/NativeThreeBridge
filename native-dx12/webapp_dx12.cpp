@@ -26,6 +26,7 @@
 #include "webapp_host.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
+#include "webapp_ui.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -110,6 +111,12 @@ public:
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
     void log(const std::string& level, const std::string& text) override;
+    void submitUi(const float* data, std::size_t floats, const std::string& strings) override {
+        if (uiReady_) ui_.setDisplayList(data, floats, strings);
+    }
+    double measureText(const std::string& families, double size, int weight, bool italic, const std::string& text) override {
+        return uiReady_ ? ui_.measureText(families, size, weight, italic, text) : -1.0;
+    }
 
     LRESULT handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
@@ -127,6 +134,9 @@ private:
     void renderFrame();
     void updateTitle(double fps);
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
+    void initUi();
+    void uploadUi(UINT frame);
+    void drawUi(UINT frame);
 
     std::filesystem::path root_;
     HWND window_ = nullptr;
@@ -165,7 +175,35 @@ private:
     std::vector<Retired> retired_;
     std::vector<std::vector<float>> pendingPasses_, passes_;
     UINT lastDraws_ = 0;
+
+    // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
+    native_three::WebappUiRenderer ui_;
+    bool uiReady_ = false, uiUpload_ = false, uiVisible_ = false;
+    ComPtr<ID3D12Resource> uiTexture_, uiStaging_[kFrameCount];
+    UINT64 uiStagingBytes_[kFrameCount] = {};
+    UINT uiTexW_ = 0, uiTexH_ = 0;
+    // One SRV slot per back buffer: a slot is rewritten only when the frame
+    // that last used it has finished on the GPU.
+    UINT64 uiTexVersion_ = 0, uiSrvVersion_[kFrameCount] = {};
+    UINT uiSrvStep_ = 0;
+    ComPtr<ID3D12DescriptorHeap> uiSrvHeap_;
+    ComPtr<ID3D12RootSignature> uiRootSig_;
+    ComPtr<ID3D12PipelineState> uiPso_;
 };
+
+const char* kUiShader = R"HLSL(
+Texture2D gUi : register(t0);
+SamplerState gPoint : register(s0);
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+V VSMain(uint id : SV_VertexID) {
+    V o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float4 PSMain(V i) : SV_Target { return gUi.Sample(gPoint, i.uv); }
+)HLSL";
 
 WebappWindow* gActive = nullptr;
 std::FILE* gCrashLog = nullptr;
@@ -301,6 +339,169 @@ void WebappWindow::initDevice() {
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
     createSizeDependent();
+    initUi();
+}
+
+void WebappWindow::initUi() {
+    std::string error;
+    uiReady_ = ui_.init(root_, error);
+    if (!error.empty()) log(uiReady_ ? "warn" : "error", "HTML/CSS UI layer: " + error);
+    if (!uiReady_) return;
+    D3D12_DESCRIPTOR_HEAP_DESC heap{};
+    heap.NumDescriptors = kFrameCount;
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&uiSrvHeap_)), "UI descriptor heap");
+    uiSrvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &range;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rs{};
+    rs.NumParameters = 1;
+    rs.pParameters = &param;
+    rs.NumStaticSamplers = 1;
+    rs.pStaticSamplers = &sampler;
+    ComPtr<ID3DBlob> blob, err;
+    check(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err), "Serialize UI root signature");
+    check(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&uiRootSig_)), "UI root signature");
+
+    ComPtr<ID3DBlob> vs, ps;
+    for (int stage = 0; stage < 2; stage++) {
+        ComPtr<ID3DBlob> e;
+        const HRESULT hr = D3DCompile(kUiShader, std::strlen(kUiShader), "webapp_ui_shader", nullptr, nullptr,
+                                      stage ? "PSMain" : "VSMain", stage ? "ps_5_0" : "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                      stage ? ps.GetAddressOf() : vs.GetAddressOf(), e.GetAddressOf());
+        if (FAILED(hr) && e) log("error", static_cast<const char*>(e->GetBufferPointer()));
+        check(hr, stage ? "Compile UI pixel shader" : "Compile UI vertex shader");
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = uiRootSig_.Get();
+    d.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    d.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    d.RasterizerState.DepthClipEnable = TRUE;
+    auto& bt = d.BlendState.RenderTarget[0];
+    bt.BlendEnable = TRUE;                       // premultiplied alpha
+    bt.SrcBlend = D3D12_BLEND_ONE;
+    bt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    bt.BlendOp = D3D12_BLEND_OP_ADD;
+    bt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    bt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    bt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    bt.LogicOp = D3D12_LOGIC_OP_NOOP;
+    bt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.DepthStencilState.DepthEnable = FALSE;
+    d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    d.SampleMask = UINT_MAX;
+    d.NumRenderTargets = 1;
+    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    d.SampleDesc.Count = 1;
+    check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&uiPso_)), "Create UI overlay pipeline");
+    log("info", "HTML/CSS UI layer ready (Direct2D + DirectWrite + WIC)");
+}
+
+// Copies the last Direct2D raster into the overlay texture (this frame's
+// staging buffer is free: renderFrame waited for its fence).
+void WebappWindow::uploadUi(UINT frame) {
+    const std::uint8_t* px = ui_.pixels();
+    const UINT w = ui_.width(), h = ui_.height();
+    uiUpload_ = false;
+    if (!px || !w || !h) return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    if (!uiTexture_ || uiTexW_ != w || uiTexH_ != h) {
+        retire(uiTexture_);
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w;
+        td.Height = h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&uiTexture_)), "UI texture");
+        uiTexVersion_++;
+        uiTexW_ = w;
+        uiTexH_ = h;
+    } else {
+        barrier.Transition.pResource = uiTexture_.Get();
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd_->ResourceBarrier(1, &barrier);
+    }
+    const UINT pitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    const UINT64 bytes = UINT64(pitch) * h;
+    if (uiStagingBytes_[frame] < bytes || !uiStaging_[frame]) {
+        retire(uiStaging_[frame]);
+        uiStaging_[frame] = uploadBuffer(nullptr, bytes);
+        uiStagingBytes_[frame] = bytes;
+    }
+    std::uint8_t* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    check(uiStaging_[frame]->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map UI staging buffer");
+    const UINT srcStride = ui_.stride();
+    for (UINT y = 0; y < h; y++) std::memcpy(mapped + std::size_t(y) * pitch, px + std::size_t(y) * srcStride, std::size_t(w) * 4);
+    uiStaging_[frame]->Unmap(0, nullptr);
+    D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+    dst.pResource = uiTexture_.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    src.pResource = uiStaging_[frame].Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = 0;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width = w;
+    src.PlacedFootprint.Footprint.Height = h;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitch;
+    cmd_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    barrier.Transition.pResource = uiTexture_.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    cmd_->ResourceBarrier(1, &barrier);
+}
+
+void WebappWindow::drawUi(UINT frame) {
+    if (!uiTexture_ || !uiPso_) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = uiSrvHeap_->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = uiSrvHeap_->GetGPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(frame) * uiSrvStep_;
+    gpu.ptr += UINT64(frame) * uiSrvStep_;
+    if (uiSrvVersion_[frame] != uiTexVersion_) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(uiTexture_.Get(), &srv, cpu);
+        uiSrvVersion_[frame] = uiTexVersion_;
+    }
+    cmd_->SetGraphicsRootSignature(uiRootSig_.Get());
+    ID3D12DescriptorHeap* heaps[] = {uiSrvHeap_.Get()};
+    cmd_->SetDescriptorHeaps(1, heaps);
+    cmd_->SetGraphicsRootDescriptorTable(0, gpu);
+    cmd_->SetPipelineState(uiPso_.Get());
+    cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd_->DrawInstanced(3, 1, 0, 0);
 }
 
 void WebappWindow::createSizeDependent() {
@@ -629,6 +830,10 @@ void WebappWindow::renderFrame() {
     }
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
+    if (uiReady_) {
+        if (uiUpload_) uploadUi(frame);
+        if (uiVisible_) drawUi(frame);
+    }
 
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     cmd_->ResourceBarrier(1, &barrier);
@@ -819,6 +1024,12 @@ int WebappWindow::run(HINSTANCE instance) {
         host_.frame(ms);
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
+        if (uiReady_) {
+            gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
+            if (ui_.render(width_, height_)) uiUpload_ = true;
+            uiVisible_ = !ui_.empty();
+            gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
+        }
         renderFrame();
         frameNumber++;
         statFrames++;
@@ -833,6 +1044,7 @@ int WebappWindow::run(HINSTANCE instance) {
             std::snprintf(line, sizeof line, "frame %d: %u draws, %zu geometries, %zu instance sets",
                           frameNumber, lastDraws_, geometries_.size(), instances_.size());
             log("info", line);
+            if (uiReady_) log("info", ui_.stats());
         }
         if (frameNumber == 30 && !bootDialogShown_) {
             const std::string status = host_.statusJson();

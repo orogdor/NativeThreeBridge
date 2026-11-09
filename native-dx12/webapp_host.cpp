@@ -324,6 +324,28 @@ JSValue jsSubmitPass(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
     return JS_UNDEFINED;
 }
 
+JSValue jsSubmitUi(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 3) return JS_ThrowTypeError(ctx, "submitUi(packet, floats, strings)");
+    const float* data = nullptr;
+    std::size_t available = 0;
+    std::uint32_t floats = 0;
+    if (!typedView(ctx, argv[0], data, available, false, "packet") || JS_ToUint32(ctx, &floats, argv[1]) < 0)
+        return JS_EXCEPTION;
+    if (floats > available || floats < 4 || data[0] != 1.0f) return JS_ThrowRangeError(ctx, "submitUi: bad packet");
+    if (self->sink) self->sink->submitUi(data, floats, argString(ctx, argv[2]));
+    return JS_UNDEFINED;
+}
+JSValue jsMeasureText(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 5 || !self->sink) return JS_NewFloat64(ctx, -1.0);
+    double size = 16, weight = 400;
+    JS_ToFloat64(ctx, &size, argv[1]);
+    JS_ToFloat64(ctx, &weight, argv[2]);
+    const bool italic = JS_ToBool(ctx, argv[3]) > 0;
+    return JS_NewFloat64(ctx, self->sink->measureText(argString(ctx, argv[0]), size, int(weight), italic, argString(ctx, argv[4])));
+}
+
 char* moduleNormalize(JSContext* ctx, const char* base, const char* name, void*) {
     Impl* self = Impl::from(ctx);
     std::string error;
@@ -439,6 +461,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", jsUploadGeometry, 5}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
         {"submitPass", jsSubmitPass, 2},
+        {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5},
     };
     for (const Fn& f : functions)
         JS_SetPropertyStr(s.ctx, api, f.name, JS_NewCFunction(s.ctx, f.fn, f.name, f.length));
