@@ -1252,14 +1252,22 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYUP: case WM_SYSKEYUP:
         keyEvent(false, wp, lp);
         return 0;
-    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
         SetCapture(hwnd);
+        const auto start = std::chrono::steady_clock::now();
         host_.pointer("down", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONDOWN ? 0 : msg == WM_MBUTTONDOWN ? 1 : 2);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (ms >= 35.0) log("warn", "[input-perf] pointer down dispatch " + std::to_string(ms) + " ms");
         return 0;
-    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP:
+    }
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+        const auto start = std::chrono::steady_clock::now();
         host_.pointer("up", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (ms >= 35.0) log("warn", "[input-perf] pointer up dispatch " + std::to_string(ms) + " ms");
         if (!(wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) ReleaseCapture();
         return 0;
+    }
     case WM_MOUSEMOVE:
         host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
         return 0;
