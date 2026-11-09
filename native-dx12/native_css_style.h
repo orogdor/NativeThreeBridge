@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include "native_css_layer.h"
 
 namespace native_three {
 struct NativeButtonStyle {
@@ -67,70 +68,27 @@ inline NativeButtonStyle parseNativeButton(const std::string& markup,
                                            const std::string& target="restart-button") {
     NativeButtonStyle style;
     style.id=target;
-    // Narrow intentionally supported HTML subset: <button id="x">Text</button>.
-    const std::string token=std::string("id=\"")+target+"\"";
-    auto start=markup.find("<button");
-    while(start!=std::string::npos) {
-        const auto end=markup.find('>',start);
-        if(end==std::string::npos) { start=std::string::npos; break; }
-        if(markup.substr(start,end-start).find(token)!=std::string::npos) break;
-        start=markup.find("<button",end+1);
-    }
-    if(start!=std::string::npos) {
-        const auto openEnd=markup.find('>',start);
-        if(openEnd!=std::string::npos &&
-            markup.substr(start,openEnd-start).find(token)!=std::string::npos){
-            const auto close=markup.find("</button>",openEnd);
-            if(close!=std::string::npos){
-                const auto label=trimCss(markup.substr(openEnd+1,close-openEnd-1));
-                if(!label.empty() && label.find('<')==std::string::npos)
-                    style.text=label;
-            }
+    auto elements=parseUiElements(markup);
+    applyUiCss(elements,css);
+    for(const auto& element:elements) {
+        if(element.id!=target || element.tag!="button")continue;
+        if(!element.text.empty())style.text=element.text;
+        for(const auto& entry:element.style) {
+            const auto& key=entry.first;
+            const auto& value=entry.second;
+            if(key=="top")cssPixels(value,style.top);
+            else if(key=="right")cssPixels(value,style.right);
+            else if(key=="width")cssPixels(value,style.width);
+            else if(key=="height")cssPixels(value,style.height);
+            else if(key=="border-radius")cssPixels(value,style.radius);
+            else if(key=="font-size")cssPixels(value,style.fontSize);
+            else if(key=="border-width")cssPixels(value,style.borderWidth);
+            else if(key=="background-color")cssHexColor(value,style.background);
+            else if(key=="color")cssHexColor(value,style.foreground);
+            else if(key=="border-color")cssHexColor(value,style.border);
+            else if(key=="font-weight")style.bold=(lowerCss(value)=="bold"||value=="700");
         }
-    }
-    const std::string input=cssWithoutComments(css);
-    // Only the exact ID selector is supported (not :hover, media queries,
-    // descendants, CSS variables or cascade).
-    const std::string selector="#"+target;
-    std::size_t pos=0;
-    while((pos=input.find(selector,pos))!=std::string::npos){
-        const auto tail=pos+selector.size();
-        if(tail<input.size() &&
-           (std::isalnum((unsigned char)input[tail]) || input[tail]=='-' ||
-            input[tail]=='_' || input[tail]==':')){
-            pos=tail;continue;
-        }
-        std::size_t open=tail;
-        while(open<input.size()&&std::isspace((unsigned char)input[open]))++open;
-        if(open>=input.size()||input[open]!='{'){pos=tail;continue;}
-        const auto close=input.find('}',open+1);
-        if(close==std::string::npos)break;
-        const std::string block=input.substr(open+1,close-open-1);
-        std::size_t begin=0;
-        while(begin<block.size()){
-            const auto end=block.find(';',begin);
-            const std::string decl=trimCss(block.substr(begin,
-                end==std::string::npos?std::string::npos:end-begin));
-            const auto colon=decl.find(':');
-            if(colon!=std::string::npos){
-                const auto key=lowerCss(trimCss(decl.substr(0,colon)));
-                const auto value=trimCss(decl.substr(colon+1));
-                if(key=="top")cssPixels(value,style.top);
-                else if(key=="right")cssPixels(value,style.right);
-                else if(key=="width")cssPixels(value,style.width);
-                else if(key=="height")cssPixels(value,style.height);
-                else if(key=="border-radius")cssPixels(value,style.radius);
-                else if(key=="font-size")cssPixels(value,style.fontSize);
-                else if(key=="border-width")cssPixels(value,style.borderWidth);
-                else if(key=="background-color")cssHexColor(value,style.background);
-                else if(key=="color")cssHexColor(value,style.foreground);
-                else if(key=="border-color")cssHexColor(value,style.border);
-                else if(key=="font-weight")style.bold=(lowerCss(value)=="bold"||value=="700");
-            }
-            if(end==std::string::npos)break;
-            begin=end+1;
-        }
-        pos=close+1;
+        break;
     }
     style.width=std::max(32,style.width);
     style.height=std::max(22,style.height);
