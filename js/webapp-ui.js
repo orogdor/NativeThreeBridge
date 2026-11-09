@@ -921,6 +921,7 @@ input[type=checkbox],input[type=radio]{width:13px;height:13px;margin:3px 3px 3px
 input[type=range]{width:129px;height:16px;padding:0;border:0;background-color:transparent}
 input[type=button],input[type=submit],input[type=reset]{width:auto;height:auto;padding:1px 6px;border:2px outset buttonborder;background-color:buttonface;text-align:center}
 select{padding:1px 2px;border:1px solid #767676;border-radius:3px;background-color:field;height:19px}
+button,select,meter,progress,input[type=button],input[type=submit],input[type=reset],input[type=color],input[type=checkbox],input[type=radio],input[type=range]{box-sizing:border-box}
 textarea{width:178px;height:32px;white-space:pre-wrap}
 progress,meter{display:inline-block;width:160px;height:16px;vertical-align:-.2em}
 img,canvas,video,svg,iframe,embed,object{display:inline}
@@ -2090,8 +2091,7 @@ center{text-align:center}
     const items = flexItems(box, true, cx, cy);
     items.forEach((it, i) => { it._order = (parseInt(it.cs.order, 10) || 0) * 1e6 + i; });
     items.sort((a, b) => a._order - b._order);
-    const mainAvail = row ? cw : chDef;
-    const definiteMain = !Number.isNaN(mainAvail);
+    let mainAvail = row ? cw : chDef;
     const alignItems = lower(get(cs, 'align-items'));
     const data = items.map((it) => {
       resolveEdges(it, cw);
@@ -2143,6 +2143,15 @@ center{text-align:center}
       const hyp = clamp(basis, minMain, Math.max(minMain, maxMain));
       return { it, basis, hyp, minMain, maxMain, grow, shrink: shrinkF, mMain, mCross, stretch, selfAlign, crossSpec, crossForMain, main: hyp };
     });
+    // A column container with auto height is as tall as its items, limited by
+    // min/max-height; when limited, the items flex within that size.
+    if (!row && Number.isNaN(mainAvail)) {
+      const sum = data.reduce((acc, d) => acc + d.hyp + d.mMain, 0) + Math.max(0, data.length - 1) * mainGap;
+      const mx = specSize(box, 'max-height', NaN), mn = specSize(box, 'min-height', NaN);
+      const lim = clamp(sum, Number.isNaN(mn) ? 0 : mn - vEdges(box), Number.isNaN(mx) ? Infinity : Math.max(0, mx - vEdges(box)));
+      if (Math.abs(lim - sum) > 0.01) mainAvail = lim;
+    }
+    const definiteMain = !Number.isNaN(mainAvail);
     // lines
     const lines = [];
     if (!wrap || !definiteMain) lines.push(data);
@@ -2454,7 +2463,36 @@ center{text-align:center}
       else if (t.kind === 'minmax') rowSize[i] = t.min;
       else rowSize[i] = t.min || 0;
     });
-    for (const p of placed) if (p.rspan === 1 && rows[p.r0].kind !== 'px') rowSize[p.r0] = Math.max(rowSize[p.r0], Math.min(p.h, rows[p.r0].cap ?? Infinity, rows[p.r0].kind === 'minmax' ? rows[p.r0].max : Infinity));
+    // auto rows: base = minimum contributions (scroll containers may shrink to
+    // their min-height), limit = max-content; the base grows towards the
+    // limit only as far as the available height (height or max-height) allows.
+    const rowLimit = rowSize.slice();
+    for (const p of placed) {
+      if (p.rspan !== 1 || rows[p.r0].kind === 'px') continue;
+      const cap = Math.min(rows[p.r0].cap ?? Infinity, rows[p.r0].kind === 'minmax' ? rows[p.r0].max : Infinity);
+      const it = p.it;
+      const scroller = lower(get(it.cs, 'overflow-y')) !== 'visible' && lower(get(it.cs, 'overflow-y')) !== '';
+      const mh = specSize(it, 'min-height', NaN);
+      const minContribution = scroller ? (Number.isNaN(mh) ? vEdges(it) : mh) + it.mt + it.mb : p.h;
+      rowSize[p.r0] = Math.max(rowSize[p.r0], Math.min(minContribution, cap));
+      rowLimit[p.r0] = Math.max(rowLimit[p.r0], Math.min(p.h, cap));
+    }
+    {
+      const maxCh = specSize(box, 'max-height', NaN);
+      const avail = !Number.isNaN(chDef) ? chDef : !Number.isNaN(maxCh) ? Math.max(0, maxCh - vEdges(box)) : Infinity;
+      const gaps = Math.max(0, nRows - 1) * rowGap;
+      const sumLimit = rowLimit.reduce((s2, v, i) => s2 + Math.max(v, rowSize[i]), 0) + gaps;
+      if (sumLimit <= avail) for (let i = 0; i < nRows; i++) rowSize[i] = Math.max(rowSize[i], rowLimit[i]);
+      else {
+        let free = avail - rowSize.reduce((s2, v) => s2 + v, 0) - gaps;
+        for (let iter = 0; iter < 4 && free > 0.01; iter++) {
+          const growing = rowSize.map((v, i) => (rowLimit[i] > v + 0.01 ? i : -1)).filter((i) => i >= 0);
+          if (!growing.length) break;
+          const share = free / growing.length;
+          for (const i of growing) { const add = Math.min(share, rowLimit[i] - rowSize[i]); rowSize[i] += add; free -= add; }
+        }
+      }
+    }
     for (const p of placed) if (p.rspan > 1) {
       const sum = rowSize.slice(p.r0, p.r0 + p.rspan).reduce((s, v) => s + v, 0) + (p.rspan - 1) * rowGap;
       if (p.h > sum) rowSize[p.r0 + p.rspan - 1] += p.h - sum;

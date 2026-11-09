@@ -192,6 +192,8 @@ private:
     std::vector<std::vector<float>> pendingPasses_, passes_;
     UINT lastDraws_ = 0;
 
+    std::chrono::steady_clock::time_point uiStatsAt_ = std::chrono::steady_clock::now();
+    std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
     bool cursorHidden_ = false;
     // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
@@ -1059,6 +1061,11 @@ int WebappWindow::run(HINSTANCE instance) {
             updateTitle(statFrames / elapsed);
             statFrames = 0;
             statStart = now;
+        }
+        if (uiReady_ && std::chrono::duration<double>(now - uiStatsAt_).count() >= 5.0) {
+            uiStatsAt_ = now;
+            const std::string stats = ui_.stats();
+            if (stats != uiLastStats_) { log("info", stats); uiLastStats_ = stats; }
         }
         if (frameNumber == 1 || frameNumber == 60 || frameNumber % 600 == 0) {
             char line[160];
