@@ -21,13 +21,16 @@ cbuffer Draw : register(b1) {
     float4 gParams;   // roughness, metalness, flags, unused
     float4 gUvU;      // u' = dot(xyz, (u, v, 1)); w alphaTest
     float4 gUvV;      // v' = dot(xyz, (u, v, 1))
+    float4 gReflection; // sky RGB and blend strength
+    float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
+    float4 gColorStage; // live scalar uniforms from the translated color stage
 };
 Texture2D gMap : register(t0);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
-                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072;
+                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -37,6 +40,7 @@ struct VSIn {
 };
 struct VSOut {
     float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0; float fogDepth : TEXCOORD1;
+    float3 localPosition : TEXCOORD2; float3 localNormal : TEXCOORD3;
 };
 
 float3 cofactorNormal(float3x3 m, float3 n) {
@@ -56,6 +60,8 @@ VSOut VSMain(VSIn i) {
     float4 view = mul(gView, world);
     float4 clip = mul(gProj, view);
     o.fogDepth = -view.z;
+    o.localPosition = i.pos;
+    o.localNormal = normalize(i.nrm);
     clip.z = 0.5 * (clip.z + clip.w);                       // OpenGL depth range -> D3D
     if (flags & F_FAR_DEPTH) clip.z = clip.w;               // sky domes: gl_Position.z = gl_Position.w
     o.pos = clip;
@@ -115,6 +121,8 @@ float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
     return float4(color, alpha);
 }
 
+// NT_COLOR_PATCH_FUNCTION
+
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
     float3 albedo = gColor.rgb * i.col.rgb;
@@ -126,6 +134,9 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         albedo *= t.rgb;
         alphaOut *= t.a;
     }
+#ifdef NT_COLOR_PATCH
+    albedo = nativeColorStage(i.localPosition, i.localNormal, float4(albedo, alphaOut));
+#endif
     if (alphaOut < gUvU.w) discard;   // material.alphaTest
     if (flags & F_UNLIT) return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     float3 V = normalize(gCamera.xyz - i.world);
@@ -189,6 +200,13 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         direct += irradiance * (diffuse / PI + spec);
     }
     float3 lit = indirect * diffuse / PI + direct + gEmissive.rgb;
+    if (flags & F_FRESNEL) {
+        float angle = 1 - saturate(dot(N, V));
+        float amount = saturate(gFresnel.x + gFresnel.y * pow(angle, gFresnel.z));
+        lit = lerp(lit, gReflection.rgb, amount * gReflection.w);
+        if (gFresnel.w < 0) alphaOut = saturate(gColor.a - amount * gFresnel.w) * i.col.a;
+        else alphaOut = saturate(alphaOut + amount * gFresnel.w);
+    }
     return shadeOutput(lit, alphaOut, flags, i.fogDepth);
 }
 )HLSL";

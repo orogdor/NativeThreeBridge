@@ -108,6 +108,40 @@ test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { ski
   for (let i = 0; i < 3; i++) assert.ok(near(sky.color[i], horizon[i] * 0.65 + top[i] * 0.175 + ground[i] * 0.175, 0.01), `sky channel ${i}`);
 });
 
+test('lit water keeps its vertex palette while sky reflection follows a live uniform', { skip }, async () => {
+  const { pass, context, host, rec } = await run();
+  const reflective = (p) => p.draws.find((d) => d.flags & DrawFlags.FRESNEL);
+  const river = reflective(pass);
+  assert.ok(river && (river.flags & DrawFlags.VERTEX_COLORS), 'the reflected sky does not replace the river vertex palette');
+  assert.deepEqual(river.color, [1, 1, 1]);
+  for (const [i, v] of [lin(0x73), lin(0x8a), lin(0xb5), .75, .03, .97, 5, .35].entries()) {
+    assert.ok(near(river.reflection[i], v, .0001), `reflection constant ${i}`);
+  }
+  context.changeReflection();
+  host.frame(3000);
+  await settle();
+  const changed = reflective(decodePass(rec.framePasses.at(-1) || rec.passes.at(-1)));
+  assert.ok(near(changed.reflection[2], lin(0x30), .0001), 'new sky RGB reaches the next draw');
+});
+
+test('terrain color stage translates local position, normals, GLSL math and live uniforms', { skip }, async () => {
+  const { pass, context, host, rec } = await run();
+  const patch = pass.draws.find((d) => d.colorStage > 0);
+  assert.ok(patch);
+  const source = rec.colorPatches.get(patch.colorStage);
+  assert.match(source, /float3 patchPosition = ntPosition/);
+  assert.match(source, /float3 patchNormal = ntNormal/);
+  assert.match(source, /return frac\(sin\(dot\(p, float2/);
+  assert.match(source, /diffuseColor\.rgb = lerp\(diffuseColor\.rgb, rock/);
+  assert.ok(near(patch.colorUniforms[0], .85));
+  context.changeTerrainBlend();
+  host.frame(3000);
+  await settle();
+  const changed = decodePass(rec.framePasses.at(-1) || rec.passes.at(-1)).draws.find((d) => d.colorStage === patch.colorStage);
+  assert.ok(near(changed.colorUniforms[0], .25), 'updating the uniform reuses the native shader');
+  assert.equal(rec.colorPatches.size, 1);
+});
+
 test('showing and hiding a fixed panel lays out only that panel', { skip }, async () => {
   const { context, host } = await run();
   const doc = context.document;

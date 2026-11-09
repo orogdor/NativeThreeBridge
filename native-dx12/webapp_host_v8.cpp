@@ -553,6 +553,12 @@ void ntReleaseInstances(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseInstances(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntRegisterColorPatch(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto* self = Impl::fromInfo(info);
+    if (info.Length() < 2 || !self->sink || !info[1]->IsString()) return;
+    const auto id = info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0);
+    info.GetReturnValue().Set(self->sink->registerColorPatch(id, self->utf8(info[1])));
+}
 void ntSubmitPass(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() < 2) return self->throwError("type", "submitPass(packet, floats)");
@@ -661,6 +667,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
+        {"registerColorPatch", ntRegisterColorPatch},
         {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
         {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor}, {"reportUi", ntReportUi},

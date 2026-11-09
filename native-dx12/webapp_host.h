@@ -44,6 +44,10 @@ public:
     virtual void uploadInstances(std::uint32_t id, const float* matrices, const float* colors,
                                  std::uint32_t count) = 0;
     virtual void releaseInstances(std::uint32_t id) = 0;
+    virtual bool registerColorPatch(std::uint32_t id, const std::string& source) {
+        (void)id; (void)source;
+        return false;
+    }
     // One render() call. Layout: see js/native-renderer.mjs (PASS_HEADER_FLOATS etc).
     virtual void submitPass(const float* data, std::size_t floatCount) = 0;
     virtual void setTitle(const std::string& title) = 0;
@@ -97,7 +101,7 @@ inline std::size_t webappUiHeaderFloats(float version) {
 // Same numbers as js/native-renderer.mjs.
 constexpr std::size_t kWebappPassHeaderFloats = 64;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 40;
+constexpr std::size_t kWebappDrawFloats = 56;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 

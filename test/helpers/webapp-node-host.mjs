@@ -6,6 +6,7 @@ import vm from 'node:vm';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { DRAW_FLOATS, LIGHT_FLOATS, PASS_HEADER_FLOATS } from '../../js/native-renderer.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -179,6 +180,11 @@ export async function runWebapp(root, options = {}) {
       await m.link(linker);
       await m.evaluate();
     },
+    registerColorPatch(id, source) {
+      rec.colorPatches ??= new Map();
+      rec.colorPatches.set(id, source);
+      return true;
+    },
     uploadGeometry(id, positions, normals, colors, indices, uvs) {
       view(positions, 'positions');
       if (positions.length % 3) throw new RangeError('positions not 3 per vertex');
@@ -255,7 +261,7 @@ export async function runWebapp(root, options = {}) {
     },
     submitPass(packet, floats) {
       const lights = packet[35], draws = packet[43];
-      if (64 + lights * 16 + draws * 40 !== floats) throw new RangeError('submitPass: header counts do not match packet size');
+      if (PASS_HEADER_FLOATS + lights * LIGHT_FLOATS + draws * DRAW_FLOATS !== floats) throw new RangeError('submitPass: header counts do not match packet size');
       rec.framePasses.push(Float32Array.from(packet.subarray(0, floats)));
     },
   };
@@ -288,8 +294,8 @@ export function decodePass(p) {
     cameraPosition: [p[32], p[33], p[34]], clear: [p[36], p[37], p[38], p[39]],
     ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], exposure: p[47], toneMapping: p[48], lights: [], draws: [],
   };
-  let o = 64;
-  for (let i = 0; i < lightCount; i++, o += 16) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]] });
-  for (let i = 0; i < drawCount; i++, o += 40) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)) });
+  let o = PASS_HEADER_FLOATS;
+  for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]] });
+  for (let i = 0; i < drawCount; i++, o += DRAW_FLOATS) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)), reflection: Array.from(p.subarray(o + 40, o + 48)), colorStage: p[o + 48], colorUniforms: Array.from(p.subarray(o + 49, o + 53)) });
   return pass;
 }

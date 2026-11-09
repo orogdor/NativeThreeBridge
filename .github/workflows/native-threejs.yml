@@ -234,6 +234,14 @@ jobs:
         run: |
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class WebappShotInput {
+            [DllImport("user32.dll")]
+            public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+          }
+          '@
           function Save-Screen($file) {
             $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
             $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
@@ -264,6 +272,17 @@ jobs:
             $folder = (Resolve-Path $r.dir).Path
             $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $folder -WorkingDirectory (Resolve-Path dist).Path -PassThru
             Start-Sleep -Seconds $r.wait
+            if ($r.name -eq 'kuningriigid' -and !$p.HasExited) {
+              $p.Refresh()
+              if ($p.MainWindowHandle -ne 0) {
+                # Continue Game in the native main menu on the standard runner window.
+                $at = [IntPtr]((175 -shl 16) -bor 752)
+                [void][WebappShotInput]::PostMessage($p.MainWindowHandle, 0x201, [IntPtr]1, $at)
+                Start-Sleep -Milliseconds 100
+                [void][WebappShotInput]::PostMessage($p.MainWindowHandle, 0x202, [IntPtr]::Zero, $at)
+                Start-Sleep -Seconds 12
+              }
+            }
             Save-Screen (Join-Path (Get-Location) "shots/$($r.name).png")
             Print-Shot (Join-Path (Get-Location) "shots/$($r.name).png") $r.name
             if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
@@ -273,6 +292,13 @@ jobs:
               Write-Host "---- $($r.name) log ----"
               Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-String -Pattern 'UI layer|frame \d+:|\[error\]|crash|Texture|Canvas|shader' | Select-Object -First 40
             }
+          }
+      - name: Verify translated material on DX12
+        shell: pwsh
+        run: |
+          $log = Get-Content shots/textures-fixture-log.txt -Raw -ErrorAction Stop
+          if ($log -notmatch '\[material-color\] compiled GLSL color stage' -or $log -match '\[material-color\] (shader patch skipped|pipeline could not)') {
+            throw "The GLSL color stage did not run on DX12"
           }
       - name: Upload UI screenshots
         if: always()

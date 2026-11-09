@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <regex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -163,6 +164,7 @@ public:
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
     void releaseInstances(std::uint32_t id) override { instances_.erase(id); }
+    bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
         pendingPasses_.emplace_back(data, data + floats);
     }
@@ -222,7 +224,7 @@ private:
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
-    ID3D12PipelineState* pipeline(UINT flags);
+    ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
     void renderFrame();
     void updateTitle(double fps);
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
@@ -262,6 +264,7 @@ private:
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3DBlob> vs_, ps_;
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
+    std::map<UINT, ComPtr<ID3DBlob>> colorPatches_;
     ComPtr<ID3D12Resource> ring_[kFrameCount];
     UINT64 ringBytes_[kFrameCount] = {};
     ComPtr<ID3D12Resource> identityInstance_;
@@ -959,10 +962,33 @@ void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float
     set.version++;
 }
 
-ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
+bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
+    if (!id || id > 16 || source.size() > 16000 || colorPatches_.count(id)) return false;
+    if (source.find_first_of("#[]\\\"'") != std::string::npos) return false;
+    static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|discard|clip)\b)");
+    if (std::regex_search(source, control)) return false;
+    std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
+    const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
+    shader.replace(shader.find(marker), marker.size(), source);
+    ComPtr<ID3DBlob> code, errors;
+    const auto hr = D3DCompile(shader.data(), shader.size(), "webapp_color_patch", nullptr, nullptr,
+                               "PSMain", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                               &code, &errors);
+    if (FAILED(hr)) {
+        log("warn", "[material-color] shader patch skipped: " + std::string(errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compilation failed"));
+        return false;
+    }
+    colorPatches_.emplace(id, std::move(code));
+    log("info", "[material-color] compiled GLSL color stage " + std::to_string(id));
+    return true;
+}
+
+ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
+    const auto patch = colorPatches_.find(patchId);
+    if (patch == colorPatches_.end()) patchId = 0;
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
     const UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
-    const UINT key = (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
+    const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
                      ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
@@ -981,7 +1007,8 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.pRootSignature = root_sig_.Get();
     d.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
-    d.PS = {ps_->GetBufferPointer(), ps_->GetBufferSize()};
+    ID3DBlob* pixel = patchId ? patch->second.Get() : ps_.Get();
+    d.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
     d.InputLayout = {layout, UINT(sizeof layout / sizeof layout[0])};
     d.PrimitiveTopologyType = lines ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1016,7 +1043,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
     d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     d.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
-    check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)), "Create webapp pipeline");
+    const auto hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    if (FAILED(hr) && patchId) {
+        log("warn", "[material-color] pipeline could not use shader patch " + std::to_string(patchId));
+        pipelines_[key] = pipeline(flags, 0);
+        return pipelines_[key].Get();
+    }
+    check(hr, "Create webapp pipeline");
     ID3D12PipelineState* raw = pso.Get();
     pipelines_[key] = pso;
     return raw;
@@ -1133,7 +1166,7 @@ void WebappWindow::renderFrame() {
                 views[1].SizeInBytes = set.count * kInstanceStride;
                 views[1].StrideInBytes = kInstanceStride;
             }
-            ID3D12PipelineState* pso = pipeline(drawFlags);
+            ID3D12PipelineState* pso = pipeline(drawFlags, UINT(d[48]));
             if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
             const D3D_PRIMITIVE_TOPOLOGY wanted = (drawFlags & F_LINE_STRIP) ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
                                                   : (drawFlags & F_LINES)    ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
@@ -1149,6 +1182,8 @@ void WebappWindow::renderFrame() {
             // uv transform rows (a c e | b d f) and alphaTest
             dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
             dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
+            std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
+            std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
             cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
             ringOffset += kDrawCBBytes;
             const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;

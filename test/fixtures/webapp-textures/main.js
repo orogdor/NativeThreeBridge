@@ -121,7 +121,50 @@ const riverGeo = new THREE.PlaneGeometry(10, 10);
 riverGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Array(4).fill([0.2, 0.5, 0.1, 0]).flat(), 4));
 const river = new THREE.Mesh(riverGeo, new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, depthWrite: false }));
 river.name = 'river';
+river.position.z = 0.4;
+const reflection = { value: new THREE.Color('#738ab5') };
+window.changeReflection = () => reflection.value.set('#102030');
+river.material.onBeforeCompile = (shader) => {
+  shader.uniforms.uSky = reflection;
+  shader.fragmentShader = 'uniform vec3 uSky;\n' + shader.fragmentShader
+    .replace('#include <color_fragment>', '#include <color_fragment>\n vec3 water = diffuseColor.rgb * .98; diffuseColor.rgb = water;')
+    .replace('#include <opaque_fragment>', `
+      vec3 V = normalize(vViewPosition);
+      float angle = clamp(dot(V, normal), 0.0, 1.0);
+      float fres = .03 + .97 * pow(1.0 - angle, 5.0);
+      outgoingLight = mix(outgoingLight, uSky, clamp(fres * .75, 0.0, .75));
+      diffuseColor.a = clamp(diffuseColor.a + fres * .35, 0.0, 1.0);
+      #include <opaque_fragment>
+    `);
+};
 scene.add(river);
+
+// Opaque procedural surface using the same vertex inputs as world terrain.
+const heightBlend = { value: 0.85 };
+window.changeTerrainBlend = () => { heightBlend.value = 0.25; };
+const strataMaterial = new THREE.MeshStandardMaterial({ color: '#426f45', side: THREE.DoubleSide });
+strataMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uHeightBlend = heightBlend;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nvarying vec3 patchPosition; varying vec3 patchNormal;')
+    .replace('#include <begin_vertex>', '#include <begin_vertex>\npatchPosition=position; patchNormal=normalize(objectNormal);');
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', `#include <common>
+      varying vec3 patchPosition;
+      varying vec3 patchNormal;
+      uniform float uHeightBlend;
+      float grain(vec2 p) { return fract(sin(dot(p, vec2(12.3, 34.5))) * 43.21); }
+    `)
+    .replace('#include <color_fragment>', `#include <color_fragment>
+      float height = smoothstep(-.7, .7, patchPosition.y + .07 * grain(patchPosition.xz));
+      float slope = 1.0 - abs(normalize(patchNormal).y);
+      vec3 rock = mix(vec3(.22, .27, .36), vec3(.63, .72, .84), height);
+      diffuseColor.rgb = mix(diffuseColor.rgb, rock, uHeightBlend * slope);
+    `);
+};
+const strata = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.5), strataMaterial);
+strata.position.set(-2, 1, 0);
+scene.add(strata);
 
 // 6) gradient sky dome (custom GLSL)
 const sky = new THREE.Mesh(new THREE.SphereGeometry(50, 16, 8), new THREE.ShaderMaterial({
