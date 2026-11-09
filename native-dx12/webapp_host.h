@@ -21,10 +21,11 @@ struct WebappBuiltin {
 class WebappRenderSink {
 public:
     virtual ~WebappRenderSink() = default;
-    // uvs: 2 floats per vertex or nullptr.
+    // colors: colorChannels (3 rgb or 4 rgba) floats per vertex or nullptr; uvs: 2 floats per vertex or nullptr.
     virtual void uploadGeometry(std::uint32_t id, const float* positions, const float* normals,
                                 const float* colors, std::uint32_t vertexCount,
-                                const std::uint32_t* indices, std::uint32_t indexCount, const float* uvs) = 0;
+                                const std::uint32_t* indices, std::uint32_t indexCount, const float* uvs,
+                                std::uint32_t colorChannels) = 0;
     virtual void releaseGeometry(std::uint32_t id) = 0;
     // Texture `id` from encoded image bytes (width == 0: PNG/JPEG/WebP/...)
     // or tightly packed RGBA8 pixels. flags: kWebappTexture*. Returns false

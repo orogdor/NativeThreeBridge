@@ -268,15 +268,16 @@ JSValue jsUploadGeometry(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
         !typedView(ctx, argv[4], indices, nIndices, true, "indices") ||
         (argc >= 6 && !typedView(ctx, argv[5], uvs, nUvs, true, "uvs")))
         return JS_EXCEPTION;
-    if (nPositions % 3 || (normals && nNormals != nPositions) || (colors && nColors != nPositions))
-        return JS_ThrowRangeError(ctx, "Geometry attributes must be 3 floats per vertex and equal length");
+    if (nPositions % 3 || (normals && nNormals != nPositions) || (colors && nColors != nPositions && nColors != nPositions / 3 * 4))
+        return JS_ThrowRangeError(ctx, "Geometry attributes must be 3 floats per vertex (colours 3 or 4) and equal length");
     const std::uint32_t vertexCount = static_cast<std::uint32_t>(nPositions / 3);
+    const std::uint32_t colorChannels = colors && nColors != nPositions ? 4 : 3;
     if (uvs && nUvs != std::size_t(vertexCount) * 2) return JS_ThrowRangeError(ctx, "Geometry uvs must be 2 floats per vertex");
     for (std::size_t i = 0; i < nIndices; i++)
         if (indices[i] >= vertexCount) return JS_ThrowRangeError(ctx, "Geometry index out of range");
     if (self->sink)
         self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices,
-                                   static_cast<std::uint32_t>(nIndices), uvs);
+                                   static_cast<std::uint32_t>(nIndices), uvs, colorChannels);
     return JS_UNDEFINED;
 }
 JSValue jsUploadTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {

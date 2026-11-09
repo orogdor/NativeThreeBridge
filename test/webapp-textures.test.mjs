@@ -41,6 +41,7 @@ test('image textures: Blob -> createImageBitmap, TextureLoader and DataTexture u
   const floor = pass.draws.find((d) => d.textureId && !(d.flags & DrawFlags.UNLIT) && d.alphaTest === 0 && d !== leaf);
   assert.ok(floor, 'DataTexture draw');
   assert.equal(rec.textureUploads, uploads, 'no re-upload while nothing changed');
+  assert.ok([...rec.geometries.values()].some((g) => g.colorChannels === 4), 'RGBA vertex colours keep their alpha');
   assert.ok(!status.unsupported.includes('Textures other than map (normalMap, envMap …)'));
 });
 

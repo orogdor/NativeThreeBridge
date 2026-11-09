@@ -43,7 +43,7 @@ using native_three::WebappHost;
 namespace {
 
 constexpr UINT kFrameCount = 2;
-constexpr UINT kVertexFloats = 11;                    // position, normal, colour, uv
+constexpr UINT kVertexFloats = 12;                    // position, normal, colour rgba, uv
 constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
@@ -154,7 +154,8 @@ public:
 
     // ---- WebappRenderSink
     void uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
-                        std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv) override;
+                        std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
+                        std::uint32_t colorChannels) override;
     void releaseGeometry(std::uint32_t id) override;
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
@@ -907,14 +908,17 @@ void WebappWindow::collectRetired() {
 }
 
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
-                                  std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv) {
+                                  std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
+                                  std::uint32_t colorChannels) {
+    const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
         float* o = &interleaved[size_t(v) * kVertexFloats];
         o[0] = p[v * 3]; o[1] = p[v * 3 + 1]; o[2] = p[v * 3 + 2];
         o[3] = n ? n[v * 3] : 0; o[4] = n ? n[v * 3 + 1] : 1; o[5] = n ? n[v * 3 + 2] : 0;
-        o[6] = c ? c[v * 3] : 1; o[7] = c ? c[v * 3 + 1] : 1; o[8] = c ? c[v * 3 + 2] : 1;
-        o[9] = uv ? uv[v * 2] : 0; o[10] = uv ? uv[v * 2 + 1] : 0;
+        o[6] = c ? c[v * cc] : 1; o[7] = c ? c[v * cc + 1] : 1; o[8] = c ? c[v * cc + 2] : 1;
+        o[9] = c && cc == 4 ? c[v * 4 + 3] : 1;
+        o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
     }
     Geometry& g = geometries_[id];
     retire(g.vertices);
@@ -966,8 +970,8 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags) {
     const D3D12_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"COLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"IROW", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},

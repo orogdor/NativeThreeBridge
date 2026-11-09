@@ -88,6 +88,13 @@ const fog = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), fogMat);
 fog.name = 'fog';
 scene.add(fog);
 
+// 5c) river surface: transparency from RGBA vertex colours (alpha 0 over the sea)
+const riverGeo = new THREE.PlaneGeometry(10, 10);
+riverGeo.setAttribute('color', new THREE.Float32BufferAttribute(new Array(4).fill([0.2, 0.5, 0.1, 0]).flat(), 4));
+const river = new THREE.Mesh(riverGeo, new THREE.MeshStandardMaterial({ vertexColors: true, transparent: true, depthWrite: false }));
+river.name = 'river';
+scene.add(river);
+
 // 6) gradient sky dome (custom GLSL)
 const sky = new THREE.Mesh(new THREE.SphereGeometry(50, 16, 8), new THREE.ShaderMaterial({
   side: THREE.BackSide, depthWrite: false,

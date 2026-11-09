@@ -29,12 +29,12 @@ static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INS
 static const float PI = 3.14159265;
 
 struct VSIn {
-    float3 pos : POSITION; float3 nrm : NORMAL; float3 col : COLOR; float2 uv : TEXCOORD0;
+    float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
     float4 r0 : IROW0; float4 r1 : IROW1; float4 r2 : IROW2; float4 r3 : IROW3;
     float3 icol : ICOLOR;
 };
 struct VSOut {
-    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float3 col : COLOR; float2 uv : TEXCOORD0;
+    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
 };
 
 float3 cofactorNormal(float3x3 m, float3 n) {
@@ -60,8 +60,8 @@ VSOut VSMain(VSIn i) {
     o.world = world.xyz;
     float3x3 w = mul((float3x3)gModel, transpose((float3x3)instT));
     o.nrm = cofactorNormal(w, i.nrm);
-    float3 c = (flags & F_VERTEX_COLORS) ? i.col : float3(1, 1, 1);
-    if (flags & F_INSTANCE_COLORS) c *= i.icol;
+    float4 c = (flags & F_VERTEX_COLORS) ? i.col : float4(1, 1, 1, 1);   // rgba vertex colours: alpha too
+    if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;
     return o;
 }
@@ -103,8 +103,8 @@ float3 toneMap(float3 c, uint flags) {
 
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
-    float3 albedo = gColor.rgb * i.col;
-    float alphaOut = gColor.a;
+    float3 albedo = gColor.rgb * i.col.rgb;
+    float alphaOut = gColor.a * i.col.a;
     float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
     if (flags & F_MAP) {
         float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)

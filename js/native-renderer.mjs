@@ -241,7 +241,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const positions = toFloat3(position);
       let normals = normal ? toFloat3(normal) : null;
       if (!normals) normals = computeNormals(THREE, position, index);
-      const colors = color ? toFloat3(color) : null;
+      const colors = color ? (color.itemSize === 4 ? toFloat4(color) : toFloat3(color)) : null;
       const uvs = uv ? toFloat2(uv) : null;
       let indices = null;
       if (index) indices = index.array instanceof Uint32Array ? index.array : Uint32Array.from(index.array);
@@ -708,6 +708,15 @@ export function toFloat3(attribute) {
   return out;
 }
 
+export function toFloat4(attribute) {
+  const count = attribute.count;
+  if (!attribute.isInterleavedBufferAttribute && attribute.itemSize === 4 && attribute.array instanceof Float32Array && !attribute.normalized) {
+    return attribute.array.length === count * 4 ? attribute.array : attribute.array.subarray(0, count * 4);
+  }
+  const out = new Float32Array(count * 4);
+  for (let i = 0; i < count; i++) { out[i * 4] = attribute.getX(i); out[i * 4 + 1] = attribute.getY(i); out[i * 4 + 2] = attribute.getZ(i); out[i * 4 + 3] = attribute.getW(i); }
+  return out;
+}
 export function toFloat2(attribute) {
   const count = attribute.count;
   if (!attribute.isInterleavedBufferAttribute && attribute.itemSize === 2 && attribute.array instanceof Float32Array && !attribute.normalized) {

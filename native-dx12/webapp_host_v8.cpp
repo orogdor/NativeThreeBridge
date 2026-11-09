@@ -340,13 +340,14 @@ void ntUploadGeometry(const v8::FunctionCallbackInfo<v8::Value>& info) {
         !typedView(self, info[3], colors, nC, true, "colors") || !typedView(self, info[4], indices, nI, true, "indices") ||
         (info.Length() >= 6 && !typedView(self, info[5], uvs, nU, true, "uvs")))
         return;
-    if (nP % 3 || (normals && nN != nP) || (colors && nC != nP))
-        return self->throwError("range", "Geometry attributes must be 3 floats per vertex and equal length");
+    if (nP % 3 || (normals && nN != nP) || (colors && nC != nP && nC != nP / 3 * 4))
+        return self->throwError("range", "Geometry attributes must be 3 floats per vertex (colours 3 or 4) and equal length");
     const std::uint32_t vertexCount = std::uint32_t(nP / 3);
+    const std::uint32_t colorChannels = colors && nC != nP ? 4 : 3;
     if (uvs && nU != std::size_t(vertexCount) * 2) return self->throwError("range", "Geometry uvs must be 2 floats per vertex");
     for (std::size_t i = 0; i < nI; i++)
         if (indices[i] >= vertexCount) return self->throwError("range", "Geometry index out of range");
-    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI), uvs);
+    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI), uvs, colorChannels);
 }
 void ntUploadTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);

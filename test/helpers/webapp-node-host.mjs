@@ -183,12 +183,12 @@ export async function runWebapp(root, options = {}) {
       view(positions, 'positions');
       if (positions.length % 3) throw new RangeError('positions not 3 per vertex');
       if (normals && normals.length !== positions.length) throw new RangeError('normals length');
-      if (colors && colors.length !== positions.length) throw new RangeError('colors length');
+      if (colors && colors.length !== positions.length && colors.length !== positions.length / 3 * 4) throw new RangeError('colors length');
       const vertexCount = positions.length / 3;
       if (uvs && uvs.length !== vertexCount * 2) throw new RangeError('uvs length');
       if (indices) for (const i of indices) if (i >= vertexCount) throw new RangeError('Geometry index out of range');
       rec.uploads++;
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, hasUvs: !!uvs });
+      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs });
     },
     // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
     // natively with WIC; here only the header is checked.
