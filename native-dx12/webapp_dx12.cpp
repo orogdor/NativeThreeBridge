@@ -1096,6 +1096,8 @@ void WebappWindow::renderFrame() {
         std::memcpy(fcb + 40, p + native_three::kWebappPassHeaderFloats,
                     lightCount * native_three::kWebappLightFloats * sizeof(float));
         fcb[296] = p[48]; fcb[297] = p[47] > 0 ? p[47] : 1.0f; // tone mapping curve, exposure
+        std::memcpy(fcb + 300, p + 49, 3 * sizeof(float)); // fog RGB in framebuffer space
+        std::memcpy(fcb + 304, p + 52, 3 * sizeof(float)); // mode, near or density, far
         cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
         ringOffset += kFrameCBBytes;
 

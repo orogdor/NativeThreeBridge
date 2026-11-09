@@ -11,6 +11,8 @@ cbuffer Frame : register(b0) {
     float4 gAmbient;  // rgb ambient irradiance, w exposure
     float4 gLights[64];
     float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
+    float4 gFogColor;
+    float4 gFog;      // mode, near or density, far
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
@@ -25,7 +27,7 @@ SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
-                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536;
+                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -34,7 +36,7 @@ struct VSIn {
     float3 icol : ICOLOR;
 };
 struct VSOut {
-    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
+    float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0; float fogDepth : TEXCOORD1;
 };
 
 float3 cofactorNormal(float3x3 m, float3 n) {
@@ -51,7 +53,9 @@ VSOut VSMain(VSIn i) {
     float4x4 instT = float4x4(i.r0, i.r1, i.r2, i.r3);      // rows = instance matrix columns
     float4 local = mul(float4(i.pos, 1), instT);
     float4 world = mul(gModel, local);
-    float4 clip = mul(gProj, mul(gView, world));
+    float4 view = mul(gView, world);
+    float4 clip = mul(gProj, view);
+    o.fogDepth = -view.z;
     clip.z = 0.5 * (clip.z + clip.w);                       // OpenGL depth range -> D3D
     if (flags & F_FAR_DEPTH) clip.z = clip.w;               // sky domes: gl_Position.z = gl_Position.w
     o.pos = clip;
@@ -101,6 +105,16 @@ float3 toneMap(float3 c, uint flags) {
     return saturate(c);
 }
 
+float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
+    float3 color = toSRGB(toneMap(rgb, flags));
+    if ((flags & F_FOG) && gFog.x != 0) {
+        float d = gFog.y * depth;
+        float f = gFog.x == 2 ? 1 - exp(-d * d) : smoothstep(gFog.y, gFog.z, depth);
+        color = lerp(color, gFogColor.rgb, f);
+    }
+    return float4(color, alpha);
+}
+
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
     float3 albedo = gColor.rgb * i.col.rgb;
@@ -113,7 +127,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         alphaOut *= t.a;
     }
     if (alphaOut < gUvU.w) discard;   // material.alphaTest
-    if (flags & F_UNLIT) return float4(toSRGB(toneMap(albedo, flags)), alphaOut);
+    if (flags & F_UNLIT) return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     float3 V = normalize(gCamera.xyz - i.world);
     float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
     if (dot(flatN, V) < 0) flatN = -flatN;
@@ -175,6 +189,6 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         direct += irradiance * (diffuse / PI + spec);
     }
     float3 lit = indirect * diffuse / PI + direct + gEmissive.rgb;
-    return float4(toSRGB(toneMap(lit, flags)), alphaOut);
+    return shadeOutput(lit, alphaOut, flags, i.fogDepth);
 }
 )HLSL";

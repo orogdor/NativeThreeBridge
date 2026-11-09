@@ -21,7 +21,7 @@ export const DrawFlags = {
   TRANSPARENT: 1, DOUBLE_SIDED: 2, BACK_SIDE: 4, VERTEX_COLORS: 8, UNLIT: 16,
   NO_DEPTH_WRITE: 32, NO_DEPTH_TEST: 64, LINES: 128, LINE_STRIP: 256,
   NORMAL_COLOR: 512, INSTANCE_COLORS: 1024, FLAT: 2048,
-  MAP: 4096, MAP_REPEAT: 8192, MAP_MIRROR: 16384, FAR_DEPTH: 32768, NO_TONE_MAP: 65536,
+  MAP: 4096, MAP_REPEAT: 8192, MAP_MIRROR: 16384, FAR_DEPTH: 32768, NO_TONE_MAP: 65536, FOG: 131072,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
@@ -255,7 +255,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     // varying and uses smoothstep() to fade its alpha (coasts, decals, foliage).
     // Approximate that ramp at vertices rather than drawing an opaque rectangle.
     // This works for arbitrary float attributes; it is not tied to game names.
-    _maskedGeometryRecord(geometry, base, material, ramp, preserveRgb) {
+    _maskedGeometryRecord(geometry, base, material, ramp, preserveRgb, colorRamp) {
       const mask = geometry.attributes[ramp.attribute];
       const vertexCount = base.vertexCount;
       if (!mask || mask.itemSize !== 1 || mask.count !== vertexCount) return null;
@@ -281,7 +281,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         this.info.memory.geometries++;
       }
       const original = geometry.attributes.color;
-      const key = `${base.key}:${mask.version}:${ramp.lo}:${ramp.hi}:${preserveRgb}:${original ? original.version : -1}`;
+      const c0 = colorRamp?.from.value, c1 = colorRamp?.to.value;
+      const colorKey = colorRamp ? [colorRamp.lo, colorRamp.hi, colorRamp.power, colorRamp.scale, c0.r, c0.g, c0.b, c1.r, c1.g, c1.b].join(':') : '';
+      const key = `${base.key}:${mask.version}:${ramp.lo}:${ramp.hi}:${preserveRgb}:${original ? original.version : -1}:${colorKey}`;
       if (key === record.key && record.mask === mask && record.colorAttribute === original) return record;
       const colors = new Float32Array(vertexCount * 4);
       for (let i = 0; i < vertexCount; i++) {
@@ -289,8 +291,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         colors[o] = preserveRgb && original ? original.getX(i) : 1;
         colors[o + 1] = preserveRgb && original && original.itemSize > 1 ? original.getY(i) : 1;
         colors[o + 2] = preserveRgb && original && original.itemSize > 2 ? original.getZ(i) : 1;
-        const t = Math.max(0, Math.min(1, (mask.getX(i) - ramp.lo) / (ramp.hi - ramp.lo)));
-        const alpha = t * t * (3 - 2 * t);
+        const depth = mask.getX(i);
+        if (colorRamp) {
+          const weight = Math.pow(1 - smoothRamp(colorRamp.lo, colorRamp.hi, depth), colorRamp.power) * colorRamp.scale;
+          colors[o] = c0.r + (c1.r - c0.r) * weight;
+          colors[o + 1] = c0.g + (c1.g - c0.g) * weight;
+          colors[o + 2] = c0.b + (c1.b - c0.b) * weight;
+        }
+        const alpha = smoothRamp(ramp.lo, ramp.hi, depth);
         colors[o + 3] = (preserveRgb && original && original.itemSize > 3 ? original.getW(i) : 1) * alpha;
       }
       const positions = toFloat3(geometry.attributes.position);
@@ -394,7 +402,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     _patchInfo(m) {
       let info = this._patches.get(m);
       if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
-      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false, alphaRamp: null };
+      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false, alphaRamp: null, colorRamp: null };
       this._patches.set(m, info);
       const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
       const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
@@ -412,6 +420,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
         if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
         info.alphaRamp = attributeAlphaRamp(shader.vertexShader, shader.fragmentShader);
+        if (info.alphaRamp && info.colors) {
+          info.colorRamp = attributeColorRamp(shader.vertexShader, shader.fragmentShader, info.alphaRamp.attribute, new Map(added));
+        }
       } catch (e) { warnOnce(`patch-${m.uuid}`, `material.onBeforeCompile could not be inspected: ${e && e.message || e}`); }
       return info;
     }
@@ -480,7 +491,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         : tm === THREE.CineonToneMapping ? ToneMapping.CINEON : tm === THREE.ACESFilmicToneMapping ? ToneMapping.ACES
           : tm === THREE.AgXToneMapping ? ToneMapping.AGX : tm === THREE.NeutralToneMapping ? ToneMapping.NEUTRAL : ToneMapping.NONE;
       if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
-      if (scene.fog) unsupported('Fog', 'scenes render without fog');
+      const fog = scene.fog;
+      if (fog?.isFog || fog?.isFogExp2) {
+        fog.color.getRGB(_srgb, THREE.SRGBColorSpace);
+        p[49] = _srgb.r; p[50] = _srgb.g; p[51] = _srgb.b;
+        p[52] = fog.isFogExp2 ? 2 : 1;
+        p[53] = fog.isFogExp2 ? fog.density : fog.near;
+        p[54] = fog.far ?? 0;
+      }
 
       let o = PASS_HEADER_FLOATS;
       for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) writeLight(p, o, lights[i]);
@@ -657,6 +675,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       else if (m.isMeshMatcapMaterial) unsupported('MeshMatcapMaterial', 'drawn as lit colour');
       else if (m.isMeshDepthMaterial || m.isMeshDistanceMaterial) return;
       if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
+      if (m.fog !== false && (!(m.isShaderMaterial || m.isRawShaderMaterial) ||
+          (m.fog && /#include\s+<fog_fragment>/.test(m.fragmentShader)))) flags |= DrawFlags.FOG;
       if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
         unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
       }
@@ -671,9 +691,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         } else unsupported('material.onBeforeCompile shader patches');
         if (patch.alpha !== null && m.transparent) opacity = patch.alpha * (m.opacity ?? 1);
         if (patch.alphaRamp && mesh.geometry) {
-          const masked = this._maskedGeometryRecord(mesh.geometry, base.record, m, patch.alphaRamp, !!(m.vertexColors && !patch.colors));
+          const masked = this._maskedGeometryRecord(mesh.geometry, base.record, m, patch.alphaRamp, !!(m.vertexColors && !patch.colors), patch.colorRamp);
           if (masked) {
             base = { ...base, record: masked };
+            if (patch.colorRamp) color = null; // RGB comes from the same attribute as the mask.
             flags |= DrawFlags.VERTEX_COLORS;
           }
         }
@@ -789,6 +810,26 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     }
     return null;
   }
+  function smoothRamp(lo, hi, value) {
+    const t = Math.max(0, Math.min(1, (value - lo) / (hi - lo)));
+    return t * t * (3 - 2 * t);
+  }
+
+  // Recognize a two-uniform palette mixed by an inverted scalar ramp.
+  // Bake the palette into the existing masked vertex buffer. Other fragment
+  // math (noise, reflections and animated wave normals) remains approximate.
+  function attributeColorRamp(vertex, fragment, attribute, uniforms) {
+    const ramp = new RegExp(`\\b([A-Za-z_]\\w*)\\s*=\\s*1(?:\\.0*)?\\s*-\\s*smoothstep\\(\\s*([+\\-\\d.eE]+)\\s*,\\s*([+\\-\\d.eE]+)\\s*,\\s*${attribute}\\s*\\)\\s*;`).exec(vertex);
+    if (!ramp) return null;
+    const [, varying, lower, upper] = ramp;
+    const mix = new RegExp(`\\bvec3\\s+([A-Za-z_]\\w*)\\s*=\\s*mix\\(\\s*([A-Za-z_]\\w*)\\s*,\\s*([A-Za-z_]\\w*)\\s*,\\s*pow\\(\\s*${varying}\\s*,\\s*([+\\-\\d.eE]+)\\s*\\)\\s*\\*\\s*([+\\-\\d.eE]+)\\s*\\)\\s*;`).exec(fragment);
+    if (!mix || !new RegExp(`\\bdiffuseColor\\.rgb\\s*=\\s*${mix[1]}\\b`).test(fragment)) return null;
+    const lo = Number(lower), hi = Number(upper), power = Number(mix[4]), scale = Number(mix[5]);
+    const from = uniforms.get(mix[2]), to = uniforms.get(mix[3]);
+    if (!from || !to || ![lo, hi, power, scale].every(Number.isFinite) || lo >= hi || power <= 0 || scale < 0 || scale > 1) return null;
+    return { lo, hi, power, scale, from, to };
+  }
+
   function mixColors(target, weighted) {
     target.setRGB(0, 0, 0, THREE.LinearSRGBColorSpace);
     for (const [u, k] of weighted) { const c = u.value; target.r += c.r * k; target.g += c.g * k; target.b += c.b * k; }

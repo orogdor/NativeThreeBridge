@@ -1933,14 +1933,152 @@
   }
 
   // ------------------------------------------------------------ storage
+  const storageError = (message, name) => Object.assign(new Error(message), { name });
+  const persistentStorage = typeof nt.storageRead === 'function';
+  const storageState = (name) => nt.storageRead(name) ?? { revision: 0 };
+  const commitStorage = (name, state) => {
+    const revision = state.revision;
+    nt.storageWrite(name, { ...state, revision: revision + 1 }, revision);
+  };
+
+  // Native, per-webapp persistence for out-of-line string keys. Run requests
+  // as tasks so saves and their Promise continuations don't run inside input.
+  function openDatabase(name, version) {
+    name = String(name);
+    if (version !== undefined && (!Number.isSafeInteger(version) || version < 1)) throw new TypeError('Invalid database version');
+    const key = 'idb:' + name;
+    const request = new EventTarget();
+    request.result = undefined;
+    request.error = null;
+    setTimeout(() => {
+      try {
+        const state = storageState(key);
+        const oldVersion = state.version ?? 0;
+        const target = version ?? (oldVersion || 1);
+        if (target < oldVersion) throw storageError('Database version is newer', 'VersionError');
+        state.version = target;
+        state.stores ??= new Map();
+        let upgrading = target > oldVersion, closed = false;
+        const db = Object.assign(new EventTarget(), {
+          name, version: target,
+          objectStoreNames: { contains: (store) => state.stores.has(String(store)) },
+          createObjectStore(store, options) {
+            if (!upgrading) throw storageError('Upgrade required', 'InvalidStateError');
+            store = String(store);
+            if (options?.keyPath != null || options?.autoIncrement) throw storageError('Inline keys are unavailable', 'NotSupportedError');
+            if (state.stores.has(store)) throw storageError('Store exists', 'ConstraintError');
+            state.stores.set(store, new Map());
+            return { name: store };
+          },
+          transaction(store, mode = 'readonly') {
+            if (closed || upgrading) throw storageError('Database is unavailable', 'InvalidStateError');
+            const names = (Array.isArray(store) ? store : [store]).map(String);
+            if (!names.length || names.some((name) => !state.stores.has(name))) throw storageError('Store is unavailable', 'NotFoundError');
+            if (mode !== 'readonly' && mode !== 'readwrite') throw new TypeError('Invalid transaction mode');
+            return storageTransaction(key, target, names, mode);
+          },
+          close() { closed = true; },
+        });
+        request.result = db;
+        if (upgrading) {
+          request.dispatchEvent(Object.assign(new Event('upgradeneeded'), { oldVersion, newVersion: target }));
+          commitStorage(key, state);
+          upgrading = false;
+        }
+      } catch (error) {
+        request.error = error;
+        request.dispatchEvent(new Event('error'));
+        return;
+      }
+      request.dispatchEvent(new Event('success'));
+    }, 0);
+    return request;
+  }
+
+  function storageTransaction(key, version, names, mode) {
+    let active = true, aborted = false;
+    const jobs = [];
+    const tx = Object.assign(new EventTarget(), {
+      error: null, mode,
+      abort() {
+        if (!active) throw storageError('Transaction is inactive', 'InvalidStateError');
+        aborted = true;
+      },
+      objectStore(name) {
+        name = String(name);
+        if (!names.includes(name)) throw storageError('Store is unavailable', 'NotFoundError');
+        function enqueue(action, key, value) {
+          if (!active || aborted) throw storageError('Transaction is inactive', 'TransactionInactiveError');
+          if (action !== 'get' && mode !== 'readwrite') throw storageError('Read-only transaction', 'ReadOnlyError');
+          if (typeof key !== 'string' && !(typeof key === 'number' && !Number.isNaN(key))) throw storageError('Unsupported key', 'DataError');
+          const request = Object.assign(new EventTarget(), { result: undefined, error: null, transaction: tx, readyState: 'pending' });
+          jobs.push({ name, action, key, value: action === 'put' ? nt.storageClone(value) : undefined, request });
+          return request;
+        }
+        return {
+          name,
+          get: (key) => enqueue('get', key),
+          put: (value, key) => enqueue('put', key, value),
+          delete: (key) => enqueue('delete', key),
+        };
+      },
+    });
+    setTimeout(() => {
+      let i = 0;
+      try {
+        const state = storageState(key);
+        if (state.version !== version) throw storageError('Database version changed', 'VersionError');
+        let dirty = false;
+        while (!aborted && i < jobs.length) {
+          const job = jobs[i++];
+          const store = state.stores.get(job.name);
+          if (job.action === 'get') job.request.result = nt.storageClone(store.get(job.key));
+          else {
+            dirty = true;
+            if (job.action === 'put') { store.set(job.key, job.value); job.request.result = job.key; }
+            else store.delete(job.key);
+          }
+          job.request.readyState = 'done';
+          job.request.dispatchEvent(new Event('success'));
+        }
+        if (aborted) throw storageError('Transaction aborted', 'AbortError');
+        if (dirty) commitStorage(key, state);
+      } catch (error) {
+        active = false;
+        tx.error = error;
+        for (const { request } of jobs) {
+          if (request.readyState === 'done') continue;
+          request.error = error;
+          request.readyState = 'done';
+          request.dispatchEvent(new Event('error'));
+        }
+        tx.dispatchEvent(new Event('abort'));
+        return;
+      }
+      active = false;
+      tx.dispatchEvent(new Event('complete'));
+    }, 0);
+    return tx;
+  }
+
   class Storage {
-    constructor() { Object.defineProperty(this, '_m', { value: new Map() }); }
-    get length() { return this._m.size; }
-    key(i) { return [...this._m.keys()][i] ?? null; }
-    getItem(k) { return this._m.has(String(k)) ? this._m.get(String(k)) : null; }
-    setItem(k, v) { this._m.set(String(k), String(v)); }
-    removeItem(k) { this._m.delete(String(k)); }
-    clear() { this._m.clear(); }
+    constructor(name = null) {
+      Object.defineProperties(this, { _m: { value: new Map() }, _name: { value: name } });
+    }
+    _values() { return this._name ? storageState(this._name).values ?? new Map() : this._m; }
+    _update(change) {
+      if (!this._name) { change(this._m); return; }
+      const state = storageState(this._name);
+      state.values ??= new Map();
+      change(state.values);
+      commitStorage(this._name, state);
+    }
+    get length() { return this._values().size; }
+    key(i) { return [...this._values().keys()][i] ?? null; }
+    getItem(k) { return this._values().get(String(k)) ?? null; }
+    setItem(k, v) { this._update((values) => values.set(String(k), String(v))); }
+    removeItem(k) { this._update((values) => values.delete(String(k))); }
+    clear() { this._update((values) => values.clear()); }
   }
 
   // ---------------------------------------------------- observers & misc
@@ -2025,7 +2163,8 @@
     window, self: window, globalThis: window, top: window, parent: window, frames: window,
     document, location, navigator, screen, console,
     history: { length: 1, state: null, pushState() {}, replaceState() {}, back() {}, forward() {}, go() {} },
-    localStorage: new Storage(), sessionStorage: new Storage(),
+    localStorage: new Storage(persistentStorage ? 'local' : null), sessionStorage: new Storage(),
+    ...(persistentStorage ? { indexedDB: { open: openDatabase } } : {}),
     setTimeout, setInterval, clearTimeout, clearInterval: clearTimeout,
     requestAnimationFrame, cancelAnimationFrame,
     requestIdleCallback: (cb) => setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 8 }), 1),

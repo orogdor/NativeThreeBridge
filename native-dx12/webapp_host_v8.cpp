@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -271,6 +273,112 @@ bool typedView(Impl* self, v8::Local<v8::Value> value, const T*& data, std::size
     count = array->ByteLength() / sizeof(T);
     return true;
 }
+
+#ifdef _WIN32
+constexpr std::size_t kStorageLimit = 128 * 1024 * 1024;
+
+std::filesystem::path storagePath(Impl* self, v8::Local<v8::Value> key) {
+    const std::string name = self->utf8(key);
+    if (name.empty() || name.size() > 96) {
+        self->throwError("range", "Invalid web storage name");
+        return {};
+    }
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string file;
+    for (const unsigned char c : name) {
+        file += hex[c >> 4];
+        file += hex[c & 15];
+    }
+    auto root = self->root.lexically_normal();
+    if (root.filename().empty()) root = root.parent_path();
+    auto directory = root;
+    directory += L".native-storage";
+    return directory / (file + ".bin");
+}
+
+v8::MaybeLocal<v8::Value> decodeStorage(v8::Local<v8::Context> ctx, const uint8_t* bytes, std::size_t size) {
+    v8::ValueDeserializer decoder(ctx->GetIsolate(), bytes, size);
+    if (!decoder.ReadHeader(ctx).FromMaybe(false)) return {};
+    return decoder.ReadValue(ctx);
+}
+
+v8::MaybeLocal<v8::Value> readStorage(Impl* self, const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec == std::errc::no_such_file_or_directory) return v8::Undefined(self->isolate);
+    if (ec || size > kStorageLimit) {
+        self->throwError("range", "Cannot read web storage");
+        return {};
+    }
+    std::vector<uint8_t> bytes(static_cast<std::size_t>(size));
+    std::ifstream file(path, std::ios::binary);
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+        self->throwError("range", "Cannot read web storage");
+        return {};
+    }
+    return decodeStorage(self->isolate->GetCurrentContext(), bytes.data(), bytes.size());
+}
+
+void ntStorageRead(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto* self = Impl::fromInfo(info);
+    const auto path = storagePath(self, info[0]);
+    if (path.empty()) return;
+    v8::Local<v8::Value> value;
+    if (readStorage(self, path).ToLocal(&value))
+        info.GetReturnValue().Set(value);
+}
+
+void ntStorageWrite(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto* self = Impl::fromInfo(info);
+    const auto path = storagePath(self, info[0]);
+    if (path.empty()) return;
+    v8::ValueSerializer encoder(info.GetIsolate());
+    encoder.WriteHeader();
+    if (!encoder.WriteValue(info.GetIsolate()->GetCurrentContext(), info[1]).FromMaybe(false)) return;
+    const auto [bytes, size] = encoder.Release();
+    std::unique_ptr<uint8_t, decltype(&std::free)> buffer(bytes, &std::free);
+    if (size > kStorageLimit) return self->throwError("range", "Web storage quota exceeded");
+    std::error_code ec;
+    const auto dir = path.parent_path();
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return self->throwError("range", "Cannot create web storage directory");
+    auto lockPath = path;
+    lockPath += L".lock";
+    const HANDLE handle = CreateFileW(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return self->throwError("range", "Web storage is busy");
+    const std::unique_ptr<void, decltype(&CloseHandle)> lock(handle, &CloseHandle);
+    if (info[2]->IsNumber()) {
+        auto ctx = info.GetIsolate()->GetCurrentContext();
+        v8::Local<v8::Value> current;
+        if (!readStorage(self, path).ToLocal(&current)) return;
+        v8::Local<v8::Value> revision = v8::Integer::New(info.GetIsolate(), 0);
+        if (current->IsObject() && !current.As<v8::Object>()->Get(ctx, self->str("revision")).ToLocal(&revision)) return;
+        if (!revision->StrictEquals(info[2])) return self->throwError("range", "Web storage changed in another window");
+    }
+    wchar_t temp[MAX_PATH];
+    if (!GetTempFileNameW(dir.c_str(), L"ntw", 0, temp))
+        return self->throwError("range", "Cannot create web storage file");
+    std::ofstream file(std::filesystem::path(temp), std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(bytes), size);
+    file.close();
+    if (!file || !MoveFileExW(temp, path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp);
+        return self->throwError("range", "Cannot commit web storage");
+    }
+}
+
+void ntStorageClone(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto ctx = info.GetIsolate()->GetCurrentContext();
+    v8::ValueSerializer encoder(info.GetIsolate());
+    encoder.WriteHeader();
+    if (!encoder.WriteValue(ctx, info[0]).FromMaybe(false)) return;
+    const auto [bytes, size] = encoder.Release();
+    std::unique_ptr<uint8_t, decltype(&std::free)> buffer(bytes, &std::free);
+    v8::Local<v8::Value> clone;
+    if (decodeStorage(ctx, bytes, size).ToLocal(&clone)) info.GetReturnValue().Set(clone);
+}
+#endif
 
 void ntLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
@@ -546,6 +654,9 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     v8::Local<v8::Object> api = v8::Object::New(isolate);
     struct Fn { const char* name; v8::FunctionCallback fn; };
     const Fn functions[] = {
+#ifdef _WIN32
+        {"storageRead", ntStorageRead}, {"storageWrite", ntStorageWrite}, {"storageClone", ntStorageClone},
+#endif
         {"log", ntLog}, {"setTitle", ntSetTitle}, {"readText", ntReadText}, {"readBinary", ntReadBinary},
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},

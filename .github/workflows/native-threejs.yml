@@ -112,6 +112,46 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed on V8" }
+      - name: Verify native web storage survives a Windows restart
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/storage-smoke | Out-Null
+          @'
+          <!doctype html><title>Storage pending</title><script type="module">
+          import * as THREE from 'three';
+          const renderer = new THREE.WebGLRenderer();
+          const scene = new THREE.Scene();
+          const camera = new THREE.PerspectiveCamera(45, 1, .1, 100);
+          camera.position.z = 5;
+          scene.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial()));
+          renderer.setAnimationLoop(() => renderer.render(scene, camera));
+          const open = indexedDB.open('smoke', 1);
+          open.onupgradeneeded = () => open.result.createObjectStore('worlds');
+          open.onerror = () => { throw open.error; };
+          open.onsuccess = () => {
+            const db = open.result;
+            if (localStorage.getItem('world') === 'seed') {
+              const read = db.transaction('worlds').objectStore('worlds').get('seed');
+              read.onsuccess = () => {
+                if (!(read.result instanceof Float32Array) || read.result[0] !== 2.5) throw Error('Incorrect persisted world');
+                document.title = 'Storage restored';
+              };
+              read.onerror = () => { throw read.error; };
+              return;
+            }
+            const tx = db.transaction('worlds', 'readwrite');
+            tx.objectStore('worlds').put(new Float32Array([2.5]), 'seed');
+            tx.oncomplete = () => { localStorage.setItem('world', 'seed'); document.title = 'Storage written'; };
+            tx.onabort = () => { throw tx.error; };
+          };
+          </script>
+          '@ | Set-Content build/storage-smoke/index.html -Encoding utf8
+          foreach ($status in 'Storage written','Storage restored') {
+            $out = & .\build\Release\WebappSmokeV8.exe build/storage-smoke 1
+            $code = $LASTEXITCODE
+            $out | Write-Host
+            if ($code -ne 0 -or !($out -match "title: $status")) { throw "$status check failed" }
+          }
       - name: Real game check - Kuningriigid through the embedded webapp runtime (informational)
         continue-on-error: true
         shell: pwsh
