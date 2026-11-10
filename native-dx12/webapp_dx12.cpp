@@ -191,6 +191,7 @@ public:
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
         if (pendingPasses_.size() >= native_three::safety::kMaxPassesPerFrame ||
+            floats > 4'194'304 - pendingPassFloats_ ||
             !native_three::safety::validPass(data, floats,
                 native_three::kWebappPassHeaderFloats, native_three::kWebappLightFloats,
                 native_three::kWebappDrawFloats, UINT(native_three::kWebappMaxLights))) {
@@ -198,6 +199,7 @@ public:
             return;
         }
         pendingPasses_.emplace_back(data, data + floats);
+        pendingPassFloats_ += floats;
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
     void log(const std::string& level, const std::string& text) override;
@@ -329,6 +331,7 @@ private:
     int textureFailures_ = 0;
     std::vector<Retired> retired_;
     std::vector<std::vector<float>> pendingPasses_, passes_;
+    std::size_t pendingPassFloats_ = 0;
     UINT lastDraws_ = 0;
 
     std::chrono::steady_clock::time_point uiStatsAt_ = std::chrono::steady_clock::now();
@@ -645,6 +648,7 @@ void WebappWindow::resetPage() {
     host_.shutdown();
     waitForGpu();
     pendingPasses_.clear();
+    pendingPassFloats_ = 0;
     passes_.clear();
     geometries_.clear();
     instances_.clear();
@@ -674,12 +678,20 @@ bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std:
         FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
                                      WICBitmapPaletteTypeCustom)))
         return false;
-    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 16384 || h > 16384) return false;
+    if (FAILED(converter->GetSize(&w, &h)) ||
+        !native_three::safety::validTextureDimensions(w, h, 4)) return false;
     rgba.resize(std::size_t(w) * h * 4);
     return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
 }
 
 bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags) {
+    const bool inputFloat = (flags & native_three::kWebappTextureFloat32) != 0;
+    const unsigned inputBpp = inputFloat ? 16u : 4u;
+    if (!native_three::safety::validTextureDimensions(w, h, inputBpp) ||
+        rgba.size() != std::size_t(w) * h * inputBpp) {
+        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected oversized or incomplete texture");
+        return false;
+    }
     UINT slot = 0;
     if (id != 0) {
         if (freeSlots_.empty()) {
@@ -716,6 +728,11 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     std::vector<UINT64> rowBytes(levels.size());
     UINT64 total = 0;
     device_->GetCopyableFootprints(&td, 0, UINT(levels.size()), 0, copy.layouts.data(), rows.data(), rowBytes.data(), &total);
+    if (!native_three::safety::validBufferBytes(total)) {
+        if (id != 0) freeSlots_.push_back(slot);
+        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected oversized mip upload");
+        return false;
+    }
     copy.staging = uploadBuffer(nullptr, total);
     std::uint8_t* mapped = nullptr;
     D3D12_RANGE none{0, 0};
@@ -853,7 +870,7 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
     if (width) {
         const bool float32 = (flags & native_three::kWebappTextureFloat32) != 0;
         const std::size_t bpp = float32 ? 16u : 4u;
-        if (height == 0 || width > 16384 || height > 16384 ||
+        if (!native_three::safety::validTextureDimensions(width, height, unsigned(bpp)) ||
             (float32 && (width > 4096 || height > 1024)) ||
             bytes < std::size_t(width) * height * bpp) return false;
         rgba.assign(data, data + std::size_t(width) * height * bpp);
@@ -1153,6 +1170,8 @@ void WebappWindow::resize(UINT width, UINT height) {
 }
 
 ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes) {
+    if (!native_three::safety::validBufferBytes(bytes))
+        check(E_INVALIDARG, "DX12 upload buffer size limit");
     ComPtr<ID3D12Resource> buffer;
     auto heap = heapProps(D3D12_HEAP_TYPE_UPLOAD);
     auto desc = bufferDesc(bytes);
@@ -1193,6 +1212,18 @@ void WebappWindow::collectRetired() {
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
                                   std::uint32_t colorChannels) {
+    if (!native_three::safety::validGeometry(p, vertexCount, idx, indexCount)) {
+        if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected oversized or invalid geometry");
+        return;
+    }
+    if (idx) {
+        for (std::uint32_t i = 0; i < indexCount; ++i) {
+            if (idx[i] >= vertexCount) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected out-of-range geometry index");
+                return;
+            }
+        }
+    }
     const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
@@ -1229,6 +1260,10 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
 }
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
+    if (!native_three::safety::validInstances(m, count)) {
+        if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected excessive instance upload");
+        return;
+    }
     InstanceSet& set = instances_[id];
     set.count = count;
     set.cpu.resize(size_t(count) * 19);
@@ -1448,12 +1483,27 @@ void WebappWindow::renderFrame() {
         ID3D12PipelineState* current = nullptr;
         D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
+            if (!native_three::safety::wholeNumber(d[0], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[1], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[2], native_three::safety::kMaxInstances) ||
+                !native_three::safety::wholeNumber(d[4], native_three::safety::kMaxGeometryIndices) ||
+                !native_three::safety::wholeNumber(d[5], native_three::safety::kMaxGeometryIndices) ||
+                !native_three::safety::wholeNumber(d[32], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[48], 16)) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected malformed draw parameters");
+                continue;
+            }
             auto g = geometries_.find(std::uint32_t(d[0]));
             if (g == geometries_.end() || !g->second.vertices) continue;
             const UINT drawFlags = UINT(d[3]) | (offscreen ? F_DEPTH_ONLY : 0u);
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
+            const UINT available = g->second.indexCount ? g->second.indexCount : g->second.vertexCount;
+            if (!native_three::safety::validDraw(start, count, available, instanceCount)) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] skipped draw beyond vertex/index buffer");
+                continue;
+            }
             D3D12_VERTEX_BUFFER_VIEW views[2] = {g->second.vbv, identityView_};
             if (d[1] > 0) {
                 auto it = instances_.find(std::uint32_t(d[1]));
@@ -1788,6 +1838,7 @@ int WebappWindow::run(HINSTANCE instance) {
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
+        pendingPassFloats_ = 0;
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
         const bool uiTick = uiCadence_.due(ms);
         host_.frame(ms, uiTick);
