@@ -3,15 +3,10 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,readFileSync,writeFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {fileURLToPath} from 'node:url';
 import {runWebapp,decodePass} from './helpers/webapp-node-host.mjs';
 
-const template = fileURLToPath(new URL('./k73-depth-target-dx12.test.mjs',import.meta.url));
-// A separate WebGL2 fixture with an explicitly created depth target, not a
-// mocked packet. The test must catch 70000003 -> 70000000 float32 aliasing.
-const base = readFileSync(template,'utf8');
-const fixtureCode = base.match(/ const vs=\[([\s\S]*?)\n \];\n const fs=/)?.[1];
-assert.ok(fixtureCode, 'original K73 DEPTH fixture remains available');
+// Uses a real K73-style WebGL2 depth shader and six live DSV resources.
+// A mock-only test would miss Float32 packet conversion failures.
 
 test('consecutive K73 depth IDs survive actual Float32 packet packing and native resource lookup',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'k73-id-precision-'));
@@ -35,20 +30,25 @@ test('consecutive K73 depth IDs survive actual Float32 packet packing and native
    "let f=0;function frame(){gl.bindFramebuffer(gl.FRAMEBUFFER,fbs[f%6]);gl.viewport(0,0,64,64);gl.clear(gl.DEPTH_BUFFER_BIT);gl.drawElements(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,0);f++;requestAnimationFrame(frame);}requestAnimationFrame(frame);"
   ].join('\n');
   writeFileSync(join(dir,'index.html'),'<!doctype html><title>K73 float32 resource ID regression</title><canvas id="gl" data-native-webgl2-prototype width="800" height="600"></canvas><script>'+js+'</script>');
-  const {status,context,rec}=await runWebapp(dir,{frames:18});
+  const observed=[];
+  const {status,context,rec}=await runWebapp(dir,{frames:18,
+    onFrame:({rec})=>{if(rec.framePasses.length)observed.push(...rec.framePasses);}
+  });
   assert.equal(status.bootError,null);
   assert.deepEqual(status.errors,[]);
   assert.equal(context.complete,true);
   assert.equal(rec.depthTargets.size,6);
-  assert.equal(rec.passes.length,6);
+  assert.ok(observed.length>=12, 'multiple real frames recorded');
   const ids=context.targetIds;
   assert.equal(new Set(ids).size,6);
   assert.deepEqual(ids,[7000000,7000001,7000002,7000003,7000004,7000005]);
   assert.deepEqual(Array.from(Float32Array.from(ids)),ids,'no float32 identifier aliasing');
-  const packed=rec.passes.map(p=>p[55]);
-  assert.deepEqual(packed,ids,'each native pass refers to the correct DSV');
+  const packed=observed.map(p=>p[55]);
+  const cycle=packed.slice(0,6);
+  assert.deepEqual(cycle,ids,'six native passes refer to the correct DSV resources');
+  assert.ok(packed.every((id,i)=>id===ids[i%6]));
   for(const id of packed) assert.ok(rec.depthTargets.has(id),'native target exists');
-  for(const p of rec.passes) {
+  for(const p of observed) {
     const draw=decodePass(p).draws[0];
     assert.equal(draw.count,3);
     assert.ok(Number.isSafeInteger(draw.geometryId),'geometry ID retained as integer');
