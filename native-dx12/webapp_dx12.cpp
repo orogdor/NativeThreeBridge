@@ -112,6 +112,7 @@ struct Texture {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
     UINT width = 0, height = 0;
+    UINT64 allocationBytes = 0;
     bool float32 = false;
 };
 struct DepthTarget {
@@ -728,9 +729,13 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     std::vector<UINT64> rowBytes(levels.size());
     UINT64 total = 0;
     device_->GetCopyableFootprints(&td, 0, UINT(levels.size()), 0, copy.layouts.data(), rows.data(), rowBytes.data(), &total);
-    if (!native_three::safety::validBufferBytes(total)) {
+    UINT64 replacingBytes = 0;
+    const auto replaced = textures_.find(id);
+    if (replaced != textures_.end()) replacingBytes = replaced->second.allocationBytes;
+    if (!native_three::safety::validBufferBytes(total) ||
+        !native_three::safety::reserveTextureBudget(textureBytes_, replacingBytes, total)) {
         if (id != 0) freeSlots_.push_back(slot);
-        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected oversized mip upload");
+        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected texture exceeding staging or 1 GiB live budget");
         return false;
     }
     copy.staging = uploadBuffer(nullptr, total);
@@ -760,6 +765,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     t.slot = slot;
     t.width = w;
     t.height = h;
+    t.allocationBytes = total;
     t.float32 = float32;
     textureBytes_ += std::size_t(total);
     pendingCopies_.push_back(std::move(copy));
@@ -859,6 +865,7 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
     retiredSlots_.push_back({it->second.slot, fenceValue_ + kFrameCount});
+    textureBytes_ -= std::size_t(it->second.allocationBytes);
     textures_.erase(it);
 }
 
@@ -1434,6 +1441,7 @@ void WebappWindow::renderFrame() {
     UINT64 boundTexture = ~0ull;
 
     UINT drawsThisFrame = 0;
+    UINT64 vertexWorkThisFrame = 0;
     for (const auto& pass : passes_) {
         const float* p = pass.data();
         const UINT lightCount = UINT(p[35]);
@@ -1525,6 +1533,11 @@ void WebappWindow::renderFrame() {
                 views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
                 views[1].SizeInBytes = set.count * kInstanceStride;
                 views[1].StrideInBytes = kInstanceStride;
+            }
+            if (!native_three::safety::chargeDrawWork(vertexWorkThisFrame, count, instanceCount)) {
+                if (invalidDrawWarnings_++ < 8)
+                    log("warn", "[dx12-safety] skipped excessive per-frame vertex/instance workload");
+                continue;
             }
             ID3D12PipelineState* pso = pipeline(drawFlags, UINT(d[48]));
             if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
