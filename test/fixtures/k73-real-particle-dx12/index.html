@@ -31,6 +31,7 @@ gl.uniform3fv(u('uCam'),new Float32Array([0,0,3]));
 gl.uniform3fv(u('uFogCol'),new Float32Array([0.5,0.4,0.3]));
 gl.uniform1f(u('uFogDen'),0.005);
 gl.uniform1f(u('uAdd'),0);
+gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
 let frames=0;
 function frame(){gl.clearColor(0.04,0.06,0.1,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
 gl.drawArraysInstanced(gl.TRIANGLES,0,6,3);window.particleDrawCount=gl.__nativeDraws;
