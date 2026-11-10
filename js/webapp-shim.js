@@ -2498,8 +2498,9 @@
       const t = document.title;
       if (t) nt.setTitle(t);
     },
-    // Called by the engine once per displayed frame with a millisecond clock.
-    frame(timeMs) {
+    // Game timers and requestAnimationFrame run at the 3D rate; CSS/UI is separately scheduled.
+    // The default keeps existing Node test hosts and legacy callers compatible.
+    frame(timeMs, uiTick = true) {
       state.now = timeMs;
       state.frame++;
       const t0 = performance.now();
@@ -2513,7 +2514,7 @@
       const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
       const tCanvas = performance.now();
-      if (uiLayer) uiLayer.frame();
+      if (uiTick !== false && uiLayer) uiLayer.frame();
       const tUi = performance.now();
       if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
         state.lastSlowFrameReport = timeMs;
