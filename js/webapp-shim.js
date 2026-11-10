@@ -908,6 +908,17 @@
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
     function compileVertex(source) {
+      // Recognise K73's actual non-skinned, non-instanced lit vertex shader.
+      // Map its model and view-projection uniforms to the native DX12 packet
+      // instead of pretending to execute arbitrary user GLSL.
+      if (/layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) &&
+          !/#define\s+(?:INST|SKIN)\b/.test(source)) {
+        return { kind: 'k73-lit', size: 3 };
+      }
       const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
       if (!attr) return null;
       // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
@@ -917,6 +928,17 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
+      // custom exposure and fog. The native fixed HLSL material backend can
+      // currently only approximate its vertex colors, sun, tint and normals.
+      if (/in\s+vec4\s+vC\s*;/.test(source) &&
+          /uniform\s+vec4\s+uTint\s*;/.test(source) &&
+          /vec3\s+base\s*=\s*vC\.rgb\s*\*\s*uTint\.rgb\s*;/.test(source) &&
+          /uniform\s+vec3\s+uSunDir/.test(source) &&
+          /out\s+vec4\s+oC\s*;/.test(source) &&
+          !/#define\s+SKIN\b/.test(source)) {
+        return { kind: 'k73-lit' };
+      }
       const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
       if (!output) return null;
       const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
@@ -976,11 +998,37 @@
         const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
         const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
         program.linked = !!(vs?.compiled && fs?.compiled);
-        program.color = program.linked ? fs.payload : null;
+        program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
+        program.profile = program.linked && vs.payload?.kind === 'k73-lit' && fs.payload?.kind === 'k73-lit'
+          ? 'k73-lit' : 'constant';
+        program.uniforms = new Map();
+        if (program.profile === 'k73-lit') unsupported('K73 advanced GLSL shading',
+          'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
       getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
       useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
+      getUniformLocation(program, name) { return program?.linked ? { program, name: String(name) } : null; },
+      uniformMatrix4fv(location, transpose, values) {
+        if (!location) return;
+        if (transpose || !ArrayBuffer.isView(values) || values.length !== 16)
+          return unsupportedRaw('uniformMatrix4fv requires one column-major matrix');
+        location.program.uniforms.set(location.name, Float32Array.from(values));
+      },
+      uniform4fv(location, values) {
+        if (!location) return;
+        if (!ArrayBuffer.isView(values) || values.length < 4) return unsupportedRaw('uniform4fv');
+        location.program.uniforms.set(location.name, Float32Array.from(values.subarray(0, 4)));
+      },
+      uniform3fv(location, values) {
+        if (!location) return;
+        if (!(ArrayBuffer.isView(values) || Array.isArray(values)) || values.length < 3)
+          return unsupportedRaw('uniform3fv');
+        location.program.uniforms.set(location.name, Float32Array.from(Array.from(values).slice(0, 3)));
+      },
+      uniform3f(location, x, y, z) { if (location) location.program.uniforms.set(location.name, Float32Array.of(x, y, z)); },
+      uniform1f(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       createBuffer() { return { data: null, version: 0 }; },
       bindBuffer(target, buffer) { if (target !== G.ARRAY_BUFFER) return unsupportedRaw('bindBuffer target'); state.buffer = buffer; },
       bufferData(target, data) {
