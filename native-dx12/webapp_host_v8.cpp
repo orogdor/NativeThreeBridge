@@ -524,6 +524,21 @@ void ntRegisterImage(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (!typedView(self, info[1], data, bytes, false, "image bytes")) return;
     if (self->sink) self->sink->registerImage(self->utf8(info[0]), data, bytes);
 }
+void ntAllocateDepthTarget(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "allocateDepthTarget(id, width, height)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0),
+        width = info[1]->Uint32Value(ctx).FromMaybe(0), height = info[2]->Uint32Value(ctx).FromMaybe(0);
+    if (!id || !width || !height || width > 4096 || height > 4096)
+        return self->throwError("range", "Invalid offscreen depth target dimensions");
+    info.GetReturnValue().Set(self->sink && self->sink->allocateDepthTarget(id, width, height));
+}
+void ntReleaseDepthTarget(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() >= 1 && self->sink)
+        self->sink->releaseDepthTarget(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
+}
 void ntReleaseTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() >= 1 && self->sink)
@@ -674,7 +689,9 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
         {"registerColorPatch", ntRegisterColorPatch},
-        {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
+        {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture},
+        {"allocateDepthTarget", ntAllocateDepthTarget}, {"releaseDepthTarget", ntReleaseDepthTarget},
+        {"uploadCanvasTexture", ntUploadCanvasTexture},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
         {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor}, {"reportUi", ntReportUi},
     };
