@@ -981,6 +981,22 @@
       // accept arbitrary GLSL or SKIN vertex shaders.
       const instanced = /#define\s+INST\b/.test(source);
       const skinned = /#define\s+SKIN\b/.test(source);
+      // K73 v86 depth-only vertex shader, including the exact INST variant.
+      // Compilation is profile recognition, not a claim of generic GLSL -> HLSL.
+      // Shadow framebuffer support is a separate, necessary stage.
+      if (!skinned &&
+          /layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uModel\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*\(\s*M\s*\*\s*vec4\s*\(\s*aPos\s*,\s*1\.0\s*\)\s*\)\s*;/.test(source)) {
+        const usesInstMatrix = /mat4\s+M\s*=\s*mat4\s*\(\s*aM0\s*,\s*aM1\s*,\s*aM2\s*,\s*aM3\s*\)\s*;/.test(source);
+        const usesModel = /mat4\s+M\s*=\s*uModel\s*;/.test(source);
+        const columns = [3, 4, 5, 6].every(i =>
+          new RegExp('layout\\s*\\(location\\s*=\\s*' + i +
+            '\\)\\s*in\\s+vec4\\s+aM' + (i - 3) + '\\s*;').test(source));
+        if (instanced ? (usesInstMatrix && columns) : usesModel)
+          return {kind: instanced ? 'k73-depth-inst' : 'k73-depth', size: 3};
+      }
       if (/layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
           /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
           /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
@@ -1000,6 +1016,10 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      // K73 depth fragment: no colour output (depth-only pipeline).
+      // Reject other empty GLSL programs rather than claiming broad support.
+      if (/^\s*#version\s+300\s+es\s*(?:#define\s+INST\s+1\s*)?precision\s+mediump\s+float\s*;\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(source))
+        return {kind: 'k73-depth'};
       // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
       // custom exposure and fog. The native fixed HLSL material backend can
       // currently only approximate its vertex colors, sun, tint and normals.
@@ -1111,7 +1131,7 @@
       return id;
     }
     function instanceRecord(count) {
-      if (state.program?.profile !== 'k73-lit-inst') return null;
+      if (!['k73-lit-inst', 'k73-depth-inst'].includes(state.program?.profile)) return null;
       const vao = state.vao;
       if (!Number.isInteger(count) || count < 0 || count > 250000)
         return unsupportedRaw('invalid instance count');
@@ -1150,9 +1170,10 @@
       const uniforms = state.program.uniforms || new Map();
       const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
       const lit = profile === 'k73-lit' || profile === 'k73-lit-inst';
-      const transform = lit ? uniform('uVP', ID) : ID;
-      const model = profile === 'k73-lit' ? uniform('uModel', ID) : ID;
-      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
+      const depth = profile === 'k73-depth' || profile === 'k73-depth-inst';
+      const transform = (lit || depth) ? uniform('uVP', ID) : ID;
+      const model = (profile === 'k73-lit' || profile === 'k73-depth') ? uniform('uModel', ID) : ID;
+      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth ? [1, 1, 1, 1] : state.program.color;
       const packet = new Float32Array(64 + (lit ? 16 : 0) + 56);
       packet.set(ID, 0); packet.set(transform, 16);
       packet.set(state.clear, 36);
@@ -1221,11 +1242,17 @@
         const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
         program.linked = !!(vs?.compiled && fs?.compiled);
         program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
-        program.profile = program.linked && ['k73-lit', 'k73-lit-inst'].includes(vs.payload?.kind) &&
-          fs.payload?.kind === 'k73-lit' ? vs.payload.kind : 'constant';
+        const litPair = ['k73-lit', 'k73-lit-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-lit';
+        const depthPair = ['k73-depth', 'k73-depth-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-depth';
+        // An empty depth fragment is only valid with the exact K73 depth vertex profile.
+        program.linked &&= !!(litPair || depthPair ||
+          (Array.isArray(fs?.payload) && Number.isInteger(vs?.payload?.size)));
+        program.profile = program.linked ? (litPair || depthPair ? vs.payload.kind : 'constant') : 'invalid';
         program.uniforms = new Map();
         if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
+        if (program.profile.startsWith('k73-depth')) unsupported('K73 shadow depth framebuffer',
+          'DEPTH_VS/DEPTH_FS variants recognised, but actual off-screen shadow texture rendering needs FBO/DX12 depth target support');
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
       getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
