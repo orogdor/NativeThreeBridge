@@ -905,6 +905,7 @@
       TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
       TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a, TEXTURE0: 0x84c0,
       RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814,
+      BYTE: 0x1400,
       TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
       TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
       TEXTURE_MAX_LEVEL: 0x813d,
@@ -971,7 +972,32 @@
       if (src.path) return new Uint8Array(nt.readBinary(src.path));
       throw new TypeError('Texture image has no encoded JPEG/PNG byte source');
     }
+    function setFloatTexture(texture, width, height, pixels, immutable = false) {
+      if (!Number.isInteger(width) || !Number.isInteger(height) ||
+          width < 1 || height < 1 || width > 4096 || height > 1024 ||
+          width * height > 1048576)
+        throw new RangeError('Native RGBA32F texture exceeds supported dimensions');
+      if (pixels !== null && !(pixels instanceof Float32Array))
+        return unsupportedRaw('RGBA32F pixels must be Float32Array or null');
+      if (pixels && pixels.length !== width * height * 4)
+        throw new RangeError('RGBA32F pixel array length');
+      const copy = pixels ? Float32Array.from(pixels) : new Float32Array(width * height * 4);
+      const bytes = new Uint8Array(copy.buffer, copy.byteOffset, copy.byteLength);
+      if (!nt.uploadTexture(texture.id, bytes, width, height, 4))
+        throw Error('Native RGBA32F GPU texture allocation failed');
+      texture.width = width; texture.height = height; texture.layers = 1;
+      texture.float32 = true; texture.floatPixels = copy; texture.loaded = true;
+      texture.immutable = immutable; texture.version++;
+      state.textureUploads++;
+    }
     function setTexImage(target, level, format, width, height, layers, pixelFormat, pixelType, pixels) {
+      if (target === G.TEXTURE_2D && level === 0 && layers === 1 &&
+          format === G.RGBA32F && pixelFormat === G.RGBA && pixelType === G.FLOAT) {
+        const tex = boundTexture(target);
+        if (tex.immutable) return unsupportedRaw('texImage on immutable float texture');
+        setFloatTexture(tex, width, height, pixels, false);
+        return;
+      }
       if (boundTexture(target).immutable) return unsupportedRaw('texImage on immutable texture storage');
       if (level !== 0 || (format !== G.RGBA8 && format !== G.RGBA) ||
           pixelFormat !== G.RGBA || pixelType !== G.UNSIGNED_BYTE)
@@ -1579,6 +1605,12 @@
       // a real D3D12 D32_FLOAT DSV resource (24-bit WebGL minimum retained)
       // through the native bridge. No false CPU-only texture object is exposed.
       texStorage2D(target, levels, format, width, height) {
+        if (target === G.TEXTURE_2D && levels === 1 && format === G.RGBA32F) {
+          const tex = boundTexture(target);
+          if (tex.immutable || tex.loaded) return unsupportedRaw('texStorage2D already initialized');
+          setFloatTexture(tex, width, height, null, true);
+          return;
+        }
         if (target !== G.TEXTURE_2D || levels !== 1 || format !== G.DEPTH_COMPONENT24 ||
             !Number.isInteger(width) || !Number.isInteger(height) ||
             width < 1 || height < 1 || width > 4096 || height > 4096)
@@ -1607,6 +1639,29 @@
           setTexImage(target, level, internalFormat, pixels.naturalWidth || pixels.width,
             pixels.naturalHeight || pixels.height, 1, format, type, pixels);
         } else return unsupportedRaw('texImage2D overload');
+      },
+      texSubImage2D(target, level, x, y, w, h, format, type, pixels, srcOffset = 0) {
+        if (target !== G.TEXTURE_2D || level !== 0 || format !== G.RGBA ||
+            type !== G.FLOAT || !Number.isInteger(srcOffset) || srcOffset < 0)
+          return unsupportedRaw('texSubImage2D: RGBA32F level 0 only');
+        const tex = boundTexture(target);
+        if (!tex.float32 || !tex.floatPixels || !tex.loaded)
+          return unsupportedRaw('texSubImage2D: no allocated float texture');
+        if (![x,y,w,h].every(Number.isInteger) || x < 0 || y < 0 ||
+            w < 1 || h < 1 || x + w > tex.width || y + h > tex.height)
+          throw new RangeError('texSubImage2D rectangle outside float texture');
+        if (!(pixels instanceof Float32Array) || srcOffset + w * h * 4 > pixels.length)
+          throw new RangeError('texSubImage2D source range');
+        const region = new Float32Array(w * h * 4);
+        region.set(pixels.subarray(srcOffset, srcOffset + region.length));
+        for (let row = 0; row < h; row++) {
+          tex.floatPixels.set(region.subarray(row*w*4,(row+1)*w*4),
+            ((y+row)*tex.width+x)*4);
+        }
+        const bytes = new Uint8Array(region.buffer,region.byteOffset,region.byteLength);
+        if (!nt.updateFloatTexture(tex.id,x,y,w,h,bytes))
+          throw Error('Native DX12 RGBA32F subregion upload failed');
+        tex.version++; state.textureUploads++;
       },
       texParameteri(target, name, value) {
         const t = boundTexture(target);
