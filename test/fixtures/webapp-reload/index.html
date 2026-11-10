@@ -1,0 +1,32 @@
+<!doctype html>
+<title>Reload pending</title>
+<script type="module">
+import * as THREE from 'three';
+if (globalThis.oldPage) throw new Error('The previous page was not discarded');
+globalThis.oldPage = true;
+const renderer = new THREE.WebGLRenderer();
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, .1, 100);
+camera.position.z = 5;
+const phase = sessionStorage.getItem('phase');
+scene.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial({
+  color: phase === 'verify' ? 0x22aa55 : 0x8844cc,
+})));
+renderer.setAnimationLoop(() => renderer.render(scene, camera));
+setTimeout(() => {
+  if (!phase) {
+    localStorage.setItem('world', JSON.stringify({ seed: 73142, type: 'continents' }));
+    sessionStorage.setItem('phase', 'replace');
+    location.replace('/index.html?world=new');
+  } else if (phase === 'replace') {
+    if (location.search !== '?world=new') throw new Error('Replacement URL was lost');
+    sessionStorage.setItem('phase', 'verify');
+    location.reload();
+  } else {
+    const world = JSON.parse(localStorage.getItem('world'));
+    if (location.search !== '?world=new' || world?.seed !== 73142 || world?.type !== 'continents')
+      throw new Error('The new world or URL did not survive reload');
+    document.title = 'New world active';
+  }
+}, 200);
+</script>

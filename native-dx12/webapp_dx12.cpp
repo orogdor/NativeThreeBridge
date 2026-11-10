@@ -231,6 +231,8 @@ private:
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
     void initUi();
     void initTextures();
+    void resetTextures();
+    void resetPage();
     bool decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h);
     bool createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags);
     void recordTextureCopies();
@@ -499,14 +501,43 @@ void WebappWindow::initTextures() {
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&texHeap_)), "Texture descriptor heap");
     texStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    for (UINT slot = kMaxTextures - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
-    // slot 0: 1x1 white, bound for untextured draws
-    std::vector<std::uint8_t> white(4, 255);
-    createTexture(0, std::move(white), 1, 1, 0);
+    resetTextures();
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     (void)co; // S_FALSE / RPC_E_CHANGED_MODE: COM is already usable on this thread
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_))))
         log("warn", "WIC is not available: image textures cannot be decoded");
+}
+
+void WebappWindow::resetTextures() {
+    pendingCopies_.clear();
+    retired_.clear();
+    retiredSlots_.clear();
+    textures_.clear();
+    textureBytes_ = 0;
+    textureFailures_ = 0;
+    freeSlots_.clear();
+    for (UINT slot = kMaxTextures - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
+    // slot 0: 1x1 white, bound for untextured draws
+    createTexture(0, std::vector<std::uint8_t>(4, 255), 1, 1, 0);
+}
+
+void WebappWindow::resetPage() {
+    host_.shutdown();
+    waitForGpu();
+    pendingPasses_.clear();
+    passes_.clear();
+    geometries_.clear();
+    instances_.clear();
+    resetTextures();
+    pipelines_.clear();
+    colorPatches_.clear();
+    ui_.resetPage();
+    uiUpload_ = uiVisible_ = false;
+    lastDraws_ = 0;
+    logErrors_ = 0;
+    bootDialogShown_ = false;
+    pageTitle_ = L"Three.js webapp";
+    setCursor("auto");
 }
 
 bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h) {
@@ -1357,7 +1388,7 @@ int WebappWindow::run(HINSTANCE instance) {
     wchar_t exePath[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     const std::filesystem::path logPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-log.txt";
-    _wfopen_s(&log_, logPath.c_str(), L"wb");
+    log_ = _wfsopen(logPath.c_str(), L"wb", _SH_DENYWR);
     gCrashLog = log_;
     const std::filesystem::path perfPath = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-webapp-frames.csv";
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
@@ -1407,8 +1438,8 @@ int WebappWindow::run(HINSTANCE instance) {
     initDevice();
 
     gCrashPhase = "loading index.html and the game's JavaScript";
-    log("info", "Starting JavaScript (QuickJS)");
-    if (!host_.start(root_, shim, std::move(builtins), this, int(width_), int(height_), error)) {
+    log("info", "Starting JavaScript");
+    if (!host_.start(root_, shim, builtins, this, int(width_), int(height_), error)) {
         log("error", error);
         MessageBoxA(window_, error.c_str(), "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
         return 45;
@@ -1418,10 +1449,26 @@ int WebappWindow::run(HINSTANCE instance) {
     SetForegroundWindow(window_);
 
     const auto start = std::chrono::steady_clock::now();
+    auto pageStart = start;
     auto statStart = start;
     int statFrames = 0, frameNumber = 0;
     MSG msg{};
+    auto reload = host_.takeReload();
     for (;;) {
+        if (reload) {
+            gCrashPhase = "reloading index.html and the game's JavaScript";
+            log("info", "Reloading the webapp");
+            resetPage();
+            if (!host_.start(root_, shim, builtins, this, int(width_), int(height_), error, *reload)) {
+                log("error", error);
+                if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
+                    MessageBoxA(window_, error.c_str(), "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
+                PostQuitMessage(45);
+            }
+            reload.reset();
+            pageStart = statStart = std::chrono::steady_clock::now();
+            frameNumber = statFrames = 0;
+        }
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 waitForGpu();
@@ -1433,13 +1480,19 @@ int WebappWindow::run(HINSTANCE instance) {
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            reload = host_.takeReload();
+            if (reload) break;
         }
+        if (!reload) reload = host_.takeReload();
+        if (reload) continue;
         if (minimized_) { Sleep(16); continue; } // like a hidden browser tab: no rAF
         const auto now = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+        const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
         host_.frame(ms);
+        reload = host_.takeReload();
+        if (reload) continue;
         const auto tJs = std::chrono::steady_clock::now();
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image

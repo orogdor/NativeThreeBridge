@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,12 @@ namespace native_three {
 struct WebappBuiltin {
     std::string name;   // e.g. "nt:three.core.min.js"
     std::string source;
+};
+
+// Same-entry navigation is applied only after the current JS call returns.
+struct WebappPage {
+    std::string url;
+    std::string storage;
 };
 
 // Receives everything NativeRenderer (js/native-renderer.mjs) sends.
@@ -140,8 +147,9 @@ public:
     // JavaScript errors inside the game are logged and counted, not fatal.
     bool start(const std::filesystem::path& root, const std::string& shimSource,
                std::vector<WebappBuiltin> builtins, WebappRenderSink* sink,
-               int width, int height, std::string& error);
+               int width, int height, std::string& error, const WebappPage& page = {});
     void shutdown();
+    std::optional<WebappPage> takeReload();
 
     void resize(int width, int height, double pixelRatio = 1.0);
     void frame(double timeMs);

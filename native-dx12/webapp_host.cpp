@@ -86,6 +86,7 @@ struct WebappHost::Impl {
     WebappRenderSink* sink = nullptr;
     std::string title;
     bool started = false;
+    std::optional<WebappPage> reload;
 
     static Impl* from(JSContext* c) { return static_cast<Impl*>(JS_GetContextOpaque(c)); }
 
@@ -168,6 +169,12 @@ bool typedView(JSContext* ctx, JSValueConst value, const T*& data, std::size_t& 
     data = reinterpret_cast<const T*>(base + offset);
     count = bytes / sizeof(T);
     return true;
+}
+
+JSValue jsRequestReload(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    auto* self = Impl::from(ctx);
+    if (argc >= 2) self->reload = WebappPage{argString(ctx, argv[0]), argString(ctx, argv[1])};
+    return JS_UNDEFINED;
 }
 
 JSValue jsLog(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
@@ -509,7 +516,7 @@ bool WebappHost::running() const { return impl_ && impl_->started; }
 
 bool WebappHost::start(const std::filesystem::path& root, const std::string& shimSource,
                        std::vector<WebappBuiltin> builtins, WebappRenderSink* sink,
-                       int width, int height, std::string& error) {
+                       int width, int height, std::string& error, const WebappPage& page) {
     shutdown();
     Impl& s = *impl_;
     s.root = root;
@@ -548,7 +555,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     JSValue api = JS_NewObject(s.ctx);
     struct Fn { const char* name; JSCFunction* fn; int length; };
     const Fn functions[] = {
-        {"log", jsLog, 2}, {"setTitle", jsSetTitle, 1},
+        {"requestReload", jsRequestReload, 2}, {"log", jsLog, 2}, {"setTitle", jsSetTitle, 1},
         {"readText", jsReadText, 1}, {"readBinary", jsReadBinary, 1},
         {"setImportMap", jsSetImportMap, 1},
         {"evalScript", jsEvalScript, 2}, {"evalModule", jsEvalModule, 2},
@@ -580,8 +587,10 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     s.started = true;
 
     resize(width, height, 1.0);
-    JSValue arg = JS_NewStringLen(s.ctx, html.data(), html.size());
-    s.callHost("boot", 1, &arg);
+    JSValue args[] = {JS_NewStringLen(s.ctx, html.data(), html.size()),
+                      JS_NewStringLen(s.ctx, page.url.data(), page.url.size()),
+                      JS_NewStringLen(s.ctx, page.storage.data(), page.storage.size())};
+    s.callHost("boot", 3, args);
     return true;
 }
 
@@ -599,6 +608,13 @@ void WebappHost::shutdown() {
         s.rt = nullptr;
     }
     s.started = false;
+    s.reload.reset();
+}
+
+std::optional<WebappPage> WebappHost::takeReload() {
+    auto page = std::move(impl_->reload);
+    impl_->reload.reset();
+    return page;
 }
 
 void WebappHost::resize(int width, int height, double pixelRatio) {

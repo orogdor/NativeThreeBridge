@@ -948,6 +948,16 @@ bool WebappUiRenderer::init(const std::filesystem::path& gameRoot, std::string& 
 }
 bool WebappUiRenderer::ready() const { return impl_->d2d && impl_->dwrite; }
 
+void WebappUiRenderer::resetPage() {
+    Impl& s = *impl_;
+    s.list.clear();
+    s.strings.clear();
+    s.canvases.clear();
+    s.images.clear();
+    s.registered.clear();
+    s.dirty = s.fullRedraw = true;
+}
+
 void WebappUiRenderer::setDisplayList(const float* data, std::size_t floats, const std::string& strings) {
     Impl& s = *impl_;
     const bool unrendered = s.dirty;

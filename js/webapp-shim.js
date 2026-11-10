@@ -158,7 +158,8 @@
   }
   let blobCounter = 0;
   const blobStore = new Map();
-  const documentURL = `${GAME_ORIGIN}/index.html`;
+  let documentURL = `${GAME_ORIGIN}/index.html`;
+  let pageURL = new URL(documentURL);
 
   // Game-folder path for a URL/relative string, or null for external URLs.
   function toGamePath(input, base = documentURL) {
@@ -2139,10 +2140,29 @@
 
   // ------------------------------------------------------------ globals
   const document = new Document();
+  const localStorage = new Storage(persistentStorage ? 'local' : null);
+  const sessionStorage = new Storage();
+  function requestNavigation(target) {
+    const url = new URL(target, documentURL);
+    if (url.origin !== GAME_ORIGIN || url.pathname !== '/index.html') {
+      unsupported('navigation', 'only the current webapp entry can be reloaded');
+      return;
+    }
+    if (typeof nt.requestReload !== 'function') {
+      warnOnce('reload', 'This host does not support reloading the webapp');
+      return;
+    }
+    nt.requestReload(url.href, JSON.stringify({
+      session: [...sessionStorage._values()],
+      local: persistentStorage ? undefined : [...localStorage._values()],
+    }));
+  }
   const location = {
-    href: documentURL, protocol: 'nt:', host: 'game', hostname: 'game', port: '', origin: GAME_ORIGIN,
-    pathname: '/index.html', search: '', hash: '',
-    reload() { warnOnce('reload', 'location.reload() is ignored'); }, assign() {}, replace() {}, toString() { return documentURL; },
+    get href() { return documentURL; }, set href(target) { requestNavigation(target); },
+    protocol: 'nt:', host: 'game', hostname: 'game', port: '', origin: GAME_ORIGIN,
+    pathname: '/index.html', get search() { return pageURL.search; }, get hash() { return pageURL.hash; },
+    reload() { requestNavigation(documentURL); }, assign: requestNavigation, replace: requestNavigation,
+    toString() { return documentURL; },
   };
   const navigator = {
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NativeThreeBridge',
@@ -2163,7 +2183,7 @@
     window, self: window, globalThis: window, top: window, parent: window, frames: window,
     document, location, navigator, screen, console,
     history: { length: 1, state: null, pushState() {}, replaceState() {}, back() {}, forward() {}, go() {} },
-    localStorage: new Storage(persistentStorage ? 'local' : null), sessionStorage: new Storage(),
+    localStorage, sessionStorage,
     ...(persistentStorage ? { indexedDB: { open: openDatabase } } : {}),
     setTimeout, setInterval, clearTimeout, clearInterval: clearTimeout,
     requestAnimationFrame, cancelAnimationFrame,
@@ -2413,7 +2433,16 @@
       }
     },
     // Called once by the engine with the text of index.html.
-    boot(html) {
+    boot(html, url, storage) {
+      if (url) {
+        documentURL = url;
+        pageURL = new URL(url);
+      }
+      if (storage) {
+        const saved = JSON.parse(storage);
+        for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
+        if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
+      }
       parseDocument(String(html));
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');

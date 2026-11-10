@@ -84,6 +84,7 @@ struct WebappHost::Impl {
     std::unordered_multimap<int, std::string> moduleNames;           // identity hash -> name
     WebappRenderSink* sink = nullptr;
     bool started = false;
+    std::optional<WebappPage> reload;
 
     static Impl* fromContext(v8::Local<v8::Context> ctx) {
         return static_cast<Impl*>(ctx->GetAlignedPointerFromEmbedderData(1));
@@ -380,6 +381,11 @@ void ntStorageClone(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }
 #endif
 
+void ntRequestReload(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    auto* self = Impl::fromInfo(info);
+    if (info.Length() >= 2) self->reload = WebappPage{self->utf8(info[0]), self->utf8(info[1])};
+}
+
 void ntLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() >= 2) self->log(self->utf8(info[0]), self->utf8(info[1]));
@@ -616,7 +622,7 @@ bool WebappHost::running() const { return impl_ && impl_->started; }
 
 bool WebappHost::start(const std::filesystem::path& root, const std::string& shimSource,
                        std::vector<WebappBuiltin> builtins, WebappRenderSink* sink,
-                       int width, int height, std::string& error) {
+                       int width, int height, std::string& error, const WebappPage& page) {
     shutdown();
     initializeV8Once();
     Impl& s = *impl_;
@@ -663,7 +669,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
 #ifdef _WIN32
         {"storageRead", ntStorageRead}, {"storageWrite", ntStorageWrite}, {"storageClone", ntStorageClone},
 #endif
-        {"log", ntLog}, {"setTitle", ntSetTitle}, {"readText", ntReadText}, {"readBinary", ntReadBinary},
+        {"requestReload", ntRequestReload}, {"log", ntLog}, {"setTitle", ntSetTitle}, {"readText", ntReadText}, {"readBinary", ntReadBinary},
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
@@ -688,14 +694,12 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     if (!runClassic(shimSource, "nt:webapp-shim.js") ||
         !runClassic("globalThis.__ntAfter = (p, ns) => Promise.resolve(p).then(() => ns);", "nt:after")) {
         error = "Webapp shim failed: " + s.exceptionText(tc);
-        shutdown();
         return false;
     }
     v8::Local<v8::Value> host, after;
     if (!ctx->Global()->Get(ctx, s.str("__ntHost")).ToLocal(&host) || !host->IsObject() ||
         !ctx->Global()->Get(ctx, s.str("__ntAfter")).ToLocal(&after) || !after->IsFunction()) {
         error = "Webapp shim did not install __ntHost";
-        shutdown();
         return false;
     }
     s.hostObject.Reset(isolate, host.As<v8::Object>());
@@ -703,8 +707,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     s.started = true;
 
     resize(width, height, 1.0);
-    v8::Local<v8::Value> arg = s.str(html);
-    s.callHost("boot", 1, &arg);
+    v8::Local<v8::Value> args[] = {s.str(html), s.str(page.url), s.str(page.storage)};
+    s.callHost("boot", 3, args);
     return true;
 }
 
@@ -721,6 +725,13 @@ void WebappHost::shutdown() {
         s.isolate = nullptr;
     }
     s.started = false;
+    s.reload.reset();
+}
+
+std::optional<WebappPage> WebappHost::takeReload() {
+    auto page = std::move(impl_->reload);
+    impl_->reload.reset();
+    return page;
 }
 
 #define NT_V8_SCOPE()                                     \

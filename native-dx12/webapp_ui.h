@@ -89,6 +89,7 @@ public:
     // Rasterises the current list at width x height if it or the size
     // changed. Returns true when new pixels are available.
     bool render(unsigned width, unsigned height);
+    void resetPage();
 
     // Premultiplied BGRA8 pixels of the last render (top-down rows).
     const std::uint8_t* pixels() const;

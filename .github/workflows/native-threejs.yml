@@ -277,6 +277,33 @@ jobs:
           if ((Get-ChildItem verify/game2 -Force | Measure-Object).Count -ne 0) { throw "game2 must be empty in the ZIP" }
           Get-ChildItem release | Format-Table Name, Length
           Write-Host "Two-game package verified: v$v"
+      - name: Verify in-window webapp reload on DX12
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
+          $folder = (Resolve-Path test/fixtures/webapp-reload).Path
+          $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $folder -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(25)
+            do {
+              Start-Sleep -Milliseconds 250
+              $p.Refresh()
+            } until ($p.HasExited -or $p.MainWindowTitle -like 'New world active*' -or (Get-Date) -ge $deadline)
+            if ($p.HasExited -or $p.MainWindowTitle -notlike 'New world active*1 draws*') {
+              Get-Content dist/NativeThreeBridge-webapp-log.txt
+              throw "The new world did not render in the same window"
+            }
+            $log = Get-Content dist/NativeThreeBridge-webapp-log.txt -Raw
+            if ([regex]::Matches($log, 'Reloading the webapp').Count -ne 2 -or $log -match '\[error\]') {
+              Write-Host $log
+              throw "Webapp replace/reload failed"
+            }
+          } finally {
+            if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
+            $p.WaitForExit()
+          }
       - name: Screenshot the HTML/CSS UI drawn by the engine (fixture and Kuningriigid)
         continue-on-error: true
         shell: pwsh
