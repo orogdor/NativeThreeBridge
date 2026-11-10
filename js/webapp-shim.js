@@ -899,12 +899,23 @@
     const G = {
       NO_ERROR: 0, FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
       ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
+      TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a, TEXTURE0: 0x84c0,
+      RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814,
+      TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+      LINEAR: 0x2601, NEAREST: 0x2600, LINEAR_MIPMAP_LINEAR: 0x2703, REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812f,
+      UNPACK_ALIGNMENT: 0x0cf5, UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243,
+      NONE: 0, BROWSER_DEFAULT_WEBGL: 0x9244,
       VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
       COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
       TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
     };
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
-      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
+      textureUnit: 0, textureBindings: new Map(), textureUploads: 0,
+      unpackAlignment: 4, unpackColorspace: 0x9244 };
+    let nextRawTextureId = 91000000;
+    let textureSequence = 0;
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
@@ -1072,12 +1083,145 @@
       nt.submitPass(packet, packet.length);
       state.draws++;
     }
+    // The same nt.uploadTexture() DX12 resource sink used by Three.js.
+    // TEXTURE_2D is genuinely uploaded to the GPU. TEXTURE_2D_ARRAY
+    // pixel layers can be staged as raw RGBA8 but the native shader still
+    // has only a Texture2D SRV, not a Texture2DArray SRV: never claim that
+    // sampling K73's eight-layer material textures is supported.
+    function checkedTarget(target) {
+      if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY)
+        return unsupportedRaw('texture target ' + target);
+    }
+    function boundTexture(target) {
+      checkedTarget(target);
+      const t = state.textureBindings.get(state.textureUnit + ':' + target);
+      if (!t || t.deleted) throw new Error('No valid bound texture for target ' + target);
+      return t;
+    }
+    function dimensions(w, h, d = 1) {
+      if (!Number.isInteger(w) || !Number.isInteger(h) || !Number.isInteger(d) ||
+          w <= 0 || h <= 0 || d <= 0 || w > 8192 || h > 8192 ||
+          d > 256 || w * h * d > 16_777_216)
+        throw new RangeError('DX12 prototype texture dimensions out of supported range');
+    }
+    function rawPixelBytes(data, length) {
+      if (!(data instanceof Uint8Array) && !(data instanceof Uint8ClampedArray))
+        return unsupportedRaw('RGBA8 pixel uploads need Uint8Array');
+      if (data.byteLength < length) throw new RangeError('RGBA8 texture pixel array is truncated');
+      return new Uint8Array(data.buffer, data.byteOffset, length).slice();
+    }
+    function uploadNativeTexture(texture) {
+      if (!texture.pixels || texture.isArray && texture.depth !== 1) return;
+      if (!nt.uploadTexture(texture.id, texture.pixels, texture.width, texture.height, 0))
+        throw new Error('Native DX12 texture upload failed');
+      state.textureUploads++;
+      texture.nativeUploaded = true;
+    }
+    function setRgba8Image(t, target, level, internalFormat, width, height, depth, border, format, type, pixels) {
+      checkedTarget(target);
+      if (t.target !== target) return unsupportedRaw('texture target mismatch');
+      if (level !== 0 || border !== 0 || internalFormat !== G.RGBA8 ||
+          format !== G.RGBA || type !== G.UNSIGNED_BYTE)
+        return unsupportedRaw('texImage3D/texImage2D only mip 0 RGBA8 UNSIGNED_BYTE');
+      dimensions(width, height, depth);
+      const data = pixels === null ? new Uint8Array(width * height * depth * 4) :
+        rawPixelBytes(pixels, width * height * depth * 4);
+      t.width = width; t.height = height; t.depth = depth;
+      t.pixels = data; t.nativeUploaded = false;
+      if (target === G.TEXTURE_2D_ARRAY && depth > 1) {
+        warnOnce('raw-gl2-arrays-not-sampled',
+          'K73 TEXTURE_2D_ARRAY stored in CPU memory only: native DX12 Texture2DArray shader sampling is not implemented');
+      } else uploadNativeTexture(t);
+    }
     const gl = {
       ...G, canvas,
       get drawingBufferWidth() { return canvas.width; },
       get drawingBufferHeight() { return canvas.height; },
       getContextAttributes: () => ({ alpha: false, depth: true, stencil: false, antialias: false }),
       getSupportedExtensions: () => [], getExtension: () => null, getError: () => 0,
+      createTexture() {
+        return { id: nextRawTextureId++, serial: ++textureSequence,
+          target: null, width: 0, height: 0, depth: 0, pixels: null,
+          isArray: false, deleted: false, nativeUploaded: false,
+          params: new Map(), mipmapsRequested: false };
+      },
+      activeTexture(which) {
+        const unit = which - G.TEXTURE0;
+        if (!Number.isInteger(unit) || unit < 0 || unit > 31) return unsupportedRaw('activeTexture unit ' + which);
+        state.textureUnit = unit;
+      },
+      bindTexture(target, texture) {
+        checkedTarget(target);
+        if (texture && (texture.deleted || texture.target && texture.target !== target))
+          return unsupportedRaw('reusing texture with different target or after deletion');
+        if (texture) { texture.target = target; texture.isArray = target === G.TEXTURE_2D_ARRAY; }
+        state.textureBindings.set(state.textureUnit + ':' + target, texture || null);
+      },
+      texImage3D(target, level, internalFormat, width, height, depth, border, format, type, pixels) {
+        if (target !== G.TEXTURE_2D_ARRAY) return unsupportedRaw('texImage3D target');
+        setRgba8Image(boundTexture(target), target, level, internalFormat, width, height, depth, border, format, type, pixels);
+      },
+      texImage2D(target, level, internalFormat, width, height, border, format, type, pixels) {
+        if (target !== G.TEXTURE_2D) return unsupportedRaw('texImage2D target');
+        const t = boundTexture(target);
+        if (arguments.length === 6) return unsupportedRaw('texImage2D image source requires native image upload separately');
+        setRgba8Image(t, target, level, internalFormat, width, height, 1, border, format, type, pixels);
+      },
+      texSubImage3D(target, level, xo, yo, zo, width, height, depth, format, type, pixels) {
+        const t = boundTexture(target);
+        if (target !== G.TEXTURE_2D_ARRAY || level !== 0 || format !== G.RGBA ||
+            type !== G.UNSIGNED_BYTE || !t.pixels || !t.isArray)
+          return unsupportedRaw('texSubImage3D target/format');
+        if (xo < 0 || yo < 0 || zo < 0 || xo + width > t.width ||
+            yo + height > t.height || zo + depth > t.depth || width <= 0 || height <= 0 || depth <= 0)
+          throw new RangeError('texSubImage3D bounds');
+        const bytes = rawPixelBytes(pixels, width * height * depth * 4);
+        for (let layer = 0; layer < depth; layer++)
+          for (let y = 0; y < height; y++) {
+            const dst = ((zo + layer) * t.width * t.height + (yo + y) * t.width + xo) * 4;
+            const src = (layer * width * height + y * width) * 4;
+            t.pixels.set(bytes.subarray(src, src + width * 4), dst);
+          }
+        uploadNativeTexture(t);
+      },
+      texSubImage2D(target, level, x, y, width, height, format, type, pixels) {
+        const t = boundTexture(target);
+        if (target !== G.TEXTURE_2D || level !== 0 || format !== G.RGBA ||
+            type !== G.UNSIGNED_BYTE || !t.pixels)
+          return unsupportedRaw('texSubImage2D target/format');
+        if (x < 0 || y < 0 || width < 0 || height < 0 ||
+            x + width > t.width || y + height > t.height) throw new RangeError('texSubImage2D bounds');
+        const bytes = rawPixelBytes(pixels, width * height * 4);
+        for (let row = 0; row < height; row++)
+          t.pixels.set(bytes.subarray(row * width * 4, (row + 1) * width * 4),
+            ((y + row) * t.width + x) * 4);
+        uploadNativeTexture(t);
+      },
+      texParameteri(target, pname, param) { boundTexture(target).params.set(pname, param); },
+      texParameterf(target, pname, param) { boundTexture(target).params.set(pname, param); },
+      pixelStorei(pname, param) {
+        if (pname === G.UNPACK_ALIGNMENT) {
+          if (![1, 2, 4, 8].includes(param)) return unsupportedRaw('UNPACK_ALIGNMENT');
+          state.unpackAlignment = param;
+        } else if (pname === G.UNPACK_COLORSPACE_CONVERSION_WEBGL) {
+          state.unpackColorspace = param;
+        } else return unsupportedRaw('pixelStorei ' + pname);
+      },
+      generateMipmap(target) {
+        const t = boundTexture(target);
+        t.mipmapsRequested = true;
+        // DX12 texture upload builds mip levels for supported ordinary 2D
+        // textures. Array mipmaps aren't implemented or sampled yet.
+        if (t.isArray) warnOnce('raw-gl2-array-mips', 'K73 array texture mipmaps not supported by native DX12 material pipeline');
+      },
+      deleteTexture(t) {
+        if (!t || t.deleted) return;
+        if (t.nativeUploaded) nt.releaseTexture(t.id);
+        t.deleted = true; t.pixels = null;
+        for (const [key, val] of state.textureBindings) if (val === t) state.textureBindings.delete(key);
+      },
+      get __nativeTextureUploads() { return state.textureUploads; },
+
       createShader(type) {
         if (type !== G.VERTEX_SHADER && type !== G.FRAGMENT_SHADER) return unsupportedRaw('createShader type');
         return { type, source: '', compiled: false, payload: null };
