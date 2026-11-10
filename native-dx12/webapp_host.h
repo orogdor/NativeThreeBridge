@@ -43,6 +43,14 @@ public:
         return false;
     }
     virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // Update RGBA32F subrectangle. data is tightly packed width*height*16 bytes.
+    // Keep the underlying D3D12 texture and SRV slot stable across frames.
+    virtual bool updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                                    std::uint32_t w, std::uint32_t h,
+                                    const std::uint8_t* data, std::size_t bytes) {
+        (void)id; (void)x; (void)y; (void)w; (void)h; (void)data; (void)bytes;
+        return false;
+    }
     // Allocate an independent offscreen DX12 depth-stencil target. WebGL2
     // DEPTH_COMPONENT24 is stored as D32_FLOAT; sampling is a later stage.
     virtual bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
