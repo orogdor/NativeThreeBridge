@@ -39,7 +39,7 @@ test('consecutive K73 depth IDs survive actual Float32 packet packing and native
   assert.equal(context.complete,true);
   assert.equal(rec.depthTargets.size,6);
   assert.ok(observed.length>=12, 'multiple real frames recorded');
-  const ids=context.targetIds;
+  const ids=Array.from(context.targetIds);
   assert.equal(new Set(ids).size,6);
   assert.deepEqual(ids,[7000000,7000001,7000002,7000003,7000004,7000005]);
   assert.deepEqual(Array.from(Float32Array.from(ids)),ids,'no float32 identifier aliasing');
