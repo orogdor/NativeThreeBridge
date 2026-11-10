@@ -1015,6 +1015,14 @@
       const rgba = nums.map(Number);
       return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
     }
+    function k73MaterialAtlas() {
+      if (state.program?.profile !== 'k73-lit') return null;
+      const unit = state.program.uniforms?.get('uMatA') ?? 6;
+      if (state.program.uniforms?.get('uMatOn') < 0.5) return null;
+      if (!Number.isInteger(unit) || unit < 0 || unit >= state.textureUnits.length) return null;
+      const texture = state.textureUnits[unit].get(G.TEXTURE_2D_ARRAY);
+      return texture?.loaded ? texture : null;
+    }
     // K73 uses independent position, normal, and RGBA8 vertex-colour VBOs.
     // Convert those existing WebGL attributes into NativeRenderer's exact
     // interleaved geometry upload format, preserving optional index buffers.
@@ -1060,6 +1068,7 @@
       }
       const cacheKey = [first, count, indexType, indexOffset,
         vao.elements?.version || 0, state.program?.profile || '',
+        !!k73MaterialAtlas(),
         ...[0, 1, 2].flatMap(i => {
           const a = attrs.get(i);
           return a ? [a.buffer?.version, a.size, a.type, a.normalized, a.stride, a.offset] : [0];
@@ -1083,7 +1092,7 @@
         // it is NOT transparency. Native HLSL's vertex alpha controls pixel
         // opacity, so pass opaque alpha until the material-class shader stage
         // is separately translated.
-        if (state.program?.profile === 'k73-lit') col[3] = 1;
+        if (state.program?.profile === 'k73-lit' && !k73MaterialAtlas()) col[3] = 1;
         colors.set(col, i * 4);
         hasColors ||= !!attrs.get(2)?.enabled;
       }
@@ -1122,7 +1131,12 @@
       const o = useLight ? 80 : 64;
       packet[o] = geometryId; packet[o + 2] = 1;
       const hasColors = !!state.vao.attributes.get(2)?.enabled;
-      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) : 16 | 2 | 64;
+      const atlas = useLight ? k73MaterialAtlas() : null;
+      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (atlas ? 4096 | 1048576 : 0) : 16 | 2 | 64;
+      if (atlas) {
+        packet[o + 32] = atlas.id;         // Native DX12 texture slot
+        packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
+      }
       packet[o + 5] = count; packet[o + 6] = 1;
       packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
       packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) : tint[3];
