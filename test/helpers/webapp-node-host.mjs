@@ -204,7 +204,8 @@ export async function runWebapp(root, options = {}) {
           alphaMax = Math.max(alphaMax, a);
         }
       }
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax });
+      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax,
+        firstPositions: Array.from(positions.slice(0, 9)), firstNormals: normals ? Array.from(normals.slice(0, 9)) : null });
     },
     // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
     // natively with WIC; here only the header is checked.
