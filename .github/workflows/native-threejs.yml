@@ -132,6 +132,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "K73 LIT geometry smoke failed on QuickJS" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-real-lit-dx12 1
           if ($LASTEXITCODE -ne 0) { throw "K73 LIT geometry smoke failed on V8" }
+          # Actual K73 v86 rock0 from its original binary model archive,
+          # complete 48-vertex, 90-index geometry and original LIT shader.
+          & .\build\Release\WebappSmoke.exe test/fixtures/k73-rock0-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-rock0-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
