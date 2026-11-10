@@ -920,6 +920,9 @@
       if (source.includes('layout(location=0) in vec2 aP;') &&
           source.includes('gl_Position=vec4(aP,0.0,1.0);'))
         return { kind: 'k73-sky-vertex', size: 2 };
+      if (source.includes('layout(location=0) in vec2 aC;') &&
+          source.includes('gl_Position = uVP*vec4(wp,1.0);'))
+        return { kind: 'k73-particle-vertex', size: 2 };
       const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
       if (!attr) return null;
       // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
@@ -932,11 +935,14 @@
       if (source.includes('vec3 base = vC.rgb*uTint.rgb;') &&
           source.includes('uniform vec4 uTint;') && !source.includes('#define SKIN 1'))
         return { kind: 'k73-lit-fragment', approximation: 'native HLSL material' };
-      if (/^#version 300 es\s+precision mediump float;\s*void main\(\)\s*\{\s*\}/.test(source.trim()))
+      if (/precision mediump float;\s*void main\(\)\s*\{\s*\}/.test(source))
         return { kind: 'k73-depth-fragment' };
       if (source.includes('uniform vec3 uZen;') && source.includes('uniform vec3 uHor;') &&
           source.includes('uInvVP') && source.includes('out vec4 oC;'))
         return { kind: 'k73-sky-fragment', approximation: 'horizon fill' };
+      if (source.includes('uniform float uAdd;') && source.includes('in vec4 vCol;') &&
+          source.includes('in vec2 vUV;'))
+        return { kind: 'k73-particle-fragment', approximation: 'unlit particle' };
       const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
       if (!output) return null;
       const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
@@ -999,7 +1005,8 @@
         const compatible = !pair ||
           (vs.payload.kind === 'k73-lit-vertex' && fs.payload.kind === 'k73-lit-fragment') ||
           (vs.payload.kind === 'k73-depth-vertex' && fs.payload.kind === 'k73-depth-fragment') ||
-          (vs.payload.kind === 'k73-sky-vertex' && fs.payload.kind === 'k73-sky-fragment');
+          (vs.payload.kind === 'k73-sky-vertex' && fs.payload.kind === 'k73-sky-fragment') ||
+          (vs.payload.kind === 'k73-particle-vertex' && fs.payload.kind === 'k73-particle-fragment');
         program.linked = !!(vs?.compiled && fs?.compiled && compatible);
         program.kind = program.linked ? (vs.payload.kind || 'simple') : null;
         program.color = program.linked && !pair ? fs.payload : [1, 1, 1, 1];
