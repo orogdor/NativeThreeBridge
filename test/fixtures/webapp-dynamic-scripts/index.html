@@ -1,0 +1,29 @@
+<!doctype html>
+<html><head><title>Dynamic loader pending</title></head><body>
+<div id="status">Loading</div>
+<script>
+window.scriptOrder = ['boot'];
+window.loadDynamic = function (src) {
+  return new Promise((resolve, reject) => {
+    const tag = document.createElement('script');
+    tag.src = src; tag.async = false;
+    tag.onload = () => { scriptOrder.push('loaded:' + src); resolve(); };
+    tag.onerror = () => { scriptOrder.push('error:' + src); reject(new Error(src)); };
+    document.body.appendChild(tag);
+  });
+};
+Promise.all([
+  loadDynamic('first.js'),
+  loadDynamic('second.js')
+]).then(() => {
+  const inline = document.createElement('script');
+  inline.textContent = "scriptOrder.push('inline');";
+  document.body.appendChild(inline);
+  document.getElementById('status').textContent = 'Ready';
+  document.title = 'Dynamic scripts ready';
+  const bad = document.createElement('script');
+  bad.src = 'not-a-file.js';
+  bad.onerror = () => { window.dynamicErrorReceived = true; scriptOrder.push('error:not-a-file.js'); };
+  document.body.appendChild(bad);
+}).catch((error) => { document.title = 'Dynamic scripts failed: ' + error.message; });
+</script></body></html>

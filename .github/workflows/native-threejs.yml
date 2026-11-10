@@ -74,6 +74,13 @@ jobs:
         run: |
           & .\\build\\Release\\NativeCoreSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Native core subsystem tests failed" }
+      - name: Verify independent UI/3D cadence clock (native C++)
+        shell: pwsh
+        run: |
+          cl /nologo /EHsc /std:c++17 test/ui-cadence-smoke.cpp /Fe:build/ui-cadence-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence smoke compile failed" }
+          & .\\build\\ui-cadence-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence smoke test failed" }
       - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
         shell: pwsh
         run: |
@@ -107,6 +114,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed on V8" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-bad-import 0 expect-boot-error
           if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly on V8" }
+          # A dynamic loader should work identically on QuickJS and V8.
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-dynamic-scripts 0 expect-dynamic-scripts
+          if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-dynamic-scripts 0 expect-dynamic-scripts
+          if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on V8" }
+          # First real raw-WebGL2 -> the same DX12 packet sink as Three.js.
+          # Opt-in only; exercise both JS engines with 300 live frames and
+          # require nonzero geometry uploads and draws, not an empty window.
+          & .\build\Release\WebappSmoke.exe test/fixtures/raw-webgl2-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/raw-webgl2-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on V8" }
+          # Real K73 v86 GLSL shaders and indexed RGBA8 vertex colors must
+          # reach the same DX12 geometry/light/pass sink as Kuningriigid.
+          & .\build\Release\WebappSmoke.exe test/fixtures/k73-real-lit-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 LIT geometry smoke failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-real-lit-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 LIT geometry smoke failed on V8" }
+          # Actual K73 v86 rock0 from its original binary model archive,
+          # complete 48-vertex, 90-index geometry and original LIT shader.
+          & .\build\Release\WebappSmoke.exe test/fixtures/k73-rock0-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-rock0-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on V8" }
+          # K73 packed RGBA8 material arrays must upload through the EXISTING
+          # DX12 texture backend and render with the triplanar atlas flag.
+          & .\build\Release\WebappSmoke.exe test/fixtures/k73-texture-array-dx12 1 expect-texture
+          if ($LASTEXITCODE -ne 0) { throw "K73 material-array DX12 smoke failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-texture-array-dx12 1 expect-texture
+          if ($LASTEXITCODE -ne 0) { throw "K73 material-array DX12 smoke failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
@@ -214,6 +251,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Kuningriigid checkout failed" }
           & .\build\Release\WebappSmokeV8.exe kuningriigid-check 1
           if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly on V8 (exit $LASTEXITCODE)" }
+      - name: K73 compatibility smoke - real WebGL2 game loads until the known graphics blocker
+        shell: pwsh
+        env:
+          CI: '1'
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git clone --depth 1 https://github.com/orogdor/game.git k73-compat-check
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check out K73" }
+          & .\build\Release\WebappSmokeV8.exe k73-compat-check 0 expect-webgl2-blocker
+          if ($LASTEXITCODE -ne 0) { throw "K73 failed before reaching its expected WebGL2 blocker" }
       - name: Set up .NET 8 for the updaters
         uses: actions/setup-dotnet@v4
         with:
@@ -393,6 +440,23 @@ jobs:
             release/NativeThreeBridge-Windows-x64.zip
             release/NativeThreeBridge-Engine-x64.zip
             release/engine-update-v2.json
+      - name: Publish isolated UI/3D cadence experiment (never replace stable updater release)
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'experiments/2d3d-')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$v-ui-cadence-test"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Could not replace previous UI cadence test release" }
+          }
+          gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – isolated UI/3D cadence experiment" --notes "Experimental build from PR #$env:PR_NUMBER ($env:HEAD_SHA). Run in a SEPARATE test folder. 3D game frames are unrestricted; 2D CSS/UI refresh defaults to 30 Hz using cached pixels. Set NATIVE_THREE_UI_HZ=0 to use original every-frame UI as an A/B baseline. This is a staged cadence split, NOT a threaded implementation. Do not run UpdateEngine.exe from the test copy: stable updates deliberately ignore this prerelease. Unmodified v0.32.15 source preserved in backup/pre-2d3d-split-v03215-20261110."
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence test prerelease failed" }
       - name: Publish stable release (only after Windows tests succeed)
         if: github.ref == 'refs/heads/main'
         shell: pwsh
