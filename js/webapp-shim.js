@@ -356,6 +356,65 @@
     abort(reason = new Error('AbortError')) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = reason; this.signal.dispatchEvent(new Event('abort')); }
   }
 
+  // Dynamic <script src=...> loading, shared by V8 and QuickJS.
+  // A classic script appended by a loader must execute and fire 'load', or
+  // Promise.all(loadScript(...)) applications (including K73) never boot.
+  // Defer until the current JavaScript job finishes and retain insertion order
+  // even when each script has .async=false assigned as a DOM property.
+  const dynamicScriptQueue = [];
+  let parsingInitialDocument = false;
+  let dynamicScriptsRunning = false;
+  let dynamicScriptCount = 0;
+  function queueConnectedScripts(node) {
+    if (parsingInitialDocument || !node.isConnected) return;
+    const visit = (n) => {
+      if (n.nodeType === 1 && n.localName === 'script' && !n._ntScriptStarted) {
+        n._ntScriptStarted = true;
+        dynamicScriptQueue.push(n);
+      } else {
+        for (const c of n.childNodes || []) visit(c);
+      }
+    };
+    visit(node);
+    if (dynamicScriptQueue.length && !dynamicScriptsRunning) {
+      Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+  async function drainDynamicScripts() {
+    if (dynamicScriptsRunning) return;
+    dynamicScriptsRunning = true;
+    try {
+      while (dynamicScriptQueue.length) {
+        const element = dynamicScriptQueue.shift();
+        const type = (element.getAttribute('type') || '').trim().toLowerCase();
+        // JSON/import maps and data scripts are not JavaScript.
+        if (type && !['text/javascript', 'application/javascript', 'javascript', 'module'].includes(type)) continue;
+        const src = element.getAttribute('src');
+        try {
+          let source, name;
+          if (src) {
+            const path = toGamePath(src);
+            if (!path) throw new TypeError(`Dynamic script source is not a local game file: ${src}`);
+            source = nt.readText(path);
+            name = path;
+          } else {
+            source = element.textContent;
+            name = `dynamic-script-${++dynamicScriptCount}`;
+          }
+          if (type === 'module') await nt.evalModule(source, name);
+          else nt.evalScript(source, name);
+          element.dispatchEvent(new Event('load'));
+        } catch (e) {
+          reportError(`dynamic script ${src || '(inline)'}`, e);
+          element.dispatchEvent(new ErrorEvent('error', { message: String(e), error: e }));
+        }
+      }
+    } finally {
+      dynamicScriptsRunning = false;
+      if (dynamicScriptQueue.length) Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+
   // ---------------------------------------------------------------- DOM
   const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   const RAW_TAGS = new Set(['script', 'style', 'textarea', 'title']);
@@ -383,6 +442,9 @@
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       uiNotify('tree', this, child);
+      // Connected DOM-inserted classic/module scripts run asynchronously, in
+      // insertion order. Initial HTML parser scripts are handled by host.boot().
+      queueConnectedScripts(child);
       return child;
     }
     removeChild(child) {
@@ -2443,7 +2505,10 @@
         for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
         if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
       }
-      parseDocument(String(html));
+      // Parser-inserted <script> tags run through host.boot(); scripts created
+      // by those scripts are dynamic and must be handled by our queue.
+      parsingInitialDocument = true;
+      try { parseDocument(String(html)); } finally { parsingInitialDocument = false; }
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');
       const imports = [];
@@ -2462,6 +2527,7 @@
         const type = (s.getAttribute('type') || 'text/javascript').toLowerCase().trim();
         const src = s.getAttribute('src');
         if (type === 'module') {
+          s._ntScriptStarted = true;
           if (src) {
             const path = toGamePath(src);
             if (path === null) { reportError('script', new Error(`External module script is not available offline: ${src}`)); continue; }
@@ -2470,6 +2536,7 @@
           continue;
         }
         if (!['text/javascript', 'application/javascript', 'javascript', ''].includes(type)) continue;
+        s._ntScriptStarted = true;
         try {
           if (src) {
             const path = toGamePath(src);
@@ -2498,8 +2565,9 @@
       const t = document.title;
       if (t) nt.setTitle(t);
     },
-    // Called by the engine once per displayed frame with a millisecond clock.
-    frame(timeMs) {
+    // Game timers and requestAnimationFrame run at the 3D rate; CSS/UI is separately scheduled.
+    // The default keeps existing Node test hosts and legacy callers compatible.
+    frame(timeMs, uiTick = true) {
       state.now = timeMs;
       state.frame++;
       const t0 = performance.now();
@@ -2513,7 +2581,7 @@
       const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
       const tCanvas = performance.now();
-      if (uiLayer) uiLayer.frame();
+      if (uiTick !== false && uiLayer) uiLayer.frame();
       const tUi = performance.now();
       if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
         state.lastSlowFrameReport = timeMs;

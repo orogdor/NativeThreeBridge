@@ -748,10 +748,10 @@ void WebappHost::resize(int width, int height, double pixelRatio) {
                                     v8::Number::New(isolate, pixelRatio)};
     impl_->callHost("resize", 3, args);
 }
-void WebappHost::frame(double timeMs) {
+void WebappHost::frame(double timeMs, bool uiTick) {
     NT_V8_SCOPE();
-    v8::Local<v8::Value> arg = v8::Number::New(isolate, timeMs);
-    impl_->callHost("frame", 1, &arg);
+    v8::Local<v8::Value> args[2] = {v8::Number::New(isolate, timeMs), v8::Boolean::New(isolate, uiTick)};
+    impl_->callHost("frame", 2, args);
 }
 void WebappHost::key(bool down, const std::string& key, const std::string& code, bool repeat, bool alt, bool ctrl,
                      bool shift, bool meta) {
