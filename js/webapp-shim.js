@@ -890,6 +890,146 @@
     get text() { return this.textContent; }
     set text(v) { this.textContent = v; }
   }
+  // Experimental raw WebGL2 commands -> the EXISTING native DX12 packet
+  // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
+  // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
+  let nextRawGeometryId = 90000000;
+  function makeRawDx12Prototype(canvas) {
+    const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const G = {
+      NO_ERROR: 0, FLOAT: 0x1406, ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88e4,
+      VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
+      COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
+      TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+    };
+    const state = { buffer: null, vao: { attributes: new Map() },
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
+    const unsupportedRaw = (method) => {
+      throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
+    };
+    function compileVertex(source) {
+      const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
+      if (!attr) return null;
+      // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
+      const assignment = new RegExp('gl_Position\\s*=\\s*vec4\\s*\\(\\s*' + attr[2] + '\\s*,\\s*1(?:\\.0+)?\\s*\\)\\s*;');
+      if (!assignment.test(source)) return null;
+      if (/uniform\s+|texture\s*\(|gl_VertexID|gl_InstanceID|mat[234]\s/.test(source)) return null;
+      return { size: Number(attr[1]) };
+    }
+    function compileFragment(source) {
+      const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
+      if (!output) return null;
+      const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
+      if (!assignment) return null;
+      const nums = assignment[1].split(',').map(x => x.trim());
+      if (nums.length !== 4 || nums.some(x => !/^(?:\d+\.?\d*|\.\d+)$/.test(x))) return null;
+      if (/uniform\s+|texture\s*\(/.test(source)) return null;
+      const rgba = nums.map(Number);
+      return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
+    }
+    function upload(first, count) {
+      const attr = state.vao.attributes.get(0);
+      if (!attr?.enabled || !attr.buffer || !(attr.buffer.data instanceof Float32Array) ||
+          attr.type !== G.FLOAT || attr.normalized || attr.size < 2 || attr.size > 3)
+        return unsupportedRaw('drawArrays requires enabled location-0 vec2/vec3 FLOAT buffer');
+      const stride = attr.stride ? attr.stride / 4 : attr.size;
+      const offset = attr.offset / 4, data = attr.buffer.data;
+      if (!Number.isInteger(stride) || !Number.isInteger(offset) || stride < attr.size)
+        return unsupportedRaw('vertex buffer stride/offset');
+      const key = [attr.buffer.version, first, count, attr.size, stride, offset].join(':');
+      const prev = state.cache.get(attr);
+      if (prev?.key === key) return prev.id;
+      const positions = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        const from = offset + (first + i) * stride;
+        if (from + attr.size > data.length) throw new RangeError('vertex position outside bound buffer');
+        positions[i * 3] = data[from];
+        positions[i * 3 + 1] = data[from + 1];
+        positions[i * 3 + 2] = attr.size === 3 ? data[from + 2] : 0;
+      }
+      if (prev) nt.releaseGeometry(prev.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, null, null, null, null);
+      state.cache.set(attr, { id, key });
+      return id;
+    }
+    const gl = {
+      ...G, canvas,
+      get drawingBufferWidth() { return canvas.width; },
+      get drawingBufferHeight() { return canvas.height; },
+      getContextAttributes: () => ({ alpha: false, depth: true, stencil: false, antialias: false }),
+      getSupportedExtensions: () => [], getExtension: () => null, getError: () => 0,
+      createShader(type) {
+        if (type !== G.VERTEX_SHADER && type !== G.FRAGMENT_SHADER) return unsupportedRaw('createShader type');
+        return { type, source: '', compiled: false, payload: null };
+      },
+      shaderSource(shader, source) { shader.source = String(source); shader.compiled = false; },
+      compileShader(shader) {
+        shader.payload = shader.type === G.VERTEX_SHADER ? compileVertex(shader.source) : compileFragment(shader.source);
+        shader.compiled = !!shader.payload;
+      },
+      getShaderParameter(shader, key) { if (key !== G.COMPILE_STATUS) return unsupportedRaw('getShaderParameter'); return shader.compiled; },
+      getShaderInfoLog(shader) { return shader.compiled ? '' : 'Unsupported GLSL. DX12 prototype accepts only position vec2/vec3 and literal vec4 output.'; },
+      createProgram() { return { shaders: [], linked: false }; },
+      attachShader(program, shader) { program.shaders.push(shader); },
+      linkProgram(program) {
+        const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
+        const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
+        program.linked = !!(vs?.compiled && fs?.compiled);
+        program.color = program.linked ? fs.payload : null;
+      },
+      getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
+      getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
+      useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
+      createBuffer() { return { data: null, version: 0 }; },
+      bindBuffer(target, buffer) { if (target !== G.ARRAY_BUFFER) return unsupportedRaw('bindBuffer target'); state.buffer = buffer; },
+      bufferData(target, data) {
+        if (target !== G.ARRAY_BUFFER || !(data instanceof Float32Array)) return unsupportedRaw('bufferData type/target');
+        if (!state.buffer) throw Error('No ARRAY_BUFFER bound');
+        state.buffer.data = new Float32Array(data); state.buffer.version++;
+      },
+      createVertexArray() { return { attributes: new Map() }; },
+      bindVertexArray(vao) { state.vao = vao || { attributes: new Map() }; },
+      enableVertexAttribArray(index) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, enabled: true });
+      },
+      vertexAttribPointer(index, size, type, normalized, stride, offset) {
+        if (index !== 0 || !state.buffer) return unsupportedRaw('vertexAttribPointer');
+        const old = state.vao.attributes.get(0) || {};
+        state.vao.attributes.set(0, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+      },
+      viewport(x, y, w, h) {
+        if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
+      },
+      clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
+      clear(mask) {
+        if (mask & G.COLOR_BUFFER_BIT) state.clearFlags |= 1;
+        if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
+      },
+      drawArrays(mode, first, count) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        const id = upload(first, count), packet = new Float32Array(64 + 56), o = 64;
+        packet.set(ID, 0); packet.set(ID, 16);
+        packet.set(state.clear, 36);
+        packet[43] = 1; packet[44] = state.clearFlags;
+        packet[45] = canvas.width; packet[46] = canvas.height; packet[47] = 1;
+        packet[o] = id; packet[o + 2] = 1;
+        packet[o + 3] = 16 | 2 | 64; // unlit, double-sided, no depth test
+        packet[o + 5] = count; packet[o + 6] = 1;
+        packet.set(state.program.color, o + 8);
+        packet.set(ID, o + 16);
+        packet[o + 34] = 1; packet[o + 37] = 1;
+        state.clearFlags = 0;
+        nt.submitPass(packet, packet.length);
+        state.draws++;
+      },
+      get __nativeDraws() { return state.draws; },
+    };
+    return gl;
+  }
+
   class HTMLCanvasElement extends HTMLElement {
     constructor(tag = 'canvas', ns) { super(tag, ns); this._width = 300; this._height = 150; }
     get width() { return this._width; }
@@ -907,7 +1047,11 @@
         if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
         return this._ctx2d;
       }
-      // WebGL is never exposed: THREE.WebGLRenderer is the NativeRenderer.
+      if (kind === 'webgl2' && this.hasAttribute('data-native-webgl2-prototype')) {
+        if (!this._nativeGL2) this._nativeGL2 = makeRawDx12Prototype(this);
+        this._ntRendererCanvas = true;
+        return this._nativeGL2;
+      }
       unsupported(`canvas.getContext('${kind}')`, 'use THREE.WebGLRenderer, which renders natively');
       return null;
     }
