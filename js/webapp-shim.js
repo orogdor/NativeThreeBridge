@@ -916,7 +916,7 @@
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
       program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
       activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
-      liveTextures: new Set(), textureUploads: 0, instanceCache: new WeakMap() };
+      liveTextures: new Set(), textureUploads: 0, instanceCache: new WeakMap(), sky: null };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
@@ -981,6 +981,14 @@
       // accept arbitrary GLSL or SKIN vertex shaders.
       const instanced = /#define\s+INST\b/.test(source);
       const skinned = /#define\s+SKIN\b/.test(source);
+      // K73 full-screen sky vertex shader (clip-space aP).
+      // The native counterpart creates a low-resolution sky gradient mesh.
+      if (!instanced && !skinned &&
+          /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec2\s+aP\s*;/.test(source) &&
+          /out\s+vec2\s+vP\s*;/.test(source) &&
+          /vP\s*=\s*aP\s*;/.test(source) &&
+          /gl_Position\s*=\s*vec4\s*\(\s*aP\s*,\s*0\.0\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return { kind: 'k73-sky', size: 2 };
       // K73 v86 depth-only vertex shader, including the exact INST variant.
       // Compilation is profile recognition, not a claim of generic GLSL -> HLSL.
       // Shadow framebuffer support is a separate, necessary stage.
@@ -1016,6 +1024,19 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      // Original K73 procedural SKY_FS. Its atmospheric/planet/cloud code is
+      // not executable GLSL here: a verified native sky approximation is used.
+      if (!/#define\s+(?:INST|SKIN)\b/.test(source) &&
+          /in\s+vec2\s+vP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uInvVP\s*;/.test(source) &&
+          /uniform\s+vec3\s+uCam\b/.test(source) &&
+          /uniform\s+vec3\s+uZen\b/.test(source) &&
+          /uniform\s+vec3\s+uHor\b/.test(source) &&
+          /uniform\s+vec3\s+uSunDir\b/.test(source) &&
+          /uniform\s+vec3\s+uFogCol\b/.test(source) &&
+          /vec4\s+a\s*=\s*uInvVP\s*\*\s*vec4\s*\(\s*vP\s*,\s*1\.0\s*,\s*1\.0\s*\)\s*;/.test(source) &&
+          /oC\s*=\s*vec4\s*\(\s*tm\s*\(\s*col\s*\*\s*uExposure\s*\)\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return {kind: 'k73-sky'};
       // K73 depth fragment: no colour output (depth-only pipeline).
       // Reject other empty GLSL programs rather than claiming broad support.
       if (/^\s*#version\s+300\s+es\s*(?:#define\s+INST\s+1\s*)?precision\s+mediump\s+float\s*;\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(source))
@@ -1130,6 +1151,80 @@
       state.cache.set(vao, { id, key: cacheKey });
       return id;
     }
+    // Clip-space K73 sky proxy. Sample the original inverse-view-projection
+    // direction per grid vertex; use the existing unlit native DX12 shader,
+    // no extra WebGL context and no fake "GLSL compiler" result.
+    // Clouds, stars, giant planet and exact sun disk require a dedicated HLSL
+    // pixel shader later. This intentionally reports that limitation.
+    function skyGeometry() {
+      const u = state.program.uniforms || new Map();
+      const val = (name, fallback) => u.get(name) ?? fallback;
+      const inv = val('uInvVP', ID);
+      const cam = val('uCam', [0, 0, 0]);
+      const zen = val('uZen', [0.25, 0.22, 0.3]);
+      const hor = val('uHor', [0.75, 0.52, 0.38]);
+      const fog = val('uFogCol', [0.62, 0.44, 0.32]);
+      const sun = val('uSunDir', [0.4, 0.5, 0.3]);
+      const sunCol = val('uSunCol', [1.3, 0.95, 0.7]);
+      const exposure = Math.max(0.01, Number(val('uExposure', 1.5)));
+      const night = Math.max(0, Math.min(1, Number(val('uNight', 0))));
+      if (!inv || inv.length !== 16) return unsupportedRaw('K73 sky needs inverse view projection mat4');
+      const key = [...inv, ...cam, ...zen, ...hor, ...fog, ...sun, ...sunCol, exposure, night].join(',');
+      if (state.sky?.key === key) return state.sky.id;
+      // 24x16 grid: 425 vertices and 2304 indexes, independent of game size.
+      const cols = 24, rows = 16;
+      const positions = new Float32Array((cols + 1) * (rows + 1) * 3);
+      const colors = new Float32Array((cols + 1) * (rows + 1) * 4);
+      const indices = new Uint32Array(cols * rows * 6);
+      const clamp = x => Math.max(0, Math.min(1, x));
+      const tm = x => {
+        x = Math.max(0, x * exposure);
+        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+      };
+      const normalize = (x, y, z) => {
+        const len = Math.hypot(x, y, z) || 1;
+        return [x / len, y / len, z / len];
+      };
+      const sn = normalize(sun[0], sun[1], sun[2]);
+      for (let iy = 0; iy <= rows; iy++) for (let ix = 0; ix <= cols; ix++) {
+        const x = -1 + ix * 2 / cols;
+        const y = -1 + iy * 2 / rows;
+        const p = (iy * (cols + 1) + ix) * 3;
+        const c = (iy * (cols + 1) + ix) * 4;
+        positions.set([x, y, 0], p);
+        const wx = inv[0] * x + inv[4] * y + inv[8] + inv[12];
+        const wy = inv[1] * x + inv[5] * y + inv[9] + inv[13];
+        const wz = inv[2] * x + inv[6] * y + inv[10] + inv[14];
+        const ww = inv[3] * x + inv[7] * y + inv[11] + inv[15];
+        const w = Math.abs(ww) < 1e-7 ? (ww < 0 ? -1e-7 : 1e-7) : ww;
+        const dir = normalize(wx / w - cam[0], wy / w - cam[1], wz / w - cam[2]);
+        const h = dir[1];
+        const skyT = Math.pow(clamp(h), 0.55);
+        const fogT = Math.exp(-Math.max(h, 0) * 9) * 0.85;
+        const sd = Math.max(0, dir[0] * sn[0] + dir[1] * sn[1] + dir[2] * sn[2]);
+        const glow = Math.pow(sd, 24) * 0.28 + Math.pow(sd, 4) * 0.1;
+        for (let ch = 0; ch < 3; ch++) {
+          let v = hor[ch] * (1 - skyT) + zen[ch] * skyT;
+          if (h < 0) v = fog[ch] * (1 - 0.2 * clamp(-h * 3));
+          else v = v * (1 - fogT) + fog[ch] * fogT;
+          v += sunCol[ch] * glow;
+          // K73's original shader already uses nighttime colors via its
+          // dynamic environment uniforms; keep those rather than hardcoding.
+          colors[c + ch] = tm(v);
+        }
+        colors[c + 3] = 1;
+      }
+      let n = 0;
+      for (let iy = 0; iy < rows; iy++) for (let ix = 0; ix < cols; ix++) {
+        const a = iy * (cols + 1) + ix, b = a + 1, d = a + cols + 1, e = d + 1;
+        indices[n++] = a; indices[n++] = b; indices[n++] = d;
+        indices[n++] = b; indices[n++] = e; indices[n++] = d;
+      }
+      const id = state.sky?.id ?? nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, null, colors, indices, null);
+      state.sky = {id, key, count: indices.length};
+      return id;
+    }
     function instanceRecord(count) {
       if (!['k73-lit-inst', 'k73-depth-inst'].includes(state.program?.profile)) return null;
       const vao = state.vao;
@@ -1171,9 +1266,10 @@
       const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
       const lit = profile === 'k73-lit' || profile === 'k73-lit-inst';
       const depth = profile === 'k73-depth' || profile === 'k73-depth-inst';
+      const sky = profile === 'k73-sky';
       const transform = (lit || depth) ? uniform('uVP', ID) : ID;
       const model = (profile === 'k73-lit' || profile === 'k73-depth') ? uniform('uModel', ID) : ID;
-      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth ? [1, 1, 1, 1] : state.program.color;
+      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth || sky ? [1, 1, 1, 1] : state.program.color;
       const packet = new Float32Array(64 + (lit ? 16 : 0) + 56);
       packet.set(ID, 0); packet.set(transform, 16);
       packet.set(state.clear, 36);
@@ -1199,7 +1295,8 @@
       const hasColors = !!state.vao.attributes.get(2)?.enabled;
       const atlas = useLight ? k73MaterialAtlas() : null;
       packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (instances ? 1024 : 0) |
-        (atlas ? 4096 | 1048576 : 0) : 16 | 2 | 64;
+        (atlas ? 4096 | 1048576 : 0) :
+        sky ? (16 | 8 | 32 | 64 | 65536 | 2) : 16 | 2 | 64;
       if (atlas) {
         packet[o + 32] = atlas.id;         // Native DX12 texture slot
         packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
@@ -1244,15 +1341,18 @@
         program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
         const litPair = ['k73-lit', 'k73-lit-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-lit';
         const depthPair = ['k73-depth', 'k73-depth-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-depth';
+        const skyPair = vs?.payload?.kind === 'k73-sky' && fs?.payload?.kind === 'k73-sky';
         // An empty depth fragment is only valid with the exact K73 depth vertex profile.
-        program.linked &&= !!(litPair || depthPair ||
+        program.linked &&= !!(litPair || depthPair || skyPair ||
           (Array.isArray(fs?.payload) && Number.isInteger(vs?.payload?.size)));
-        program.profile = program.linked ? (litPair || depthPair ? vs.payload.kind : 'constant') : 'invalid';
+        program.profile = program.linked ? (litPair || depthPair || skyPair ? vs.payload.kind : 'constant') : 'invalid';
         program.uniforms = new Map();
         if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
         if (program.profile.startsWith('k73-depth')) unsupported('K73 shadow depth framebuffer',
           'DEPTH_VS/DEPTH_FS variants recognised, but actual off-screen shadow texture rendering needs FBO/DX12 depth target support');
+        if (program.profile === 'k73-sky') unsupported('K73 sky shader approximation',
+          'Sky gradient and broad sun glow use native unlit DX12 geometry; procedural clouds, stars, planet and precise GLSL atmosphere are not yet translated');
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
       getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
@@ -1418,7 +1518,11 @@
       drawArrays(mode, first, count) {
         if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
-        submitRawPass(upload(first, count), count, state.program.profile);
+        if (state.program.profile === 'k73-sky') {
+          if (first !== 0 || count !== 3) return unsupportedRaw('K73 sky requires fullscreen triangle');
+          const id = skyGeometry();
+          submitRawPass(id, state.sky.count, 'k73-sky');
+        } else submitRawPass(upload(first, count), count, state.program.profile);
       },
       drawElements(mode, count, type, offset) {
         if (mode !== G.TRIANGLES || count < 3 || count % 3) return unsupportedRaw('drawElements primitive');
