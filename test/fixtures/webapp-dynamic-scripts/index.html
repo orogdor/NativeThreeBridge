@@ -23,7 +23,7 @@ Promise.all([
   document.title = 'Dynamic scripts ready';
   const bad = document.createElement('script');
   bad.src = 'not-a-file.js';
-  bad.onerror = () => { window.dynamicErrorReceived = true; };
+  bad.onerror = () => { window.dynamicErrorReceived = true; scriptOrder.push('error:not-a-file.js'); };
   document.body.appendChild(bad);
 }).catch((error) => { document.title = 'Dynamic scripts failed: ' + error.message; });
 </script></body></html>
