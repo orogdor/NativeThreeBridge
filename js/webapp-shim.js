@@ -1724,13 +1724,19 @@
       },
       uniform4fv(location, values, srcOffset = 0, srcLength) {
         if (!location) return;
-        if (!ArrayBuffer.isView(values) || !Number.isInteger(srcOffset) || srcOffset < 0 ||
+        // WebGL2 accepts both Float32Array and a regular JavaScript sequence.
+        // K73 passes ordinary arrays for mesh tints and typed subranges for
+        // bone matrices; refusing sequences aborts its main scene draw.
+        if (!(ArrayBuffer.isView(values) || Array.isArray(values)) ||
+            !Number.isInteger(srcOffset) || srcOffset < 0 ||
             (srcLength !== undefined && (!Number.isInteger(srcLength) || srcLength < 1)))
           return unsupportedRaw('uniform4fv source range');
         const end = srcLength === undefined ? values.length : srcOffset + srcLength;
         if (end > values.length || end-srcOffset < 4 || (end-srcOffset)%4)
           return unsupportedRaw('uniform4fv vector array range');
-        location.program.uniforms.set(location.name, Float32Array.from(values.subarray(srcOffset,end)));
+        const subset = ArrayBuffer.isView(values)
+          ? values.subarray(srcOffset, end) : values.slice(srcOffset, end);
+        location.program.uniforms.set(location.name, Float32Array.from(subset));
       },
       uniform3fv(location, values) {
         if (!location) return;
