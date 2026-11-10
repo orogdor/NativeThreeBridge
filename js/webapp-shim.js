@@ -362,10 +362,11 @@
   // Defer until the current JavaScript job finishes and retain insertion order
   // even when each script has .async=false assigned as a DOM property.
   const dynamicScriptQueue = [];
+  let parsingInitialDocument = false;
   let dynamicScriptsRunning = false;
   let dynamicScriptCount = 0;
   function queueConnectedScripts(node) {
-    if (!state.booted || !node.isConnected) return;
+    if (parsingInitialDocument || !node.isConnected) return;
     const visit = (n) => {
       if (n.nodeType === 1 && n.localName === 'script' && !n._ntScriptStarted) {
         n._ntScriptStarted = true;
@@ -2504,7 +2505,10 @@
         for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
         if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
       }
-      parseDocument(String(html));
+      // Parser-inserted <script> tags run through host.boot(); scripts created
+      // by those scripts are dynamic and must be handled by our queue.
+      parsingInitialDocument = true;
+      try { parseDocument(String(html)); } finally { parsingInitialDocument = false; }
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');
       const imports = [];
