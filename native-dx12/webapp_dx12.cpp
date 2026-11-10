@@ -110,6 +110,7 @@ struct Texture {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
     UINT width = 0, height = 0;
+    bool float32 = false;
 };
 struct DepthTarget {
     ComPtr<ID3D12Resource> resource;
@@ -120,6 +121,11 @@ struct DepthTarget {
 struct PendingTextureCopy {
     ComPtr<ID3D12Resource> texture, staging;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+};
+struct PendingFloatCopy {
+    ComPtr<ID3D12Resource> texture, staging;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    UINT x = 0, y = 0;
 };
 struct RetiredSlot {
     UINT slot;
@@ -171,6 +177,9 @@ public:
     void releaseGeometry(std::uint32_t id) override;
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
+    bool updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                            std::uint32_t w, std::uint32_t h,
+                            const std::uint8_t* data, std::size_t bytes) override;
     void releaseTexture(std::uint32_t id) override;
     bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) override;
     void releaseDepthTarget(std::uint32_t id) override;
@@ -297,6 +306,7 @@ private:
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<PendingFloatCopy> pendingFloatCopies_;
     std::vector<UINT> freeSlots_;
     std::vector<RetiredSlot> retiredSlots_;
     ComPtr<ID3D12DescriptorHeap> texHeap_;
@@ -645,6 +655,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     t.slot = slot;
     t.width = w;
     t.height = h;
+    t.float32 = float32;
     textureBytes_ += std::size_t(total);
     pendingCopies_.push_back(std::move(copy));
     return true;
@@ -706,6 +717,38 @@ void WebappWindow::releaseDepthTarget(std::uint32_t id) {
     depthTargets_.erase(it);
 }
 
+bool WebappWindow::updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                                         std::uint32_t w, std::uint32_t h,
+                                         const std::uint8_t* data, std::size_t bytes) {
+    auto it = textures_.find(id);
+    if (it == textures_.end() || !it->second.float32 || !it->second.resource ||
+        !w || !h || !data || x > it->second.width || y > it->second.height ||
+        w > it->second.width - x || h > it->second.height - y ||
+        bytes != std::size_t(w) * h * 16) return false;
+    // D3D12 requires the row pitch of an upload buffer to be 256-aligned.
+    const UINT rowPitch = (w * 16u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    PendingFloatCopy copy;
+    copy.texture = it->second.resource;
+    copy.x = x; copy.y = y;
+    copy.layout.Offset = 0;
+    copy.layout.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    copy.layout.Footprint.Width = w;
+    copy.layout.Footprint.Height = h;
+    copy.layout.Footprint.Depth = 1;
+    copy.layout.Footprint.RowPitch = rowPitch;
+    copy.staging = uploadBuffer(nullptr, UINT64(rowPitch) * h);
+    std::uint8_t* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    check(copy.staging->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map RGBA32F staging");
+    for (UINT row = 0; row < h; row++)
+        std::memcpy(mapped + UINT64(row) * rowPitch,
+                    data + std::size_t(row) * w * 16, std::size_t(w) * 16);
+    copy.staging->Unmap(0, nullptr);
+    pendingFloatCopies_.push_back(std::move(copy));
+    return true;
+}
+
 void WebappWindow::releaseTexture(std::uint32_t id) {
     auto it = textures_.find(id);
     if (it == textures_.end() || id == 0) return;
@@ -743,7 +786,7 @@ bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId,
 
 // Copies queued texture pixels; runs at the start of a frame's command list.
 void WebappWindow::recordTextureCopies() {
-    if (pendingCopies_.empty()) return;
+    if (pendingCopies_.empty() && pendingFloatCopies_.empty()) return;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     for (auto& c : pendingCopies_) {
         for (UINT m = 0; m < UINT(c.layouts.size()); m++) {
@@ -764,7 +807,8 @@ void WebappWindow::recordTextureCopies() {
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barriers.push_back(b);
     }
-    cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+    if (!barriers.empty())
+        cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
     for (auto& c : pendingCopies_) {
         retire(c.staging);
         // the texture itself stays referenced by textures_ (or is retired there)
@@ -772,6 +816,29 @@ void WebappWindow::recordTextureCopies() {
         retire(keep);
     }
     pendingCopies_.clear();
+    // Update an existing float texture without replacing its SRV descriptor
+    // (critical for many animated bone rows per frame).
+    for (auto& c : pendingFloatCopies_) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = c.texture.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd_->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = c.texture.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        src.pResource = c.staging.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = c.layout;
+        cmd_->CopyTextureRegion(&dst, c.x, c.y, 0, &src, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd_->ResourceBarrier(1, &barrier);
+        retire(c.staging);
+    }
+    pendingFloatCopies_.clear();
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE WebappWindow::textureHandle(std::uint32_t id) const {
