@@ -212,12 +212,29 @@ export async function runWebapp(root, options = {}) {
       view(data, 'texture data');
       let info;
       if (width > 0) {
-        if (data.length < width * height * 4) throw new RangeError('uploadTexture: pixel data too short');
-        info = { w: width, h: height, type: 'rgba' };
+        if ((flags & 4) !== 0) {
+          if (height < 1 || data.byteLength !== width * height * 16)
+            throw new RangeError('RGBA32F must be tightly packed float32 pixels');
+          const v = new DataView(data.buffer,data.byteOffset,data.byteLength);
+          info = {w:width,h:height,type:'rgba32f',first:[0,4,8,12].map(x=>v.getFloat32(x,true)),pixels:new Float32Array(data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength))};
+        } else {
+          if (data.byteLength < width * height * 4) throw new RangeError('uploadTexture: pixel data too short');
+          info = { w: width, h: height, type: 'rgba' };
+        }
       } else info = context.__ntHost.ui.sniffImage(data);
       if (!info) return false;
       rec.textures.set(id, { ...info, flags, bytes: data.length });
       rec.textureUploads = (rec.textureUploads || 0) + 1;
+      return true;
+    },
+    updateFloatTexture(id,x,y,w,h,bytes) {
+      const t=rec.textures.get(id);
+      if (!t || t.type!=='rgba32f' || !w || !h || x+w>t.w || y+h>t.h ||
+          bytes.byteLength!==w*h*16) return false;
+      const v=new Float32Array(bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength));
+      for(let row=0;row<h;row++)
+        t.pixels.set(v.subarray(row*w*4,(row+1)*w*4),((y+row)*t.w+x)*4);
+      rec.floatSubUploads=(rec.floatSubUploads||0)+1;
       return true;
     },
     releaseTexture(id) { rec.textures.delete(id); },
