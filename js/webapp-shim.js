@@ -893,8 +893,26 @@
   // Experimental raw WebGL2 commands -> the EXISTING native DX12 packet
   // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
   // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
-  let nextRawGeometryId = 90000000;
-  let nextRawInstanceId = 95000000;
+  // The native DX12 pass protocol transports IDs in Float32 fields.
+  // Values > 2**24 lose consecutive integer precision (70m/90m/95m
+  // previously caused resource-key aliasing and missing depth targets).
+  // Each resource category gets a separate float32-exact, bounded range.
+  const RAW_TEXTURE_ID_START = 7000000, RAW_TEXTURE_ID_END = 7999999;
+  const RAW_GEOMETRY_ID_START = 9000000, RAW_GEOMETRY_ID_END = 10999999;
+  const RAW_INSTANCE_ID_START = 11000000, RAW_INSTANCE_ID_END = 12999999;
+  let nextRawGeometryId = RAW_GEOMETRY_ID_START;
+  let nextRawInstanceId = RAW_INSTANCE_ID_START;
+  function checkedRawId(id, max, kind) {
+    if (id > max || new Float32Array([id])[0] !== id)
+      throw new RangeError('Native DX12 ' + kind + ' ID range exhausted or not float32-exact: ' + id);
+    return id;
+  }
+  function allocateRawGeometryId() {
+    return checkedRawId(nextRawGeometryId++, RAW_GEOMETRY_ID_END, 'geometry');
+  }
+  function allocateRawInstanceId() {
+    return checkedRawId(nextRawInstanceId++, RAW_INSTANCE_ID_END, 'instance');
+  }
   function makeRawDx12Prototype(canvas) {
     const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
     const G = {
@@ -943,7 +961,10 @@
     // width x (height*N) RGBA8 pixels, or exactly the original JPEG atlas.
     // This preserves layer data; the K73-specific HLSL profile remaps the
     // triplanar layer coordinate, without creating a second GPU backend.
-    let nextRawTextureId = 70000000;
+    let nextRawTextureId = RAW_TEXTURE_ID_START;
+    function allocateRawTextureId() {
+      return checkedRawId(nextRawTextureId++, RAW_TEXTURE_ID_END, 'texture');
+    }
     function boundTexture(target) {
       if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY)
         return unsupportedRaw('texture target 0x' + target.toString(16));
@@ -1231,7 +1252,7 @@
         hasColors ||= !!attrs.get(2)?.enabled;
       }
       if (old) nt.releaseGeometry(old.id);
-      const id = nextRawGeometryId++;
+      const id = allocateRawGeometryId();
       nt.uploadGeometry(id, positions, hasNormals ? normals : null,
         hasColors ? colors : null,
         indexType ? new Uint32Array(vertexIndices) : null, null);
@@ -1359,7 +1380,7 @@
         colors.set([1,1,1,1],i*4);
         uvs.set(uv,i*2);
       }
-      const id=old?.id??nextRawGeometryId++;
+      const id=old?.id??allocateRawGeometryId();
       nt.uploadGeometry(id,positions,normals,colors,indices,uvs);
       state.cache.set(vao,{id,skinKey:baseKey,bones:Float32Array.from(bones),
         morphWeights:morphN?Float32Array.from(morphWeights):null});
@@ -1434,7 +1455,7 @@
         indices[n++] = a; indices[n++] = b; indices[n++] = d;
         indices[n++] = b; indices[n++] = e; indices[n++] = d;
       }
-      const id = state.sky?.id ?? nextRawGeometryId++;
+      const id = state.sky?.id ?? allocateRawGeometryId();
       nt.uploadGeometry(id, positions, null, colors, indices, null);
       state.sky = {id, key, count: indices.length};
       return id;
@@ -1461,7 +1482,7 @@
         pos[i*3+1] = v.getFloat32(4,true);
       }
       if (old) nt.releaseGeometry(old.id);
-      const id = nextRawGeometryId++;
+      const id = allocateRawGeometryId();
       nt.uploadGeometry(id,pos,null,null,null,null);
       state.cache.set(vao,{id,key});
       return id;
@@ -1520,7 +1541,7 @@
           color[1]*(additive?opacity:1), color[2]*(additive?opacity:1)],i*3);
         alphaTotal+=opacity;
       }
-      if(!record) record={id:nextRawInstanceId++};
+      if(!record) record={id:allocateRawInstanceId()};
       nt.uploadInstances(record.id,matrices,colors,count);
       record.count=count;record.key=key;
       // DX12 instance colours currently carry RGB, not individual alphas.
@@ -1560,7 +1581,7 @@
           }
         }
       }
-      if (!old) old = { id: nextRawInstanceId++ };
+      if (!old) old = { id: allocateRawInstanceId() };
       nt.uploadInstances(old.id, matrices, colors, count);
       old.key = key; old.count = count;
       state.instanceCache.set(vao, old);
@@ -1729,7 +1750,7 @@
       },
       uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       createTexture() {
-        const t = { id: nextRawTextureId++, target: null, width: 0, height: 0,
+        const t = { id: allocateRawTextureId(), target: null, width: 0, height: 0,
           layers: 0, version: 0, loaded: false, deleted: false, parameters: new Map() };
         state.liveTextures.add(t);
         return t;
