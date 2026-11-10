@@ -1,36 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,writeFileSync,rmSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {runWebapp} from './helpers/webapp-node-host.mjs';
 
-test('WebGL2 uniform4fv accepts ordinary JS arrays for K73 mesh tints and typed bone subranges',async()=>{
-  const dir=mkdtempSync(join(tmpdir(),'k73-uniform-sequence-'));
-  try {
-    const js=[
-      "const gl=document.getElementById('gl').getContext('webgl2');",
-      "function shader(t,src){const s=gl.createShader(t);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}",
-      "const p=gl.createProgram();",
-      "gl.attachShader(p,shader(gl.VERTEX_SHADER,'#version 300 es\\nlayout(location=0) in vec3 aPos;void main(){gl_Position=vec4(aPos,1.0);}'));",
-      "gl.attachShader(p,shader(gl.FRAGMENT_SHADER,'#version 300 es\\nprecision mediump float;out vec4 oC;void main(){oC=vec4(1.0);}'));",
-      "gl.linkProgram(p);if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(p));",
-      "gl.useProgram(p);",
-      "gl.uniform4fv(gl.getUniformLocation(p,'uTint'),[0.25,0.5,0.75,1]);",
-      "window.tint=Array.from(p.uniforms.get('uTint'));",
-      "gl.uniform4fv(gl.getUniformLocation(p,'uB'),new Float32Array([100,101,102,103, 2,3,4,5, 6,7,8,9]),4,8);",
-      "window.bones=Array.from(p.uniforms.get('uB'));",
-      "gl.uniform4fv(gl.getUniformLocation(p,'uArray'),[8,9,10,11,12,13,14,15],4,4);",
-      "window.arrayOffset=Array.from(p.uniforms.get('uArray'));",
-      "window.invalidRejected=false;try{gl.uniform4fv(gl.getUniformLocation(p,'uWrong'),[1,2,3]);}catch(e){window.invalidRejected=true;}"
-    ].join('\n');
-    writeFileSync(join(dir,'index.html'),'<!doctype html><title>K73 uniform4fv array support</title><canvas id="gl" data-native-webgl2-prototype width="640" height="480"></canvas><script>'+js+'</script>');
-    const {context,status}=await runWebapp(dir,{frames:2});
-    assert.equal(status.bootError,null);
-    assert.deepEqual(status.errors,[]);
-    assert.deepEqual(Array.from(context.tint),[0.25,0.5,0.75,1]);
-    assert.deepEqual(Array.from(context.bones),[2,3,4,5,6,7,8,9]);
-    assert.deepEqual(Array.from(context.arrayOffset),[12,13,14,15]);
-    assert.equal(context.invalidRejected,true);
-  }finally{rmSync(dir,{recursive:true,force:true});}
+// Reuse a fixture with the real K73 v86 LIT shaders; this tests the native
+// WebGL2 uniform contract, not an arbitrary unsupported GLSL program.
+const k73=fileURLToPath(new URL('./fixtures/k73-real-lit-dx12',import.meta.url));
+test('WebGL2 uniform4fv accepts JS array tints and typed bone offsets',async()=>{
+  const {context,status}=await runWebapp(k73,{frames:2});
+  assert.equal(status.bootError,null);assert.deepEqual(status.errors,[]);
+  const result=context.__nt.evalScript([
+    "gl.uniform4fv(gl.getUniformLocation(program,'uTint'),[0.25,0.5,0.75,1]);",
+    "const a=Array.from(program.uniforms.get('uTint'));",
+    "gl.uniform4fv(gl.getUniformLocation(program,'uB'),new Float32Array([100,101,102,103,2,3,4,5,6,7,8,9]),4,8);",
+    "const b=Array.from(program.uniforms.get('uB'));",
+    "gl.uniform4fv(gl.getUniformLocation(program,'uOther'),[8,9,10,11,12,13,14,15],4,4);",
+    "const c=Array.from(program.uniforms.get('uOther'));",
+    "let rejected=false;try{gl.uniform4fv(gl.getUniformLocation(program,'uBad'),[1,2,3]);}catch(e){rejected=true;}",
+    "({a,b,c,rejected});"
+  ].join('\n'),'k73-uniform4fv-inline.js');
+  assert.deepEqual(Array.from(result.a),[0.25,0.5,0.75,1]);
+  assert.deepEqual(Array.from(result.b),[2,3,4,5,6,7,8,9]);
+  assert.deepEqual(Array.from(result.c),[12,13,14,15]);
+  assert.equal(result.rejected,true);
 });
