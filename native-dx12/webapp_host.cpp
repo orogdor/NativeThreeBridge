@@ -369,6 +369,20 @@ JSValue jsReleaseDepthTarget(JSContext* ctx, JSValueConst, int argc, JSValueCons
         self->sink->releaseDepthTarget(id);
     return JS_UNDEFINED;
 }
+JSValue jsUpdateFloatTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 6) return JS_ThrowTypeError(ctx, "updateFloatTexture(id,x,y,w,h,bytes)");
+    std::uint32_t id=0,x=0,y=0,w=0,h=0;
+    if (JS_ToUint32(ctx,&id,argv[0]) < 0 || JS_ToUint32(ctx,&x,argv[1]) < 0 ||
+        JS_ToUint32(ctx,&y,argv[2]) < 0 || JS_ToUint32(ctx,&w,argv[3]) < 0 ||
+        JS_ToUint32(ctx,&h,argv[4]) < 0) return JS_EXCEPTION;
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+    if (!typedView(ctx,argv[5],data,bytes,false,"RGBA32F update bytes")) return JS_EXCEPTION;
+    if (!w || !h || w > 4096 || h > 1024 || bytes != std::size_t(w)*h*16)
+        return JS_ThrowRangeError(ctx,"Invalid RGBA32F subrectangle payload");
+    return JS_NewBool(ctx,self->sink && self->sink->updateFloatTexture(id,x,y,w,h,data,bytes));
+}
 JSValue jsReleaseTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     std::uint32_t id = 0;
@@ -579,7 +593,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"evalScript", jsEvalScript, 2}, {"evalModule", jsEvalModule, 2},
         {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
-        {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
+        {"uploadTexture", jsUploadTexture, 5}, {"updateFloatTexture", jsUpdateFloatTexture, 6},
+        {"releaseTexture", jsReleaseTexture, 1},
         {"allocateDepthTarget", jsAllocateDepthTarget, 3}, {"releaseDepthTarget", jsReleaseDepthTarget, 1},
         {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
