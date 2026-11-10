@@ -916,12 +916,22 @@
       COMPARE_REF_TO_TEXTURE: 0x884e, TEXTURE_COMPARE_FUNC: 0x884d, LEQUAL: 0x0203,
       FRAMEBUFFER: 0x8d40, DEPTH_ATTACHMENT: 0x8d00,
       FRAMEBUFFER_COMPLETE: 0x8cd5, FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 0x8cd6,
+      DEPTH_TEST: 0x0b71, CULL_FACE: 0x0b44, BLEND: 0x0be2,
+      POLYGON_OFFSET_FILL: 0x8037,
+      ZERO: 0, ONE: 1, SRC_ALPHA: 0x0302, ONE_MINUS_SRC_ALPHA: 0x0303,
+      FRONT: 0x0404, BACK: 0x0405, CCW: 0x0901, CW: 0x0900,
     };
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
       program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
       activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
       liveTextures: new Set(), textureUploads: 0, depthAllocations: 0,
       framebuffers: new Set(), framebuffer: null,
+      // WebGL2 initial raster state. These values feed the DX12 PSO flags
+      // rather than silently treating all draw calls alike.
+      capabilities: new Set(), depthWrite: true,
+      blendSrc: G.ONE, blendDst: G.ZERO,
+      cullMode: G.BACK, frontWinding: G.CCW,
+      polygonFactor: 0, polygonUnits: 0,
       instanceCache: new WeakMap(), sky: null };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
@@ -1425,10 +1435,19 @@
       packet[o + 2] = instances?.count || 1;
       const hasColors = !!state.vao.attributes.get(2)?.enabled;
       const atlas = useLight ? k73MaterialAtlas() : null;
-      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (instances ? 1024 : 0) |
-        (atlas ? 4096 | 1048576 : 0) :
-        sky ? (16 | 8 | 32 | 64 | 65536 | 2) :
-        particle ? (1 | 2 | 16 | 32 | 1024 | 65536) : 16 | 2 | 64;
+      const raster = sky ? (2 | 32 | 64) :
+        (!state.capabilities.has(G.CULL_FACE) ? 2 : (state.cullMode === G.FRONT ? 4 : 0)) |
+        (!state.capabilities.has(G.DEPTH_TEST) ? 64 : 0) |
+        (!state.depthWrite ? 32 : 0) |
+        (state.capabilities.has(G.BLEND) ? 1 : 0) |
+        (state.capabilities.has(G.BLEND) && state.blendSrc === G.ONE &&
+         state.blendDst === G.ONE ? 4194304 : 0) |
+        (state.capabilities.has(G.POLYGON_OFFSET_FILL) ? 8388608 : 0) |
+        (state.frontWinding === G.CW ? 16777216 : 0);
+      packet[o + 3] = (useLight ? ((hasColors ? 8 : 0) | (instances ? 1024 : 0) |
+        (atlas ? 4096 | 1048576 : 0)) :
+        sky ? (16 | 8 | 65536) :
+        particle ? (16 | 1024 | 65536) : 16) | raster;
       if (atlas) {
         packet[o + 32] = atlas.id;         // Native DX12 texture slot
         packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
@@ -1717,6 +1736,43 @@
         const g = state.cache.get(vao);
         if (g) { nt.releaseGeometry(g.id); state.cache.delete(vao); }
         if (state.vao === vao) state.vao = { attributes: new Map(), elements: null };
+      },
+      enable(cap) {
+        if (![G.DEPTH_TEST, G.CULL_FACE, G.BLEND, G.POLYGON_OFFSET_FILL].includes(cap))
+          return unsupportedRaw('enable capability ' + cap);
+        state.capabilities.add(cap);
+      },
+      disable(cap) {
+        if (![G.DEPTH_TEST, G.CULL_FACE, G.BLEND, G.POLYGON_OFFSET_FILL].includes(cap))
+          return unsupportedRaw('disable capability ' + cap);
+        state.capabilities.delete(cap);
+      },
+      isEnabled(cap) { return state.capabilities.has(cap); },
+      depthMask(value) { state.depthWrite = !!value; },
+      cullFace(mode) {
+        if (mode !== G.BACK && mode !== G.FRONT) return unsupportedRaw('cullFace mode');
+        state.cullMode = mode;
+      },
+      frontFace(mode) {
+        if (mode !== G.CCW && mode !== G.CW) return unsupportedRaw('frontFace mode');
+        state.frontWinding = mode;
+      },
+      blendFunc(src, dst) {
+        if (!((src === G.SRC_ALPHA && dst === G.ONE_MINUS_SRC_ALPHA) ||
+              (src === G.ONE && dst === G.ONE) ||
+              (src === G.ONE && dst === G.ZERO)))
+          return unsupportedRaw('blendFunc combination');
+        state.blendSrc = src; state.blendDst = dst;
+      },
+      polygonOffset(factor, units) {
+        if (!Number.isFinite(factor) || !Number.isFinite(units))
+          return unsupportedRaw('polygonOffset non-finite');
+        // K73 only enables polygon offset during its depth-only shadow pass.
+        // Native DX12 uses its fixed DepthBias/SlopeScaledDepthBias profile.
+        state.polygonFactor = factor; state.polygonUnits = units;
+        if (factor !== 1.6 || units !== 3)
+          unsupported('K73 polygon offset approximation',
+            'Native D3D12 depth bias currently uses the K73 shadow profile factor=1.6, units=3');
       },
       viewport(x, y, w, h) {
         const target = state.framebuffer?.depth;
