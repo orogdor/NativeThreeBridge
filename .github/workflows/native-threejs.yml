@@ -400,6 +400,23 @@ jobs:
             release/NativeThreeBridge-Windows-x64.zip
             release/NativeThreeBridge-Engine-x64.zip
             release/engine-update-v2.json
+      - name: Publish isolated UI/3D cadence experiment (never replace stable updater release)
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'experiments/2d3d-')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          $v = (Get-Content version.txt -Raw).Trim()
+          $tag = "v$v-ui-cadence-test"
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { throw "Could not replace previous UI cadence test release" }
+          }
+          gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – isolated UI/3D cadence experiment" --notes "Experimental build from PR #$env:PR_NUMBER ($env:HEAD_SHA). Run in a SEPARATE test folder. 3D game frames are unrestricted; 2D CSS/UI refresh defaults to 30 Hz using cached pixels. Set NATIVE_THREE_UI_HZ=0 to use original every-frame UI as an A/B baseline. This is a staged cadence split, NOT a threaded implementation. Do not run UpdateEngine.exe from the test copy: stable updates deliberately ignore this prerelease. Unmodified v0.32.15 source preserved in backup/pre-2d3d-split-v03215-20261110."
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence test prerelease failed" }
       - name: Publish stable release (only after Windows tests succeed)
         if: github.ref == 'refs/heads/main'
         shell: pwsh
