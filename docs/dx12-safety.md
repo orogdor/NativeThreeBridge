@@ -13,6 +13,7 @@ On 10 November 2026, a K73 DX12 session on an RTX 2080 Super coincided with a Wi
 - **Bounded waits**: CPU fence waits time out after 5 seconds rather than waiting indefinitely. An expired wait logs the stage and DRED information and exits the process. This **cannot guarantee prevention of a kernel bugcheck**.
 - **Device removal**: `Present`, fence signaling and completed-frame checks inspect failing HRESULTs / `GetDeviceRemovedReason`. DRED auto-breadcrumb and GPU page-fault collection is configured before device creation and logged if the graphics driver reports a lost device. DRED information may be absent when a system crashes abruptly.
 - **Opt-in diagnostic mode**: `NATIVETHREE_DX12_DEBUG=1` enables the D3D12 debug layer if installed. This can be slow; do not enable it automatically in production.
+- **Opt-in flight recorder**: `NATIVETHREE_DX12_FLIGHTLOG=1` flushes one `before-submit` and one `submitted` record per DX12 frame with draw counts, GPU-work budget, live texture usage and fence values. This records **CPU submission progress**, not proof a specific command finished executing on the GPU. Logging every frame incurs I/O overhead and cannot necessarily flush through a hard BSOD.
 - **Software adapter**: `NATIVETHREE_DX12_WARP=1` selects the Microsoft WARP software adapter, bypassing the discrete NVIDIA GPU for rendering. This only works with an EXE built **after** the safety implementation. WARP still uses CPU/RAM, so it does not guarantee that a machine with unstable RAM cannot crash.
 
 ## Safe validation order
