@@ -13,9 +13,15 @@ test('RG8B8 Texture2D pixel data is GPU-uploaded and sampled by existing DX12 sa
   assert.equal(context.textureStatus.nativeUploadCount, 1, 'only 2D texture uploaded; 2-layer array CPU staging');
   assert.equal(context.textureStatus.stackDepth, 2);
   assert.deepEqual([...context.textureStatus.stackSecondPixel], [128, 80, 60, 255]);
-  assert.equal(rec.textureUploads, 1);
-  assert.equal(rec.textures.size, 1);
-  const tex = [...rec.textures.values()][0];
+  assert.equal(context.textureStatus.encodedAtlasUploaded, true);
+  assert.equal(context.textureStatus.encodedAtlasStoredAs2D, true,
+    'encoded JPEG/PNG layers are DX12 2D strip until native Texture2DArray is implemented');
+  assert.equal(context.textureStatus.encodedAtlasDepth, 2);
+  assert.equal(rec.textureUploads, 2);
+  assert.equal(rec.textures.size, 2);
+  const tex = [...rec.textures.values()].find(t => t.type === 'rgba');
+  const png = [...rec.textures.values()].find(t => t.type === 'png');
+  assert.deepEqual([png.w, png.h], [2, 4]);
   assert.deepEqual([tex.w, tex.h, tex.bytes], [2, 2, 16]);
   assert.equal(rec.uploads, 1);
   const geo = [...rec.geometries.values()][0];
