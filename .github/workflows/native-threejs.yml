@@ -119,6 +119,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on QuickJS" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-dynamic-scripts 0 expect-dynamic-scripts
           if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on V8" }
+          # First real raw-WebGL2 -> the same DX12 packet sink as Three.js.
+          # Opt-in only; exercise both JS engines with 300 live frames and
+          # require nonzero geometry uploads and draws, not an empty window.
+          & .\build\Release\WebappSmoke.exe test/fixtures/raw-webgl2-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/raw-webgl2-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
