@@ -1080,14 +1080,18 @@
       },
       deleteVertexArray() {},
       viewport(x, y, w, h) {
-        if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
+        if (state.framebuffer) return; // shadow/post viewport, target not yet implemented
+        if (x || y || w !== canvas.width || h !== canvas.height)
+          nt.log('warn', '[K73 DX12 prototype] default-framebuffer viewport adjusted to canvas size');
       },
       clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
       clear(mask) {
+        if (state.framebuffer) return;
         if (mask & G.COLOR_BUFFER_BIT) state.clearFlags |= 1;
         if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
       },
       drawArrays(mode, first, count) {
+        if (state.framebuffer) return; // do not present shadow passes as colour
         if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
         const id = upload(first, count), packet = new Float32Array(64 + 56), o = 64;
