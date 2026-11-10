@@ -539,6 +539,23 @@ void ntReleaseDepthTarget(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseDepthTarget(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntUpdateFloatTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 6) return self->throwError("type", "updateFloatTexture(id,x,y,w,h,bytes)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const auto id = info[0]->Uint32Value(ctx).FromMaybe(0);
+    const auto x = info[1]->Uint32Value(ctx).FromMaybe(0);
+    const auto y = info[2]->Uint32Value(ctx).FromMaybe(0);
+    const auto w = info[3]->Uint32Value(ctx).FromMaybe(0);
+    const auto h = info[4]->Uint32Value(ctx).FromMaybe(0);
+    const std::uint8_t* data = nullptr;
+    std::size_t bytes = 0;
+    if (!typedView(self, info[5], data, bytes, false, "RGBA32F update bytes")) return;
+    if (!w || !h || w > 4096 || h > 1024 || bytes != std::size_t(w) * h * 16)
+        return self->throwError("range", "Invalid RGBA32F subrectangle payload");
+    info.GetReturnValue().Set(bool(self->sink &&
+        self->sink->updateFloatTexture(id, x, y, w, h, data, bytes)));
+}
 void ntReleaseTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() >= 1 && self->sink)
@@ -689,7 +706,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
         {"registerColorPatch", ntRegisterColorPatch},
-        {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture},
+        {"uploadTexture", ntUploadTexture}, {"updateFloatTexture", ntUpdateFloatTexture},
+        {"releaseTexture", ntReleaseTexture},
         {"allocateDepthTarget", ntAllocateDepthTarget}, {"releaseDepthTarget", ntReleaseDepthTarget},
         {"uploadCanvasTexture", ntUploadCanvasTexture},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
