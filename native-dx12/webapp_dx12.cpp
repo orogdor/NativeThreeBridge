@@ -286,6 +286,8 @@ private:
     int logErrors_ = 0;
     unsigned invalidPacketWarnings_ = 0;
     unsigned invalidDrawWarnings_ = 0;
+    bool flightLog_ = false;
+    UINT64 submissionSerial_ = 0;
     bool bootDialogShown_ = false;
 
     D3D12_CPU_DESCRIPTOR_HANDLE depthViewHandle(UINT slot) const {
@@ -485,6 +487,11 @@ void WebappWindow::initDevice() {
         dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
     }
+    char trace[8] = {};
+    flightLog_ = GetEnvironmentVariableA("NATIVETHREE_DX12_FLIGHTLOG", trace, sizeof trace) > 0 &&
+                 std::strcmp(trace, "1") == 0;
+    if (flightLog_)
+        log("info", "[dx12-safety] GPU submission flight recorder enabled (file flush per submission)");
     char warp[8] = {};
     const bool forceWarp = GetEnvironmentVariableA("NATIVETHREE_DX12_WARP", warp, sizeof warp) > 0 &&
                            std::strcmp(warp, "1") == 0;
@@ -1594,6 +1601,16 @@ void WebappWindow::renderFrame() {
     cmd_->ResourceBarrier(1, &barrier);
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
+    const UINT64 serial = ++submissionSerial_;
+    if (flightLog_) {
+        char state[280];
+        std::snprintf(state, sizeof state,
+            "[dx12-flight] before-submit #%llu: backbuffer=%u passes=%zu draws=%u vertexWork=%llu geometries=%zu instances=%zu textureUploadMiB=%zu",
+            static_cast<unsigned long long>(serial), frame, passes_.size(), drawsThisFrame,
+            static_cast<unsigned long long>(vertexWorkThisFrame),
+            geometries_.size(), instances_.size(), textureBytes_ / (1024 * 1024));
+        log("info", state);
+    }
     queue_->ExecuteCommandLists(1, lists);
     const auto presentStart = std::chrono::steady_clock::now();
     const HRESULT present = swap_->Present(1, 0);
@@ -1603,6 +1620,14 @@ void WebappWindow::renderFrame() {
     check(queue_->Signal(fence_.Get(), frameFence_[frame]), "Signal frame fence");
     const HRESULT removed = device_->GetDeviceRemovedReason();
     if (FAILED(removed)) check(removed, "GPU device lost after submission");
+    if (flightLog_) {
+        char state[160];
+        std::snprintf(state, sizeof state,
+                      "[dx12-flight] submitted #%llu: fence=%llu Present OK (GPU completion not implied)",
+                      static_cast<unsigned long long>(serial),
+                      static_cast<unsigned long long>(frameFence_[frame]));
+        log("info", state);
+    }
 }
 
 void WebappWindow::updateTitle(double fps) {
