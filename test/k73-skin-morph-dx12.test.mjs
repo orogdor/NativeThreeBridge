@@ -7,7 +7,7 @@ import {fileURLToPath} from 'node:url';
 import {runWebapp} from './helpers/webapp-node-host.mjs';
 
 test('K73 SKIN morph texture offsets are read as RGBA32F before weighted bone transforms', async()=>{
- const source=readFileSync(fileURLToPath(new URL('./fixtures/k73-real-skin-dx12/index.html',import.meta.url)),'utf8');
+ const source=readFileSync(fileURLToPath(new URL('./fixtures/k73-real-skin-dx12/index.html',import.meta.url)),'utf8').replace(/\r\n/g,'\n');
  const dir=mkdtempSync(join(tmpdir(),'k73-morph-'));
  try {
    const a="gl.uniform1i(gl.getUniformLocation(lit,'uMorphN'),0);\ngl.uniform4fv(gl.getUniformLocation(lit,'uMW'),new Float32Array(8));";
