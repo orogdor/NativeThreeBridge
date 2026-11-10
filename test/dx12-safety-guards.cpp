@@ -37,6 +37,18 @@ int main() {
     assert(s::validTextureDimensions(2048,2048,4));
     assert(!s::validTextureDimensions(16384,16384,4));
     assert(!s::validTextureDimensions(8192,8192,16));
+    assert(s::reserveTextureBudget(512ull * 1024 * 1024, 0, 256ull * 1024 * 1024));
+    assert(!s::reserveTextureBudget(1024ull * 1024 * 1024, 0, 1));
+    assert(s::reserveTextureBudget(1024ull * 1024 * 1024, 256ull * 1024 * 1024, 256ull * 1024 * 1024));
+    assert(!s::reserveTextureBudget(1, 2, 0));
+    std::uint64_t vertexWork = 0;
+    assert(s::chargeDrawWork(vertexWork, 3'000'000, 5));
+    assert(vertexWork == 15'000'000);
+    assert(!s::chargeDrawWork(vertexWork, 6'000'000, 10));
+    assert(vertexWork == 15'000'000);
+    assert(s::chargeDrawWork(vertexWork, 7'000'000, 5));
+    assert(vertexWork == s::kMaxVertexInvocationsPerFrame);
+    assert(!s::chargeDrawWork(vertexWork, 1, 1));
     assert(s::validBufferBytes(1024));
     assert(!s::validBufferBytes(s::kMaxBufferBytes+1));
 }
