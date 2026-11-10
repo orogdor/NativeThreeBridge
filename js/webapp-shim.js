@@ -979,6 +979,161 @@
       state.cache.set(attr, { id, key });
       return id;
     }
+    // K73 shader input contract -> existing DX12 geometry buffers/pass packets.
+    // The K73 GLSL lighting/material code is not executed yet: the shader
+    // family maps to the engine's generic HLSL material and directional light.
+    // This path preserves actual indexed positions, normals, vertex colours,
+    // uVP/uModel, tint, alpha and (where present) instance transforms.
+    let nextMeshInstanceId = 80000000;
+    const k73Geometry = new WeakMap(), k73Instances = new WeakMap();
+    const GLTYPE = { FLOAT: 0x1406, UBYTE: 0x1401, BYTE: 0x1400, USHORT: 0x1403, SHORT: 0x1402, UINT: 0x1405 };
+    const bytesPer = (type) => type === GLTYPE.FLOAT || type === GLTYPE.UINT ? 4 :
+      type === GLTYPE.USHORT || type === GLTYPE.SHORT ? 2 : 1;
+    function attrValue(attr, vertex, component) {
+      if (!attr?.buffer?.data || !attr.enabled) return component === 3 ? 1 : 0;
+      const src = attr.buffer.data;
+      const bytes = bytesPer(attr.type), stride = attr.stride || attr.size * bytes;
+      const at = attr.offset + stride * vertex + bytes * component;
+      if (at < 0 || at + bytes > src.byteLength) throw RangeError('K73 vertex attribute outside buffer');
+      const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+      let value;
+      switch (attr.type) {
+        case GLTYPE.FLOAT: value = view.getFloat32(at, true); break;
+        case GLTYPE.UBYTE: value = view.getUint8(at); break;
+        case GLTYPE.BYTE: value = view.getInt8(at); break;
+        case GLTYPE.USHORT: value = view.getUint16(at, true); break;
+        case GLTYPE.SHORT: value = view.getInt16(at, true); break;
+        case GLTYPE.UINT: value = view.getUint32(at, true); break;
+        default: throw Error('Unsupported K73 vertex attribute type 0x' + attr.type.toString(16));
+      }
+      if (attr.normalized) {
+        if (attr.type === GLTYPE.UBYTE) return value / 255;
+        if (attr.type === GLTYPE.BYTE) return Math.max(-1, value / 127);
+        if (attr.type === GLTYPE.USHORT) return value / 65535;
+        if (attr.type === GLTYPE.SHORT) return Math.max(-1, value / 32767);
+      }
+      return value;
+    }
+    function k73Record(indexed) {
+      const vao = state.vao, pos = vao.attributes.get(0), nor = vao.attributes.get(1),
+        col = vao.attributes.get(2), ib = vao.indexBuffer;
+      if (!pos?.buffer?.data || !pos.enabled || pos.type !== GLTYPE.FLOAT)
+        throw Error('K73 DX12: missing FLOAT position attribute');
+      if (indexed && !ib?.data) throw Error('K73 DX12: drawElements missing index buffer');
+      if (pos.divisor) throw Error('K73 DX12: position attribute may not be instanced');
+      const stride = pos.stride || pos.size * 4, vertexCount = Math.floor(
+        (pos.buffer.data.byteLength - pos.offset - pos.size * 4) / stride) + 1;
+      if (vertexCount < 3 || vertexCount > 2500000) throw RangeError('K73 DX12: vertex count invalid');
+      const indexData = indexed ? ib.data : null;
+      if (indexed && !(indexData instanceof Uint16Array || indexData instanceof Uint32Array))
+        throw Error('K73 DX12: only Uint16/Uint32 indices are supported');
+      const key = [pos.buffer.version, nor?.buffer?.version, col?.buffer?.version,
+        ib?.version, vertexCount, indexed ? indexData.length : 0, indexed, pos.size, nor?.size, col?.size].join(':');
+      const cached = k73Geometry.get(vao);
+      if (cached?.key === key) return cached;
+      const positions = new Float32Array(vertexCount * 3);
+      const normals = nor?.enabled ? new Float32Array(vertexCount * 3) : null;
+      const colors = col?.enabled ? new Float32Array(vertexCount * 4) : null;
+      for (let i = 0; i < vertexCount; i++) {
+        for (let c = 0; c < Math.min(pos.size, 3); c++) positions[i * 3 + c] = attrValue(pos, i, c);
+        if (normals) for (let c = 0; c < Math.min(nor.size, 3); c++) normals[i * 3 + c] = attrValue(nor, i, c);
+        if (colors) {
+          for (let c = 0; c < 3; c++) colors[i * 4 + c] = c < col.size ? attrValue(col, i, c) : 1;
+          // K73 stores MATERIAL-ID in aCol.a. This must not turn into alpha.
+          colors[i * 4 + 3] = 1;
+        }
+      }
+      const indices = indexData ? Uint32Array.from(indexData) : null;
+      if (indices?.some(i => i >= vertexCount)) throw RangeError('K73 DX12: index out of bounds');
+      if (cached) nt.releaseGeometry(cached.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, normals, colors, indices, null);
+      const rec = { id, key, indexed, vertexCount, indexCount: indices?.length || 0, vertexColors: !!colors };
+      k73Geometry.set(vao, rec);
+      return rec;
+    }
+    function k73InstanceSet(count) {
+      const vao = state.vao, attr = vao.attributes.get(3);
+      if (!attr?.buffer?.data || attr.divisor !== 1)
+        throw Error('K73 DX12: missing instance matrix data');
+      const key = [attr.buffer.version, count].join(':');
+      const cached = k73Instances.get(vao);
+      if (cached?.key === key) return cached;
+      const matrices = new Float32Array(count * 16);
+      const colors = new Float32Array(count * 3);
+      const cols = vao.attributes.get(7);
+      for (let i = 0; i < count; i++) {
+        for (let r = 0; r < 4; r++) {
+          const a = vao.attributes.get(3 + r);
+          for (let c = 0; c < 4; c++) matrices[i * 16 + r * 4 + c] = attrValue(a, i, c);
+        }
+        for (let c = 0; c < 3; c++) colors[i * 3 + c] = cols ? attrValue(cols, i, c) : 1;
+      }
+      const id = cached?.id || nextMeshInstanceId++;
+      nt.uploadInstances(id, matrices, colors, count);
+      const rec = { id, key };
+      k73Instances.set(vao, rec);
+      return rec;
+    }
+    function k73Submit(indexed, first, count, instanceCount = 1) {
+      if (state.framebuffer) return; // no shadow/render-to-texture presentation
+      const program = state.program;
+      if (!program?.linked) throw Error('K73 DX12: program not linked');
+      if (program.kind === 'k73-particle-vertex')
+        return; // particle shaders need billboard expansion, not yet translated
+      const rec = k73Record(indexed);
+      if (first + count > (indexed ? rec.indexCount : rec.vertexCount))
+        throw RangeError('K73 DX12: draw count exceeds uploaded geometry');
+      const isLit = program.kind === 'k73-lit-vertex';
+      const isSky = program.kind === 'k73-sky-vertex';
+      const inst = instanceCount > 1 ? k73InstanceSet(instanceCount) : null;
+      const lights = isLit ? 1 : 0, off = 64 + lights * 16;
+      const p = new Float32Array(off + 56), uniforms = program.uniforms;
+      const vp = uniforms.get('uVP'), model = uniforms.get('uModel');
+      p.set(ID, 0); p.set(vp?.length === 16 && !isSky ? vp : ID, 16);
+      p[32] = uniforms.get('uCam')?.[0] || 0;
+      p[33] = uniforms.get('uCam')?.[1] || 0;
+      p[34] = uniforms.get('uCam')?.[2] || 0;
+      p[35] = lights;
+      p.set(state.clear, 36);
+      const ambient = uniforms.get('uSkyCol') || [0.5, 0.55, 0.6];
+      if (isLit) {
+        p[40] = ambient[0] * 0.4; p[41] = ambient[1] * 0.4; p[42] = ambient[2] * 0.4;
+        p[64] = 3;
+        const sun = uniforms.get('uSunCol') || [1, 1, 1];
+        const dir = uniforms.get('uSunDir') || [0.5, 0.7, 0.2];
+        p[65] = sun[0]; p[66] = sun[1]; p[67] = sun[2];
+        p[72] = -dir[0]; p[73] = -dir[1]; p[74] = -dir[2];
+      }
+      p[43] = 1;
+      p[44] = state.clearFlags;
+      p[45] = canvas.width; p[46] = canvas.height;
+      p[47] = 1;
+      p[off] = rec.id;
+      p[off + 1] = inst?.id || 0;
+      p[off + 2] = instanceCount;
+      let flags = 2; // double sided; culling not yet translated
+      if (isSky) flags |= 16 | 64; // sky is unlit and ignores depth test
+      if (rec.vertexColors) flags |= 8;
+      if (inst) flags |= 1024;
+      p[off + 3] = flags;
+      p[off + 4] = first; p[off + 5] = count;
+      p[off + 6] = 1; // roughness
+      const tint = uniforms.get('uTint') || [1, 1, 1, 1];
+      const sky = uniforms.get('uHor') || [0.45, 0.55, 0.7];
+      const c = isSky ? sky : tint;
+      p[off + 8] = c[0]; p[off + 9] = c[1]; p[off + 10] = c[2];
+      p[off + 11] = uniforms.get('uAlpha') ?? 1;
+      p[off + 12] = (uniforms.get('uEmis') || [0, 0, 0])[0];
+      p[off + 13] = (uniforms.get('uEmis') || [0, 0, 0])[1];
+      p[off + 14] = (uniforms.get('uEmis') || [0, 0, 0])[2];
+      p[off + 15] = -1; // physical model
+      p.set(model?.length === 16 && !inst ? model : ID, off + 16);
+      p[off + 34] = 1; p[off + 37] = 1; // UV identity
+      state.clearFlags = 0;
+      nt.submitPass(p, p.length);
+      state.draws++;
+    }
     const gl = {
       ...G, canvas,
       get drawingBufferWidth() { return canvas.width; },
@@ -1091,6 +1246,11 @@
         if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
       },
       drawArrays(mode, first, count) {
+        if (state.program?.kind?.startsWith('k73-')) {
+          if (mode !== G.TRIANGLES) return unsupportedRaw('K73 drawArrays mode');
+          k73Submit(false, first, count);
+          return;
+        }
         if (state.framebuffer) return; // do not present shadow passes as colour
         if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
@@ -1108,6 +1268,23 @@
         state.clearFlags = 0;
         nt.submitPass(packet, packet.length);
         state.draws++;
+      },
+      drawElements(mode, count, indexType, byteOffset) {
+        if (mode !== G.TRIANGLES || count < 0 || count % 3)
+          return unsupportedRaw('K73 drawElements primitive');
+        const indexSize = indexType === 0x1405 ? 4 : indexType === 0x1403 ? 2 : 0;
+        if (!indexSize || byteOffset % indexSize) return unsupportedRaw('drawElements index type/offset');
+        k73Submit(true, byteOffset / indexSize, count);
+      },
+      drawElementsInstanced(mode, count, type, byteOffset, instances) {
+        if (mode !== G.TRIANGLES || count % 3) return unsupportedRaw('K73 drawElementsInstanced primitive');
+        const stride = type === 0x1405 ? 4 : type === 0x1403 ? 2 : 0;
+        if (!stride || byteOffset % stride) return unsupportedRaw('K73 drawElementsInstanced index type');
+        if (instances > 0) k73Submit(true, byteOffset / stride, count, instances);
+      },
+      drawArraysInstanced(mode, first, count, instances) {
+        if (mode !== G.TRIANGLES || count % 3) return unsupportedRaw('K73 drawArraysInstanced primitive');
+        if (instances > 0) k73Submit(false, first, count, instances);
       },
       get __nativeDraws() { return state.draws; },
     };
