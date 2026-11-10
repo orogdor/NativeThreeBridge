@@ -226,6 +226,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Kuningriigid checkout failed" }
           & .\build\Release\WebappSmokeV8.exe kuningriigid-check 1
           if ($LASTEXITCODE -ne 0) { throw "Kuningriigid did not run cleanly on V8 (exit $LASTEXITCODE)" }
+      - name: K73 compatibility smoke - real WebGL2 game loads until the known graphics blocker
+        shell: pwsh
+        env:
+          CI: '1'
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git clone --depth 1 https://github.com/orogdor/game.git k73-compat-check
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check out K73" }
+          & .\build\Release\WebappSmokeV8.exe k73-compat-check 0 expect-webgl2-blocker
+          if ($LASTEXITCODE -ne 0) { throw "K73 failed before reaching its expected WebGL2 blocker" }
       - name: Set up .NET 8 for the updaters
         uses: actions/setup-dotnet@v4
         with:
