@@ -356,6 +356,65 @@
     abort(reason = new Error('AbortError')) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = reason; this.signal.dispatchEvent(new Event('abort')); }
   }
 
+  // Dynamic <script src=...> loading, shared by V8 and QuickJS.
+  // A classic script appended by a loader must execute and fire 'load', or
+  // Promise.all(loadScript(...)) applications (including K73) never boot.
+  // Defer until the current JavaScript job finishes and retain insertion order
+  // even when each script has .async=false assigned as a DOM property.
+  const dynamicScriptQueue = [];
+  let parsingInitialDocument = false;
+  let dynamicScriptsRunning = false;
+  let dynamicScriptCount = 0;
+  function queueConnectedScripts(node) {
+    if (parsingInitialDocument || !node.isConnected) return;
+    const visit = (n) => {
+      if (n.nodeType === 1 && n.localName === 'script' && !n._ntScriptStarted) {
+        n._ntScriptStarted = true;
+        dynamicScriptQueue.push(n);
+      } else {
+        for (const c of n.childNodes || []) visit(c);
+      }
+    };
+    visit(node);
+    if (dynamicScriptQueue.length && !dynamicScriptsRunning) {
+      Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+  async function drainDynamicScripts() {
+    if (dynamicScriptsRunning) return;
+    dynamicScriptsRunning = true;
+    try {
+      while (dynamicScriptQueue.length) {
+        const element = dynamicScriptQueue.shift();
+        const type = (element.getAttribute('type') || '').trim().toLowerCase();
+        // JSON/import maps and data scripts are not JavaScript.
+        if (type && !['text/javascript', 'application/javascript', 'javascript', 'module'].includes(type)) continue;
+        const src = element.getAttribute('src');
+        try {
+          let source, name;
+          if (src) {
+            const path = toGamePath(src);
+            if (!path) throw new TypeError(`Dynamic script source is not a local game file: ${src}`);
+            source = nt.readText(path);
+            name = path;
+          } else {
+            source = element.textContent;
+            name = `dynamic-script-${++dynamicScriptCount}`;
+          }
+          if (type === 'module') await nt.evalModule(source, name);
+          else nt.evalScript(source, name);
+          element.dispatchEvent(new Event('load'));
+        } catch (e) {
+          reportError(`dynamic script ${src || '(inline)'}`, e);
+          element.dispatchEvent(new ErrorEvent('error', { message: String(e), error: e }));
+        }
+      }
+    } finally {
+      dynamicScriptsRunning = false;
+      if (dynamicScriptQueue.length) Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+
   // ---------------------------------------------------------------- DOM
   const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   const RAW_TAGS = new Set(['script', 'style', 'textarea', 'title']);
@@ -383,6 +442,9 @@
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       uiNotify('tree', this, child);
+      // Connected DOM-inserted classic/module scripts run asynchronously, in
+      // insertion order. Initial HTML parser scripts are handled by host.boot().
+      queueConnectedScripts(child);
       return child;
     }
     removeChild(child) {
@@ -828,6 +890,473 @@
     get text() { return this.textContent; }
     set text(v) { this.textContent = v; }
   }
+  // Experimental raw WebGL2 commands -> the EXISTING native DX12 packet
+  // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
+  // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
+  let nextRawGeometryId = 90000000;
+  function makeRawDx12Prototype(canvas) {
+    const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const G = {
+      NO_ERROR: 0, FLOAT: 0x1406, ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88e4,
+      VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
+      COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
+      TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+    };
+    const state = { buffer: null, vao: { attributes: new Map() },
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
+    const unsupportedRaw = (method) => {
+      throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
+    };
+    function compileVertex(source) {
+      // Known K73 GLSL ES 3.00 shader families. We translate their uniform /
+      // buffer contracts to the existing native HLSL lighting model, not the
+      // fragment GLSL instructions themselves; fidelity is limited.
+      if (source.includes('uniform mat4 uVP') && source.includes('out vec3 vW;') &&
+          source.includes('gl_Position = uVP*w;') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-lit-vertex', size: 3, instanced: source.includes('#define INST 1') };
+      if (source.includes('uniform mat4 uVP') &&
+          source.includes('gl_Position = uVP*(M*vec4(aPos,1.0));') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-depth-vertex', size: 3, instanced: source.includes('#define INST 1') };
+      if (source.includes('layout(location=0) in vec2 aP;') &&
+          source.includes('gl_Position=vec4(aP,0.0,1.0);'))
+        return { kind: 'k73-sky-vertex', size: 2 };
+      if (source.includes('layout(location=0) in vec2 aC;') &&
+          source.includes('gl_Position = uVP*vec4(wp,1.0);'))
+        return { kind: 'k73-particle-vertex', size: 2 };
+      const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
+      if (!attr) return null;
+      // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
+      const assignment = new RegExp('gl_Position\\s*=\\s*vec4\\s*\\(\\s*' + attr[2] + '\\s*,\\s*1(?:\\.0+)?\\s*\\)\\s*;');
+      if (!assignment.test(source)) return null;
+      if (/uniform\s+|texture\s*\(|gl_VertexID|gl_InstanceID|mat[234]\s/.test(source)) return null;
+      return { size: Number(attr[1]) };
+    }
+    function compileFragment(source) {
+      if (source.includes('vec3 base = vC.rgb*uTint.rgb;') &&
+          source.includes('uniform vec4 uTint;') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-lit-fragment', approximation: 'native HLSL material' };
+      if (/precision mediump float;\s*void main\(\)\s*\{\s*\}/.test(source))
+        return { kind: 'k73-depth-fragment' };
+      if (source.includes('uniform vec3 uZen;') && source.includes('uniform vec3 uHor;') &&
+          source.includes('uInvVP') && source.includes('out vec4 oC;'))
+        return { kind: 'k73-sky-fragment', approximation: 'horizon fill' };
+      if (source.includes('uniform float uAdd;') && source.includes('in vec4 vCol;') &&
+          source.includes('in vec2 vUV;'))
+        return { kind: 'k73-particle-fragment', approximation: 'unlit particle' };
+      const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
+      if (!output) return null;
+      const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
+      if (!assignment) return null;
+      const nums = assignment[1].split(',').map(x => x.trim());
+      if (nums.length !== 4 || nums.some(x => !/^(?:\d+\.?\d*|\.\d+)$/.test(x))) return null;
+      if (/uniform\s+|texture\s*\(/.test(source)) return null;
+      const rgba = nums.map(Number);
+      return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
+    }
+    function upload(first, count) {
+      const attr = state.vao.attributes.get(0);
+      if (!attr?.enabled || !attr.buffer || !(attr.buffer.data instanceof Float32Array) ||
+          attr.type !== G.FLOAT || attr.normalized || attr.size < 2 || attr.size > 3)
+        return unsupportedRaw('drawArrays requires enabled location-0 vec2/vec3 FLOAT buffer');
+      const stride = attr.stride ? attr.stride / 4 : attr.size;
+      const offset = attr.offset / 4, data = attr.buffer.data;
+      if (!Number.isInteger(stride) || !Number.isInteger(offset) || stride < attr.size)
+        return unsupportedRaw('vertex buffer stride/offset');
+      const key = [attr.buffer.version, first, count, attr.size, stride, offset].join(':');
+      const prev = state.cache.get(attr);
+      if (prev?.key === key) return prev.id;
+      const positions = new Float32Array(count * 3);
+      for (let i = 0; i < count; i++) {
+        const from = offset + (first + i) * stride;
+        if (from + attr.size > data.length) throw new RangeError('vertex position outside bound buffer');
+        positions[i * 3] = data[from];
+        positions[i * 3 + 1] = data[from + 1];
+        positions[i * 3 + 2] = attr.size === 3 ? data[from + 2] : 0;
+      }
+      if (prev) nt.releaseGeometry(prev.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, null, null, null, null);
+      state.cache.set(attr, { id, key });
+      return id;
+    }
+    // K73 shader input contract -> existing DX12 geometry buffers/pass packets.
+    // The K73 GLSL lighting/material code is not executed yet: the shader
+    // family maps to the engine's generic HLSL material and directional light.
+    // This path preserves actual indexed positions, normals, vertex colours,
+    // uVP/uModel, tint, alpha and (where present) instance transforms.
+    let nextMeshInstanceId = 80000000;
+    const k73Geometry = new WeakMap(), k73Instances = new WeakMap();
+    const GLTYPE = { FLOAT: 0x1406, UBYTE: 0x1401, BYTE: 0x1400, USHORT: 0x1403, SHORT: 0x1402, UINT: 0x1405 };
+    const bytesPer = (type) => type === GLTYPE.FLOAT || type === GLTYPE.UINT ? 4 :
+      type === GLTYPE.USHORT || type === GLTYPE.SHORT ? 2 : 1;
+    function attrValue(attr, vertex, component) {
+      if (!attr?.buffer?.data || !attr.enabled) return component === 3 ? 1 : 0;
+      const src = attr.buffer.data;
+      const bytes = bytesPer(attr.type), stride = attr.stride || attr.size * bytes;
+      const at = attr.offset + stride * vertex + bytes * component;
+      if (at < 0 || at + bytes > src.byteLength) throw RangeError('K73 vertex attribute outside buffer');
+      const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+      let value;
+      switch (attr.type) {
+        case GLTYPE.FLOAT: value = view.getFloat32(at, true); break;
+        case GLTYPE.UBYTE: value = view.getUint8(at); break;
+        case GLTYPE.BYTE: value = view.getInt8(at); break;
+        case GLTYPE.USHORT: value = view.getUint16(at, true); break;
+        case GLTYPE.SHORT: value = view.getInt16(at, true); break;
+        case GLTYPE.UINT: value = view.getUint32(at, true); break;
+        default: throw Error('Unsupported K73 vertex attribute type 0x' + attr.type.toString(16));
+      }
+      if (attr.normalized) {
+        if (attr.type === GLTYPE.UBYTE) return value / 255;
+        if (attr.type === GLTYPE.BYTE) return Math.max(-1, value / 127);
+        if (attr.type === GLTYPE.USHORT) return value / 65535;
+        if (attr.type === GLTYPE.SHORT) return Math.max(-1, value / 32767);
+      }
+      return value;
+    }
+    function k73Record(indexed) {
+      const vao = state.vao, pos = vao.attributes.get(0), nor = vao.attributes.get(1),
+        col = vao.attributes.get(2), ib = vao.indexBuffer;
+      if (!pos?.buffer?.data || !pos.enabled || pos.type !== GLTYPE.FLOAT)
+        throw Error('K73 DX12: missing FLOAT position attribute');
+      if (indexed && !ib?.data) throw Error('K73 DX12: drawElements missing index buffer');
+      if (pos.divisor) throw Error('K73 DX12: position attribute may not be instanced');
+      const stride = pos.stride || pos.size * 4, vertexCount = Math.floor(
+        (pos.buffer.data.byteLength - pos.offset - pos.size * 4) / stride) + 1;
+      if (vertexCount < 3 || vertexCount > 2500000) throw RangeError('K73 DX12: vertex count invalid');
+      const indexData = indexed ? ib.data : null;
+      if (indexed && !(indexData instanceof Uint16Array || indexData instanceof Uint32Array))
+        throw Error('K73 DX12: only Uint16/Uint32 indices are supported');
+      const key = [pos.buffer.version, nor?.buffer?.version, col?.buffer?.version,
+        ib?.version, vertexCount, indexed ? indexData.length : 0, indexed, pos.size, nor?.size, col?.size].join(':');
+      const cached = k73Geometry.get(vao);
+      if (cached?.key === key) return cached;
+      const positions = new Float32Array(vertexCount * 3);
+      const normals = nor?.enabled ? new Float32Array(vertexCount * 3) : null;
+      const colors = col?.enabled ? new Float32Array(vertexCount * 4) : null;
+      for (let i = 0; i < vertexCount; i++) {
+        for (let c = 0; c < Math.min(pos.size, 3); c++) positions[i * 3 + c] = attrValue(pos, i, c);
+        if (normals) for (let c = 0; c < Math.min(nor.size, 3); c++) normals[i * 3 + c] = attrValue(nor, i, c);
+        if (colors) {
+          for (let c = 0; c < 3; c++) colors[i * 4 + c] = c < col.size ? attrValue(col, i, c) : 1;
+          // K73 stores MATERIAL-ID in aCol.a. This must not turn into alpha.
+          colors[i * 4 + 3] = 1;
+        }
+      }
+      const indices = indexData ? Uint32Array.from(indexData) : null;
+      if (indices?.some(i => i >= vertexCount)) throw RangeError('K73 DX12: index out of bounds');
+      if (cached) nt.releaseGeometry(cached.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, normals, colors, indices, null);
+      const rec = { id, key, indexed, vertexCount, indexCount: indices?.length || 0, vertexColors: !!colors };
+      k73Geometry.set(vao, rec);
+      return rec;
+    }
+    function k73InstanceSet(count) {
+      const vao = state.vao, attr = vao.attributes.get(3);
+      if (!attr?.buffer?.data || attr.divisor !== 1)
+        throw Error('K73 DX12: missing instance matrix data');
+      const key = [attr.buffer.version, count].join(':');
+      const cached = k73Instances.get(vao);
+      if (cached?.key === key) return cached;
+      const matrices = new Float32Array(count * 16);
+      const colors = new Float32Array(count * 3);
+      const cols = vao.attributes.get(7);
+      for (let i = 0; i < count; i++) {
+        for (let r = 0; r < 4; r++) {
+          const a = vao.attributes.get(3 + r);
+          for (let c = 0; c < 4; c++) matrices[i * 16 + r * 4 + c] = attrValue(a, i, c);
+        }
+        for (let c = 0; c < 3; c++) colors[i * 3 + c] = cols ? attrValue(cols, i, c) : 1;
+      }
+      const id = cached?.id || nextMeshInstanceId++;
+      nt.uploadInstances(id, matrices, colors, count);
+      const rec = { id, key };
+      k73Instances.set(vao, rec);
+      return rec;
+    }
+    function k73Submit(indexed, first, count, instanceCount = 1) {
+      if (state.framebuffer) return; // no shadow/render-to-texture presentation
+      const program = state.program;
+      if (!program?.linked) throw Error('K73 DX12: program not linked');
+      if (program.kind === 'k73-particle-vertex')
+        return; // particle shaders need billboard expansion, not yet translated
+      const rec = k73Record(indexed);
+      if (first + count > (indexed ? rec.indexCount : rec.vertexCount))
+        throw RangeError('K73 DX12: draw count exceeds uploaded geometry');
+      const isLit = program.kind === 'k73-lit-vertex';
+      const isSky = program.kind === 'k73-sky-vertex';
+      const inst = instanceCount > 1 ? k73InstanceSet(instanceCount) : null;
+      const lights = isLit ? 1 : 0, off = 64 + lights * 16;
+      const p = new Float32Array(off + 56), uniforms = program.uniforms;
+      const vp = uniforms.get('uVP'), model = uniforms.get('uModel');
+      p.set(ID, 0); p.set(vp?.length === 16 && !isSky ? vp : ID, 16);
+      p[32] = uniforms.get('uCam')?.[0] || 0;
+      p[33] = uniforms.get('uCam')?.[1] || 0;
+      p[34] = uniforms.get('uCam')?.[2] || 0;
+      p[35] = lights;
+      p.set(state.clear, 36);
+      const ambient = uniforms.get('uSkyCol') || [0.5, 0.55, 0.6];
+      if (isLit) {
+        p[40] = ambient[0] * 0.4; p[41] = ambient[1] * 0.4; p[42] = ambient[2] * 0.4;
+        p[64] = 3;
+        const sun = uniforms.get('uSunCol') || [1, 1, 1];
+        const dir = uniforms.get('uSunDir') || [0.5, 0.7, 0.2];
+        p[65] = sun[0]; p[66] = sun[1]; p[67] = sun[2];
+        p[72] = -dir[0]; p[73] = -dir[1]; p[74] = -dir[2];
+      }
+      p[43] = 1;
+      p[44] = state.clearFlags;
+      p[45] = canvas.width; p[46] = canvas.height;
+      p[47] = 1;
+      p[off] = rec.id;
+      p[off + 1] = inst?.id || 0;
+      p[off + 2] = instanceCount;
+      let flags = 2; // double sided; culling not yet translated
+      if (isSky) flags |= 16 | 64; // sky is unlit and ignores depth test
+      if (rec.vertexColors) flags |= 8;
+      if (inst) flags |= 1024;
+      p[off + 3] = flags;
+      p[off + 4] = first; p[off + 5] = count;
+      p[off + 6] = 1; // roughness
+      const tint = uniforms.get('uTint') || [1, 1, 1, 1];
+      const sky = uniforms.get('uHor') || [0.45, 0.55, 0.7];
+      const c = isSky ? sky : tint;
+      p[off + 8] = c[0]; p[off + 9] = c[1]; p[off + 10] = c[2];
+      p[off + 11] = uniforms.get('uAlpha') ?? 1;
+      p[off + 12] = (uniforms.get('uEmis') || [0, 0, 0])[0];
+      p[off + 13] = (uniforms.get('uEmis') || [0, 0, 0])[1];
+      p[off + 14] = (uniforms.get('uEmis') || [0, 0, 0])[2];
+      p[off + 15] = -1; // physical model
+      p.set(model?.length === 16 && !inst ? model : ID, off + 16);
+      p[off + 34] = 1; p[off + 37] = 1; // UV identity
+      state.clearFlags = 0;
+      nt.submitPass(p, p.length);
+      state.draws++;
+    }
+    const gl = {
+      ...G, canvas,
+      get drawingBufferWidth() { return canvas.width; },
+      get drawingBufferHeight() { return canvas.height; },
+      getContextAttributes: () => ({ alpha: false, depth: true, stencil: false, antialias: false }),
+      getSupportedExtensions: () => [], getExtension: () => null, getError: () => 0,
+      createShader(type) {
+        if (type !== G.VERTEX_SHADER && type !== G.FRAGMENT_SHADER) return unsupportedRaw('createShader type');
+        return { type, source: '', compiled: false, payload: null };
+      },
+      shaderSource(shader, source) { shader.source = String(source); shader.compiled = false; },
+      compileShader(shader) {
+        shader.payload = shader.type === G.VERTEX_SHADER ? compileVertex(shader.source) : compileFragment(shader.source);
+        shader.compiled = !!shader.payload;
+      },
+      getShaderParameter(shader, key) { if (key !== G.COMPILE_STATUS) return unsupportedRaw('getShaderParameter'); return shader.compiled; },
+      getShaderInfoLog(shader) { return shader.compiled ? '' : 'Unsupported GLSL. DX12 prototype accepts only position vec2/vec3 and literal vec4 output.'; },
+      createProgram() { return { shaders: [], linked: false }; },
+      attachShader(program, shader) { program.shaders.push(shader); },
+      linkProgram(program) {
+        const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
+        const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
+        const pair = vs?.payload?.kind && fs?.payload?.kind;
+        const compatible = !pair ||
+          (vs.payload.kind === 'k73-lit-vertex' && fs.payload.kind === 'k73-lit-fragment') ||
+          (vs.payload.kind === 'k73-depth-vertex' && fs.payload.kind === 'k73-depth-fragment') ||
+          (vs.payload.kind === 'k73-sky-vertex' && fs.payload.kind === 'k73-sky-fragment') ||
+          (vs.payload.kind === 'k73-particle-vertex' && fs.payload.kind === 'k73-particle-fragment');
+        program.linked = !!(vs?.compiled && fs?.compiled && compatible);
+        program.kind = program.linked ? (vs.payload.kind || 'simple') : null;
+        program.color = program.linked && !pair ? fs.payload : [1, 1, 1, 1];
+        program.uniforms = new Map();
+      },
+      getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
+      getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
+      getUniformLocation(program, name) { return { program, name: String(name) }; },
+      uniformMatrix4fv(loc, transpose, data) {
+        if (transpose) return unsupportedRaw('transpose uniformMatrix4fv');
+        loc.program.uniforms.set(loc.name, Float32Array.from(data));
+      },
+      uniform4fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform3fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform2fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform1fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform1i(loc, value) { loc.program.uniforms.set(loc.name, value | 0); },
+      uniform1f(loc, value) { loc.program.uniforms.set(loc.name, Number(value)); },
+      uniform2f(loc, x, y) { loc.program.uniforms.set(loc.name, [x, y]); },
+      uniform3f(loc, x, y, z) { loc.program.uniforms.set(loc.name, [x, y, z]); },
+      uniform4f(loc, x, y, z, w) { loc.program.uniforms.set(loc.name, [x, y, z, w]); },
+      useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
+      createBuffer() { return { data: null, version: 0 }; },
+      bindBuffer(target, buffer) {
+        if (target === G.ARRAY_BUFFER) state.buffer = buffer;
+        else if (target === 0x8893) state.vao.indexBuffer = buffer;
+        else return unsupportedRaw('bindBuffer target');
+      },
+      bufferData(target, data) {
+        const buffer = target === G.ARRAY_BUFFER ? state.buffer :
+          target === 0x8893 ? state.vao.indexBuffer : null;
+        if (!buffer) throw Error('bufferData: no supported buffer bound');
+        if (typeof data === 'number') {
+          if (!Number.isInteger(data) || data < 0 || data > 67108864) throw RangeError('bufferData size too large');
+          buffer.data = new Uint8Array(data);
+        } else if (ArrayBuffer.isView(data)) {
+          buffer.data = data.slice();
+        } else if (data instanceof ArrayBuffer) {
+          buffer.data = new Uint8Array(data.slice(0));
+        } else return unsupportedRaw('bufferData type');
+        buffer.version++;
+      },
+      bufferSubData(target, dstByteOffset, source, srcOffset = 0, length) {
+        const buffer = target === G.ARRAY_BUFFER ? state.buffer :
+          target === 0x8893 ? state.vao.indexBuffer : null;
+        if (!buffer?.data || !ArrayBuffer.isView(source)) return unsupportedRaw('bufferSubData target/type');
+        const src = source.subarray(srcOffset, length === undefined ? source.length : srcOffset + length);
+        const dst = new Uint8Array(buffer.data.buffer, buffer.data.byteOffset, buffer.data.byteLength);
+        const bytes = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+        if (dstByteOffset < 0 || dstByteOffset + bytes.length > dst.length) throw RangeError('bufferSubData exceeds buffer');
+        dst.set(bytes, dstByteOffset); buffer.version++;
+      },
+      deleteBuffer() {},
+      createVertexArray() { return { attributes: new Map() }; },
+      bindVertexArray(vao) { state.vao = vao || { attributes: new Map() }; },
+      enableVertexAttribArray(index) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, enabled: true });
+      },
+      vertexAttribPointer(index, size, type, normalized, stride, offset) {
+        if (index < 0 || index > 15 || !state.buffer) return unsupportedRaw('vertexAttribPointer');
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+      },
+      vertexAttribIPointer(index, size, type, stride, offset) {
+        gl.vertexAttribPointer(index, size, type, false, stride, offset);
+      },
+      vertexAttribDivisor(index, divisor) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, divisor });
+      },
+      deleteVertexArray() {},
+      viewport(x, y, w, h) {
+        if (state.framebuffer) return; // shadow/post viewport, target not yet implemented
+        if (x || y || w !== canvas.width || h !== canvas.height)
+          nt.log('warn', '[K73 DX12 prototype] default-framebuffer viewport adjusted to canvas size');
+      },
+      clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
+      clear(mask) {
+        if (state.framebuffer) return;
+        if (mask & G.COLOR_BUFFER_BIT) state.clearFlags |= 1;
+        if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
+      },
+      drawArrays(mode, first, count) {
+        if (state.program?.kind?.startsWith('k73-')) {
+          if (mode !== G.TRIANGLES) return unsupportedRaw('K73 drawArrays mode');
+          k73Submit(false, first, count);
+          return;
+        }
+        if (state.framebuffer) return; // do not present shadow passes as colour
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        const id = upload(first, count), packet = new Float32Array(64 + 56), o = 64;
+        packet.set(ID, 0); packet.set(ID, 16);
+        packet.set(state.clear, 36);
+        packet[43] = 1; packet[44] = state.clearFlags;
+        packet[45] = canvas.width; packet[46] = canvas.height; packet[47] = 1;
+        packet[o] = id; packet[o + 2] = 1;
+        packet[o + 3] = 16 | 2 | 64; // unlit, double-sided, no depth test
+        packet[o + 5] = count; packet[o + 6] = 1;
+        packet.set(state.program.color, o + 8);
+        packet.set(ID, o + 16);
+        packet[o + 34] = 1; packet[o + 37] = 1;
+        state.clearFlags = 0;
+        nt.submitPass(packet, packet.length);
+        state.draws++;
+      },
+      drawElements(mode, count, indexType, byteOffset) {
+        if (mode !== G.TRIANGLES || count < 0 || count % 3)
+          return unsupportedRaw('K73 drawElements primitive');
+        const indexSize = indexType === 0x1405 ? 4 : indexType === 0x1403 ? 2 : 0;
+        if (!indexSize || byteOffset % indexSize) return unsupportedRaw('drawElements index type/offset');
+        k73Submit(true, byteOffset / indexSize, count);
+      },
+      drawElementsInstanced(mode, count, type, byteOffset, instances) {
+        if (mode !== G.TRIANGLES || count % 3) return unsupportedRaw('K73 drawElementsInstanced primitive');
+        const stride = type === 0x1405 ? 4 : type === 0x1403 ? 2 : 0;
+        if (!stride || byteOffset % stride) return unsupportedRaw('K73 drawElementsInstanced index type');
+        if (instances > 0) k73Submit(true, byteOffset / stride, count, instances);
+      },
+      drawArraysInstanced(mode, first, count, instances) {
+        if (mode !== G.TRIANGLES || count % 3) return unsupportedRaw('K73 drawArraysInstanced primitive');
+        if (instances > 0) k73Submit(false, first, count, instances);
+      },
+      get __nativeDraws() { return state.draws; },
+    };
+    // Bootstrap-only resource interfaces. These objects preserve enough GL
+    // state for the title scene to initialize. The current DX12 renderer does
+    // NOT yet sample K73's array textures or render shadow/MSAA framebuffers.
+    // Keep explicit warnings so they cannot be mistaken for implemented GL.
+    const warned = new Set();
+    const warn = (name) => {
+      if (!warned.has(name)) {
+        warned.add(name);
+        nt.log('warn', '[K73 DX12 prototype] ' + name + ' is a resource placeholder, not a full GPU implementation');
+      }
+    };
+    const rawEnums = {
+      TEXTURE0: 0x84c0, TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a,
+      RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814, UNSIGNED_BYTE: 0x1401,
+      UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405, BYTE: 0x1400, SHORT: 0x1402,
+      NEAREST: 0x2600, LINEAR: 0x2601, LINEAR_MIPMAP_LINEAR: 0x2703,
+      CLAMP_TO_EDGE: 0x812f, REPEAT: 0x2901, MIRRORED_REPEAT: 0x8370,
+      TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+      TEXTURE_COMPARE_MODE: 0x884c, TEXTURE_COMPARE_FUNC: 0x884d,
+      COMPARE_REF_TO_TEXTURE: 0x884e, LEQUAL: 0x0203,
+      DEPTH_COMPONENT24: 0x81a6, DEPTH_TEST: 0x0b71, CULL_FACE: 0x0b44,
+      POLYGON_OFFSET_FILL: 0x8037, BLEND: 0x0be2,
+      SRC_ALPHA: 0x0302, ONE_MINUS_SRC_ALPHA: 0x0303, ONE: 1,
+      FRAMEBUFFER: 0x8d40, READ_FRAMEBUFFER: 0x8ca8, DRAW_FRAMEBUFFER: 0x8ca9,
+      RENDERBUFFER: 0x8d41, DEPTH_ATTACHMENT: 0x8d00,
+      COLOR_ATTACHMENT0: 0x8ce0, FRAMEBUFFER_COMPLETE: 0x8cd5,
+      MAX_SAMPLES: 0x8d57, MAX_TEXTURE_SIZE: 0x0d33,
+      MAX_VERTEX_UNIFORM_VECTORS: 0x8dfb, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8dfd,
+      RENDERER: 0x1f01, VERSION: 0x1f02, VENDOR: 0x1f00,
+      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, BROWSER_DEFAULT_WEBGL: 0x9244,
+      NONE: 0, STATIC_READ: 0x88e5, DYNAMIC_DRAW: 0x88e8,
+      ELEMENT_ARRAY_BUFFER: 0x8893,
+    };
+    Object.assign(gl, rawEnums, {
+      getParameter(key) {
+        if (key === rawEnums.MAX_SAMPLES) return 0;
+        if (key === rawEnums.MAX_TEXTURE_SIZE) return 4096;
+        if (key === rawEnums.MAX_VERTEX_UNIFORM_VECTORS ||
+            key === rawEnums.MAX_FRAGMENT_UNIFORM_VECTORS) return 1024;
+        if (key === rawEnums.RENDERER) return 'NativeThreeBridge DX12 K73 prototype';
+        if (key === rawEnums.VERSION) return 'Experimental WebGL2 command adapter (not conformant)';
+        return 0;
+      },
+      createTexture() { warn('texture storage'); return { type: 'texture' }; },
+      deleteTexture() {}, activeTexture() {}, bindTexture() {},
+      texParameteri() {}, texParameterf() {}, pixelStorei() {},
+      texStorage2D() {}, texStorage3D() {}, texImage2D() {},
+      texImage3D() {}, texSubImage2D() {}, texSubImage3D() {},
+      generateMipmap() {}, deleteSampler() {},
+      createFramebuffer() { warn('offscreen framebuffer'); return { type: 'framebuffer' }; },
+      deleteFramebuffer() {},
+      bindFramebuffer(type, fbo) {
+        if (type === rawEnums.FRAMEBUFFER || type === rawEnums.DRAW_FRAMEBUFFER) state.framebuffer = fbo;
+      },
+      framebufferTexture2D() {}, framebufferTextureLayer() {}, framebufferRenderbuffer() {},
+      checkFramebufferStatus() { return rawEnums.FRAMEBUFFER_COMPLETE; },
+      drawBuffers() {}, readBuffer() {}, blitFramebuffer() {},
+      createRenderbuffer() { warn('multisample renderbuffer'); return { type: 'renderbuffer' }; },
+      deleteRenderbuffer() {}, bindRenderbuffer() {}, renderbufferStorage() {},
+      renderbufferStorageMultisample() {},
+      enable() {}, disable() {}, depthMask() {}, blendFunc() {},
+      polygonOffset() {}, colorMask() {}, depthFunc() {}, cullFace() {},
+      frontFace() {}, scissor() {},
+      finish() {}, flush() {},
+    });
+    return gl;
+  }
+
   class HTMLCanvasElement extends HTMLElement {
     constructor(tag = 'canvas', ns) { super(tag, ns); this._width = 300; this._height = 150; }
     get width() { return this._width; }
@@ -845,7 +1374,11 @@
         if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
         return this._ctx2d;
       }
-      // WebGL is never exposed: THREE.WebGLRenderer is the NativeRenderer.
+      if (kind === 'webgl2' && this.hasAttribute('data-native-webgl2-prototype')) {
+        if (!this._nativeGL2) this._nativeGL2 = makeRawDx12Prototype(this);
+        this._ntRendererCanvas = true;
+        return this._nativeGL2;
+      }
       unsupported(`canvas.getContext('${kind}')`, 'use THREE.WebGLRenderer, which renders natively');
       return null;
     }
@@ -2443,7 +2976,10 @@
         for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
         if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
       }
-      parseDocument(String(html));
+      // Parser-inserted <script> tags run through host.boot(); scripts created
+      // by those scripts are dynamic and must be handled by our queue.
+      parsingInitialDocument = true;
+      try { parseDocument(String(html)); } finally { parsingInitialDocument = false; }
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');
       const imports = [];
@@ -2462,6 +2998,7 @@
         const type = (s.getAttribute('type') || 'text/javascript').toLowerCase().trim();
         const src = s.getAttribute('src');
         if (type === 'module') {
+          s._ntScriptStarted = true;
           if (src) {
             const path = toGamePath(src);
             if (path === null) { reportError('script', new Error(`External module script is not available offline: ${src}`)); continue; }
@@ -2470,6 +3007,7 @@
           continue;
         }
         if (!['text/javascript', 'application/javascript', 'javascript', ''].includes(type)) continue;
+        s._ntScriptStarted = true;
         try {
           if (src) {
             const path = toGamePath(src);
@@ -2498,8 +3036,9 @@
       const t = document.title;
       if (t) nt.setTitle(t);
     },
-    // Called by the engine once per displayed frame with a millisecond clock.
-    frame(timeMs) {
+    // Game timers and requestAnimationFrame run at the 3D rate; CSS/UI is separately scheduled.
+    // The default keeps existing Node test hosts and legacy callers compatible.
+    frame(timeMs, uiTick = true) {
       state.now = timeMs;
       state.frame++;
       const t0 = performance.now();
@@ -2513,7 +3052,7 @@
       const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
       const tCanvas = performance.now();
-      if (uiLayer) uiLayer.frame();
+      if (uiTick !== false && uiLayer) uiLayer.frame();
       const tUi = performance.now();
       if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
         state.lastSlowFrameReport = timeMs;
