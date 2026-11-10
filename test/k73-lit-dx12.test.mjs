@@ -15,7 +15,7 @@ test('recognized K73 vertex/fragment GLSL uniform contract routes indexed colour
  const pass=decodePass(rec.passes[0]);
  assert.equal(pass.draws.length,1);
  assert.equal(pass.draws[0].count,3);
- assert.equal(pass.draws[0].color[0],0.8);
+ assert.ok(Math.abs(pass.draws[0].color[0]-0.8)<1e-5);
  assert.ok(Math.abs(pass.draws[0].color[1]-0.6)<1e-5);
  assert.equal(pass.draws[0].flags & 8,8,'native vertex colour flag enabled');
  assert.equal(pass.draws[0].flags & 16,0,'native HLSL lit path, not flat unlit');
