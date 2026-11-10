@@ -118,6 +118,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool expectBootError = argc > 3 && std::wcscmp(argv[3], L"expect-boot-error") == 0;
     const bool expectResize = argc > 3 && std::wcscmp(argv[3], L"expect-resize") == 0;
     const bool expectUi = argc > 3 && std::wcscmp(argv[3], L"expect-ui") == 0;
+    const bool expectDynamic = argc > 3 && std::wcscmp(argv[3], L"expect-dynamic-scripts") == 0;
     expect(compileShaders(), "webapp HLSL (VSMain/PSMain) compiles");
 
     std::string shim, error;
@@ -158,7 +159,13 @@ int wmain(int argc, wchar_t** argv) {
     std::printf("HTML/CSS UI: %d submits, last list %zu commands (%zu text, %zu images)\n",
                 sink.uiSubmits, sink.uiCommands, sink.uiTexts, sink.uiImages);
     expect(sink.uiValid, "every UI display list is well-formed");
-    if (expectBootError) {
+    if (expectDynamic) {
+        expect(status.find("\"booted\":true") != std::string::npos, "dynamic loader booted");
+        expect(status.find("Dynamic scripts ready") != std::string::npos, "both ordered dynamic scripts loaded and executed");
+        expect(sink.title == "Dynamic scripts ready", "dynamic loader completed and updated the page title");
+        expect(sink.errors == 1, "deliberately missing script reports one error");
+        expect(sink.passes == 0, "script fixture does not submit any 3D drawing");
+    } else if (expectBootError) {
         expect(status.find("\"bootError\":null") == std::string::npos, "broken import is reported as a boot error");
         expect(sink.passes == 0, "nothing was rendered by the failed module");
     } else {
