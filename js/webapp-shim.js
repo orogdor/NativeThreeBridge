@@ -940,6 +940,13 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      // An exact GLSL sampler2D fragment pass can reuse the same DX12
+      // Texture2D SRV and UV interpolation as Three.js, without ANGLE.
+      if (/uniform\s+sampler2D\s+uTex\s*;/.test(source) &&
+          /in\s+vec2\s+vUV\s*;/.test(source) &&
+          /out\s+vec4\s+outColor\s*;/.test(source) &&
+          /outColor\s*=\s*texture\s*\(\s*uTex\s*,\s*vUV\s*\)\s*;/.test(source) &&
+          !/sampler2DArray/.test(source)) return { kind: 'texture2d' };
       // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
       // custom exposure and fog. The native fixed HLSL material backend can
       // currently only approximate its vertex colors, sun, tint and normals.
@@ -1016,14 +1023,21 @@
       const positions = new Float32Array(numVertices * 3);
       const normals = new Float32Array(numVertices * 3);
       const colors = new Float32Array(numVertices * 4);
-      let hasNormals = false, hasColors = false;
+      const uvs = new Float32Array(numVertices * 2);
+      let hasNormals = false, hasColors = false, hasUvs = false;
       for (let i = 0; i < numVertices; i++) {
         const vertex = indexType ? i : first + i;
         const p = attributeData(0, vertex, pos.size, [0, 0, 0]);
         positions.set([p[0], p[1], p[2] || 0], i * 3);
-        const n = attributeData(1, vertex, 3, [0, 1, 0]);
-        normals.set(n, i * 3);
-        hasNormals ||= !!attrs.get(1)?.enabled;
+        if (state.program?.profile === 'texture2d') {
+          const uv = attributeData(1, vertex, 2, [0, 0]);
+          uvs.set(uv, i * 2);
+          hasUvs ||= !!attrs.get(1)?.enabled;
+        } else {
+          const n = attributeData(1, vertex, 3, [0, 1, 0]);
+          normals.set(n, i * 3);
+          hasNormals ||= !!attrs.get(1)?.enabled;
+        }
         const col = attributeData(2, vertex, 4, [1, 1, 1, 1]);
         // K73 stores its material-class identifier in vertex-color alpha;
         // it is NOT transparency. Native HLSL's vertex alpha controls pixel
@@ -1037,7 +1051,7 @@
       const id = nextRawGeometryId++;
       nt.uploadGeometry(id, positions, hasNormals ? normals : null,
         hasColors ? colors : null,
-        indexType ? new Uint32Array(vertexIndices) : null, null);
+        indexType ? new Uint32Array(vertexIndices) : null, hasUvs ? uvs : null);
       state.cache.set(vao, { id, key: cacheKey });
       return id;
     }
@@ -1046,7 +1060,8 @@
       const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
       const transform = profile === 'k73-lit' ? uniform('uVP', ID) : ID;
       const model = profile === 'k73-lit' ? uniform('uModel', ID) : ID;
-      const tint = profile === 'k73-lit' ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
+      const tint = profile === 'k73-lit' ? uniform('uTint', [1, 1, 1, 1]) :
+        profile === 'texture2d' ? [1, 1, 1, 1] : state.program.color;
       const packet = new Float32Array(64 + (profile === 'k73-lit' ? 16 : 0) + 56);
       packet.set(ID, 0); packet.set(transform, 16);
       packet.set(state.clear, 36);
@@ -1069,6 +1084,13 @@
       packet[o] = geometryId; packet[o + 2] = 1;
       const hasColors = !!state.vao.attributes.get(2)?.enabled;
       packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) : 16 | 2 | 64;
+      if (profile === 'texture2d') {
+        const unit = uniform('uTex', 0);
+        const tex = state.textureBindings.get(unit + ':' + G.TEXTURE_2D);
+        if (!tex?.nativeUploaded || tex.deleted) throw Error('drawArrays: active Texture2D not uploaded to native GPU');
+        packet[o + 3] |= 4096; // native F_MAP (Texture2D SRV)
+        packet[o + 32] = tex.id;
+      }
       packet[o + 5] = count; packet[o + 6] = 1;
       packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
       packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) : tint[3];
@@ -1287,7 +1309,7 @@
         program.linked = !!(vs?.compiled && fs?.compiled);
         program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
         program.profile = program.linked && vs.payload?.kind === 'k73-lit' && fs.payload?.kind === 'k73-lit'
-          ? 'k73-lit' : 'constant';
+          ? 'k73-lit' : program.linked && fs.payload?.kind === 'texture2d' ? 'texture2d' : 'constant';
         program.uniforms = new Map();
         if (program.profile === 'k73-lit') unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
