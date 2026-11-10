@@ -56,7 +56,8 @@ constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
-               F_DEPTH_ONLY = 2097152;
+               F_DEPTH_ONLY = 2097152, F_ADDITIVE_BLEND = 4194304,
+               F_POLYGON_OFFSET = 8388608, F_FRONT_CW = 16777216;
 constexpr UINT kMaxOffscreenDepthTargets = 64;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 
@@ -1108,7 +1109,10 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     const UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
     const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
                      ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
-                     ((flags & F_DEPTH_ONLY) ? (1u << 30) : 0u);
+                     ((flags & F_DEPTH_ONLY) ? (1u << 30) : 0u) |
+                     ((flags & F_ADDITIVE_BLEND) ? (1u << 29) : 0u) |
+                     ((flags & F_POLYGON_OFFSET) ? (1u << 28) : 0u) |
+                     ((flags & F_FRONT_CW) ? (1u << 27) : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1133,17 +1137,22 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.PrimitiveTopologyType = lines ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = cull == 1 ? D3D12_CULL_MODE_NONE : cull == 2 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
-    d.RasterizerState.FrontCounterClockwise = TRUE; // Three.js / OpenGL winding
+    d.RasterizerState.FrontCounterClockwise = (flags & F_FRONT_CW) ? FALSE : TRUE;
     d.RasterizerState.DepthClipEnable = TRUE;
+    if (flags & F_POLYGON_OFFSET) {
+        // K73 shadow pass calls gl.polygonOffset(1.6, 3.0).
+        d.RasterizerState.DepthBias = 3;
+        d.RasterizerState.SlopeScaledDepthBias = 1.6f;
+    }
     auto& rt = d.BlendState.RenderTarget[0];
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     if (flags & F_TRANSPARENT) {
         rt.BlendEnable = TRUE;
-        rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.SrcBlend = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+        rt.DestBlend = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         rt.BlendOp = D3D12_BLEND_OP_ADD;
         rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-        rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.DestBlendAlpha = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     } else {
         rt.SrcBlend = D3D12_BLEND_ONE;
