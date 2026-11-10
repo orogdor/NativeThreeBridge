@@ -44,6 +44,16 @@ gl.texImage3D(gl.TEXTURE_2D_ARRAY,0,gl.RGBA8,1,1,2,0,gl.RGBA,gl.UNSIGNED_BYTE,ne
 gl.texSubImage3D(gl.TEXTURE_2D_ARRAY,0,0,0,1,1,1,1,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([128,80,60,255]));
 gl.activeTexture(gl.TEXTURE0);
 window.textureStatus={nativeUploadCount:gl.__nativeTextureUploads,stackDepth:stack.depth,stackSecondPixel:Array.from(stack.pixels.slice(4,8))};
+const strip=new Image();
+strip.onload=()=>{
+ const a=gl.createTexture();gl.activeTexture(gl.TEXTURE0+7);gl.bindTexture(gl.TEXTURE_2D_ARRAY,a);
+ gl.texImage3D(gl.TEXTURE_2D_ARRAY,0,gl.RGBA8,2,2,2,0,gl.RGBA,gl.UNSIGNED_BYTE,strip);
+ window.textureStatus.encodedAtlasUploaded=!!a.nativeUploaded;
+ window.textureStatus.encodedAtlasStoredAs2D=!!a.atlasOnly;
+ window.textureStatus.encodedAtlasDepth=a.depth;
+ gl.activeTexture(gl.TEXTURE0);
+};
+strip.src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAAECAYAAACk7+45AAAAG0lEQVR4nGP8z8Dwn4GBgYGJAQoYGSr+o4oAAGfCBHvzu4cxAAAAAElFTkSuQmCC';
 function frame(){
  gl.viewport(0,0,cv.width,cv.height);
  gl.clearColor(0.025,0.035,0.05,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
