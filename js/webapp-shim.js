@@ -912,11 +912,17 @@
       LINEAR_MIPMAP_LINEAR: 0x2703,
       REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812f,
       UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, NONE: 0, BROWSER_DEFAULT_WEBGL: 0x9244,
+      DEPTH_COMPONENT24: 0x81a6, TEXTURE_COMPARE_MODE: 0x884c,
+      COMPARE_REF_TO_TEXTURE: 0x884e, TEXTURE_COMPARE_FUNC: 0x884d, LEQUAL: 0x0203,
+      FRAMEBUFFER: 0x8d40, DEPTH_ATTACHMENT: 0x8d00,
+      FRAMEBUFFER_COMPLETE: 0x8cd5, FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 0x8cd6,
     };
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
       program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
       activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
-      liveTextures: new Set(), textureUploads: 0, instanceCache: new WeakMap(), sky: null };
+      liveTextures: new Set(), textureUploads: 0, depthAllocations: 0,
+      framebuffers: new Set(), framebuffer: null,
+      instanceCache: new WeakMap(), sky: null };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
@@ -956,6 +962,7 @@
       throw new TypeError('Texture image has no encoded JPEG/PNG byte source');
     }
     function setTexImage(target, level, format, width, height, layers, pixelFormat, pixelType, pixels) {
+      if (boundTexture(target).immutable) return unsupportedRaw('texImage on immutable texture storage');
       if (level !== 0 || (format !== G.RGBA8 && format !== G.RGBA) ||
           pixelFormat !== G.RGBA || pixelType !== G.UNSIGNED_BYTE)
         return unsupportedRaw('texImage: only level-0 RGBA8/UNSIGNED_BYTE is supported');
@@ -1401,6 +1408,15 @@
         packet[72] = -dir[0]; packet[73] = -dir[1]; packet[74] = -dir[2];
       }
       packet[43] = 1; packet[44] = state.clearFlags;
+      if (state.framebuffer) {
+        const depthTexture = state.framebuffer.depth;
+        if (!depthTexture?.depth || !depthTexture.loaded ||
+            !['k73-depth', 'k73-depth-inst'].includes(profile))
+          return unsupportedRaw('depth framebuffer draws require K73 DEPTH shader and allocated depth texture');
+        // Native WebappWindow directs this pass to the real DSV instead of
+        // silently overwriting the game swap-chain framebuffer.
+        packet[55] = depthTexture.id;
+      }
       packet[45] = canvas.width; packet[46] = canvas.height;
       packet[47] = uniform('uExposure', 1);
       const o = useLight ? 80 : 64;
@@ -1496,7 +1512,15 @@
         location.program.uniforms.set(location.name, Float32Array.from(Array.from(values).slice(0, 3)));
       },
       uniform3f(location, x, y, z) { if (location) location.program.uniforms.set(location.name, Float32Array.of(x, y, z)); },
-      uniform1f(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      uniform1f(location, x) {
+        if (!location) return;
+        if (location.name === 'uShadowOn' && x > 0) {
+          unsupported('K73 DX12 shadow sampling',
+            'Native depth texture receives offscreen shadow draws, but PCF sampling is not yet bound to the lit HLSL pixel shader');
+          x = 0;
+        }
+        location.program.uniforms.set(location.name, Number(x));
+      },
       uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       createTexture() {
         const t = { id: nextRawTextureId++, target: null, width: 0, height: 0,
@@ -1506,7 +1530,11 @@
       },
       deleteTexture(t) {
         if (!t || t.deleted) return;
-        if (t.loaded) nt.releaseTexture(t.id);
+        if (t.loaded) {
+          if (t.depth) nt.releaseDepthTarget(t.id);
+          else nt.releaseTexture(t.id);
+        }
+        for (const fb of state.framebuffers) if (fb.depth === t) fb.depth = null;
         t.deleted = true; t.loaded = false;
         state.liveTextures.delete(t);
         for (const unit of state.textureUnits) {
@@ -1528,6 +1556,23 @@
         t.target = target;
         bindings.set(target, t);
       },
+      // Immutable WebGL2 depth storage. Unlike an RGBA upload, this allocates
+      // a real D3D12 D32_FLOAT DSV resource (24-bit WebGL minimum retained)
+      // through the native bridge. No false CPU-only texture object is exposed.
+      texStorage2D(target, levels, format, width, height) {
+        if (target !== G.TEXTURE_2D || levels !== 1 || format !== G.DEPTH_COMPONENT24 ||
+            !Number.isInteger(width) || !Number.isInteger(height) ||
+            width < 1 || height < 1 || width > 4096 || height > 4096)
+          return unsupportedRaw('texStorage2D: only level-1 DEPTH_COMPONENT24 up to 4096 supported');
+        const t = boundTexture(target);
+        if (t.immutable || t.loaded) return unsupportedRaw('texStorage2D already initialized');
+        if (typeof nt.allocateDepthTarget !== 'function' ||
+            !nt.allocateDepthTarget(t.id, width, height))
+          throw Error('NativeThreeBridge DX12 depth render target allocation failed');
+        t.immutable = true; t.depth = true; t.loaded = true;
+        t.width = width; t.height = height; t.layers = 1; t.version++;
+        state.depthAllocations++;
+      },
       texImage3D(target, level, internalFormat, width, height, depth, border, format, type, pixels) {
         if (target !== G.TEXTURE_2D_ARRAY || border !== 0) return unsupportedRaw('texImage3D target/border');
         setTexImage(target, level, internalFormat, width, height, depth, format, type, pixels);
@@ -1547,8 +1592,13 @@
       texParameteri(target, name, value) {
         const t = boundTexture(target);
         if (![G.TEXTURE_MIN_FILTER, G.TEXTURE_MAG_FILTER, G.TEXTURE_WRAP_S,
-              G.TEXTURE_WRAP_T, G.TEXTURE_MAX_LEVEL].includes(name))
+              G.TEXTURE_WRAP_T, G.TEXTURE_MAX_LEVEL,
+              G.TEXTURE_COMPARE_MODE, G.TEXTURE_COMPARE_FUNC].includes(name))
           return unsupportedRaw('texParameteri pname 0x' + name.toString(16));
+        if (name === G.TEXTURE_COMPARE_MODE && value !== G.COMPARE_REF_TO_TEXTURE && value !== G.NONE)
+          return unsupportedRaw('texParameteri invalid compare mode');
+        if (name === G.TEXTURE_COMPARE_FUNC && value !== G.LEQUAL)
+          return unsupportedRaw('texParameteri unsupported compare function');
         t.parameters.set(name, value);
       },
       texParameterf(target, name, value) {
@@ -1565,6 +1615,47 @@
         if (!t.loaded) throw Error('generateMipmap on incomplete texture');
         if (t.layers > 1) unsupported('K73 texture-array mipmaps',
           'Native DX12 vertical atlas retains full-resolution layers; mipmaps disabled to prevent cross-layer bleed');
+      },
+      get __nativeDepthAllocations() { return state.depthAllocations; },
+      createFramebuffer() {
+        const f = {depth: null, deleted: false, draw: null, read: null};
+        state.framebuffers.add(f);
+        return f;
+      },
+      deleteFramebuffer(f) {
+        if (!f || f.deleted) return;
+        if (state.framebuffer === f) state.framebuffer = null;
+        f.deleted = true; f.depth = null; state.framebuffers.delete(f);
+      },
+      bindFramebuffer(target, f) {
+        if (target !== G.FRAMEBUFFER) return unsupportedRaw('bindFramebuffer target');
+        if (f !== null && (!state.framebuffers.has(f) || f.deleted))
+          return unsupportedRaw('bindFramebuffer invalid framebuffer');
+        state.framebuffer = f;
+      },
+      framebufferTexture2D(target, attachment, textureTarget, tex, level) {
+        if (target !== G.FRAMEBUFFER || attachment !== G.DEPTH_ATTACHMENT ||
+            textureTarget !== G.TEXTURE_2D || level !== 0 || !state.framebuffer)
+          return unsupportedRaw('framebufferTexture2D only depth attachment 0');
+        if (tex !== null && (!state.liveTextures.has(tex) || !tex.depth || !tex.loaded))
+          return unsupportedRaw('framebufferTexture2D needs allocated depth texture');
+        state.framebuffer.depth = tex;
+      },
+      checkFramebufferStatus(target) {
+        if (target !== G.FRAMEBUFFER) return unsupportedRaw('checkFramebufferStatus target');
+        return !state.framebuffer || state.framebuffer.depth?.loaded
+          ? G.FRAMEBUFFER_COMPLETE : G.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+      },
+      drawBuffers(buffers) {
+        if (!state.framebuffer || !Array.isArray(buffers) ||
+            buffers.length !== 1 || buffers[0] !== G.NONE)
+          return unsupportedRaw('drawBuffers: only depth-only framebuffer');
+        state.framebuffer.draw = G.NONE;
+      },
+      readBuffer(mode) {
+        if (!state.framebuffer || mode !== G.NONE)
+          return unsupportedRaw('readBuffer: only depth-only framebuffer');
+        state.framebuffer.read = G.NONE;
       },
       get __nativeTextureUploads() { return state.textureUploads; },
       get __nativeTextureUnits() { return state.textureUnits; },
@@ -1628,7 +1719,9 @@
         if (state.vao === vao) state.vao = { attributes: new Map(), elements: null };
       },
       viewport(x, y, w, h) {
-        if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
+        const target = state.framebuffer?.depth;
+        const width = target?.width ?? canvas.width, height = target?.height ?? canvas.height;
+        if (x || y || w !== width || h !== height) return unsupportedRaw('partial viewport');
       },
       clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
       clear(mask) {
