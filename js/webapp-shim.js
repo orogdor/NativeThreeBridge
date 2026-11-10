@@ -897,12 +897,13 @@
   function makeRawDx12Prototype(canvas) {
     const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
     const G = {
-      NO_ERROR: 0, FLOAT: 0x1406, ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88e4,
+      NO_ERROR: 0, FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
+      ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
       VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
       COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
       TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
     };
-    const state = { buffer: null, vao: { attributes: new Map() },
+    const state = { buffer: null, vao: { attributes: new Map(), elements: null },
       program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
@@ -949,31 +950,122 @@
       const rgba = nums.map(Number);
       return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
     }
-    function upload(first, count) {
-      const attr = state.vao.attributes.get(0);
-      if (!attr?.enabled || !attr.buffer || !(attr.buffer.data instanceof Float32Array) ||
-          attr.type !== G.FLOAT || attr.normalized || attr.size < 2 || attr.size > 3)
-        return unsupportedRaw('drawArrays requires enabled location-0 vec2/vec3 FLOAT buffer');
-      const stride = attr.stride ? attr.stride / 4 : attr.size;
-      const offset = attr.offset / 4, data = attr.buffer.data;
-      if (!Number.isInteger(stride) || !Number.isInteger(offset) || stride < attr.size)
-        return unsupportedRaw('vertex buffer stride/offset');
-      const key = [attr.buffer.version, first, count, attr.size, stride, offset].join(':');
-      const prev = state.cache.get(attr);
-      if (prev?.key === key) return prev.id;
-      const positions = new Float32Array(count * 3);
-      for (let i = 0; i < count; i++) {
-        const from = offset + (first + i) * stride;
-        if (from + attr.size > data.length) throw new RangeError('vertex position outside bound buffer');
-        positions[i * 3] = data[from];
-        positions[i * 3 + 1] = data[from + 1];
-        positions[i * 3 + 2] = attr.size === 3 ? data[from + 2] : 0;
+    // K73 uses independent position, normal, and RGBA8 vertex-colour VBOs.
+    // Convert those existing WebGL attributes into NativeRenderer's exact
+    // interleaved geometry upload format, preserving optional index buffers.
+    function upload(first, count, indexType = 0, indexOffset = 0) {
+      const vao = state.vao, attrs = vao.attributes, pos = attrs.get(0);
+      if (!pos?.enabled || !pos.buffer || pos.type !== G.FLOAT ||
+          pos.size !== 3 && pos.size !== 2 || pos.normalized)
+        return unsupportedRaw('position attribute 0 must be FLOAT vec2/vec3');
+      const vertexIndices = [];
+      let maxVertex = first + count - 1;
+      if (indexType) {
+        const buf = vao.elements?.data;
+        const bytes = indexType === G.UNSIGNED_SHORT ? 2 : indexType === G.UNSIGNED_INT ? 4 : 0;
+        if (!buf || !bytes || buf.BYTES_PER_ELEMENT !== bytes || indexOffset % bytes)
+          return unsupportedRaw('drawElements requires aligned Uint16Array/Uint32Array index buffer');
+        const indexStart = indexOffset / bytes;
+        if (indexStart + count > buf.length) throw new RangeError('drawElements indexes outside index buffer');
+        for (let i = 0; i < count; i++) vertexIndices.push(buf[indexStart + i]);
+        maxVertex = Math.max(0, ...vertexIndices);
       }
-      if (prev) nt.releaseGeometry(prev.id);
+      const numVertices = indexType ? maxVertex + 1 : count;
+      if (numVertices > 400000) throw new RangeError('DX12 prototype geometry too large');
+      function attributeData(i, vertex, expectedSize, defaultValues) {
+        const attr = attrs.get(i);
+        if (!attr?.enabled) return defaultValues;
+        if (!attr.buffer?.data || attr.size !== expectedSize) return unsupportedRaw('vertex attribute size/buffer ' + i);
+        if (attr.type !== G.FLOAT && attr.type !== G.UNSIGNED_BYTE)
+          return unsupportedRaw('attribute component type ' + i);
+        const data = attr.buffer.data;
+        const bytes = attr.type === G.FLOAT ? 4 : 1;
+        const stride = attr.stride || bytes * attr.size;
+        const start = attr.offset + vertex * stride;
+        if (start < 0 || start + bytes * attr.size > data.byteLength || start % bytes)
+          throw new RangeError('vertex attribute outside byte buffer: ' + i);
+        const view = new DataView(data.buffer, data.byteOffset + start, bytes * attr.size);
+        const v = [];
+        for (let c = 0; c < attr.size; c++) {
+          let x = attr.type === G.FLOAT ? view.getFloat32(c * bytes, true) : view.getUint8(c);
+          if (attr.normalized && attr.type === G.UNSIGNED_BYTE) x /= 255;
+          v.push(x);
+        }
+        return v;
+      }
+      const cacheKey = [first, count, indexType, indexOffset,
+        vao.elements?.version || 0,
+        ...[0, 1, 2].flatMap(i => {
+          const a = attrs.get(i);
+          return a ? [a.buffer?.version, a.size, a.type, a.normalized, a.stride, a.offset] : [0];
+        }),
+      ].join(':');
+      const old = state.cache.get(vao);
+      if (old?.key === cacheKey) return old.id;
+      const positions = new Float32Array(numVertices * 3);
+      const normals = new Float32Array(numVertices * 3);
+      const colors = new Float32Array(numVertices * 4);
+      let hasNormals = false, hasColors = false;
+      for (let i = 0; i < numVertices; i++) {
+        const vertex = indexType ? i : first + i;
+        const p = attributeData(0, vertex, pos.size, [0, 0, 0]);
+        positions.set([p[0], p[1], p[2] || 0], i * 3);
+        const n = attributeData(1, vertex, 3, [0, 1, 0]);
+        normals.set(n, i * 3);
+        hasNormals ||= !!attrs.get(1)?.enabled;
+        const col = attributeData(2, vertex, 4, [1, 1, 1, 1]);
+        colors.set(col, i * 4);
+        hasColors ||= !!attrs.get(2)?.enabled;
+      }
+      if (old) nt.releaseGeometry(old.id);
       const id = nextRawGeometryId++;
-      nt.uploadGeometry(id, positions, null, null, null, null);
-      state.cache.set(attr, { id, key });
+      nt.uploadGeometry(id, positions, hasNormals ? normals : null,
+        hasColors ? colors : null,
+        indexType ? new Uint32Array(vertexIndices) : null, null);
+      state.cache.set(vao, { id, key: cacheKey });
       return id;
+    }
+    function submitRawPass(geometryId, count, profile) {
+      const uniforms = state.program.uniforms || new Map();
+      const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
+      const transform = profile === 'k73-lit' ? uniform('uVP', ID) : ID;
+      const model = profile === 'k73-lit' ? uniform('uModel', ID) : ID;
+      const tint = profile === 'k73-lit' ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
+      const packet = new Float32Array(64 + (profile === 'k73-lit' ? 16 : 0) + 56);
+      packet.set(ID, 0); packet.set(transform, 16);
+      packet.set(state.clear, 36);
+      const useLight = profile === 'k73-lit';
+      packet[35] = useLight ? 1 : 0;
+      if (useLight) {
+        const sky = uniform('uSkyCol', [0.3, 0.3, 0.35]);
+        packet[40] = sky[0] * 0.65; packet[41] = sky[1] * 0.65; packet[42] = sky[2] * 0.65;
+        const cam = uniform('uCam', [0, 0, 10]);
+        packet.set(cam.subarray ? cam.subarray(0, 3) : cam, 32);
+        const sun = uniform('uSunCol', [1, 1, 1]);
+        const dir = uniform('uSunDir', [0.4, 0.7, 0.6]);
+        packet[64] = 3; packet[65] = sun[0]; packet[66] = sun[1]; packet[67] = sun[2];
+        packet[72] = -dir[0]; packet[73] = -dir[1]; packet[74] = -dir[2];
+      }
+      packet[43] = 1; packet[44] = state.clearFlags;
+      packet[45] = canvas.width; packet[46] = canvas.height;
+      packet[47] = uniform('uExposure', 1);
+      const o = useLight ? 80 : 64;
+      packet[o] = geometryId; packet[o + 2] = 1;
+      const hasColors = !!state.vao.attributes.get(2)?.enabled;
+      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) : 16 | 2 | 64;
+      packet[o + 5] = count; packet[o + 6] = 1;
+      packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
+      packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) : tint[3];
+      packet[o + 15] = -1;
+      if (useLight) {
+        const e = uniform('uEmis', [0, 0, 0]);
+        packet[o + 12] = e[0]; packet[o + 13] = e[1]; packet[o + 14] = e[2];
+      }
+      packet.set(model, o + 16);
+      packet[o + 34] = 1; packet[o + 37] = 1;
+      state.clearFlags = 0;
+      nt.submitPass(packet, packet.length);
+      state.draws++;
     }
     const gl = {
       ...G, canvas,
@@ -1030,22 +1122,36 @@
       uniform1f(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       createBuffer() { return { data: null, version: 0 }; },
-      bindBuffer(target, buffer) { if (target !== G.ARRAY_BUFFER) return unsupportedRaw('bindBuffer target'); state.buffer = buffer; },
-      bufferData(target, data) {
-        if (target !== G.ARRAY_BUFFER || !(data instanceof Float32Array)) return unsupportedRaw('bufferData type/target');
-        if (!state.buffer) throw Error('No ARRAY_BUFFER bound');
-        state.buffer.data = new Float32Array(data); state.buffer.version++;
+      bindBuffer(target, buffer) {
+        if (target === G.ARRAY_BUFFER) state.buffer = buffer;
+        else if (target === G.ELEMENT_ARRAY_BUFFER) state.vao.elements = buffer;
+        else return unsupportedRaw('bindBuffer target');
       },
-      createVertexArray() { return { attributes: new Map() }; },
-      bindVertexArray(vao) { state.vao = vao || { attributes: new Map() }; },
+      bufferData(target, data) {
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferData typed arrays only');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        if (!dst) throw Error('No buffer bound for bufferData');
+        dst.data = new data.constructor(data); dst.version++;
+      },
+      bufferSubData(target, offset, data) {
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferSubData data');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        if (!dst?.data || offset < 0 || offset % dst.data.BYTES_PER_ELEMENT ||
+            offset / dst.data.BYTES_PER_ELEMENT + data.length > dst.data.length) return unsupportedRaw('bufferSubData range');
+        dst.data.set(data, offset / dst.data.BYTES_PER_ELEMENT); dst.version++;
+      },
+      createVertexArray() { return { attributes: new Map(), elements: null }; },
+      bindVertexArray(vao) { state.vao = vao || { attributes: new Map(), elements: null }; },
       enableVertexAttribArray(index) {
         const old = state.vao.attributes.get(index) || {};
         state.vao.attributes.set(index, { ...old, enabled: true });
       },
       vertexAttribPointer(index, size, type, normalized, stride, offset) {
-        if (index !== 0 || !state.buffer) return unsupportedRaw('vertexAttribPointer');
-        const old = state.vao.attributes.get(0) || {};
-        state.vao.attributes.set(0, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+        if (index < 0 || index > 2 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
       },
       viewport(x, y, w, h) {
         if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
@@ -1058,20 +1164,12 @@
       drawArrays(mode, first, count) {
         if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
-        const id = upload(first, count), packet = new Float32Array(64 + 56), o = 64;
-        packet.set(ID, 0); packet.set(ID, 16);
-        packet.set(state.clear, 36);
-        packet[43] = 1; packet[44] = state.clearFlags;
-        packet[45] = canvas.width; packet[46] = canvas.height; packet[47] = 1;
-        packet[o] = id; packet[o + 2] = 1;
-        packet[o + 3] = 16 | 2 | 64; // unlit, double-sided, no depth test
-        packet[o + 5] = count; packet[o + 6] = 1;
-        packet.set(state.program.color, o + 8);
-        packet.set(ID, o + 16);
-        packet[o + 34] = 1; packet[o + 37] = 1;
-        state.clearFlags = 0;
-        nt.submitPass(packet, packet.length);
-        state.draws++;
+        submitRawPass(upload(first, count), count, state.program.profile);
+      },
+      drawElements(mode, count, type, offset) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3) return unsupportedRaw('drawElements primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        submitRawPass(upload(0, count, type, offset), count, state.program.profile);
       },
       get __nativeDraws() { return state.draws; },
     };
