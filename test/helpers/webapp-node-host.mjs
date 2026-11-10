@@ -295,6 +295,10 @@ export async function runWebapp(root, options = {}) {
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-shim.js'), 'utf8'), context, { filename: 'nt:webapp-shim.js' });
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-ui.js'), 'utf8'), context, { filename: 'nt:webapp-ui.js' });
   const host = context.__ntHost;
+  // Test-only fixture state injection: allows the same unmodified K73 game
+  // to boot with its existing user settings (e.g., postprocessing Off).
+  if (typeof options.preBootScript === 'string' && options.preBootScript.trim())
+    vm.runInContext(options.preBootScript, context, { filename: 'test:preboot-settings.js' });
   const settle = () => new Promise((r) => setImmediate(r));
 
   host.resize(width, height, 1);
