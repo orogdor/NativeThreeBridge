@@ -981,6 +981,18 @@
       // accept arbitrary GLSL or SKIN vertex shaders.
       const instanced = /#define\s+INST\b/.test(source);
       const skinned = /#define\s+SKIN\b/.test(source);
+      // K73 v86 PART_VS billboard particles: four attributes and uVP.
+      // Exact GLSL is recognized; the native path uses GPU instanced quads.
+      if (!instanced && !skinned &&
+          /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec2\s+aC\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*1\s*\)\s*in\s+vec4\s+aPS\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*2\s*\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*3\s*\)\s*in\s+vec4\s+aDir\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+vec3\s+uR\s*;/.test(source) &&
+          /uniform\s+vec3\s+uU\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*vec4\s*\(\s*wp\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return {kind: 'k73-part', size: 2};
       // K73 full-screen sky vertex shader (clip-space aP).
       // The native counterpart creates a low-resolution sky gradient mesh.
       if (!instanced && !skinned &&
@@ -1024,6 +1036,17 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      // Original K73 PART_FS uses a screen-space radial falloff and
+      // procedural smoke. Native unlit instancing currently approximates both.
+      if (!/#define\s+(?:INST|SKIN)\b/.test(source) &&
+          /in\s+vec4\s+vCol\s*;/.test(source) &&
+          /in\s+vec2\s+vUV\s*;/.test(source) &&
+          /in\s+float\s+vF\s*;/.test(source) &&
+          /uniform\s+float\s+uAdd\s*;/.test(source) &&
+          /uniform\s+vec3\s+uFogCol\s*;/.test(source) &&
+          /if\s*\(\s*uAdd\s*>\s*0\.5\s*\)/.test(source) &&
+          /oC\s*=\s*vec4\s*\(\s*mix\s*\(\s*vCol\.rgb\s*\*\s*sh\s*,\s*uFogCol\s*,\s*vF\s*\*\s*0\.8\s*\)\s*,\s*vCol\.a\s*\*\s*a\s*\*\s*a\s*\)\s*;/.test(source))
+        return {kind:'k73-part'};
       // Original K73 procedural SKY_FS. Its atmospheric/planet/cloud code is
       // not executable GLSL here: a verified native sky approximation is used.
       if (!/#define\s+(?:INST|SKIN)\b/.test(source) &&
@@ -1225,6 +1248,97 @@
       state.sky = {id, key, count: indices.length};
       return id;
     }
+    // K73 particle attribute 0 is a six-vertex billboard with aC.xy.
+    // Upload one local-space quad and let DX12 draw its N instances at once.
+    function particleGeometry(first, count) {
+      const vao = state.vao;
+      const a = vao.attributes.get(0);
+      if (!a?.enabled || a?.divisor || a.size !== 2 || a.type !== G.FLOAT ||
+          !a.buffer?.data || a.normalized || first !== 0 || count !== 6)
+        return unsupportedRaw('K73 particle quad needs 6 FLOAT vec2 vertices at attribute 0');
+      const key = [a.buffer.version, a.offset, a.stride, first, count].join(':');
+      let old = state.cache.get(vao);
+      if (old?.key === key) return old.id;
+      const stride = a.stride || 8;
+      const pos = new Float32Array(18);
+      for (let i=0;i<6;i++) {
+        const offset = a.offset + i * stride;
+        if (offset < 0 || offset + 8 > a.buffer.data.byteLength)
+          throw new RangeError('K73 particle quad attribute 0 outside buffer');
+        const v = new DataView(a.buffer.data.buffer,a.buffer.data.byteOffset+offset,8);
+        pos[i*3] = v.getFloat32(0,true);
+        pos[i*3+1] = v.getFloat32(4,true);
+      }
+      if (old) nt.releaseGeometry(old.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id,pos,null,null,null,null);
+      state.cache.set(vao,{id,key});
+      return id;
+    }
+    function particleRecord(count) {
+      if (state.program?.profile !== 'k73-part') return null;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 100000)
+        return unsupportedRaw('K73 particle instance count');
+      const vao = state.vao;
+      const attrs = [1,2,3].map(i=>vao.attributes.get(i));
+      if (attrs.some(a=>!a?.enabled || a?.divisor !== 1 ||
+          !a.buffer?.data || a.size !== 4 || a.type !== G.FLOAT || a.normalized))
+        return unsupportedRaw('K73 particle instances require aPS/aCol/aDir FLOAT vec4 divisor 1');
+      const uniforms = state.program.uniforms || new Map();
+      const u = (key,defaultValue) => uniforms.get(key) ?? defaultValue;
+      const cam = u('uCam',[0,0,10]), right = u('uR',[1,0,0]), up = u('uU',[0,1,0]);
+      const additive = Number(u('uAdd',0)) > 0.5;
+      const key = [count, ...cam, ...right, ...up, additive,
+        ...attrs.flatMap(a=>[a.buffer.version,a.stride,a.offset])].join(':');
+      let record = state.instanceCache.get(vao);
+      if (record?.key === key) return record;
+      const matrices = new Float32Array(count*16);
+      const colors = new Float32Array(count*3);
+      let alphaTotal = 0;
+      const norm = (x,y,z) => {
+        const len = Math.hypot(x,y,z);
+        return len > 1e-7 ? [x/len,y/len,z/len] : [0,1,0];
+      };
+      const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],
+        a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+      function attrib(a,index) {
+        const offset = a.offset+index*(a.stride||16);
+        if (offset<0 || offset+16>a.buffer.data.byteLength)
+          throw new RangeError('K73 particle attribute outside buffer');
+        const view=new DataView(a.buffer.data.buffer,a.buffer.data.byteOffset+offset,16);
+        return [view.getFloat32(0,true),view.getFloat32(4,true),
+          view.getFloat32(8,true),view.getFloat32(12,true)];
+      }
+      for (let i=0;i<count;i++) {
+        const ps=attrib(attrs[0],i), color=attrib(attrs[1],i), dir=attrib(attrs[2],i);
+        const stretch=dir[3]>0;
+        const upward=stretch ? norm(dir[0],dir[1],dir[2]) : up;
+        const towards=norm(cam[0]-ps[0],cam[1]-ps[1],cam[2]-ps[2]);
+        const side=stretch ? norm(...cross(upward,towards)) : right;
+        const sx=ps[3],sy=stretch?dir[3]:ps[3];
+        const depth=norm(...cross(side,upward));
+        const o=i*16;
+        matrices.set([
+          side[0]*sx,side[1]*sx,side[2]*sx,0,
+          upward[0]*sy,upward[1]*sy,upward[2]*sy,0,
+          depth[0],depth[1],depth[2],0,
+          ps[0],ps[1],ps[2],1
+        ],o);
+        const opacity=Math.max(0,Math.min(1,color[3]));
+        colors.set([color[0]*(additive?opacity:1),
+          color[1]*(additive?opacity:1), color[2]*(additive?opacity:1)],i*3);
+        alphaTotal+=opacity;
+      }
+      if(!record) record={id:nextRawInstanceId++};
+      nt.uploadInstances(record.id,matrices,colors,count);
+      record.count=count;record.key=key;
+      // DX12 instance colours currently carry RGB, not individual alphas.
+      // Pool-level mean opacity is explicit approximation, not per-pixel GLSL.
+      record.opacity=count?alphaTotal/count:1;
+      record.additive=additive;
+      state.instanceCache.set(vao,record);
+      return record;
+    }
     function instanceRecord(count) {
       if (!['k73-lit-inst', 'k73-depth-inst'].includes(state.program?.profile)) return null;
       const vao = state.vao;
@@ -1267,9 +1381,10 @@
       const lit = profile === 'k73-lit' || profile === 'k73-lit-inst';
       const depth = profile === 'k73-depth' || profile === 'k73-depth-inst';
       const sky = profile === 'k73-sky';
+      const particle = profile === 'k73-part';
       const transform = (lit || depth) ? uniform('uVP', ID) : ID;
       const model = (profile === 'k73-lit' || profile === 'k73-depth') ? uniform('uModel', ID) : ID;
-      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth || sky ? [1, 1, 1, 1] : state.program.color;
+      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth || sky || particle ? [1, 1, 1, 1] : state.program.color;
       const packet = new Float32Array(64 + (lit ? 16 : 0) + 56);
       packet.set(ID, 0); packet.set(transform, 16);
       packet.set(state.clear, 36);
@@ -1296,14 +1411,16 @@
       const atlas = useLight ? k73MaterialAtlas() : null;
       packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (instances ? 1024 : 0) |
         (atlas ? 4096 | 1048576 : 0) :
-        sky ? (16 | 8 | 32 | 64 | 65536 | 2) : 16 | 2 | 64;
+        sky ? (16 | 8 | 32 | 64 | 65536 | 2) :
+        particle ? (1 | 2 | 16 | 32 | 1024 | 65536) : 16 | 2 | 64;
       if (atlas) {
         packet[o + 32] = atlas.id;         // Native DX12 texture slot
         packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
       }
       packet[o + 5] = count; packet[o + 6] = 1;
       packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
-      packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) : tint[3];
+      packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) :
+        particle ? (instances?.opacity ?? 1) : tint[3];
       packet[o + 15] = -1;
       if (useLight) {
         const e = uniform('uEmis', [0, 0, 0]);
@@ -1342,10 +1459,11 @@
         const litPair = ['k73-lit', 'k73-lit-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-lit';
         const depthPair = ['k73-depth', 'k73-depth-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-depth';
         const skyPair = vs?.payload?.kind === 'k73-sky' && fs?.payload?.kind === 'k73-sky';
+        const particlePair = vs?.payload?.kind === 'k73-part' && fs?.payload?.kind === 'k73-part';
         // An empty depth fragment is only valid with the exact K73 depth vertex profile.
-        program.linked &&= !!(litPair || depthPair || skyPair ||
+        program.linked &&= !!(litPair || depthPair || skyPair || particlePair ||
           (Array.isArray(fs?.payload) && Number.isInteger(vs?.payload?.size)));
-        program.profile = program.linked ? (litPair || depthPair || skyPair ? vs.payload.kind : 'constant') : 'invalid';
+        program.profile = program.linked ? (litPair || depthPair || skyPair || particlePair ? vs.payload.kind : 'constant') : 'invalid';
         program.uniforms = new Map();
         if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
@@ -1353,6 +1471,8 @@
           'DEPTH_VS/DEPTH_FS variants recognised, but actual off-screen shadow texture rendering needs FBO/DX12 depth target support');
         if (program.profile === 'k73-sky') unsupported('K73 sky shader approximation',
           'Sky gradient and broad sun glow use native unlit DX12 geometry; procedural clouds, stars, planet and precise GLSL atmosphere are not yet translated');
+        if (program.profile === 'k73-part') unsupported('K73 particle GLSL approximation',
+          'Particles use GPU-instanced billboard quads and per-pool opacity; exact smoke noise, radial soft alpha and additive blend need native HLSL and per-instance alpha');
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
       getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
@@ -1534,6 +1654,11 @@
           return unsupportedRaw('drawArraysInstanced primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
         if (!instanceCount) return;
+        if (state.program.profile === 'k73-part') {
+          const geometryId=particleGeometry(first,count), instances=particleRecord(instanceCount);
+          submitRawPass(geometryId,count,'k73-part',instances);
+          return;
+        }
         const instances = instanceRecord(instanceCount);
         if (!instances) return unsupportedRaw('instanced shader profile mismatch');
         submitRawPass(upload(first, count), count, state.program.profile, instances);
