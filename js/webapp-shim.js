@@ -968,7 +968,7 @@
         const indexStart = indexOffset / bytes;
         if (indexStart + count > buf.length) throw new RangeError('drawElements indexes outside index buffer');
         for (let i = 0; i < count; i++) vertexIndices.push(buf[indexStart + i]);
-        maxVertex = Math.max(0, ...vertexIndices);
+        maxVertex = vertexIndices.reduce((max, i) => Math.max(max, i), 0);
       }
       const numVertices = indexType ? maxVertex + 1 : count;
       if (numVertices > 400000) throw new RangeError('DX12 prototype geometry too large');
@@ -994,7 +994,7 @@
         return v;
       }
       const cacheKey = [first, count, indexType, indexOffset,
-        vao.elements?.version || 0,
+        vao.elements?.version || 0, state.program?.profile || '',
         ...[0, 1, 2].flatMap(i => {
           const a = attrs.get(i);
           return a ? [a.buffer?.version, a.size, a.type, a.normalized, a.stride, a.offset] : [0];
@@ -1014,6 +1014,11 @@
         normals.set(n, i * 3);
         hasNormals ||= !!attrs.get(1)?.enabled;
         const col = attributeData(2, vertex, 4, [1, 1, 1, 1]);
+        // K73 stores its material-class identifier in vertex-color alpha;
+        // it is NOT transparency. Native HLSL's vertex alpha controls pixel
+        // opacity, so pass opaque alpha until the material-class shader stage
+        // is separately translated.
+        if (state.program?.profile === 'k73-lit') col[3] = 1;
         colors.set(col, i * 4);
         hasColors ||= !!attrs.get(2)?.enabled;
       }
