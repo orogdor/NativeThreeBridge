@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <share.h>
 #include <fstream>
 #include <map>
@@ -30,6 +31,7 @@
 #include "webapp_resources.h"
 #include "webapp_shader.h"
 #include "webapp_ui.h"
+#include "ui_cadence.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -294,7 +296,7 @@ private:
         int frames = 0;
         double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
-        int forced = 0, full = 0, partial = 0, rasters = 0;
+        int forced = 0, full = 0, partial = 0, rasters = 0, uiTicks = 0;
     } perf_;
     std::FILE* perfCsv_ = nullptr;
     std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
@@ -306,6 +308,7 @@ private:
     bool cursorHidden_ = false;
     // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
     native_three::WebappUiRenderer ui_;
+    native_three::UiCadence uiCadence_{};
     bool uiReady_ = false, uiUpload_ = false, uiVisible_ = false;
     ComPtr<ID3D12Resource> uiTexture_, uiStaging_[kFrameCount];
     UINT64 uiStagingBytes_[kFrameCount] = {};
@@ -532,6 +535,7 @@ void WebappWindow::resetPage() {
     pipelines_.clear();
     colorPatches_.clear();
     ui_.resetPage();
+    uiCadence_.reset();
     uiUpload_ = uiVisible_ = false;
     lastDraws_ = 0;
     logErrors_ = 0;
@@ -1321,17 +1325,21 @@ void WebappWindow::keyEvent(bool down, WPARAM vk, LPARAM lp) {
 LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_SIZE:
+        uiCadence_.force();
         minimized_ = wp == SIZE_MINIMIZED;
         if (!minimized_) resize(LOWORD(lp), HIWORD(lp));
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        uiCadence_.force();
         if (wp == VK_F4 && GetKeyState(VK_MENU) < 0) break; // Alt+F4 closes
         keyEvent(true, wp, lp);
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
+        uiCadence_.force();
         keyEvent(false, wp, lp);
         return 0;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
+        uiCadence_.force();
         SetCapture(hwnd);
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("down", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONDOWN ? 0 : msg == WM_MBUTTONDOWN ? 1 : 2);
@@ -1340,6 +1348,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+        uiCadence_.force();
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("up", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1351,6 +1360,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
         return 0;
     case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
+        uiCadence_.force();
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         const double delta = -double(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 100.0;
@@ -1363,8 +1373,8 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ ? nullptr : cursor_); return TRUE; }
         break;
-    case WM_SETFOCUS: host_.focus(true); return 0;
-    case WM_KILLFOCUS: host_.focus(false); return 0;
+    case WM_SETFOCUS: uiCadence_.force(); host_.focus(true); return 0;
+    case WM_KILLFOCUS: uiCadence_.force(); host_.focus(false); return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1376,9 +1386,9 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f,%d\n",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
-                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n);
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n, p.uiTicks);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1394,7 +1404,7 @@ int WebappWindow::run(HINSTANCE instance) {
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg,ui_ticks\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
@@ -1436,6 +1446,20 @@ int WebappWindow::run(HINSTANCE instance) {
     width_ = std::max<LONG>(1, client.right);
     height_ = std::max<LONG>(1, client.bottom);
     initDevice();
+
+    // Experimental UI/3D decoupling: 0 restores the exact legacy UI cadence.
+    // The 3D frame, timers and game rAF remain unrestricted by this setting.
+    double uiHz = 30.0;
+    char uiHzText[32] = {};
+    const DWORD uiHzChars = GetEnvironmentVariableA("NATIVE_THREE_UI_HZ", uiHzText, DWORD(sizeof(uiHzText)));
+    if (uiHzChars > 0 && uiHzChars < sizeof(uiHzText)) {
+        char* tail = nullptr;
+        const double value = std::strtod(uiHzText, &tail);
+        if (tail && tail != uiHzText && !*tail && std::isfinite(value) && value >= 0.0 && value <= 240.0)
+            uiHz = value;
+    }
+    uiCadence_.setHz(uiHz);
+    log("info", "[ui-cadence] " + std::to_string(uiHz) + " Hz (0 = legacy, input events force refresh)");
 
     gCrashPhase = "loading index.html and the game's JavaScript";
     log("info", "Starting JavaScript");
@@ -1490,13 +1514,15 @@ int WebappWindow::run(HINSTANCE instance) {
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
-        host_.frame(ms);
+        const bool uiTick = uiCadence_.due(ms);
+        host_.frame(ms, uiTick);
         reload = host_.takeReload();
         if (reload) continue;
         const auto tJs = std::chrono::steady_clock::now();
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
-        if (uiReady_) {
+        if (uiReady_ && uiTick) {
+            perf_.uiTicks++;
             gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
             if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
             uiVisible_ = !ui_.empty();
