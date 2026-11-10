@@ -58,8 +58,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const canvas = parameters.canvas || (typeof document !== 'undefined' ? document.createElement('canvas') : { width: 300, height: 150, style: {} });
       // The experimental raw WebGL2 prototype and native Three.js are
       // independent rendering paths; never claim a canvas owned by raw GL.
-      if (canvas._nativeGL2 || canvas._ntGraphicsOwner === 'raw-webgl2')
-        throw new TypeError('NativeRenderer cannot reuse a raw WebGL2 canvas; create a separate canvas');
+      if (canvas._nativeGL2 || canvas._ctx2d ||
+          canvas._ntGraphicsOwner === 'raw-webgl2' || canvas._ntGraphicsOwner === '2d')
+        throw new TypeError('NativeRenderer cannot reuse a WebGL2 or Canvas 2D context; create a separate canvas');
       this.domElement = canvas;
       // The HTML UI layer composites everything painted above this canvas.
       try {
