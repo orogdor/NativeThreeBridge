@@ -21,6 +21,13 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Verify DX12 packet and allocation safety guards (CPU only)
+        shell: pwsh
+        run: |
+          cl /nologo /W4 /EHsc /std:c++17 test/dx12-safety-guards.cpp /Fe:dx12-safety-guards.exe
+          if ($LASTEXITCODE -ne 0) { throw "DX12 safety guards failed to compile" }
+          & .\dx12-safety-guards.exe
+          if ($LASTEXITCODE -ne 0) { throw "DX12 safety guards rejected expected valid input or accepted corrupt input" }
       - name: Build official Three.js core separately from game/scene.js
         shell: pwsh
         run: |
