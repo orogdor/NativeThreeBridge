@@ -1112,7 +1112,7 @@
     }
     function uploadNativeTexture(texture) {
       if (!texture.pixels || texture.isArray && texture.depth !== 1) return;
-      if (!nt.uploadTexture(texture.id, texture.pixels, texture.width, texture.height, 0))
+      if (!nt.uploadTexture(texture.id, texture.pixels, texture.width, texture.height, texture.mipmapsRequested ? 2 : 0))
         throw new Error('Native DX12 texture upload failed');
       state.textureUploads++;
       texture.nativeUploaded = true;
@@ -1124,6 +1124,29 @@
           format !== G.RGBA || type !== G.UNSIGNED_BYTE)
         return unsupportedRaw('texImage3D/texImage2D only mip 0 RGBA8 UNSIGNED_BYTE');
       dimensions(width, height, depth);
+      // A WebGL 3D-array texture may be supplied as an Image containing a
+      // vertical strip of layers (K73 uses JPEG 8-layer albedo/normal atlases).
+      // WIC can decode that complete strip via the EXISTING native 2D uploader.
+      // Sampling its individual array layers still requires a new DX12
+      // Texture2DArray SRV + HLSL sampler, so explicitly warn about that.
+      if (pixels instanceof HTMLImageElement) {
+        if (!pixels.complete || !pixels._ntSource ||
+            pixels.naturalWidth !== width || pixels.naturalHeight !== height * depth)
+          throw new RangeError('texImage3D Image source dimensions do not match width*height*depth');
+        const src = pixels._ntSource;
+        const data = src.path ? new Uint8Array(nt.readBinary(src.path)) :
+          src.bytes ? new Uint8Array(src.bytes) : null;
+        if (!data || !data.length) return unsupportedRaw('texImage3D Image lacks encoded source bytes');
+        if (!nt.uploadTexture(t.id, data, 0, 0, t.mipmapsRequested ? 2 : 0))
+          throw new Error('Native DX12 encoded-image texture upload failed');
+        state.textureUploads++;
+        t.width = width; t.height = height; t.depth = depth;
+        t.encodedSource = data; t.nativeUploaded = true;
+        t.pixels = null; t.atlasOnly = target === G.TEXTURE_2D_ARRAY;
+        if (t.atlasOnly) warnOnce('raw-gl2-encoded-array',
+          'K73 image array atlas loaded to DX12 as Texture2D; native Texture2DArray layer sampling is not supported yet');
+        return;
+      }
       const data = pixels === null ? new Uint8Array(width * height * depth * 4) :
         rawPixelBytes(pixels, width * height * depth * 4);
       t.width = width; t.height = height; t.depth = depth;
@@ -1164,7 +1187,22 @@
       texImage2D(target, level, internalFormat, width, height, border, format, type, pixels) {
         if (target !== G.TEXTURE_2D) return unsupportedRaw('texImage2D target');
         const t = boundTexture(target);
-        if (arguments.length === 6) return unsupportedRaw('texImage2D image source requires native image upload separately');
+        if (arguments.length === 6) {
+          // texImage2D(target,level,internalFormat,format,type,Image)
+          const formatFromArgs = width, typeFromArgs = height, image = border;
+          if (level !== 0 || internalFormat !== G.RGBA8 ||
+              formatFromArgs !== G.RGBA || typeFromArgs !== G.UNSIGNED_BYTE ||
+              !(image instanceof HTMLImageElement) || !image.complete || !image._ntSource)
+            return unsupportedRaw('texImage2D image source/format');
+          const src = image._ntSource;
+          const encoded = src.path ? new Uint8Array(nt.readBinary(src.path)) :
+            src.bytes ? new Uint8Array(src.bytes) : null;
+          if (!encoded || !nt.uploadTexture(t.id, encoded, 0, 0, t.mipmapsRequested ? 2 : 0))
+            throw Error('Native DX12 texImage2D encoded source upload failed');
+          t.width = image.naturalWidth; t.height = image.naturalHeight;
+          t.depth = 1; t.encodedSource = encoded; t.nativeUploaded = true;
+          state.textureUploads++; return;
+        }
         setRgba8Image(t, target, level, internalFormat, width, height, 1, border, format, type, pixels);
       },
       texSubImage3D(target, level, xo, yo, zo, width, height, depth, format, type, pixels) {
@@ -1213,6 +1251,14 @@
         // DX12 texture upload builds mip levels for supported ordinary 2D
         // textures. Array mipmaps aren't implemented or sampled yet.
         if (t.isArray) warnOnce('raw-gl2-array-mips', 'K73 array texture mipmaps not supported by native DX12 material pipeline');
+        if (t.nativeUploaded && !t.isArray) {
+          if (t.pixels) uploadNativeTexture(t);
+          else if (t.encodedSource) {
+            if (!nt.uploadTexture(t.id, t.encodedSource, 0, 0, 2))
+              throw Error('Native DX12 image mipmaps upload failed');
+            state.textureUploads++;
+          }
+        }
       },
       deleteTexture(t) {
         if (!t || t.deleted) return;
