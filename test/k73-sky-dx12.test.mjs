@@ -42,7 +42,7 @@ test('unmatched non-K73 GLSL fragment cannot be linked as a sky shader', async (
   gl.shaderSource(vertex, '#version 300 es\nlayout(location=0) in vec2 aP; out vec2 vP; void main(){vP=aP;gl_Position=vec4(aP,0.0,1.0);}');
   gl.compileShader(vertex);
   const fragment = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fragment, '#version 300 es\nprecision mediump float; out vec4 oC;void main(){oC=vec4(1.0,0.2,0.3,1.0);}');
+  gl.shaderSource(fragment, '#version 300 es\nprecision mediump float; uniform vec3 uHor; out vec4 oC;void main(){oC=vec4(uHor,1.0);}');
   gl.compileShader(fragment);
   const program = gl.createProgram();
   gl.attachShader(program, vertex);
