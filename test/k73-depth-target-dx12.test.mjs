@@ -75,7 +75,7 @@ test('WebGL2 depth storage validation rejects unsupported formats before allocat
   const {context,rec}=await runWebapp(dir,{frames:1});
   const gl=context.document.getElementById('gl').getContext('webgl2');
   const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
-  assert.throws(()=>gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA32F,64,64),/only level-1 DEPTH_COMPONENT24/);
+  assert.throws(()=>gl.texStorage2D(gl.TEXTURE_2D,1,0x881A,64,64),/only level-1 DEPTH_COMPONENT24/);
   assert.equal(rec.depthTargets.size,1);
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
