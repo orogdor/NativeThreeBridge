@@ -2093,12 +2093,22 @@
     }
     getContext(kind, options) {
       if (kind === '2d') {
+        // Browser semantics: a canvas has one graphics-context family. Neither
+        // Three.js' native renderer nor the experimental raw WebGL2 bridge may
+        // silently be replaced by a 2D context.
+        if (this._nativeGL2 || this._ntRendererCanvas) return null;
         if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
         return this._ctx2d;
       }
-      if (kind === 'webgl2' && this.hasAttribute('data-native-webgl2-prototype')) {
-        if (!this._nativeGL2) this._nativeGL2 = makeRawDx12Prototype(this);
-        this._ntRendererCanvas = true;
+      if (kind === 'webgl2') {
+        // Raw WebGL2 is opt-in per canvas. The supported Three.js
+        // WebGLRenderer -> NativeRenderer path is entirely separate.
+        if (this._nativeGL2) return this._nativeGL2;
+        if (this._ctx2d || this._ntRendererCanvas ||
+            !this.hasAttribute('data-native-webgl2-prototype')) return null;
+        this._nativeGL2 = makeRawDx12Prototype(this);
+        this._ntRendererCanvas = true; // same compositor output, separate JS API
+        this._ntGraphicsOwner = 'raw-webgl2';
         return this._nativeGL2;
       }
       unsupported(`canvas.getContext('${kind}')`, 'use THREE.WebGLRenderer, which renders natively');
