@@ -119,8 +119,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._transparent = [];
       this._lights = [];
       this._lastFrame = -1;
-      // Renderer-local transform state; never changes the webapp's Object3D flags.
-      this._worldTransforms = new WeakMap();
       this._disposed = false;
     }
 
@@ -444,98 +442,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return info;
     }
 
-    // Three.js updates every Object3D's local matrix and then forces its entire
-    // subtree on each scene.updateMatrixWorld() call, even when nothing moves.
-    // Read the public transform components instead: Vector3 position/scale have
-    // no change notifications, so a per-frame comparison is necessary to keep
-    // unchanged webapps (including direct position.x writes) working.
-    _syncWorldMatrices(root) {
-      const records = this._worldTransforms;
-      const defaultWorldUpdate = THREE.Object3D.prototype.updateMatrixWorld;
-      const defaultLocalUpdate = THREE.Object3D.prototype.updateMatrix;
-      const invalidate = (object) => {
-        records.delete(object);
-        for (const child of object.children) invalidate(child);
-      };
-      const visit = (object, parentDirty) => {
-        // Cameras, custom objects and overridden hooks must retain their normal
-        // Three.js behaviour. Do not modify the library's global prototypes.
-        if (object.updateMatrixWorld !== defaultWorldUpdate ||
-            object.updateMatrix !== defaultLocalUpdate) {
-          invalidate(object);
-          object.updateMatrixWorld(parentDirty);
-          return;
-        }
-        let rec = records.get(object);
-        const fresh = !rec;
-        if (fresh) {
-          rec = { parent: null, localAuto: null, worldAuto: null, values: null, local: null, world: null };
-          records.set(object, rec);
-        }
-        let dirty = fresh || parentDirty || object.matrixWorldNeedsUpdate ||
-          rec.parent !== object.parent || rec.localAuto !== object.matrixAutoUpdate ||
-          rec.worldAuto !== object.matrixWorldAutoUpdate;
-
-        if (object.matrixAutoUpdate) {
-          const p = object.position, q = object.quaternion, s = object.scale, v = rec.values;
-          if (!v || v[0] !== p.x || v[1] !== p.y || v[2] !== p.z ||
-              v[3] !== q.x || v[4] !== q.y || v[5] !== q.z || v[6] !== q.w ||
-              v[7] !== s.x || v[8] !== s.y || v[9] !== s.z) {
-            object.updateMatrix(); // also honours matrixWorldNeedsUpdate
-            dirty = true;
-            const t = v || (rec.values = new Float64Array(10));
-            t[0] = p.x; t[1] = p.y; t[2] = p.z;
-            t[3] = q.x; t[4] = q.y; t[5] = q.z; t[6] = q.w;
-            t[7] = s.x; t[8] = s.y; t[9] = s.z;
-          }
-          rec.local = null;
-        } else {
-          // With matrixAutoUpdate=false, applications commonly write the local
-          // Matrix4 directly without raising matrixWorldNeedsUpdate.
-          const elements = object.matrix.elements, previous = rec.local;
-          let modified = !previous;
-          if (!modified) for (let i = 0; i < 16; i++) {
-            if (previous[i] !== elements[i]) { modified = true; break; }
-          }
-          if (modified) {
-            (previous || (rec.local = new Float64Array(16))).set(elements);
-            dirty = true;
-          }
-          rec.values = null;
-        }
-
-        if (object.matrixWorldAutoUpdate === false) {
-          // Manually managed world matrices can move children without changing
-          // local transforms; preserve that propagation as well.
-          const elements = object.matrixWorld.elements, previous = rec.world;
-          let modified = !previous;
-          if (!modified) for (let i = 0; i < 16; i++) {
-            if (previous[i] !== elements[i]) { modified = true; break; }
-          }
-          if (modified) {
-            (previous || (rec.world = new Float64Array(16))).set(elements);
-            dirty = true;
-          }
-        } else {
-          rec.world = null;
-        }
-
-        if (dirty) {
-          if (object.matrixWorldAutoUpdate === true) {
-            if (object.parent === null) object.matrixWorld.copy(object.matrix);
-            else object.matrixWorld.multiplyMatrices(object.parent.matrixWorld, object.matrix);
-          }
-          object.matrixWorldNeedsUpdate = false;
-        }
-        rec.parent = object.parent;
-        rec.localAuto = object.matrixAutoUpdate;
-        rec.worldAuto = object.matrixWorldAutoUpdate;
-        const children = object.children;
-        for (let i = 0; i < children.length; i++) visit(children[i], dirty);
-      };
-      visit(root, false);
-    }
-
     // ---------------------------------------------------------------- render
     render(scene, camera) {
       // Debug aid: tests and tools inspect what the game drew last.
@@ -544,7 +450,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!camera || !camera.isCamera) { warnOnce('render-no-camera', 'render() called without a camera'); return; }
       if (this._renderTarget) return; // render-to-texture is not supported yet: skip, do not draw to screen
 
-      if (scene.matrixWorldAutoUpdate !== false) this._syncWorldMatrices(scene);
+      if (scene.matrixWorldAutoUpdate !== false) scene.updateMatrixWorld();
       if (camera.parent === null && camera.matrixWorldAutoUpdate !== false) camera.updateMatrixWorld();
       if (this.info.autoReset) this.info.reset();
       this.info.render.frame++;
