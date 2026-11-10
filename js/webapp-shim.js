@@ -902,12 +902,77 @@
       VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
       COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
       TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+      TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a, TEXTURE0: 0x84c0,
+      RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814,
+      TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+      TEXTURE_MAX_LEVEL: 0x813d,
+      LINEAR: 0x2601, NEAREST: 0x2600,
+      LINEAR_MIPMAP_LINEAR: 0x2703,
+      REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812f,
+      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, NONE: 0, BROWSER_DEFAULT_WEBGL: 0x9244,
     };
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
-      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
+      activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
+      liveTextures: new Set(), textureUploads: 0 };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
+    // Reuse NativeThreeBridge's existing nt.uploadTexture / DX12 Texture2D.
+    // A TEXTURE_2D_ARRAY with N layers is stored as a VERTICAL ATLAS:
+    // width x (height*N) RGBA8 pixels, or exactly the original JPEG atlas.
+    // This preserves layer data; the K73-specific HLSL profile remaps the
+    // triplanar layer coordinate, without creating a second GPU backend.
+    let nextRawTextureId = 70000000;
+    function boundTexture(target) {
+      if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY)
+        return unsupportedRaw('texture target 0x' + target.toString(16));
+      const texture = state.textureUnits[state.activeTextureUnit].get(target);
+      if (!texture || texture.deleted) throw Error('WebGL2 texture target has no live bound texture');
+      return texture;
+    }
+    function setTexturePixels(texture, width, height, layers, bytes, encoded = false) {
+      if (!Number.isInteger(width) || !Number.isInteger(height) || !Number.isInteger(layers) ||
+          width < 1 || height < 1 || layers < 1 || width > 8192 || height * layers > 16384)
+        throw new RangeError('Texture dimensions out of native DX12 range');
+      if (!encoded && (!(bytes instanceof Uint8Array) || bytes.byteLength !== width * height * layers * 4))
+        throw new RangeError('Expected tightly packed RGBA8 texture pixels for all layers');
+      const ok = nt.uploadTexture(texture.id, bytes, encoded ? 0 : width,
+        encoded ? 0 : height * layers, 0); // atlas mipmaps not safe across layers
+      if (!ok) throw Error('NativeThreeBridge DX12 texture upload failed');
+      texture.width = width; texture.height = height; texture.layers = layers;
+      texture.loaded = true; texture.encoded = encoded; texture.version++;
+      state.textureUploads++;
+    }
+    function imageBytesAndSize(image, width, height, layers) {
+      const src = image?._ntSource;
+      const w = image?.naturalWidth || image?.width, h = image?.naturalHeight || image?.height;
+      if (!src || w !== width || h !== height * layers)
+        throw new RangeError('Image dimensions do not match width x (height * layers) K73 atlas');
+      if (src.bytes) return new Uint8Array(src.bytes);
+      if (src.path) return new Uint8Array(nt.readBinary(src.path));
+      throw new TypeError('Texture image has no encoded JPEG/PNG byte source');
+    }
+    function setTexImage(target, level, format, width, height, layers, pixelFormat, pixelType, pixels) {
+      if (level !== 0 || (format !== G.RGBA8 && format !== G.RGBA) ||
+          pixelFormat !== G.RGBA || pixelType !== G.UNSIGNED_BYTE)
+        return unsupportedRaw('texImage: only level-0 RGBA8/UNSIGNED_BYTE is supported');
+      const texture = boundTexture(target);
+      if (pixels?._ntSource) {
+        const bytes = imageBytesAndSize(pixels, width, height, layers);
+        setTexturePixels(texture, width, height, layers, bytes, true);
+      } else if (pixels instanceof Uint8Array) {
+        setTexturePixels(texture, width, height, layers, pixels, false);
+      } else if (pixels === null) {
+        // WebGL allows allocating with null pixels. Keep all bytes defined as
+        // transparent black, so uninitialised data never leak to the GPU.
+        setTexturePixels(texture, width, height, layers,
+          new Uint8Array(width * height * layers * 4), false);
+      } else {
+        return unsupportedRaw('texImage pixels: only Uint8Array, Image, or null');
+      }
+    }
     function compileVertex(source) {
       // Recognise K73's actual non-skinned, non-instanced lit vertex shader.
       // Map its model and view-projection uniforms to the native DX12 packet
@@ -1126,6 +1191,76 @@
       uniform3f(location, x, y, z) { if (location) location.program.uniforms.set(location.name, Float32Array.of(x, y, z)); },
       uniform1f(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
       uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      createTexture() {
+        const t = { id: nextRawTextureId++, target: null, width: 0, height: 0,
+          layers: 0, version: 0, loaded: false, deleted: false, parameters: new Map() };
+        state.liveTextures.add(t);
+        return t;
+      },
+      deleteTexture(t) {
+        if (!t || t.deleted) return;
+        if (t.loaded) nt.releaseTexture(t.id);
+        t.deleted = true; t.loaded = false;
+        state.liveTextures.delete(t);
+        for (const unit of state.textureUnits) {
+          for (const [key, value] of unit) if (value === t) unit.delete(key);
+        }
+      },
+      activeTexture(unit) {
+        const index = unit - G.TEXTURE0;
+        if (!Number.isInteger(index) || index < 0 || index >= state.textureUnits.length)
+          return unsupportedRaw('activeTexture unit ' + unit);
+        state.activeTextureUnit = index;
+      },
+      bindTexture(target, t) {
+        if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY) return unsupportedRaw('bindTexture target');
+        const bindings = state.textureUnits[state.activeTextureUnit];
+        if (t === null) { bindings.delete(target); return; }
+        if (!state.liveTextures.has(t) || t.deleted) return unsupportedRaw('bindTexture invalid/deleted texture');
+        if (t.target !== null && t.target !== target) return unsupportedRaw('bindTexture immutable texture target');
+        t.target = target;
+        bindings.set(target, t);
+      },
+      texImage3D(target, level, internalFormat, width, height, depth, border, format, type, pixels) {
+        if (target !== G.TEXTURE_2D_ARRAY || border !== 0) return unsupportedRaw('texImage3D target/border');
+        setTexImage(target, level, internalFormat, width, height, depth, format, type, pixels);
+      },
+      texImage2D(...a) {
+        if (a.length === 9) {
+          const [target, level, internalFormat, width, height, border, format, type, pixels] = a;
+          if (target !== G.TEXTURE_2D || border !== 0) return unsupportedRaw('texImage2D target/border');
+          setTexImage(target, level, internalFormat, width, height, 1, format, type, pixels);
+        } else if (a.length === 6) {
+          const [target, level, internalFormat, format, type, pixels] = a;
+          if (target !== G.TEXTURE_2D || !pixels?._ntSource) return unsupportedRaw('texImage2D image');
+          setTexImage(target, level, internalFormat, pixels.naturalWidth || pixels.width,
+            pixels.naturalHeight || pixels.height, 1, format, type, pixels);
+        } else return unsupportedRaw('texImage2D overload');
+      },
+      texParameteri(target, name, value) {
+        const t = boundTexture(target);
+        if (![G.TEXTURE_MIN_FILTER, G.TEXTURE_MAG_FILTER, G.TEXTURE_WRAP_S,
+              G.TEXTURE_WRAP_T, G.TEXTURE_MAX_LEVEL].includes(name))
+          return unsupportedRaw('texParameteri pname 0x' + name.toString(16));
+        t.parameters.set(name, value);
+      },
+      texParameterf(target, name, value) {
+        return unsupportedRaw('texParameterf extension 0x' + name.toString(16));
+      },
+      pixelStorei(name, value) {
+        if (name !== G.UNPACK_COLORSPACE_CONVERSION_WEBGL || (value !== G.NONE && value !== G.BROWSER_DEFAULT_WEBGL))
+          return unsupportedRaw('pixelStorei pname');
+        // JPEG colorspace is decoded natively by Windows WIC; the material
+        // atlas is already authored for this texture path.
+      },
+      generateMipmap(target) {
+        const t = boundTexture(target);
+        if (!t.loaded) throw Error('generateMipmap on incomplete texture');
+        if (t.layers > 1) unsupported('K73 texture-array mipmaps',
+          'Native DX12 vertical atlas retains full-resolution layers; mipmaps disabled to prevent cross-layer bleed');
+      },
+      get __nativeTextureUploads() { return state.textureUploads; },
+      get __nativeTextureUnits() { return state.textureUnits; },
       createBuffer() { return { data: null, version: 0 }; },
       bindBuffer(target, buffer) {
         if (target === G.ARRAY_BUFFER) state.buffer = buffer;
