@@ -2097,7 +2097,10 @@
         // Three.js' native renderer nor the experimental raw WebGL2 bridge may
         // silently be replaced by a 2D context.
         if (this._nativeGL2 || this._ntRendererCanvas) return null;
-        if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
+        if (!this._ctx2d) {
+          this._ctx2d = new CanvasRenderingContext2D(this, options || {});
+          this._ntGraphicsOwner = '2d';
+        }
         return this._ctx2d;
       }
       if (kind === 'webgl2') {
