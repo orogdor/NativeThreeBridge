@@ -14,6 +14,8 @@ constexpr std::uint32_t kMaxGeometryVertices = 2'000'000;
 constexpr std::uint32_t kMaxGeometryIndices = 6'000'000;
 constexpr std::uint32_t kMaxInstances = 65'536;
 constexpr std::uint64_t kMaxBufferBytes = 256ull * 1024 * 1024;
+constexpr std::uint64_t kMaxLiveTextureBytes = 1024ull * 1024 * 1024;
+constexpr std::uint64_t kMaxVertexInvocationsPerFrame = 50'000'000ull;
 constexpr std::uint32_t kMaxTextureDimension = 8192;
 constexpr std::uint32_t kFenceTimeoutMs = 5000;
 
@@ -49,6 +51,19 @@ inline bool validInstances(const float* matrices, std::uint32_t count) {
 inline bool validDraw(std::uint32_t start, std::uint32_t count,
                       std::uint32_t available, std::uint32_t instances) {
     return count > 0 && instances > 0 && start <= available && count <= available - start;
+}
+
+inline bool reserveTextureBudget(std::uint64_t live, std::uint64_t replacing, std::uint64_t incoming) {
+    return replacing <= live && incoming <= kMaxLiveTextureBytes &&
+           live - replacing <= kMaxLiveTextureBytes - incoming;
+}
+
+inline bool chargeDrawWork(std::uint64_t& used, std::uint32_t vertices, std::uint32_t instances) {
+    if (used > kMaxVertexInvocationsPerFrame || vertices == 0 || instances == 0) return false;
+    const std::uint64_t work = std::uint64_t(vertices) * instances;
+    if (work > kMaxVertexInvocationsPerFrame - used) return false;
+    used += work;
+    return true;
 }
 
 inline bool validBufferBytes(std::uint64_t bytes) {
