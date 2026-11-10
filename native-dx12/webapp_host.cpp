@@ -351,6 +351,24 @@ JSValue jsRegisterImage(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     if (self->sink) self->sink->registerImage(argString(ctx, argv[0]), data, bytes);
     return JS_UNDEFINED;
 }
+JSValue jsAllocateDepthTarget(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 3) return JS_ThrowTypeError(ctx, "allocateDepthTarget(id, width, height)");
+    std::uint32_t id = 0, width = 0, height = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &width, argv[1]) < 0 ||
+        JS_ToUint32(ctx, &height, argv[2]) < 0)
+        return JS_EXCEPTION;
+    if (!id || !width || !height || width > 4096 || height > 4096)
+        return JS_ThrowRangeError(ctx, "Invalid offscreen depth target dimensions");
+    return JS_NewBool(ctx, self->sink && self->sink->allocateDepthTarget(id, width, height));
+}
+JSValue jsReleaseDepthTarget(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0;
+    if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink)
+        self->sink->releaseDepthTarget(id);
+    return JS_UNDEFINED;
+}
 JSValue jsReleaseTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     std::uint32_t id = 0;
@@ -562,6 +580,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
         {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
+        {"allocateDepthTarget", jsAllocateDepthTarget, 3}, {"releaseDepthTarget", jsReleaseDepthTarget, 1},
         {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
         {"registerImage", jsRegisterImage, 2},
