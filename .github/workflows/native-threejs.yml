@@ -126,6 +126,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on QuickJS" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/raw-webgl2-dx12 1
           if ($LASTEXITCODE -ne 0) { throw "raw WebGL2->DX12 bridge fixture failed on V8" }
+          # Actual K73-style GLSL contract and indexed vertex colours through
+          # the shared DX12 HLSL renderer; never accept a zero-draw smoke.
+          & .\build\Release\WebappSmoke.exe test/fixtures/k73-lit-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 indexed DX12 mesh bridge failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-lit-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "K73 indexed DX12 mesh bridge failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
