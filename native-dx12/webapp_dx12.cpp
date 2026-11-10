@@ -1431,6 +1431,13 @@ void WebappWindow::renderFrame() {
     }
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
+    // A depth-only K73 shadow pass binds zero colour targets. Restore the
+    // swap-chain RTV, viewport and scissor before composing HTML/CSS.
+    // Otherwise drawUi() executes with no colour target bound and the
+    // entire menu/HUD disappears as soon as shadow rendering succeeds.
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    cmd_->RSSetViewports(1, &viewport);
+    cmd_->RSSetScissorRects(1, &scissor);
     if (uiReady_) {
         if (uiUpload_) uploadUi(frame);
         if (uiVisible_) drawUi(frame);
