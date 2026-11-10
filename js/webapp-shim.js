@@ -894,6 +894,7 @@
   // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
   // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
   let nextRawGeometryId = 90000000;
+  let nextRawInstanceId = 95000000;
   function makeRawDx12Prototype(canvas) {
     const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
     const G = {
@@ -915,7 +916,7 @@
     const state = { buffer: null, vao: { attributes: new Map(), elements: null },
       program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
       activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
-      liveTextures: new Set(), textureUploads: 0 };
+      liveTextures: new Set(), textureUploads: 0, instanceCache: new WeakMap() };
     const unsupportedRaw = (method) => {
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
@@ -974,16 +975,21 @@
       }
     }
     function compileVertex(source) {
-      // Recognise K73's actual non-skinned, non-instanced lit vertex shader.
-      // Map its model and view-projection uniforms to the native DX12 packet
-      // instead of pretending to execute arbitrary user GLSL.
+      // K73's INST variant has exactly four per-instance matrix columns at
+      // locations 3..6 and a per-instance colour at 7. Route those attributes
+      // to NativeRenderer's real DX12 instancing buffer; never silently
+      // accept arbitrary GLSL or SKIN vertex shaders.
+      const instanced = /#define\s+INST\b/.test(source);
+      const skinned = /#define\s+SKIN\b/.test(source);
       if (/layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
           /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
           /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
           /uniform\s+mat4\s+uVP\s*;/.test(source) &&
-          /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) &&
-          !/#define\s+(?:INST|SKIN)\b/.test(source)) {
-        return { kind: 'k73-lit', size: 3 };
+          /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) && !skinned) {
+        if (instanced && ![3, 4, 5, 6, 7].every(i =>
+            new RegExp('layout\\s*\\(location\\s*=\\s*' + i + '\\)\\s*in\\s+vec4\\s+a' +
+              (i === 7 ? 'IC' : 'M' + (i - 3)) + '\\s*;').test(source))) return null;
+        return { kind: instanced ? 'k73-lit-inst' : 'k73-lit', size: 3 };
       }
       const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
       if (!attr) return null;
@@ -1016,7 +1022,7 @@
       return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
     }
     function k73MaterialAtlas() {
-      if (state.program?.profile !== 'k73-lit') return null;
+      if (!['k73-lit', 'k73-lit-inst'].includes(state.program?.profile)) return null;
       const unit = state.program.uniforms?.get('uMatA') ?? 6;
       if (state.program.uniforms?.get('uMatOn') < 0.5) return null;
       if (!Number.isInteger(unit) || unit < 0 || unit >= state.textureUnits.length) return null;
@@ -1092,7 +1098,7 @@
         // it is NOT transparency. Native HLSL's vertex alpha controls pixel
         // opacity, so pass opaque alpha until the material-class shader stage
         // is separately translated.
-        if (state.program?.profile === 'k73-lit' && !k73MaterialAtlas()) col[3] = 1;
+        if (state.program?.profile?.startsWith('k73-lit') && !k73MaterialAtlas()) col[3] = 1;
         colors.set(col, i * 4);
         hasColors ||= !!attrs.get(2)?.enabled;
       }
@@ -1104,16 +1110,53 @@
       state.cache.set(vao, { id, key: cacheKey });
       return id;
     }
-    function submitRawPass(geometryId, count, profile) {
+    function instanceRecord(count) {
+      if (state.program?.profile !== 'k73-lit-inst') return null;
+      const vao = state.vao;
+      if (!Number.isInteger(count) || count < 0 || count > 250000)
+        return unsupportedRaw('invalid instance count');
+      const attrs = [3, 4, 5, 6, 7].map(i => vao.attributes.get(i));
+      if (attrs.some(a => !a?.enabled || !a.buffer?.data || a.divisor !== 1 ||
+            a.type !== G.FLOAT || a.size !== 4 || a.normalized))
+        return unsupportedRaw('K73 INST needs five FLOAT vec4 attributes with divisor=1');
+      const key = [count, ...attrs.flatMap(a =>
+        [a.buffer.version, a.stride, a.offset, a.buffer.data.byteLength])].join(':');
+      let old = state.instanceCache.get(vao);
+      if (old?.key === key) return old;
+      const matrices = new Float32Array(count * 16);
+      const colors = new Float32Array(count * 3);
+      for (let row = 0; row < count; row++) {
+        for (let col = 0; col < 5; col++) {
+          const a = attrs[col], stride = a.stride || 16;
+          const byteOffset = a.offset + row * stride;
+          if (byteOffset < 0 || byteOffset + 16 > a.buffer.data.byteLength)
+            throw new RangeError('K73 INST attribute data outside buffer');
+          const view = new DataView(a.buffer.data.buffer,
+            a.buffer.data.byteOffset + byteOffset, 16);
+          for (let c = 0; c < (col === 4 ? 3 : 4); c++) {
+            const value = view.getFloat32(c * 4, true);
+            if (col === 4) colors[row * 3 + c] = value;
+            else matrices[row * 16 + col * 4 + c] = value;
+          }
+        }
+      }
+      if (!old) old = { id: nextRawInstanceId++ };
+      nt.uploadInstances(old.id, matrices, colors, count);
+      old.key = key; old.count = count;
+      state.instanceCache.set(vao, old);
+      return old;
+    }
+    function submitRawPass(geometryId, count, profile, instances = null) {
       const uniforms = state.program.uniforms || new Map();
       const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
-      const transform = profile === 'k73-lit' ? uniform('uVP', ID) : ID;
+      const lit = profile === 'k73-lit' || profile === 'k73-lit-inst';
+      const transform = lit ? uniform('uVP', ID) : ID;
       const model = profile === 'k73-lit' ? uniform('uModel', ID) : ID;
-      const tint = profile === 'k73-lit' ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
-      const packet = new Float32Array(64 + (profile === 'k73-lit' ? 16 : 0) + 56);
+      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
+      const packet = new Float32Array(64 + (lit ? 16 : 0) + 56);
       packet.set(ID, 0); packet.set(transform, 16);
       packet.set(state.clear, 36);
-      const useLight = profile === 'k73-lit';
+      const useLight = lit;
       packet[35] = useLight ? 1 : 0;
       if (useLight) {
         const sky = uniform('uSkyCol', [0.3, 0.3, 0.35]);
@@ -1129,10 +1172,13 @@
       packet[45] = canvas.width; packet[46] = canvas.height;
       packet[47] = uniform('uExposure', 1);
       const o = useLight ? 80 : 64;
-      packet[o] = geometryId; packet[o + 2] = 1;
+      packet[o] = geometryId;
+      packet[o + 1] = instances?.id || 0;
+      packet[o + 2] = instances?.count || 1;
       const hasColors = !!state.vao.attributes.get(2)?.enabled;
       const atlas = useLight ? k73MaterialAtlas() : null;
-      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (atlas ? 4096 | 1048576 : 0) : 16 | 2 | 64;
+      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) | (instances ? 1024 : 0) |
+        (atlas ? 4096 | 1048576 : 0) : 16 | 2 | 64;
       if (atlas) {
         packet[o + 32] = atlas.id;         // Native DX12 texture slot
         packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
@@ -1175,10 +1221,10 @@
         const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
         program.linked = !!(vs?.compiled && fs?.compiled);
         program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
-        program.profile = program.linked && vs.payload?.kind === 'k73-lit' && fs.payload?.kind === 'k73-lit'
-          ? 'k73-lit' : 'constant';
+        program.profile = program.linked && ['k73-lit', 'k73-lit-inst'].includes(vs.payload?.kind) &&
+          fs.payload?.kind === 'k73-lit' ? vs.payload.kind : 'constant';
         program.uniforms = new Map();
-        if (program.profile === 'k73-lit') unsupported('K73 advanced GLSL shading',
+        if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
@@ -1282,19 +1328,32 @@
         else return unsupportedRaw('bindBuffer target');
       },
       bufferData(target, data) {
-        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferData typed arrays only');
+        if (typeof data === 'number') {
+          if (!Number.isSafeInteger(data) || data < 0 || data > 256 * 1024 * 1024)
+            return unsupportedRaw('bufferData size');
+          data = new Uint8Array(data);
+        }
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferData typed arrays or size');
         const dst = target === G.ARRAY_BUFFER ? state.buffer :
           target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
         if (!dst) throw Error('No buffer bound for bufferData');
         dst.data = new data.constructor(data); dst.version++;
       },
-      bufferSubData(target, offset, data) {
-        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferSubData data');
+      bufferSubData(target, offset, data, sourceOffset = 0, length) {
+        if (!ArrayBuffer.isView(data) || !Number.isInteger(sourceOffset) || sourceOffset < 0)
+          return unsupportedRaw('bufferSubData data/sourceOffset');
         const dst = target === G.ARRAY_BUFFER ? state.buffer :
           target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
-        if (!dst?.data || offset < 0 || offset % dst.data.BYTES_PER_ELEMENT ||
-            offset / dst.data.BYTES_PER_ELEMENT + data.length > dst.data.length) return unsupportedRaw('bufferSubData range');
-        dst.data.set(data, offset / dst.data.BYTES_PER_ELEMENT); dst.version++;
+        const elements = length === undefined ? data.length - sourceOffset : length;
+        if (!Number.isInteger(elements) || elements < 0 || sourceOffset + elements > data.length)
+          return unsupportedRaw('bufferSubData element range');
+        const byteCount = elements * data.BYTES_PER_ELEMENT;
+        if (!dst?.data || !Number.isInteger(offset) || offset < 0 ||
+            offset + byteCount > dst.data.byteLength) return unsupportedRaw('bufferSubData byte range');
+        new Uint8Array(dst.data.buffer, dst.data.byteOffset, dst.data.byteLength).set(
+          new Uint8Array(data.buffer, data.byteOffset +
+            sourceOffset * data.BYTES_PER_ELEMENT, byteCount), offset);
+        dst.version++;
       },
       createVertexArray() { return { attributes: new Map(), elements: null }; },
       bindVertexArray(vao) { state.vao = vao || { attributes: new Map(), elements: null }; },
@@ -1303,9 +1362,23 @@
         state.vao.attributes.set(index, { ...old, enabled: true });
       },
       vertexAttribPointer(index, size, type, normalized, stride, offset) {
-        if (index < 0 || index > 2 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
+        if (index < 0 || index > 7 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
         const old = state.vao.attributes.get(index) || {};
         state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+      },
+      vertexAttribDivisor(index, divisor) {
+        if (index < 0 || index > 7 || (divisor !== 0 && divisor !== 1))
+          return unsupportedRaw('vertexAttribDivisor attribute/divisor');
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, divisor });
+      },
+      deleteBuffer(buffer) { if (buffer) { buffer.data = null; buffer.version++; } },
+      deleteVertexArray(vao) {
+        const rec = state.instanceCache.get(vao);
+        if (rec) { nt.releaseInstances(rec.id); state.instanceCache.delete(vao); }
+        const g = state.cache.get(vao);
+        if (g) { nt.releaseGeometry(g.id); state.cache.delete(vao); }
+        if (state.vao === vao) state.vao = { attributes: new Map(), elements: null };
       },
       viewport(x, y, w, h) {
         if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
@@ -1324,6 +1397,24 @@
         if (mode !== G.TRIANGLES || count < 3 || count % 3) return unsupportedRaw('drawElements primitive');
         if (!state.program?.linked) throw Error('No linked shader program');
         submitRawPass(upload(0, count, type, offset), count, state.program.profile);
+      },
+      drawArraysInstanced(mode, first, count, instanceCount) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0)
+          return unsupportedRaw('drawArraysInstanced primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        if (!instanceCount) return;
+        const instances = instanceRecord(instanceCount);
+        if (!instances) return unsupportedRaw('instanced shader profile mismatch');
+        submitRawPass(upload(first, count), count, state.program.profile, instances);
+      },
+      drawElementsInstanced(mode, count, type, offset, instanceCount) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3)
+          return unsupportedRaw('drawElementsInstanced primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        if (!instanceCount) return;
+        const instances = instanceRecord(instanceCount);
+        if (!instances) return unsupportedRaw('instanced shader profile mismatch');
+        submitRawPass(upload(0, count, type, offset), count, state.program.profile, instances);
       },
       get __nativeDraws() { return state.draws; },
     };
