@@ -107,7 +107,8 @@ function normalizeGamePath(p) {
 // Recording sink with the same validation as the C++ __nt functions.
 export function createRecorder() {
   return {
-    geometries: new Map(), instances: new Map(), textures: new Map(), canvases: new Map(), passes: [], framePasses: [], titles: [], logs: [],
+    geometries: new Map(), instances: new Map(), textures: new Map(), depthTargets: new Map(),
+    canvases: new Map(), passes: [], framePasses: [], titles: [], logs: [],
     uploads: 0, instanceUploads: 0,
   };
 }
@@ -220,6 +221,13 @@ export async function runWebapp(root, options = {}) {
       return true;
     },
     releaseTexture(id) { rec.textures.delete(id); },
+    allocateDepthTarget(id, width, height) {
+      if (!id || width < 1 || height < 1 || width > 4096 || height > 4096)
+        return false;
+      rec.depthTargets.set(id, {width, height, format:'D32_FLOAT'});
+      return true;
+    },
+    releaseDepthTarget(id) { rec.depthTargets.delete(id); },
     // Canvas 2D command batches (executed by Direct2D in the engine).
     canvasCommands(id, width, height, ops, floats, strings) {
       view(ops, 'canvas commands');
