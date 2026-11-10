@@ -7,6 +7,11 @@ const folder = fileURLToPath(new URL('./fixtures/webapp-dynamic-scripts', import
 
 test('connected dynamically appended scripts execute in order and signal load/error', async () => {
   const { context: w, status } = await runWebapp(folder, { frames: 25 });
+  // A queued script's error event may finish in the following microtask
+  // checkpoint, after the host has returned its last synthetic frame.
+  for (let i = 0; i < 30 && !w.dynamicErrorReceived; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
   assert.equal(status.booted, true);
   assert.equal(status.bootError, null);
   assert.equal(w.document.title, 'Dynamic scripts ready');
