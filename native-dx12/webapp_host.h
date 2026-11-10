@@ -116,7 +116,7 @@ inline std::size_t webappUiHeaderFloats(float version) {
 constexpr std::size_t kWebappPassHeaderFloats = 64;
 constexpr std::size_t kWebappLightFloats = 16;
 constexpr std::size_t kWebappDrawFloats = 56;
-constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
+constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2, kWebappTextureFloat32 = 4;
 constexpr std::size_t kWebappMaxLights = 16;
 
 // Game-folder path checks shared by the module loader and file reads.
