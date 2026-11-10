@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "webapp_host.h"
+#include "webapp_dx12_guard.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
 #include "webapp_ui.h"
@@ -188,6 +190,13 @@ public:
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
+        if (pendingPasses_.size() >= native_three::safety::kMaxPassesPerFrame ||
+            !native_three::safety::validPass(data, floats,
+                native_three::kWebappPassHeaderFloats, native_three::kWebappLightFloats,
+                native_three::kWebappDrawFloats, UINT(native_three::kWebappMaxLights))) {
+            if (invalidPacketWarnings_++ < 8) log("warn", "[dx12-safety] rejected malformed or oversized render packet");
+            return;
+        }
         pendingPasses_.emplace_back(data, data + floats);
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
@@ -238,6 +247,8 @@ public:
 
 private:
     void check(HRESULT hr, const char* what);
+    void reportDeviceLoss(const char* stage);
+    void waitForFenceValue(UINT64 value, const char* stage);
     void initDevice();
     void createSizeDependent();
     void releaseSizeDependent();
@@ -270,6 +281,8 @@ private:
     std::wstring pageTitle_ = L"Three.js webapp";
     std::wstring adapterName_ = L"GPU";
     int logErrors_ = 0;
+    unsigned invalidPacketWarnings_ = 0;
+    unsigned invalidDrawWarnings_ = 0;
     bool bootDialogShown_ = false;
 
     D3D12_CPU_DESCRIPTOR_HANDLE depthViewHandle(UINT slot) const {
@@ -395,6 +408,7 @@ void WebappWindow::check(HRESULT hr, const char* what) {
     char text[512];
     std::snprintf(text, sizeof text, "%s failed (HRESULT 0x%08lX)", what, (unsigned long)hr);
     log("error", text);
+    if (device_) reportDeviceLoss(what);
     if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
         MessageBoxA(window_, text, "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
     ExitProcess(44);
@@ -409,10 +423,77 @@ void WebappWindow::log(const std::string& level, const std::string& text) {
     OutputDebugStringA(("[webapp " + level + "] " + text + "\n").c_str());
 }
 
+void WebappWindow::reportDeviceLoss(const char* stage) {
+    if (!device_) return;
+    const HRESULT reason = device_->GetDeviceRemovedReason();
+    char message[240];
+    std::snprintf(message, sizeof message, "[dx12-safety] %s: GetDeviceRemovedReason=0x%08lX",
+                  stage, static_cast<unsigned long>(reason));
+    log(FAILED(reason) ? "error" : "warn", message);
+    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+    if (FAILED(device_.As(&dred))) {
+        log("warn", "[dx12-safety] DRED unavailable on this Windows version");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+        unsigned count = 0;
+        for (auto* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+             node && count++ < 16; node = node->pNext) {
+            const UINT last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0u;
+            std::snprintf(message, sizeof message, "[dx12-dred] queue=%s list=%s completed=%u/%u",
+                          node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "?",
+                          node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "?",
+                          last, node->BreadcrumbCount);
+            log("error", message);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA != 0) {
+        std::snprintf(message, sizeof message, "[dx12-dred] page fault GPU virtual address=0x%llX",
+                      static_cast<unsigned long long>(fault.PageFaultVA));
+        log("error", message);
+    }
+}
+
+void WebappWindow::waitForFenceValue(UINT64 value, const char* stage) {
+    if (fence_->GetCompletedValue() >= value) return;
+    check(fence_->SetEventOnCompletion(value, fenceEvent_), "SetEventOnCompletion");
+    const DWORD result = WaitForSingleObject(fenceEvent_, native_three::safety::kFenceTimeoutMs);
+    if (result == WAIT_OBJECT_0 && fence_->GetCompletedValue() >= value) return;
+    char detail[256];
+    std::snprintf(detail, sizeof detail,
+                  "[dx12-safety] %s: GPU fence wait failed or exceeded %lu ms (wait=%lu, target=%llu, completed=%llu)",
+                  stage, static_cast<unsigned long>(native_three::safety::kFenceTimeoutMs),
+                  static_cast<unsigned long>(result), static_cast<unsigned long long>(value),
+                  static_cast<unsigned long long>(fence_->GetCompletedValue()));
+    log("error", detail);
+    reportDeviceLoss(stage);
+    // Never spin forever on a dead GPU; allow the OS to reclaim this process.
+    ExitProcess(45);
+}
+
 void WebappWindow::initDevice() {
+    // DRED must be configured BEFORE D3D12CreateDevice. It records breadcrumbs
+    // and allocation faults if the driver later reports a removed GPU.
+    ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+        dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    }
+    char warp[8] = {};
+    const bool forceWarp = GetEnvironmentVariableA("NATIVETHREE_DX12_WARP", warp, sizeof warp) > 0 &&
+                           std::strcmp(warp, "1") == 0;
+    char debug[8] = {};
+    if (GetEnvironmentVariableA("NATIVETHREE_DX12_DEBUG", debug, sizeof debug) > 0 &&
+        std::strcmp(debug, "1") == 0) {
+        ComPtr<ID3D12Debug> layer;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer))))
+            layer->EnableDebugLayer(); // opt-in: substantial overhead, never auto-enabled
+    }
     check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "Create DXGI factory");
     ComPtr<IDXGIFactory6> factory6;
-    if (SUCCEEDED(factory_.As(&factory6))) {
+    if (!forceWarp && SUCCEEDED(factory_.As(&factory6))) {
         for (UINT i = 0;; i++) {
             ComPtr<IDXGIAdapter1> adapter;
             if (factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
@@ -427,12 +508,18 @@ void WebappWindow::initDevice() {
             }
         }
     }
-    if (!device_ && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)))) {
-        ComPtr<IDXGIAdapter> warp;
-        check(factory_->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "Find WARP adapter");
-        check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)), "Create DX12 device");
-        adapterName_ = L"WARP (software)";
+    if (!device_) {
+        if (!forceWarp && SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)))) {
+            adapterName_ = L"Default hardware adapter";
+        } else {
+            ComPtr<IDXGIAdapter> software;
+            check(factory_->EnumWarpAdapter(IID_PPV_ARGS(&software)), "Find WARP adapter");
+            check(D3D12CreateDevice(software.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)),
+                  "Create WARP DX12 device");
+            adapterName_ = L"WARP (software)";
+        }
     }
+    if (forceWarp) log("info", "[dx12-safety] WARP software rendering enabled (no dedicated GPU adapter)");
     D3D12_COMMAND_QUEUE_DESC q{};
     q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(device_->CreateCommandQueue(&q, IID_PPV_ARGS(&queue_)), "Create command queue");
@@ -467,6 +554,7 @@ void WebappWindow::initDevice() {
     cmd_->Close();
     check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "Fence");
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fenceEvent_) check(HRESULT_FROM_WIN32(GetLastError()), "Create GPU fence event");
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
     // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
@@ -1044,11 +1132,8 @@ void WebappWindow::releaseSizeDependent() {
 void WebappWindow::waitForGpu() {
     if (!queue_ || !fence_) return;
     const UINT64 value = ++fenceValue_;
-    queue_->Signal(fence_.Get(), value);
-    if (fence_->GetCompletedValue() < value) {
-        fence_->SetEventOnCompletion(value, fenceEvent_);
-        WaitForSingleObject(fenceEvent_, INFINITE);
-    }
+    check(queue_->Signal(fence_.Get(), value), "Signal GPU fence");
+    waitForFenceValue(value, "waitForGpu/resize");
     collectRetired();
 }
 
@@ -1265,8 +1350,7 @@ void WebappWindow::renderFrame() {
     const UINT frame = swap_->GetCurrentBackBufferIndex();
     if (fence_->GetCompletedValue() < frameFence_[frame]) {
         const auto waitStart = std::chrono::steady_clock::now();
-        fence_->SetEventOnCompletion(frameFence_[frame], fenceEvent_);
-        WaitForSingleObject(fenceEvent_, INFINITE);
+        waitForFenceValue(frameFence_[frame], "renderFrame/backbuffer reuse");
         fenceWaitMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
     }
     collectRetired();
@@ -1451,9 +1535,11 @@ void WebappWindow::renderFrame() {
     const auto presentStart = std::chrono::steady_clock::now();
     const HRESULT present = swap_->Present(1, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
-    if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
+    check(present, "Present swap chain");
     frameFence_[frame] = ++fenceValue_;
-    queue_->Signal(fence_.Get(), frameFence_[frame]);
+    check(queue_->Signal(fence_.Get(), frameFence_[frame]), "Signal frame fence");
+    const HRESULT removed = device_->GetDeviceRemovedReason();
+    if (FAILED(removed)) check(removed, "GPU device lost after submission");
 }
 
 void WebappWindow::updateTitle(double fps) {
