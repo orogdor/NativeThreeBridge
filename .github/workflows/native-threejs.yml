@@ -114,6 +114,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "edge-case webapp failed on V8" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-bad-import 0 expect-boot-error
           if ($LASTEXITCODE -ne 0) { throw "broken import was not reported correctly on V8" }
+          # A dynamic loader should work identically on QuickJS and V8.
+          & .\build\Release\WebappSmoke.exe test/fixtures/webapp-dynamic-scripts 0 expect-dynamic-scripts
+          if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-dynamic-scripts 0 expect-dynamic-scripts
+          if ($LASTEXITCODE -ne 0) { throw "dynamic scripts failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
