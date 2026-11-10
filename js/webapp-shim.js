@@ -908,6 +908,18 @@
       throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
     };
     function compileVertex(source) {
+      // Known K73 GLSL ES 3.00 shader families. We translate their uniform /
+      // buffer contracts to the existing native HLSL lighting model, not the
+      // fragment GLSL instructions themselves; fidelity is limited.
+      if (source.includes('uniform mat4 uVP') && source.includes('out vec3 vW;') &&
+          source.includes('gl_Position = uVP*w;') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-lit-vertex', size: 3, instanced: source.includes('#define INST 1') };
+      if (source.includes('uniform mat4 uVP') &&
+          source.includes('gl_Position = uVP*(M*vec4(aPos,1.0));') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-depth-vertex', size: 3, instanced: source.includes('#define INST 1') };
+      if (source.includes('layout(location=0) in vec2 aP;') &&
+          source.includes('gl_Position=vec4(aP,0.0,1.0);'))
+        return { kind: 'k73-sky-vertex', size: 2 };
       const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
       if (!attr) return null;
       // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
@@ -917,6 +929,14 @@
       return { size: Number(attr[1]) };
     }
     function compileFragment(source) {
+      if (source.includes('vec3 base = vC.rgb*uTint.rgb;') &&
+          source.includes('uniform vec4 uTint;') && !source.includes('#define SKIN 1'))
+        return { kind: 'k73-lit-fragment', approximation: 'native HLSL material' };
+      if (/^#version 300 es\s+precision mediump float;\s*void main\(\)\s*\{\s*\}/.test(source.trim()))
+        return { kind: 'k73-depth-fragment' };
+      if (source.includes('uniform vec3 uZen;') && source.includes('uniform vec3 uHor;') &&
+          source.includes('uInvVP') && source.includes('out vec4 oC;'))
+        return { kind: 'k73-sky-fragment', approximation: 'horizon fill' };
       const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
       if (!output) return null;
       const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
@@ -975,11 +995,32 @@
       linkProgram(program) {
         const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
         const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
-        program.linked = !!(vs?.compiled && fs?.compiled);
-        program.color = program.linked ? fs.payload : null;
+        const pair = vs?.payload?.kind && fs?.payload?.kind;
+        const compatible = !pair ||
+          (vs.payload.kind === 'k73-lit-vertex' && fs.payload.kind === 'k73-lit-fragment') ||
+          (vs.payload.kind === 'k73-depth-vertex' && fs.payload.kind === 'k73-depth-fragment') ||
+          (vs.payload.kind === 'k73-sky-vertex' && fs.payload.kind === 'k73-sky-fragment');
+        program.linked = !!(vs?.compiled && fs?.compiled && compatible);
+        program.kind = program.linked ? (vs.payload.kind || 'simple') : null;
+        program.color = program.linked && !pair ? fs.payload : [1, 1, 1, 1];
+        program.uniforms = new Map();
       },
       getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
       getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
+      getUniformLocation(program, name) { return { program, name: String(name) }; },
+      uniformMatrix4fv(loc, transpose, data) {
+        if (transpose) return unsupportedRaw('transpose uniformMatrix4fv');
+        loc.program.uniforms.set(loc.name, Float32Array.from(data));
+      },
+      uniform4fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform3fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform2fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform1fv(loc, data) { loc.program.uniforms.set(loc.name, Float32Array.from(data)); },
+      uniform1i(loc, value) { loc.program.uniforms.set(loc.name, value | 0); },
+      uniform1f(loc, value) { loc.program.uniforms.set(loc.name, Number(value)); },
+      uniform2f(loc, x, y) { loc.program.uniforms.set(loc.name, [x, y]); },
+      uniform3f(loc, x, y, z) { loc.program.uniforms.set(loc.name, [x, y, z]); },
+      uniform4f(loc, x, y, z, w) { loc.program.uniforms.set(loc.name, [x, y, z, w]); },
       useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
       createBuffer() { return { data: null, version: 0 }; },
       bindBuffer(target, buffer) { if (target !== G.ARRAY_BUFFER) return unsupportedRaw('bindBuffer target'); state.buffer = buffer; },
