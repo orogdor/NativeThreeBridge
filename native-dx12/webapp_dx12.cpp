@@ -594,15 +594,20 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
         slot = freeSlots_.back();
         freeSlots_.pop_back();
     }
-    const bool srgb = (flags & native_three::kWebappTextureSrgb) != 0;
-    std::vector<std::vector<std::uint8_t>> levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    const bool float32 = (flags & native_three::kWebappTextureFloat32) != 0;
+    const bool srgb = !float32 && (flags & native_three::kWebappTextureSrgb) != 0;
+    const UINT bytesPerPixel = float32 ? 16 : 4;
+    std::vector<std::vector<std::uint8_t>> levels;
+    if (float32) levels.push_back(std::move(rgba)); // float data: no mips or quantisation
+    else levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = w;
     td.Height = h;
     td.DepthOrArraySize = 1;
     td.MipLevels = UINT16(levels.size());
-    td.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = float32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+        srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     PendingTextureCopy copy;
     auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
@@ -621,7 +626,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
         const auto& L = copy.layouts[m];
         const UINT lw = L.Footprint.Width;
         for (UINT y = 0; y < rows[m]; y++)
-            std::memcpy(mapped + L.Offset + std::size_t(y) * L.Footprint.RowPitch, levels[m].data() + std::size_t(y) * lw * 4, std::size_t(lw) * 4);
+            std::memcpy(mapped + L.Offset + std::size_t(y) * L.Footprint.RowPitch, levels[m].data() + std::size_t(y) * lw * bytesPerPixel, std::size_t(lw) * bytesPerPixel);
     }
     copy.staging->Unmap(0, nullptr);
 
@@ -715,8 +720,12 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
     std::vector<std::uint8_t> rgba;
     UINT w = width, h = height;
     if (width) {
-        if (width > 16384 || height > 16384 || bytes < std::size_t(width) * height * 4) return false;
-        rgba.assign(data, data + std::size_t(width) * height * 4);
+        const bool float32 = (flags & native_three::kWebappTextureFloat32) != 0;
+        const std::size_t bpp = float32 ? 16u : 4u;
+        if (height == 0 || width > 16384 || height > 16384 ||
+            (float32 && (width > 4096 || height > 1024)) ||
+            bytes < std::size_t(width) * height * bpp) return false;
+        rgba.assign(data, data + std::size_t(width) * height * bpp);
     } else if (!decodeImage(data, bytes, rgba, w, h)) {
         if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes) + " bytes; WebP needs the Windows WebP Image Extension)");
         return false;
