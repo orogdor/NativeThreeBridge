@@ -138,6 +138,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on QuickJS" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/k73-rock0-dx12 1
           if ($LASTEXITCODE -ne 0) { throw "K73 real rock model DX12 draw failed on V8" }
+          # An uploaded raw GL2 RGBA8 texture must reach the native DX12
+          # Texture2D SRV on both QuickJS and V8 (real draw, not a fake context).
+          & .\build\Release\WebappSmoke.exe test/fixtures/raw-webgl2-texture-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "Raw WebGL2 texture DX12 smoke failed on QuickJS" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/raw-webgl2-texture-dx12 1
+          if ($LASTEXITCODE -ne 0) { throw "Raw WebGL2 texture DX12 smoke failed on V8" }
           # HTML/CSS UI layer: stylesheets, layout, display list over the 3D scene.
           & .\build\Release\WebappSmoke.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
