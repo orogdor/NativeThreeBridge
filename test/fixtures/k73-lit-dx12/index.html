@@ -1,0 +1,38 @@
+<!DOCTYPE html><html><head><title>K73 lit DX12 proof</title></head><body>
+<canvas id="gl" data-native-webgl2-prototype width="640" height="480"></canvas>
+<script>
+const gl=document.getElementById('gl').getContext('webgl2');
+if(!gl) throw Error('Raw DX12 prototype missing');
+const vs=gl.createShader(gl.VERTEX_SHADER);
+gl.shaderSource(vs, '#version 300 es\nprecision highp float;\nlayout(location=0) in vec3 aPos;\nlayout(location=1) in vec3 aNor;\nlayout(location=2) in vec4 aCol;\nuniform mat4 uVP;\nuniform mat4 uModel;\nout vec3 vW;\nvoid main(){vec4 w=uModel*vec4(aPos,1.0);vW=w.xyz; gl_Position = uVP*w;}');
+gl.compileShader(vs);if(!gl.getShaderParameter(vs,gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(vs));
+const fs=gl.createShader(gl.FRAGMENT_SHADER);
+gl.shaderSource(fs, '#version 300 es\nprecision highp float;\nin vec3 vW;\nin vec4 vC;\nuniform vec4 uTint;\nout vec4 oC;\nvoid main(){vec3 base = vC.rgb*uTint.rgb; oC=vec4(base,1.0);}');
+gl.compileShader(fs);if(!gl.getShaderParameter(fs,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(fs));
+const prog=gl.createProgram();gl.attachShader(prog,vs);gl.attachShader(prog,fs);gl.linkProgram(prog);if(!gl.getProgramParameter(prog,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const identity=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uVP'),false,identity);
+gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uModel'),false,identity);
+gl.uniform4fv(gl.getUniformLocation(prog,'uTint'),new Float32Array([0.8,0.6,0.4,1]));
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+function attribute(loc,bytes,size,type,normalized=false){
+ const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.STATIC_DRAW);
+ gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,size,type,normalized,0,0);return b;
+}
+attribute(0,new Float32Array([-0.8,-0.8,0,0.8,-0.8,0,0,0.8,0]),3,gl.FLOAT);
+attribute(1,new Float32Array([0,0,1,0,0,1,0,0,1]),3,gl.FLOAT);
+attribute(2,new Uint8Array([255,125,55,8,255,0,0,9,0,255,0,10]),4,gl.UNSIGNED_BYTE,true);
+const ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2]),gl.STATIC_DRAW);
+let drawn=0;
+function frame(){
+  gl.clearColor(0.1,0.15,0.2,1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.drawElements(gl.TRIANGLES,3,gl.UNSIGNED_SHORT,0);
+  drawn++;
+  requestAnimationFrame(frame);
+}
+window.__k73LitTest={get drawn(){return drawn;}};
+requestAnimationFrame(frame);
+</script></body></html>
