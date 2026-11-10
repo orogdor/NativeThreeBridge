@@ -152,7 +152,8 @@ public:
     std::optional<WebappPage> takeReload();
 
     void resize(int width, int height, double pixelRatio = 1.0);
-    void frame(double timeMs);
+    // uiTick controls CSS/UI layout and submit cadence; timers and game rAF still run every frame.
+    void frame(double timeMs, bool uiTick = true);
     void key(bool down, const std::string& key, const std::string& code, bool repeat,
              bool alt, bool ctrl, bool shift, bool meta);
     void pointer(const char* kind, double x, double y, int button);   // "down" | "up" | "move"

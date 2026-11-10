@@ -624,10 +624,10 @@ void WebappHost::resize(int width, int height, double pixelRatio) {
                        JS_NewFloat64(c, pixelRatio)};
     impl_->callHost("resize", 3, args);
 }
-void WebappHost::frame(double timeMs) {
+void WebappHost::frame(double timeMs, bool uiTick) {
     if (!running()) return;
-    JSValue arg = JS_NewFloat64(impl_->ctx, timeMs);
-    impl_->callHost("frame", 1, &arg);
+    JSValue args[2] = {JS_NewFloat64(impl_->ctx, timeMs), JS_NewBool(impl_->ctx, uiTick)};
+    impl_->callHost("frame", 2, args);
 }
 void WebappHost::key(bool down, const std::string& key, const std::string& code, bool repeat,
                      bool alt, bool ctrl, bool shift, bool meta) {
