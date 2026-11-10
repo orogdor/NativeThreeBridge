@@ -1068,6 +1068,72 @@
       },
       get __nativeDraws() { return state.draws; },
     };
+    // Bootstrap-only resource interfaces. These objects preserve enough GL
+    // state for the title scene to initialize. The current DX12 renderer does
+    // NOT yet sample K73's array textures or render shadow/MSAA framebuffers.
+    // Keep explicit warnings so they cannot be mistaken for implemented GL.
+    const warned = new Set();
+    const warn = (name) => {
+      if (!warned.has(name)) {
+        warned.add(name);
+        nt.log('warn', '[K73 DX12 prototype] ' + name + ' is a resource placeholder, not a full GPU implementation');
+      }
+    };
+    const rawEnums = {
+      TEXTURE0: 0x84c0, TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a,
+      RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814, UNSIGNED_BYTE: 0x1401,
+      UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405, BYTE: 0x1400, SHORT: 0x1402,
+      NEAREST: 0x2600, LINEAR: 0x2601, LINEAR_MIPMAP_LINEAR: 0x2703,
+      CLAMP_TO_EDGE: 0x812f, REPEAT: 0x2901, MIRRORED_REPEAT: 0x8370,
+      TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+      TEXTURE_COMPARE_MODE: 0x884c, TEXTURE_COMPARE_FUNC: 0x884d,
+      COMPARE_REF_TO_TEXTURE: 0x884e, LEQUAL: 0x0203,
+      DEPTH_COMPONENT24: 0x81a6, DEPTH_TEST: 0x0b71, CULL_FACE: 0x0b44,
+      POLYGON_OFFSET_FILL: 0x8037, BLEND: 0x0be2,
+      SRC_ALPHA: 0x0302, ONE_MINUS_SRC_ALPHA: 0x0303, ONE: 1,
+      FRAMEBUFFER: 0x8d40, READ_FRAMEBUFFER: 0x8ca8, DRAW_FRAMEBUFFER: 0x8ca9,
+      RENDERBUFFER: 0x8d41, DEPTH_ATTACHMENT: 0x8d00,
+      COLOR_ATTACHMENT0: 0x8ce0, FRAMEBUFFER_COMPLETE: 0x8cd5,
+      MAX_SAMPLES: 0x8d57, MAX_TEXTURE_SIZE: 0x0d33,
+      MAX_VERTEX_UNIFORM_VECTORS: 0x8dfb, MAX_FRAGMENT_UNIFORM_VECTORS: 0x8dfd,
+      RENDERER: 0x1f01, VERSION: 0x1f02, VENDOR: 0x1f00,
+      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, BROWSER_DEFAULT_WEBGL: 0x9244,
+      NONE: 0, STATIC_READ: 0x88e5, DYNAMIC_DRAW: 0x88e8,
+      ELEMENT_ARRAY_BUFFER: 0x8893,
+    };
+    Object.assign(gl, rawEnums, {
+      getParameter(key) {
+        if (key === rawEnums.MAX_SAMPLES) return 0;
+        if (key === rawEnums.MAX_TEXTURE_SIZE) return 4096;
+        if (key === rawEnums.MAX_VERTEX_UNIFORM_VECTORS ||
+            key === rawEnums.MAX_FRAGMENT_UNIFORM_VECTORS) return 1024;
+        if (key === rawEnums.RENDERER) return 'NativeThreeBridge DX12 K73 prototype';
+        if (key === rawEnums.VERSION) return 'Experimental WebGL2 command adapter (not conformant)';
+        return 0;
+      },
+      createTexture() { warn('texture storage'); return { type: 'texture' }; },
+      deleteTexture() {}, activeTexture() {}, bindTexture() {},
+      texParameteri() {}, texParameterf() {}, pixelStorei() {},
+      texStorage2D() {}, texStorage3D() {}, texImage2D() {},
+      texImage3D() {}, texSubImage2D() {}, texSubImage3D() {},
+      generateMipmap() {}, deleteSampler() {},
+      createFramebuffer() { warn('offscreen framebuffer'); return { type: 'framebuffer' }; },
+      deleteFramebuffer() {},
+      bindFramebuffer(type, fbo) {
+        if (type === rawEnums.FRAMEBUFFER || type === rawEnums.DRAW_FRAMEBUFFER) state.framebuffer = fbo;
+      },
+      framebufferTexture2D() {}, framebufferTextureLayer() {}, framebufferRenderbuffer() {},
+      checkFramebufferStatus() { return rawEnums.FRAMEBUFFER_COMPLETE; },
+      drawBuffers() {}, readBuffer() {}, blitFramebuffer() {},
+      createRenderbuffer() { warn('multisample renderbuffer'); return { type: 'renderbuffer' }; },
+      deleteRenderbuffer() {}, bindRenderbuffer() {}, renderbufferStorage() {},
+      renderbufferStorageMultisample() {},
+      enable() {}, disable() {}, depthMask() {}, blendFunc() {},
+      polygonOffset() {}, colorMask() {}, depthFunc() {}, cullFace() {},
+      frontFace() {}, scissor() {},
+      finish() {}, flush() {},
+    });
     return gl;
   }
 
