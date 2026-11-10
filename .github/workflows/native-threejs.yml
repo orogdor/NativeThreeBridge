@@ -74,6 +74,13 @@ jobs:
         run: |
           & .\\build\\Release\\NativeCoreSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Native core subsystem tests failed" }
+      - name: Verify independent UI/3D cadence clock (native C++)
+        shell: pwsh
+        run: |
+          cl /nologo /EHsc /std:c++17 test/ui-cadence-smoke.cpp /Fe:build/ui-cadence-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence smoke compile failed" }
+          & .\\build\\ui-cadence-smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "UI cadence smoke test failed" }
       - name: Compile HLSL main lighting and per-soldier shadow shaders without GPU
         shell: pwsh
         run: |
