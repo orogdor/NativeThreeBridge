@@ -55,7 +55,9 @@ constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
-               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096;
+               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
+               F_DEPTH_ONLY = 2097152;
+constexpr UINT kMaxOffscreenDepthTargets = 64;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 
 std::wstring widen(const std::string& s) {
@@ -104,6 +106,11 @@ struct Retired {
     UINT64 fence;
 };
 struct Texture {
+    ComPtr<ID3D12Resource> resource;
+    UINT slot = 0;
+    UINT width = 0, height = 0;
+};
+struct DepthTarget {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
     UINT width = 0, height = 0;
@@ -164,6 +171,8 @@ public:
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
     void releaseTexture(std::uint32_t id) override;
+    bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) override;
+    void releaseDepthTarget(std::uint32_t id) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
     void releaseInstances(std::uint32_t id) override;
@@ -253,12 +262,20 @@ private:
     int logErrors_ = 0;
     bool bootDialogShown_ = false;
 
+    D3D12_CPU_DESCRIPTOR_HANDLE depthViewHandle(UINT slot) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE view = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        view.ptr += SIZE_T(slot) * dsvStep_;
+        return view;
+    }
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_, dsvHeap_;
-    UINT rtvStep_ = 0;
+    UINT rtvStep_ = 0, dsvStep_ = 0;
+    UINT nextDepthSlot_ = 1;
+    std::vector<UINT> freeDepthSlots_;
+    std::unordered_map<std::uint32_t, DepthTarget> depthTargets_;
     ComPtr<ID3D12Resource> targets_[kFrameCount], depth_;
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
@@ -427,9 +444,10 @@ void WebappWindow::initDevice() {
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_)), "RTV heap");
     rtvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    heap.NumDescriptors = 1;
+    heap.NumDescriptors = 1 + kMaxOffscreenDepthTargets;
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&dsvHeap_)), "DSV heap");
+    dsvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     for (UINT i = 0; i < kFrameCount; i++)
         check(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators_[i])), "Command allocator");
@@ -624,6 +642,62 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     textureBytes_ += std::size_t(total);
     pendingCopies_.push_back(std::move(copy));
     return true;
+}
+
+bool WebappWindow::allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+    if (!id || !device_ || width < 1 || height < 1 || width > 4096 || height > 4096) return false;
+    auto existing = depthTargets_.find(id);
+    if (existing != depthTargets_.end()) {
+        if (existing->second.width == width && existing->second.height == height) return true;
+        releaseDepthTarget(id);
+    }
+    UINT slot = 0;
+    if (!freeDepthSlots_.empty()) {
+        slot = freeDepthSlots_.back(); freeDepthSlots_.pop_back();
+    } else if (nextDepthSlot_ <= kMaxOffscreenDepthTargets) {
+        slot = nextDepthSlot_++;
+    } else {
+        log("warn", "[depth] maximum offscreen targets reached");
+        return false;
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height;
+    desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    // WebGL2 DEPTH_COMPONENT24 minimum precision is fulfilled by D32_FLOAT.
+    // HLSL sampler2DShadow PCF sampling still requires a separate shader stage.
+    desc.Format = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1.0f;
+    ComPtr<ID3D12Resource> texture;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+        &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        freeDepthSlots_.push_back(slot);
+        log("warn", "[depth] D32_FLOAT allocation failed");
+        return false;
+    }
+    device_->CreateDepthStencilView(texture.Get(), nullptr, depthViewHandle(slot));
+    DepthTarget target{};
+    target.resource = texture;
+    target.slot = slot; target.width = width; target.height = height;
+    depthTargets_.emplace(id, std::move(target));
+    log("info", "[depth] allocated DX12 D32_FLOAT target " + std::to_string(id) +
+        " " + std::to_string(width) + "x" + std::to_string(height));
+    return true;
+}
+
+void WebappWindow::releaseDepthTarget(std::uint32_t id) {
+    auto it = depthTargets_.find(id);
+    if (it == depthTargets_.end()) return;
+    // Reuse DSV descriptors only after all in-flight GPU consumers finish.
+    waitForGpu();
+    freeDepthSlots_.push_back(it->second.slot);
+    depthTargets_.erase(it);
 }
 
 void WebappWindow::releaseTexture(std::uint32_t id) {
@@ -1033,7 +1107,8 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
     const UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
     const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
+                     ((flags & F_DEPTH_ONLY) ? (1u << 30) : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1052,7 +1127,8 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.pRootSignature = root_sig_.Get();
     d.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
     ID3DBlob* pixel = patchId ? patch->second.Get() : ps_.Get();
-    d.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    d.PS = (flags & F_DEPTH_ONLY) ? D3D12_SHADER_BYTECODE{} :
+           D3D12_SHADER_BYTECODE{pixel->GetBufferPointer(), pixel->GetBufferSize()};
     d.InputLayout = {layout, UINT(sizeof layout / sizeof layout[0])};
     d.PrimitiveTopologyType = lines ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1078,12 +1154,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
         rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     rt.LogicOp = D3D12_LOGIC_OP_NOOP;
-    d.DepthStencilState.DepthEnable = (flags & F_NO_DEPTH_TEST) ? FALSE : TRUE;
-    d.DepthStencilState.DepthWriteMask = (flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+    d.DepthStencilState.DepthEnable = (flags & F_DEPTH_ONLY) ? TRUE : ((flags & F_NO_DEPTH_TEST) ? FALSE : TRUE);
+    d.DepthStencilState.DepthWriteMask = (flags & F_DEPTH_ONLY) ? D3D12_DEPTH_WRITE_MASK_ALL :
+        ((flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL);
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     d.SampleMask = UINT_MAX;
-    d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.NumRenderTargets = (flags & F_DEPTH_ONLY) ? 0 : 1;
+    d.RTVFormats[0] = (flags & F_DEPTH_ONLY) ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
     d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     d.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
@@ -1158,11 +1235,31 @@ void WebappWindow::renderFrame() {
         const UINT lightCount = UINT(p[35]);
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
-        if (flags & P_CLEAR_COLOR) {
+        const std::uint32_t offscreenId = std::uint32_t(p[55]);
+        const bool offscreen = offscreenId != 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE passDsv = dsv;
+        if (offscreen) {
+            auto target = depthTargets_.find(offscreenId);
+            if (target == depthTargets_.end() || !target->second.resource) {
+                log("warn", "[depth] draw skipped: missing offscreen depth target");
+                continue;
+            }
+            passDsv = depthViewHandle(target->second.slot);
+            cmd_->OMSetRenderTargets(0, nullptr, FALSE, &passDsv);
+            D3D12_VIEWPORT pv{0, 0, float(target->second.width), float(target->second.height), 0, 1};
+            D3D12_RECT pr{0, 0, LONG(target->second.width), LONG(target->second.height)};
+            cmd_->RSSetViewports(1, &pv);
+            cmd_->RSSetScissorRects(1, &pr);
+        } else {
+            cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            cmd_->RSSetViewports(1, &viewport);
+            cmd_->RSSetScissorRects(1, &scissor);
+        }
+        if ((flags & P_CLEAR_COLOR) && !offscreen) {
             const float clear[4] = {p[36], p[37], p[38], p[39]};
             cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
         }
-        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(passDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         // cbuffer Frame: view, projection, camera+lightCount, ambient+exposure, lights.
         float* fcb = reinterpret_cast<float*>(ring + ringOffset);
@@ -1184,7 +1281,7 @@ void WebappWindow::renderFrame() {
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
             auto g = geometries_.find(std::uint32_t(d[0]));
             if (g == geometries_.end() || !g->second.vertices) continue;
-            const UINT drawFlags = UINT(d[3]);
+            const UINT drawFlags = UINT(d[3]) | (offscreen ? F_DEPTH_ONLY : 0u);
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
