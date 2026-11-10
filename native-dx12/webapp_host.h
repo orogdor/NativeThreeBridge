@@ -43,6 +43,13 @@ public:
         return false;
     }
     virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // Allocate an independent offscreen DX12 depth-stencil target. WebGL2
+    // DEPTH_COMPONENT24 is stored as D32_FLOAT; sampling is a later stage.
+    virtual bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+        (void)id; (void)width; (void)height;
+        return false;
+    }
+    virtual void releaseDepthTarget(std::uint32_t id) { (void)id; }
     // Texture `id` from the current pixels of Canvas 2D surface `canvasId`.
     virtual bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
         (void)id; (void)canvasId; (void)flags;
