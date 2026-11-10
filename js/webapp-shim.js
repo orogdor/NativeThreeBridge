@@ -1030,12 +1030,36 @@
       uniform4f(loc, x, y, z, w) { loc.program.uniforms.set(loc.name, [x, y, z, w]); },
       useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
       createBuffer() { return { data: null, version: 0 }; },
-      bindBuffer(target, buffer) { if (target !== G.ARRAY_BUFFER) return unsupportedRaw('bindBuffer target'); state.buffer = buffer; },
-      bufferData(target, data) {
-        if (target !== G.ARRAY_BUFFER || !(data instanceof Float32Array)) return unsupportedRaw('bufferData type/target');
-        if (!state.buffer) throw Error('No ARRAY_BUFFER bound');
-        state.buffer.data = new Float32Array(data); state.buffer.version++;
+      bindBuffer(target, buffer) {
+        if (target === G.ARRAY_BUFFER) state.buffer = buffer;
+        else if (target === 0x8893) state.vao.indexBuffer = buffer;
+        else return unsupportedRaw('bindBuffer target');
       },
+      bufferData(target, data) {
+        const buffer = target === G.ARRAY_BUFFER ? state.buffer :
+          target === 0x8893 ? state.vao.indexBuffer : null;
+        if (!buffer) throw Error('bufferData: no supported buffer bound');
+        if (typeof data === 'number') {
+          if (!Number.isInteger(data) || data < 0 || data > 67108864) throw RangeError('bufferData size too large');
+          buffer.data = new Uint8Array(data);
+        } else if (ArrayBuffer.isView(data)) {
+          buffer.data = data.slice();
+        } else if (data instanceof ArrayBuffer) {
+          buffer.data = new Uint8Array(data.slice(0));
+        } else return unsupportedRaw('bufferData type');
+        buffer.version++;
+      },
+      bufferSubData(target, dstByteOffset, source, srcOffset = 0, length) {
+        const buffer = target === G.ARRAY_BUFFER ? state.buffer :
+          target === 0x8893 ? state.vao.indexBuffer : null;
+        if (!buffer?.data || !ArrayBuffer.isView(source)) return unsupportedRaw('bufferSubData target/type');
+        const src = source.subarray(srcOffset, length === undefined ? source.length : srcOffset + length);
+        const dst = new Uint8Array(buffer.data.buffer, buffer.data.byteOffset, buffer.data.byteLength);
+        const bytes = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+        if (dstByteOffset < 0 || dstByteOffset + bytes.length > dst.length) throw RangeError('bufferSubData exceeds buffer');
+        dst.set(bytes, dstByteOffset); buffer.version++;
+      },
+      deleteBuffer() {},
       createVertexArray() { return { attributes: new Map() }; },
       bindVertexArray(vao) { state.vao = vao || { attributes: new Map() }; },
       enableVertexAttribArray(index) {
@@ -1043,10 +1067,18 @@
         state.vao.attributes.set(index, { ...old, enabled: true });
       },
       vertexAttribPointer(index, size, type, normalized, stride, offset) {
-        if (index !== 0 || !state.buffer) return unsupportedRaw('vertexAttribPointer');
-        const old = state.vao.attributes.get(0) || {};
-        state.vao.attributes.set(0, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+        if (index < 0 || index > 15 || !state.buffer) return unsupportedRaw('vertexAttribPointer');
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
       },
+      vertexAttribIPointer(index, size, type, stride, offset) {
+        gl.vertexAttribPointer(index, size, type, false, stride, offset);
+      },
+      vertexAttribDivisor(index, divisor) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, divisor });
+      },
+      deleteVertexArray() {},
       viewport(x, y, w, h) {
         if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
       },
