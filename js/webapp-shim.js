@@ -356,6 +356,65 @@
     abort(reason = new Error('AbortError')) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = reason; this.signal.dispatchEvent(new Event('abort')); }
   }
 
+  // Dynamic <script src=...> loading, shared by V8 and QuickJS.
+  // A classic script appended by a loader must execute and fire 'load', or
+  // Promise.all(loadScript(...)) applications (including K73) never boot.
+  // Defer until the current JavaScript job finishes and retain insertion order
+  // even when each script has .async=false assigned as a DOM property.
+  const dynamicScriptQueue = [];
+  let parsingInitialDocument = false;
+  let dynamicScriptsRunning = false;
+  let dynamicScriptCount = 0;
+  function queueConnectedScripts(node) {
+    if (parsingInitialDocument || !node.isConnected) return;
+    const visit = (n) => {
+      if (n.nodeType === 1 && n.localName === 'script' && !n._ntScriptStarted) {
+        n._ntScriptStarted = true;
+        dynamicScriptQueue.push(n);
+      } else {
+        for (const c of n.childNodes || []) visit(c);
+      }
+    };
+    visit(node);
+    if (dynamicScriptQueue.length && !dynamicScriptsRunning) {
+      Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+  async function drainDynamicScripts() {
+    if (dynamicScriptsRunning) return;
+    dynamicScriptsRunning = true;
+    try {
+      while (dynamicScriptQueue.length) {
+        const element = dynamicScriptQueue.shift();
+        const type = (element.getAttribute('type') || '').trim().toLowerCase();
+        // JSON/import maps and data scripts are not JavaScript.
+        if (type && !['text/javascript', 'application/javascript', 'javascript', 'module'].includes(type)) continue;
+        const src = element.getAttribute('src');
+        try {
+          let source, name;
+          if (src) {
+            const path = toGamePath(src);
+            if (!path) throw new TypeError(`Dynamic script source is not a local game file: ${src}`);
+            source = nt.readText(path);
+            name = path;
+          } else {
+            source = element.textContent;
+            name = `dynamic-script-${++dynamicScriptCount}`;
+          }
+          if (type === 'module') await nt.evalModule(source, name);
+          else nt.evalScript(source, name);
+          element.dispatchEvent(new Event('load'));
+        } catch (e) {
+          reportError(`dynamic script ${src || '(inline)'}`, e);
+          element.dispatchEvent(new ErrorEvent('error', { message: String(e), error: e }));
+        }
+      }
+    } finally {
+      dynamicScriptsRunning = false;
+      if (dynamicScriptQueue.length) Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+
   // ---------------------------------------------------------------- DOM
   const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   const RAW_TAGS = new Set(['script', 'style', 'textarea', 'title']);
@@ -383,6 +442,9 @@
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       uiNotify('tree', this, child);
+      // Connected DOM-inserted classic/module scripts run asynchronously, in
+      // insertion order. Initial HTML parser scripts are handled by host.boot().
+      queueConnectedScripts(child);
       return child;
     }
     removeChild(child) {
@@ -828,6 +890,297 @@
     get text() { return this.textContent; }
     set text(v) { this.textContent = v; }
   }
+  // Experimental raw WebGL2 commands -> the EXISTING native DX12 packet
+  // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
+  // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
+  let nextRawGeometryId = 90000000;
+  function makeRawDx12Prototype(canvas) {
+    const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const G = {
+      NO_ERROR: 0, FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
+      ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
+      VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
+      COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
+      TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+    };
+    const state = { buffer: null, vao: { attributes: new Map(), elements: null },
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0 };
+    const unsupportedRaw = (method) => {
+      throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
+    };
+    function compileVertex(source) {
+      // Recognise K73's actual non-skinned, non-instanced lit vertex shader.
+      // Map its model and view-projection uniforms to the native DX12 packet
+      // instead of pretending to execute arbitrary user GLSL.
+      if (/layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) &&
+          !/#define\s+(?:INST|SKIN)\b/.test(source)) {
+        return { kind: 'k73-lit', size: 3 };
+      }
+      const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
+      if (!attr) return null;
+      // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
+      const assignment = new RegExp('gl_Position\\s*=\\s*vec4\\s*\\(\\s*' + attr[2] + '\\s*,\\s*1(?:\\.0+)?\\s*\\)\\s*;');
+      if (!assignment.test(source)) return null;
+      if (/uniform\s+|texture\s*\(|gl_VertexID|gl_InstanceID|mat[234]\s/.test(source)) return null;
+      return { size: Number(attr[1]) };
+    }
+    function compileFragment(source) {
+      // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
+      // custom exposure and fog. The native fixed HLSL material backend can
+      // currently only approximate its vertex colors, sun, tint and normals.
+      if (/in\s+vec4\s+vC\s*;/.test(source) &&
+          /uniform\s+vec4\s+uTint\s*;/.test(source) &&
+          /vec3\s+base\s*=\s*vC\.rgb\s*\*\s*uTint\.rgb\s*;/.test(source) &&
+          /uniform\s+vec3\s+uSunDir/.test(source) &&
+          /out\s+vec4\s+oC\s*;/.test(source) &&
+          !/#define\s+SKIN\b/.test(source)) {
+        return { kind: 'k73-lit' };
+      }
+      const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
+      if (!output) return null;
+      const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
+      if (!assignment) return null;
+      const nums = assignment[1].split(',').map(x => x.trim());
+      if (nums.length !== 4 || nums.some(x => !/^(?:\d+\.?\d*|\.\d+)$/.test(x))) return null;
+      if (/uniform\s+|texture\s*\(/.test(source)) return null;
+      const rgba = nums.map(Number);
+      return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
+    }
+    // K73 uses independent position, normal, and RGBA8 vertex-colour VBOs.
+    // Convert those existing WebGL attributes into NativeRenderer's exact
+    // interleaved geometry upload format, preserving optional index buffers.
+    function upload(first, count, indexType = 0, indexOffset = 0) {
+      const vao = state.vao, attrs = vao.attributes, pos = attrs.get(0);
+      if (!pos?.enabled || !pos.buffer || pos.type !== G.FLOAT ||
+          pos.size !== 3 && pos.size !== 2 || pos.normalized)
+        return unsupportedRaw('position attribute 0 must be FLOAT vec2/vec3');
+      const vertexIndices = [];
+      let maxVertex = first + count - 1;
+      if (indexType) {
+        const buf = vao.elements?.data;
+        const bytes = indexType === G.UNSIGNED_SHORT ? 2 : indexType === G.UNSIGNED_INT ? 4 : 0;
+        if (!buf || !bytes || buf.BYTES_PER_ELEMENT !== bytes || indexOffset % bytes)
+          return unsupportedRaw('drawElements requires aligned Uint16Array/Uint32Array index buffer');
+        const indexStart = indexOffset / bytes;
+        if (indexStart + count > buf.length) throw new RangeError('drawElements indexes outside index buffer');
+        for (let i = 0; i < count; i++) vertexIndices.push(buf[indexStart + i]);
+        maxVertex = vertexIndices.reduce((max, i) => Math.max(max, i), 0);
+      }
+      const numVertices = indexType ? maxVertex + 1 : count;
+      if (numVertices > 400000) throw new RangeError('DX12 prototype geometry too large');
+      function attributeData(i, vertex, expectedSize, defaultValues) {
+        const attr = attrs.get(i);
+        if (!attr?.enabled) return defaultValues;
+        if (!attr.buffer?.data || attr.size !== expectedSize) return unsupportedRaw('vertex attribute size/buffer ' + i);
+        if (attr.type !== G.FLOAT && attr.type !== G.UNSIGNED_BYTE)
+          return unsupportedRaw('attribute component type ' + i);
+        const data = attr.buffer.data;
+        const bytes = attr.type === G.FLOAT ? 4 : 1;
+        const stride = attr.stride || bytes * attr.size;
+        const start = attr.offset + vertex * stride;
+        if (start < 0 || start + bytes * attr.size > data.byteLength || start % bytes)
+          throw new RangeError('vertex attribute outside byte buffer: ' + i);
+        const view = new DataView(data.buffer, data.byteOffset + start, bytes * attr.size);
+        const v = [];
+        for (let c = 0; c < attr.size; c++) {
+          let x = attr.type === G.FLOAT ? view.getFloat32(c * bytes, true) : view.getUint8(c);
+          if (attr.normalized && attr.type === G.UNSIGNED_BYTE) x /= 255;
+          v.push(x);
+        }
+        return v;
+      }
+      const cacheKey = [first, count, indexType, indexOffset,
+        vao.elements?.version || 0, state.program?.profile || '',
+        ...[0, 1, 2].flatMap(i => {
+          const a = attrs.get(i);
+          return a ? [a.buffer?.version, a.size, a.type, a.normalized, a.stride, a.offset] : [0];
+        }),
+      ].join(':');
+      const old = state.cache.get(vao);
+      if (old?.key === cacheKey) return old.id;
+      const positions = new Float32Array(numVertices * 3);
+      const normals = new Float32Array(numVertices * 3);
+      const colors = new Float32Array(numVertices * 4);
+      let hasNormals = false, hasColors = false;
+      for (let i = 0; i < numVertices; i++) {
+        const vertex = indexType ? i : first + i;
+        const p = attributeData(0, vertex, pos.size, [0, 0, 0]);
+        positions.set([p[0], p[1], p[2] || 0], i * 3);
+        const n = attributeData(1, vertex, 3, [0, 1, 0]);
+        normals.set(n, i * 3);
+        hasNormals ||= !!attrs.get(1)?.enabled;
+        const col = attributeData(2, vertex, 4, [1, 1, 1, 1]);
+        // K73 stores its material-class identifier in vertex-color alpha;
+        // it is NOT transparency. Native HLSL's vertex alpha controls pixel
+        // opacity, so pass opaque alpha until the material-class shader stage
+        // is separately translated.
+        if (state.program?.profile === 'k73-lit') col[3] = 1;
+        colors.set(col, i * 4);
+        hasColors ||= !!attrs.get(2)?.enabled;
+      }
+      if (old) nt.releaseGeometry(old.id);
+      const id = nextRawGeometryId++;
+      nt.uploadGeometry(id, positions, hasNormals ? normals : null,
+        hasColors ? colors : null,
+        indexType ? new Uint32Array(vertexIndices) : null, null);
+      state.cache.set(vao, { id, key: cacheKey });
+      return id;
+    }
+    function submitRawPass(geometryId, count, profile) {
+      const uniforms = state.program.uniforms || new Map();
+      const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
+      const transform = profile === 'k73-lit' ? uniform('uVP', ID) : ID;
+      const model = profile === 'k73-lit' ? uniform('uModel', ID) : ID;
+      const tint = profile === 'k73-lit' ? uniform('uTint', [1, 1, 1, 1]) : state.program.color;
+      const packet = new Float32Array(64 + (profile === 'k73-lit' ? 16 : 0) + 56);
+      packet.set(ID, 0); packet.set(transform, 16);
+      packet.set(state.clear, 36);
+      const useLight = profile === 'k73-lit';
+      packet[35] = useLight ? 1 : 0;
+      if (useLight) {
+        const sky = uniform('uSkyCol', [0.3, 0.3, 0.35]);
+        packet[40] = sky[0] * 0.65; packet[41] = sky[1] * 0.65; packet[42] = sky[2] * 0.65;
+        const cam = uniform('uCam', [0, 0, 10]);
+        packet.set(cam.subarray ? cam.subarray(0, 3) : cam, 32);
+        const sun = uniform('uSunCol', [1, 1, 1]);
+        const dir = uniform('uSunDir', [0.4, 0.7, 0.6]);
+        packet[64] = 3; packet[65] = sun[0]; packet[66] = sun[1]; packet[67] = sun[2];
+        packet[72] = -dir[0]; packet[73] = -dir[1]; packet[74] = -dir[2];
+      }
+      packet[43] = 1; packet[44] = state.clearFlags;
+      packet[45] = canvas.width; packet[46] = canvas.height;
+      packet[47] = uniform('uExposure', 1);
+      const o = useLight ? 80 : 64;
+      packet[o] = geometryId; packet[o + 2] = 1;
+      const hasColors = !!state.vao.attributes.get(2)?.enabled;
+      packet[o + 3] = useLight ? 2 | (hasColors ? 8 : 0) : 16 | 2 | 64;
+      packet[o + 5] = count; packet[o + 6] = 1;
+      packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
+      packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) : tint[3];
+      packet[o + 15] = -1;
+      if (useLight) {
+        const e = uniform('uEmis', [0, 0, 0]);
+        packet[o + 12] = e[0]; packet[o + 13] = e[1]; packet[o + 14] = e[2];
+      }
+      packet.set(model, o + 16);
+      packet[o + 34] = 1; packet[o + 37] = 1;
+      state.clearFlags = 0;
+      nt.submitPass(packet, packet.length);
+      state.draws++;
+    }
+    const gl = {
+      ...G, canvas,
+      get drawingBufferWidth() { return canvas.width; },
+      get drawingBufferHeight() { return canvas.height; },
+      getContextAttributes: () => ({ alpha: false, depth: true, stencil: false, antialias: false }),
+      getSupportedExtensions: () => [], getExtension: () => null, getError: () => 0,
+      createShader(type) {
+        if (type !== G.VERTEX_SHADER && type !== G.FRAGMENT_SHADER) return unsupportedRaw('createShader type');
+        return { type, source: '', compiled: false, payload: null };
+      },
+      shaderSource(shader, source) { shader.source = String(source); shader.compiled = false; },
+      compileShader(shader) {
+        shader.payload = shader.type === G.VERTEX_SHADER ? compileVertex(shader.source) : compileFragment(shader.source);
+        shader.compiled = !!shader.payload;
+      },
+      getShaderParameter(shader, key) { if (key !== G.COMPILE_STATUS) return unsupportedRaw('getShaderParameter'); return shader.compiled; },
+      getShaderInfoLog(shader) { return shader.compiled ? '' : 'Unsupported GLSL. DX12 prototype accepts only position vec2/vec3 and literal vec4 output.'; },
+      createProgram() { return { shaders: [], linked: false }; },
+      attachShader(program, shader) { program.shaders.push(shader); },
+      linkProgram(program) {
+        const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
+        const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
+        program.linked = !!(vs?.compiled && fs?.compiled);
+        program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
+        program.profile = program.linked && vs.payload?.kind === 'k73-lit' && fs.payload?.kind === 'k73-lit'
+          ? 'k73-lit' : 'constant';
+        program.uniforms = new Map();
+        if (program.profile === 'k73-lit') unsupported('K73 advanced GLSL shading',
+          'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
+      },
+      getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
+      getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
+      useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
+      getUniformLocation(program, name) { return program?.linked ? { program, name: String(name) } : null; },
+      uniformMatrix4fv(location, transpose, values) {
+        if (!location) return;
+        if (transpose || !ArrayBuffer.isView(values) || values.length !== 16)
+          return unsupportedRaw('uniformMatrix4fv requires one column-major matrix');
+        location.program.uniforms.set(location.name, Float32Array.from(values));
+      },
+      uniform4fv(location, values) {
+        if (!location) return;
+        if (!ArrayBuffer.isView(values) || values.length < 4) return unsupportedRaw('uniform4fv');
+        location.program.uniforms.set(location.name, Float32Array.from(values.subarray(0, 4)));
+      },
+      uniform3fv(location, values) {
+        if (!location) return;
+        if (!(ArrayBuffer.isView(values) || Array.isArray(values)) || values.length < 3)
+          return unsupportedRaw('uniform3fv');
+        location.program.uniforms.set(location.name, Float32Array.from(Array.from(values).slice(0, 3)));
+      },
+      uniform3f(location, x, y, z) { if (location) location.program.uniforms.set(location.name, Float32Array.of(x, y, z)); },
+      uniform1f(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      createBuffer() { return { data: null, version: 0 }; },
+      bindBuffer(target, buffer) {
+        if (target === G.ARRAY_BUFFER) state.buffer = buffer;
+        else if (target === G.ELEMENT_ARRAY_BUFFER) state.vao.elements = buffer;
+        else return unsupportedRaw('bindBuffer target');
+      },
+      bufferData(target, data) {
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferData typed arrays only');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        if (!dst) throw Error('No buffer bound for bufferData');
+        dst.data = new data.constructor(data); dst.version++;
+      },
+      bufferSubData(target, offset, data) {
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferSubData data');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        if (!dst?.data || offset < 0 || offset % dst.data.BYTES_PER_ELEMENT ||
+            offset / dst.data.BYTES_PER_ELEMENT + data.length > dst.data.length) return unsupportedRaw('bufferSubData range');
+        dst.data.set(data, offset / dst.data.BYTES_PER_ELEMENT); dst.version++;
+      },
+      createVertexArray() { return { attributes: new Map(), elements: null }; },
+      bindVertexArray(vao) { state.vao = vao || { attributes: new Map(), elements: null }; },
+      enableVertexAttribArray(index) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, enabled: true });
+      },
+      vertexAttribPointer(index, size, type, normalized, stride, offset) {
+        if (index < 0 || index > 2 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+      },
+      viewport(x, y, w, h) {
+        if (x || y || w !== canvas.width || h !== canvas.height) return unsupportedRaw('partial viewport');
+      },
+      clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
+      clear(mask) {
+        if (mask & G.COLOR_BUFFER_BIT) state.clearFlags |= 1;
+        if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
+      },
+      drawArrays(mode, first, count) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        submitRawPass(upload(first, count), count, state.program.profile);
+      },
+      drawElements(mode, count, type, offset) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3) return unsupportedRaw('drawElements primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        submitRawPass(upload(0, count, type, offset), count, state.program.profile);
+      },
+      get __nativeDraws() { return state.draws; },
+    };
+    return gl;
+  }
+
   class HTMLCanvasElement extends HTMLElement {
     constructor(tag = 'canvas', ns) { super(tag, ns); this._width = 300; this._height = 150; }
     get width() { return this._width; }
@@ -845,7 +1198,11 @@
         if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
         return this._ctx2d;
       }
-      // WebGL is never exposed: THREE.WebGLRenderer is the NativeRenderer.
+      if (kind === 'webgl2' && this.hasAttribute('data-native-webgl2-prototype')) {
+        if (!this._nativeGL2) this._nativeGL2 = makeRawDx12Prototype(this);
+        this._ntRendererCanvas = true;
+        return this._nativeGL2;
+      }
       unsupported(`canvas.getContext('${kind}')`, 'use THREE.WebGLRenderer, which renders natively');
       return null;
     }
@@ -2443,7 +2800,10 @@
         for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
         if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
       }
-      parseDocument(String(html));
+      // Parser-inserted <script> tags run through host.boot(); scripts created
+      // by those scripts are dynamic and must be handled by our queue.
+      parsingInitialDocument = true;
+      try { parseDocument(String(html)); } finally { parsingInitialDocument = false; }
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');
       const imports = [];
@@ -2462,6 +2822,7 @@
         const type = (s.getAttribute('type') || 'text/javascript').toLowerCase().trim();
         const src = s.getAttribute('src');
         if (type === 'module') {
+          s._ntScriptStarted = true;
           if (src) {
             const path = toGamePath(src);
             if (path === null) { reportError('script', new Error(`External module script is not available offline: ${src}`)); continue; }
@@ -2470,6 +2831,7 @@
           continue;
         }
         if (!['text/javascript', 'application/javascript', 'javascript', ''].includes(type)) continue;
+        s._ntScriptStarted = true;
         try {
           if (src) {
             const path = toGamePath(src);
@@ -2498,8 +2860,9 @@
       const t = document.title;
       if (t) nt.setTitle(t);
     },
-    // Called by the engine once per displayed frame with a millisecond clock.
-    frame(timeMs) {
+    // Game timers and requestAnimationFrame run at the 3D rate; CSS/UI is separately scheduled.
+    // The default keeps existing Node test hosts and legacy callers compatible.
+    frame(timeMs, uiTick = true) {
       state.now = timeMs;
       state.frame++;
       const t0 = performance.now();
@@ -2513,7 +2876,7 @@
       const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
       const tCanvas = performance.now();
-      if (uiLayer) uiLayer.frame();
+      if (uiTick !== false && uiLayer) uiLayer.frame();
       const tUi = performance.now();
       if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
         state.lastSlowFrameReport = timeMs;
