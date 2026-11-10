@@ -1024,6 +1024,25 @@
       // accept arbitrary GLSL or SKIN vertex shaders.
       const instanced = /#define\s+INST\b/.test(source);
       const skinned = /#define\s+SKIN\b/.test(source);
+      // K73 SKIN shader pair. Uniform-bone variant is supported through a
+      // CPU pose-to-geometry fallback until a dedicated GPU skin vertex shader
+      // is available. BONETEX / TINTTEX variants are rejected explicitly.
+      if (skinned && !instanced &&
+          !/#define\s+(?:BONETEX|TINTTEX)\b/.test(source) &&
+          /layout\s*\(location\s*=\s*3\)\s*in\s+vec4\s+aJ\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*4\)\s*in\s+vec4\s+aW\s*;/.test(source) &&
+          /uniform\s+vec4\s+uB\s*\[\s*96\s*\]\s*;/.test(source) &&
+          /mat4\s+boneM\s*\(\s*float\s+j\s*\)/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uModel\s*;/.test(source) &&
+          /gl_Position\s*=/.test(source) &&
+          /layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source)) {
+        const depth = /gl_Position\s*=\s*uVP\s*\*\s*\(\s*M\s*\*\s*vec4\s*\(\s*aPos\s*,\s*1\.0\s*\)\s*\)\s*;/.test(source);
+        const lit = /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source);
+        if (depth || lit) return {kind: depth ? 'k73-depth-skin' : 'k73-lit-skin',size:3};
+      }
       // K73 v86 PART_VS billboard particles: four attributes and uVP.
       // Exact GLSL is recognized; the native path uses GPU instanced quads.
       if (!instanced && !skinned &&
@@ -1105,7 +1124,7 @@
         return {kind: 'k73-sky'};
       // K73 depth fragment: no colour output (depth-only pipeline).
       // Reject other empty GLSL programs rather than claiming broad support.
-      if (/^\s*#version\s+300\s+es\s*(?:#define\s+INST\s+1\s*)?precision\s+mediump\s+float\s*;\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(source))
+      if (/^\s*#version\s+300\s+es\s*(?:#define\s+(?:INST|SKIN)\s+1\s*)?precision\s+mediump\s+float\s*;\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(source))
         return {kind: 'k73-depth'};
       // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
       // custom exposure and fog. The native fixed HLSL material backend can
@@ -1115,8 +1134,9 @@
           /vec3\s+base\s*=\s*vC\.rgb\s*\*\s*uTint\.rgb\s*;/.test(source) &&
           /uniform\s+vec3\s+uSunDir/.test(source) &&
           /out\s+vec4\s+oC\s*;/.test(source) &&
-          !/#define\s+SKIN\b/.test(source)) {
-        return { kind: 'k73-lit' };
+          (!/#define\s+SKIN\b/.test(source) ||
+           !/#define\s+(?:BONETEX|TINTTEX)\b/.test(source))) {
+        return { kind: /#define\s+SKIN\b/.test(source) ? 'k73-lit-skin' : 'k73-lit' };
       }
       const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
       if (!output) return null;
@@ -1519,12 +1539,14 @@
         program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
         const litPair = ['k73-lit', 'k73-lit-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-lit';
         const depthPair = ['k73-depth', 'k73-depth-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-depth';
+        const skinLitPair = vs?.payload?.kind === 'k73-lit-skin' && fs?.payload?.kind === 'k73-lit-skin';
+        const skinDepthPair = vs?.payload?.kind === 'k73-depth-skin' && fs?.payload?.kind === 'k73-depth';
         const skyPair = vs?.payload?.kind === 'k73-sky' && fs?.payload?.kind === 'k73-sky';
         const particlePair = vs?.payload?.kind === 'k73-part' && fs?.payload?.kind === 'k73-part';
         // An empty depth fragment is only valid with the exact K73 depth vertex profile.
-        program.linked &&= !!(litPair || depthPair || skyPair || particlePair ||
+        program.linked &&= !!(litPair || depthPair || skinLitPair || skinDepthPair || skyPair || particlePair ||
           (Array.isArray(fs?.payload) && Number.isInteger(vs?.payload?.size)));
-        program.profile = program.linked ? (litPair || depthPair || skyPair || particlePair ? vs.payload.kind : 'constant') : 'invalid';
+        program.profile = program.linked ? (litPair || depthPair || skinLitPair || skinDepthPair || skyPair || particlePair ? vs.payload.kind : 'constant') : 'invalid';
         program.uniforms = new Map();
         if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
           'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
@@ -1532,6 +1554,9 @@
           'DEPTH_VS/DEPTH_FS variants recognised, but actual off-screen shadow texture rendering needs FBO/DX12 depth target support');
         if (program.profile === 'k73-sky') unsupported('K73 sky shader approximation',
           'Sky gradient and broad sun glow use native unlit DX12 geometry; procedural clouds, stars, planet and precise GLSL atmosphere are not yet translated');
+        if (program.profile === 'k73-lit-skin' || program.profile === 'k73-depth-skin')
+          unsupported('K73 CPU skinning fallback',
+            'K73 uniform bones and morph offsets are processed on CPU and uploaded as animated geometry; dedicated HLSL GPU skinning is needed for performance and exact material appearance');
         if (program.profile === 'k73-part') unsupported('K73 particle GLSL approximation',
           'Particles use GPU-instanced billboard quads and per-pool opacity; exact smoke noise, radial soft alpha and additive blend need native HLSL and per-instance alpha');
       },
@@ -1545,10 +1570,15 @@
           return unsupportedRaw('uniformMatrix4fv requires one column-major matrix');
         location.program.uniforms.set(location.name, Float32Array.from(values));
       },
-      uniform4fv(location, values) {
+      uniform4fv(location, values, srcOffset = 0, srcLength) {
         if (!location) return;
-        if (!ArrayBuffer.isView(values) || values.length < 4) return unsupportedRaw('uniform4fv');
-        location.program.uniforms.set(location.name, Float32Array.from(values.subarray(0, 4)));
+        if (!ArrayBuffer.isView(values) || !Number.isInteger(srcOffset) || srcOffset < 0 ||
+            (srcLength !== undefined && (!Number.isInteger(srcLength) || srcLength < 1)))
+          return unsupportedRaw('uniform4fv source range');
+        const end = srcLength === undefined ? values.length : srcOffset + srcLength;
+        if (end > values.length || end-srcOffset < 4 || (end-srcOffset)%4)
+          return unsupportedRaw('uniform4fv vector array range');
+        location.program.uniforms.set(location.name, Float32Array.from(values.subarray(srcOffset,end)));
       },
       uniform3fv(location, values) {
         if (!location) return;
@@ -1772,6 +1802,11 @@
       enableVertexAttribArray(index) {
         const old = state.vao.attributes.get(index) || {};
         state.vao.attributes.set(index, { ...old, enabled: true });
+      },
+      vertexAttribIPointer(index, size, type, stride, offset) {
+        if (type !== G.UNSIGNED_BYTE || size !== 4)
+          return unsupportedRaw('vertexAttribIPointer: only unsigned byte uvec4');
+        return this.vertexAttribPointer(index,size,type,false,stride,offset);
       },
       vertexAttribPointer(index, size, type, normalized, stride, offset) {
         if (index < 0 || index > 7 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
