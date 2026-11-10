@@ -161,9 +161,9 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         float3 sampleRGB = gMap.SampleLevel(gRepeat, ax, 0).rgb * weight.x
                          + gMap.SampleLevel(gRepeat, ay, 0).rgb * weight.y
                          + gMap.SampleLevel(gRepeat, az, 0).rgb * weight.z;
-        float cameraDistance = length(i.world - gCameraPosition.xyz);
+        float cameraDistance = length(i.world - gCamera.xyz);
         float nearFactor = 1.0 - smoothstep(22.0, 52.0, cameraDistance);
-        albedo *= lerp(1.0.xxx, sampleRGB * 2.0, saturate(amount * nearFactor));
+        albedo *= lerp(float3(1.0, 1.0, 1.0), sampleRGB * 2.0, saturate(amount * nearFactor));
     } else if (flags & F_MAP) {
         float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
                  : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
