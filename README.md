@@ -1,3 +1,7 @@
+# NativeThreeBridge v0.32.16 — mirrored GLTF meshes drawn the right way round
+
+GLTF models often mirror part of a mesh with a negative scale. Three.js flips the front face for a mesh whose world matrix has a negative determinant; the engine did not, so the side facing the camera was culled and double-sided surfaces were lit from the wrong side (thatch roofs and hair cards looked shredded). Such draws now carry `DrawFlags.MIRRORED`: the DX12 pipeline swaps back/front culling and the pixel shader inverts `SV_IsFrontFace`. Not yet: per-instance mirroring inside an `InstancedMesh`. Test: `test/webapp-mirrored-mesh.test.mjs`.
+
 # NativeThreeBridge v0.32.0 — textures, Canvas 2D, sprites, tone mapping
 
 Kuningriigid in the engine had no trees (its GLB trees could not be loaded), a white-ish sea, an empty minimap and no city icons. v0.32.0 adds what those need:
