@@ -8,12 +8,12 @@
 //   * InstancedMesh matrices/colours only when they change,
 //   * textures once per image (encoded bytes are decoded natively),
 //   * one compact Float32Array "pass" per render() call: camera, lights and
-//     a 56-float record per visible draw.
+//     a 60-float record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
-export const PASS_HEADER_FLOATS = 64;
+export const PASS_HEADER_FLOATS = 96;   // [56..94]: shadow-casting light (see render())
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 56;
+export const DRAW_FLOATS = 60;          // [56]: ShadowDraw bits
 export const MAX_LIGHTS = 16;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
@@ -33,6 +33,8 @@ export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
 // Pass header [48]: tone mapping curve (same numbers as THREE.*ToneMapping).
 export const ToneMapping = { NONE: 0, LINEAR: 1, REINHARD: 2, CINEON: 3, ACES: 4, AGX: 6, NEUTRAL: 7 };
 export const PassFlags = { CLEAR_COLOR: 1, CLEAR_DEPTH: 2 };
+// Draw record [56]: drawn into the shadow map / only there (outside the camera view).
+export const ShadowDraw = { CAST: 1, ONLY: 2 };
 
 // `shaders`: { ShaderLib, UniformsUtils } from three.module.js (not in three.core.js).
 export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHost, shaders = {}) {
@@ -41,6 +43,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
   const _projScreen = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
+  const _shadowFrustum = new THREE.Frustum();
+  const _shadowScreen = new THREE.Matrix4();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
   const _color = new THREE.Color();
@@ -526,7 +530,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
+      this._shadowCandidates = this.shadowMap.enabled ? [] : null;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      const shadow = this.shadowMap.enabled ? this._shadowLight(lights) : null;
+      if (shadow) {
+        // Casters outside the camera view can still throw shadows into it.
+        _shadowScreen.multiplyMatrices(shadow.light.shadow.camera.projectionMatrix, shadow.light.shadow.camera.matrixWorldInverse);
+        _shadowFrustum.setFromProjectionMatrix(_shadowScreen, shadow.light.shadow.camera.coordinateSystem);
+        for (const mesh of this._shadowCandidates) {
+          if (!mesh.frustumCulled || _shadowFrustum.intersectsObject(mesh)) this._addMesh(mesh, camera, opaque, transparent, true);
+        }
+      }
+      this._shadowCandidates = null;
 
       if (this.sortObjects) {
         opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
@@ -577,6 +592,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         p[53] = fog.isFogExp2 ? fog.density : fog.near;
         p[54] = fog.far ?? 0;
       }
+      if (shadow) {
+        const sh = shadow.light.shadow;
+        p.set(sh.camera.matrixWorldInverse.elements, 56);
+        p.set(sh.camera.projectionMatrix.elements, 72);
+        p[88] = 1; p[89] = sh.bias; p[90] = sh.normalBias; p[91] = Math.max(sh.mapSize.x, sh.mapSize.y);
+        p[92] = sh.radius; p[93] = sh.intensity ?? 1; p[94] = shadow.index;
+      }
 
       let o = PASS_HEADER_FLOATS;
       for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) writeLight(p, o, lights[i]);
@@ -593,7 +615,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const layerVisible = object.layers.test(camera.layers);
       if (layerVisible) {
         if (object.isLight) this._addLight(object, lights, ambient);
-        else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
+        else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent, false);
         else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
         else if (object.isSprite) this._addSprite(object, camera, opaque, transparent);
       }
@@ -601,13 +623,28 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       for (let i = 0; i < children.length; i++) this._collect(children[i], camera, opaque, transparent, lights, ambient);
     }
 
+    // The first directional or spot light with castShadow (among the lights
+    // actually sent) gets the shadow map, as WebGLShadowMap would render it.
+    _shadowLight(lights) {
+      const n = Math.min(lights.length, MAX_LIGHTS);
+      let found = null;
+      for (let i = 0; i < n; i++) {
+        const light = lights[i].light;
+        if (!light || !light.castShadow || !light.shadow) continue;
+        if (!light.isDirectionalLight && !light.isSpotLight) { unsupported('Point light shadows', 'drawn without shadows'); continue; }
+        if (found) { unsupported('More than one shadow-casting light', 'only the first casts shadows'); break; }
+        found = { light, index: i };
+      }
+      if (found) found.light.shadow.updateMatrices(found.light);
+      return found;
+    }
+
     _addLight(light, lights, ambient) {
       const c = light.color, k = light.intensity;
       if (light.isAmbientLight) { ambient[0] += c.r * k; ambient[1] += c.g * k; ambient[2] += c.b * k; return; }
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
-      if (light.castShadow) unsupported('Shadow maps in webapps', 'lights work, shadows are not rendered yet');
-      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
+      const rec = { light, type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
       if (light.isHemisphereLight) {
@@ -670,11 +707,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return this._spriteMatrices[i] || (this._spriteMatrices[i] = new THREE.Matrix4());
     }
 
-    _addMesh(mesh, camera, opaque, transparent) {
+    _addMesh(mesh, camera, opaque, transparent, shadowOnly) {
       const geometry = mesh.geometry;
       if (!geometry || !geometry.isBufferGeometry || !geometry.attributes.position) return;
       if (mesh.isInstancedMesh && mesh.count === 0) return;
-      if (mesh.frustumCulled && !_frustum.intersectsObject(mesh)) return;
+      if (!shadowOnly && mesh.frustumCulled && !_frustum.intersectsObject(mesh)) {
+        if (mesh.castShadow && this._shadowCandidates && !mesh.isLine) this._shadowCandidates.push(mesh);
+        return;
+      }
       if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
       const skinnable = mesh.isSkinnedMesh && mesh.skeleton && geometry.attributes.skinIndex && geometry.attributes.skinWeight;
@@ -687,7 +727,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const z = _vec.z;
       const total = record.indexCount || record.vertexCount;
       const range = geometry.drawRange;
-      const base = { mesh, record, instances, z };
+      const base = { mesh, record, instances, z, shadowOnly: !!shadowOnly };
       if (Array.isArray(mesh.material)) {
         const groups = geometry.groups.length ? geometry.groups : [{ start: 0, count: total, materialIndex: 0 }];
         for (const group of groups) {
@@ -720,6 +760,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.flatShading) flags |= DrawFlags.FLAT;
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
       if (!mesh.isSprite && mesh.matrixWorld.determinant() < 0) flags |= DrawFlags.MIRRORED;
+      if (mesh.receiveShadow) flags |= DrawFlags.RECEIVE_SHADOW;
+      if (mesh.castShadow && !mesh.isLine) flags |= DrawFlags.CAST_SHADOW;
       let roughness = 1, metalness = 0, shininess = -1;
       let color = m.color || null, opacity = m.opacity ?? 1;
       let shaderMap = null, reflection = null, reflectionMask = false, colorStage = null;
@@ -832,6 +874,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         opacity, reflection, reflectionMask, colorStage,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         normalMapId, normalScaleX, normalScaleY,
+        shadow: ((flags & DrawFlags.CAST_SHADOW) ? ShadowDraw.CAST : 0) | (base.shadowOnly ? ShadowDraw.ONLY : 0),
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
       if (globalThis.__ntDebugDraws) {
@@ -880,6 +923,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
     p[o + 53] = d.normalMapId || 0; p[o + 54] = d.normalScaleX ?? 1; p[o + 55] = d.normalScaleY ?? 1;
+    p[o + 56] = d.shadow || 0; p[o + 57] = p[o + 58] = p[o + 59] = 0;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {

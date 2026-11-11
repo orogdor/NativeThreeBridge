@@ -42,8 +42,8 @@ test('unlit materials ignore normal maps', () => {
   assert.equal(draw.flags & DrawFlags.NORMAL_MAP, 0);
 });
 
-test('the draw record carries normal map id and scale in its last three floats', () => {
-  assert.equal(DRAW_FLOATS, 56);
+test('the draw record carries the normal map id and scale at [53..55]', () => {
+  assert.equal(DRAW_FLOATS, 60);
   const src = readFileSync(new URL('../js/native-renderer.mjs', import.meta.url), 'utf8');
   assert.match(src, /p\[o \+ 53\] = d\.normalMapId/);
   const cpp = readFileSync(new URL('../native-dx12/webapp_dx12.cpp', import.meta.url), 'utf8');
@@ -126,4 +126,46 @@ test('a skinned mesh is re-uploaded only when its bones move', () => {
   renderer.info.render.frame = 3;
   renderer._skinnedRecord(mesh);
   assert.deepEqual(uploads.at(-1)[1], [1, 5, 0]);
+});
+
+test('the first shadow-casting directional or spot light gets the shadow map', () => {
+  const renderer = makeRenderer();
+  const shadow = () => ({ updates: 0, updateMatrices() { this.updates++; } });
+  const lights = [
+    { light: { isPointLight: true, castShadow: false } },
+    { light: { isPointLight: true, castShadow: true, shadow: shadow() } },
+    { light: { isDirectionalLight: true, castShadow: true, shadow: shadow() } },
+    { light: { isSpotLight: true, castShadow: true, shadow: shadow() } },
+  ];
+  const found = renderer._shadowLight(lights);
+  assert.equal(found.index, 2);
+  assert.equal(lights[2].light.shadow.updates, 1, 'shadow camera follows the light');
+  assert.equal(lights[3].light.shadow.updates, 0);
+  assert.equal(renderer._shadowLight([{ light: { isDirectionalLight: true, castShadow: false } }]), null);
+});
+
+test('casters and receivers are flagged; off-screen casters go to the shadow map only', () => {
+  const renderer = makeRenderer();
+  const mesh = { matrixWorld: { determinant: () => 1, elements: new Float32Array(16) }, renderOrder: 0, castShadow: true, receiveShadow: true };
+  const opaque = [];
+  renderer._queue({ mesh, record: { id: 1, hasUvs: false }, instances: null, z: 0, shadowOnly: true }, standard({}), 0, 3, opaque, []);
+  const draw = opaque[0];
+  assert.ok(draw.flags & DrawFlags.RECEIVE_SHADOW);
+  assert.ok(draw.flags & DrawFlags.CAST_SHADOW);
+  assert.equal(draw.shadow, 3, 'cast + shadow-only');
+});
+
+test('native and shader code agree on the shadow layout', () => {
+  const cpp = readFileSync(new URL('../native-dx12/webapp_dx12.cpp', import.meta.url), 'utf8');
+  const hlsl = readFileSync(new URL('../native-dx12/webapp_shader.h', import.meta.url), 'utf8');
+  const h = readFileSync(new URL('../native-dx12/webapp_host.h', import.meta.url), 'utf8');
+  assert.match(h, new RegExp(`kWebappDrawFloats = ${DRAW_FLOATS};`));
+  assert.match(hlsl, new RegExp(`F_RECEIVE_SHADOW = ${DrawFlags.RECEIVE_SHADOW}\\b`));
+  // Frame cbuffer: ... gFog (304) then gShadowVP at float 308 and two float4s: 332 floats.
+  assert.match(hlsl, /float4 gFog;[^\n]*\n\s*float4x4 gShadowVP;[^\n]*\n\s*float4 gShadow;[^\n]*\n\s*float4 gShadow2;/);
+  assert.match(cpp, /std::memcpy\(fcb \+ 308, shadowVP/);
+  assert.match(cpp, /kFrameCBBytes = 1536;/);
+  assert.ok(332 * 4 <= 1536);
+  assert.match(hlsl, /void ShadowPS\(VSOut i\)/);
+  assert.match(cpp, /"ShadowPS"/);
 });

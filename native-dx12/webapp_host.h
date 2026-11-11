@@ -106,9 +106,9 @@ inline std::size_t webappUiHeaderFloats(float version) {
 }
 
 // Same numbers as js/native-renderer.mjs.
-constexpr std::size_t kWebappPassHeaderFloats = 64;
+constexpr std::size_t kWebappPassHeaderFloats = 96;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 56;
+constexpr std::size_t kWebappDrawFloats = 60;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 
