@@ -2582,7 +2582,11 @@ center{text-align:center}
   function formsContext(b) {
     if (b.anonText) return false;
     const cs = b.cs;
-    if (b.pos !== 'static') return true;
+    // A positioned box forms a stacking context only with a z-index (or when
+    // fixed/sticky). With z-index:auto it is painted in its parent's z=0 layer
+    // and its positioned descendants stack in the parent's context (CSS 2.1 E).
+    if (b.pos === 'fixed' || b.pos === 'sticky') return true;
+    if (b.pos !== 'static') { const z = lower(cs['z-index']); if (z && z !== 'auto') return true; }
     if (cs['clip-path'] && lower(cs['clip-path']) !== 'none') return true;
     const zi = lower(cs['z-index']);
     if (zi && zi !== 'auto' && b.parent && (b.parent.inner === 'flex' || b.parent.inner === 'grid')) return true;
@@ -2749,7 +2753,7 @@ center{text-align:center}
       if (c.pos === 'absolute' || c.pos === 'fixed') return c.cbBox && c.cbBox !== viewportBox ? (c.cbBox._clipInner ?? null) : null;
       return clip;
     };
-    const collect = (p, clip) => {
+    const collect = (p, clip, into) => {
       for (const c of paintChildren(p)) {
         const cc = clipFor(c, clip);
         if (formsContext(c)) {
@@ -2757,17 +2761,29 @@ center{text-align:center}
           (z < 0 ? neg : z === 0 ? zero : pos).push({ box: c, clip: cc, z, seq: seq++ });
           continue;
         }
-        flow.push({ box: c, clip: cc });
         c._clipInner = innerClip(c, cc);
-        collect(c, c._clipInner);
+        if (c.pos !== 'static') {
+          // positioned, z-index:auto: painted in the z=0 layer with its own
+          // in-flow content; its positioned descendants join this context.
+          const own = [];
+          zero.push({ box: c, clip: cc, z: 0, seq: seq++, own });
+          collect(c, c._clipInner, own);
+          continue;
+        }
+        into.push({ box: c, clip: cc });
+        collect(c, c._clipInner, into);
       }
     };
-    collect(b, b._clipInner);
+    collect(b, b._clipInner, flow);
     neg.sort((a, c) => a.z - c.z || a.seq - c.seq);
     pos.sort((a, c) => a.z - c.z || a.seq - c.seq);
     for (const e of neg) paintContext(e.box, e.clip);
     for (const e of flow) paintOwn(e.box, e.clip);
-    for (const e of zero) paintContext(e.box, e.clip);
+    for (const e of zero) {
+      if (!e.own) { paintContext(e.box, e.clip); continue; }
+      paintOwn(e.box, e.clip);
+      for (const f of e.own) paintOwn(f.box, f.clip);
+    }
     for (const e of pos) paintContext(e.box, e.clip);
   }
   const prim = (clip, d) => prims.push({ clip, d });

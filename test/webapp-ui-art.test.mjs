@@ -47,3 +47,12 @@ test('clip-path inset() cuts an image', { skip }, async () => {
   decodeUi(rec.ui.floats, (op, a) => { if (op === CLIP && near(a[0], 620) && near(a[1], 60)) clipped = Array.from(a.slice(0, 4)); });
   assert.deepEqual(clipped, [620, 60, 160, 120]);
 });
+
+test('a positioned z-index:auto box does not trap its z-indexed children below a sibling', { skip }, async () => {
+  const { rec } = await runWebapp(fixture, { frames: 3, width: 1280, height: 720 });
+  const order = [];
+  decodeUi(rec.ui.floats, (op, a) => { if (op === IMAGE) order.push(rec.ui.strings[a[4]].split('/').pop() + '@' + Math.round(a[0])); });
+  const frame = order.indexOf('panel.png@1080'), portrait = order.indexOf('portrait.png@1130');
+  assert.ok(frame >= 0 && portrait >= 0, order.join(' '));
+  assert.ok(portrait > frame, 'z-index:2 portrait paints after the z-index:1 frame');
+});

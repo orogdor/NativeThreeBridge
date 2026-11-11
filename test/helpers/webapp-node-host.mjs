@@ -180,6 +180,12 @@ export async function runWebapp(root, options = {}) {
       await m.link(linker);
       await m.evaluate();
     },
+    // Per-webapp persistence (localStorage, IndexedDB) like the engine's
+    // <game>.native-storage: options.storage is a Map of name -> state.
+    ...(options.storage ? {
+      storageRead(name) { return options.storage.get(String(name)) ?? null; },
+      storageWrite(name, state) { options.storage.set(String(name), state); return true; },
+    } : {}),
     registerColorPatch(id, source) {
       rec.colorPatches ??= new Map();
       rec.colorPatches.set(id, source);

@@ -7,3 +7,9 @@ body{margin:0;width:1280px;height:720px}
 /* A circular portrait cut with clip-path. */
 #portrait-box{position:absolute;left:600px;top:40px;width:200px;height:200px}
 #portrait{position:absolute;left:10%;top:10%;width:80%;height:80%;object-fit:cover;clip-path:inset(0 0 25% 0)}
+/* Kuningriigid V306 selection: the frame is z-index 1; the portrait sits in a
+   positioned z-index:auto head and must still stack above it with z-index 2. */
+#selection{position:absolute;right:0;top:300px;width:200px;height:200px;z-index:6}
+#sel-frame{position:absolute;inset:0;width:100%;height:100%;z-index:1}
+#sel-head{position:absolute;inset:0}
+#sel-portrait{position:absolute;left:25%;top:25%;width:50%;height:50%;z-index:2}
