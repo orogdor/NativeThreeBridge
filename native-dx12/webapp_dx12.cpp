@@ -16,7 +16,9 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <share.h>
 #include <fstream>
 #include <map>
@@ -55,7 +57,11 @@ constexpr UINT kDrawCBBytes = 256;
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
                F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
+// Set here, not by JS: an alphaTest cut-out drawn with MSAA alpha-to-coverage.
+constexpr UINT F_ALPHA_COVERAGE = 8388608;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
+constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -259,6 +265,11 @@ private:
     ComPtr<ID3D12DescriptorHeap> rtvHeap_, dsvHeap_;
     UINT rtvStep_ = 0;
     ComPtr<ID3D12Resource> targets_[kFrameCount], depth_;
+    // Multisampled scene target (msaa_ > 1), resolved into the back buffer
+    // before the HTML/CSS UI is drawn. NT_MSAA=1/2/4/8 overrides the default 4.
+    UINT msaa_ = 1;
+    ComPtr<ID3D12Resource> msaaColor_;
+    void chooseMsaa();
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
     ComPtr<ID3D12Fence> fence_;
@@ -421,7 +432,7 @@ void WebappWindow::initDevice() {
     factory_->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER);
 
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
-    heap.NumDescriptors = kFrameCount;
+    heap.NumDescriptors = kFrameCount + 1;   // back buffers + multisampled scene target
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_)), "RTV heap");
     rtvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -458,7 +469,7 @@ void WebappWindow::initDevice() {
                                                   D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
     for (UINT i = 0; i < 3; i++) {
         samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
-        samplers[i].MaxAnisotropy = 4;
+        samplers[i].MaxAnisotropy = 16;   // sharp textures at grazing angles (ground, roads)
         samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
         samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[i].ShaderRegister = i;
@@ -489,6 +500,7 @@ void WebappWindow::initDevice() {
     identityView_.BufferLocation = identityInstance_->GetGPUVirtualAddress();
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
+    chooseMsaa();
     createSizeDependent();
     initTextures();
     initUi();
@@ -762,8 +774,8 @@ void WebappWindow::initUi() {
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     d.SampleMask = UINT_MAX;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    d.RTVFormats[0] = kColorFormat;
+    d.DSVFormat = DXGI_FORMAT_UNKNOWN;   // drawn on the back buffer with no depth buffer bound
     d.SampleDesc.Count = 1;
     check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&uiPso_)), "Create UI overlay pipeline");
     log("info", "HTML/CSS UI layer ready (Direct2D + DirectWrite + WIC)");
@@ -857,6 +869,26 @@ void WebappWindow::drawUi(UINT frame) {
     cmd_->DrawInstanced(3, 1, 0, 0);
 }
 
+void WebappWindow::chooseMsaa() {
+    UINT wanted = 4;
+    char env[8] = {};
+    if (GetEnvironmentVariableA("NT_MSAA", env, sizeof env) > 0) wanted = UINT(std::atoi(env));
+    msaa_ = 1;
+    for (UINT n : {8u, 4u, 2u}) {
+        if (n > wanted) continue;
+        bool ok = true;
+        for (DXGI_FORMAT f : {kColorFormat, kDepthFormat}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{};
+            q.Format = f;
+            q.SampleCount = n;
+            if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) || q.NumQualityLevels == 0)
+                ok = false;
+        }
+        if (ok) { msaa_ = n; break; }
+    }
+    log("info", "Antialiasing: " + (msaa_ > 1 ? std::to_string(msaa_) + "x MSAA" : std::string("off")));
+}
+
 void WebappWindow::createSizeDependent() {
     for (UINT i = 0; i < kFrameCount; i++) {
         check(swap_->GetBuffer(i, IID_PPV_ARGS(&targets_[i])), "Get back buffer");
@@ -870,8 +902,8 @@ void WebappWindow::createSizeDependent() {
     d.Height = height_;
     d.DepthOrArraySize = 1;
     d.MipLevels = 1;
-    d.Format = DXGI_FORMAT_D32_FLOAT;
-    d.SampleDesc.Count = 1;
+    d.Format = kDepthFormat;
+    d.SampleDesc.Count = msaa_;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear{};
     clear.Format = DXGI_FORMAT_D32_FLOAT;
@@ -880,11 +912,26 @@ void WebappWindow::createSizeDependent() {
     check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                            &clear, IID_PPV_ARGS(&depth_)), "Depth buffer");
     device_->CreateDepthStencilView(depth_.Get(), nullptr, dsvHeap_->GetCPUDescriptorHandleForHeapStart());
+    if (msaa_ > 1) {
+        D3D12_RESOURCE_DESC c = d;
+        c.Format = kColorFormat;
+        c.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE black{};
+        black.Format = kColorFormat;
+        black.Color[3] = 1.0f;
+        // Starts (and ends every frame) as the resolve source.
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &c, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                               &black, IID_PPV_ARGS(&msaaColor_)), "Multisampled colour target");
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(kFrameCount) * rtvStep_;
+        device_->CreateRenderTargetView(msaaColor_.Get(), nullptr, rtv);
+    }
 }
 
 void WebappWindow::releaseSizeDependent() {
     for (auto& t : targets_) t.Reset();
     depth_.Reset();
+    msaaColor_.Reset();
 }
 
 void WebappWindow::waitForGpu() {
@@ -1032,8 +1079,9 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
     // side that faces the camera is the other one (Three.js flips frontFace).
     if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
-    const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+    const bool coverage = (flags & F_ALPHA_COVERAGE) && !lines && msaa_ > 1;
+    const UINT key = (patchId << 7) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
+                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) | (coverage ? 64u : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1081,11 +1129,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.DepthStencilState.DepthEnable = (flags & F_NO_DEPTH_TEST) ? FALSE : TRUE;
     d.DepthStencilState.DepthWriteMask = (flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    d.BlendState.AlphaToCoverageEnable = coverage ? TRUE : FALSE;
     d.SampleMask = UINT_MAX;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    d.SampleDesc.Count = 1;
+    d.RTVFormats[0] = kColorFormat;
+    d.DSVFormat = kDepthFormat;
+    d.SampleDesc.Count = msaa_;
+    d.RasterizerState.MultisampleEnable = msaa_ > 1 ? TRUE : FALSE;
     ComPtr<ID3D12PipelineState> pso;
     const auto hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
     if (FAILED(hr) && patchId) {
@@ -1127,15 +1177,32 @@ void WebappWindow::renderFrame() {
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
     recordTextureCopies();
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = targets_[frame].Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmd_->ResourceBarrier(1, &barrier);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += SIZE_T(frame) * rtvStep_;
+    const bool msaa = msaa_ > 1 && msaaColor_;
+    auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        return b;
+    };
+    {
+        // The scene goes into the multisampled target (resolved below) or
+        // straight into the back buffer when MSAA is off.
+        D3D12_RESOURCE_BARRIER begin[2] = {
+            transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                       msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_RENDER_TARGET),
+            transition(msaaColor_.Get(), D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+        cmd_->ResourceBarrier(msaa ? 2 : 1, begin);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE backRtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    backRtv.ptr += SIZE_T(frame) * rtvStep_;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = backRtv;
+    if (msaa) {
+        rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(kFrameCount) * rtvStep_;
+    }
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
     cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     // A browser canvas starts every frame cleared (preserveDrawingBuffer=false).
@@ -1184,7 +1251,9 @@ void WebappWindow::renderFrame() {
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
             auto g = geometries_.find(std::uint32_t(d[0]));
             if (g == geometries_.end() || !g->second.vertices) continue;
-            const UINT drawFlags = UINT(d[3]);
+            UINT drawFlags = UINT(d[3]);
+            // alphaTest cut-outs (foliage, thatch, hair) get soft MSAA edges.
+            if (msaa && d[33] > 0 && !(drawFlags & (F_TRANSPARENT | F_LINES | F_LINE_STRIP))) drawFlags |= F_ALPHA_COVERAGE;
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
@@ -1249,13 +1318,26 @@ void WebappWindow::renderFrame() {
     }
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
+    if (msaa) {
+        D3D12_RESOURCE_BARRIER toResolve = transition(msaaColor_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        cmd_->ResourceBarrier(1, &toResolve);
+        cmd_->ResolveSubresource(targets_[frame].Get(), 0, msaaColor_.Get(), 0, kColorFormat);
+        D3D12_RESOURCE_BARRIER toTarget = transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd_->ResourceBarrier(1, &toTarget);
+    }
     if (uiReady_) {
         if (uiUpload_) uploadUi(frame);
-        if (uiVisible_) drawUi(frame);
+        if (uiVisible_) {
+            cmd_->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
+            drawUi(frame);
+        }
     }
 
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    cmd_->ResourceBarrier(1, &barrier);
+    D3D12_RESOURCE_BARRIER toPresent = transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                  D3D12_RESOURCE_STATE_PRESENT);
+    cmd_->ResourceBarrier(1, &toPresent);
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);

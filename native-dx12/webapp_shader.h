@@ -31,7 +31,7 @@ SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
-                  F_MIRRORED = 524288;
+                  F_MIRRORED = 524288, F_ALPHA_COVERAGE = 8388608;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -138,7 +138,11 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
 #ifdef NT_COLOR_PATCH
     albedo = nativeColorStage(i.localPosition, i.localNormal, float4(albedo, alphaOut));
 #endif
-    if (alphaOut < gUvU.w) discard;   // material.alphaTest
+    // material.alphaTest: with MSAA alpha-to-coverage the cut-out edge is a
+    // sharpened alpha ramp one pixel wide instead of a hard discard.
+    float alphaWidth = max(fwidth(alphaOut), 1e-4);
+    if (flags & F_ALPHA_COVERAGE) alphaOut = saturate((alphaOut - gUvU.w) / alphaWidth + 0.5);
+    else if (alphaOut < gUvU.w) discard;
     if (flags & F_UNLIT) return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     float3 V = normalize(gCamera.xyz - i.world);
     float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
