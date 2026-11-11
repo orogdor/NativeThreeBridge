@@ -18,20 +18,21 @@ cbuffer Draw : register(b1) {
     float4x4 gModel;
     float4 gColor;    // linear rgb, opacity
     float4 gEmissive; // linear rgb, w shininess (<0: physical)
-    float4 gParams;   // roughness, metalness, flags, unused
+    float4 gParams;   // roughness, metalness, flags, normalScale.x
     float4 gUvU;      // u' = dot(xyz, (u, v, 1)); w alphaTest
-    float4 gUvV;      // v' = dot(xyz, (u, v, 1))
+    float4 gUvV;      // v' = dot(xyz, (u, v, 1)); w normalScale.y
     float4 gReflection; // sky RGB and blend strength
     float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
     float4 gColorStage; // live scalar uniforms from the translated color stage
 };
 Texture2D gMap : register(t0);
+Texture2D gNormalMap : register(t1);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
-                  F_MIRRORED = 524288, F_ALPHA_COVERAGE = 8388608;
+                  F_MIRRORED = 524288, F_NORMAL_MAP = 1048576, F_ALPHA_COVERAGE = 8388608;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -129,6 +130,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     float3 albedo = gColor.rgb * i.col.rgb;
     float alphaOut = gColor.a * i.col.a;
     float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
+    float3 posDx = ddx(i.world), posDy = ddy(i.world);
     if (flags & F_MAP) {
         float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
                  : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
@@ -145,12 +147,28 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     else if (alphaOut < gUvU.w) discard;
     if (flags & F_UNLIT) return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     float3 V = normalize(gCamera.xyz - i.world);
-    float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
+    float3 flatN = normalize(cross(posDx, posDy));
     if (dot(flatN, V) < 0) flatN = -flatN;
     float3 N = normalize(i.nrm);
     if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
     if (!front) N = -N;
     if (flags & F_FLAT) N = flatN;
+    if (flags & F_NORMAL_MAP) {
+        // Three.js getTangentFrame (no tangent attribute); D3D's ddy runs down
+        // the screen, GLSL's dFdy up, hence the negated y derivatives.
+        float4 nt = (flags & F_MAP_REPEAT) ? gNormalMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
+                  : (flags & F_MAP_MIRROR) ? gNormalMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gNormalMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
+        float3 mapN = nt.xyz * 2 - 1;
+        mapN.xy *= float2(gParams.w, gUvV.w);
+        float3 q0 = posDx, q1 = -posDy;
+        float2 st0 = uvDx, st1 = -uvDy;
+        float3 q1perp = cross(q1, N), q0perp = cross(N, q0);
+        float3 T = q1perp * st0.x + q0perp * st1.x;
+        float3 B = q1perp * st0.y + q0perp * st1.y;
+        float det = max(dot(T, T), dot(B, B));
+        float s = (det == 0 ? 0 : rsqrt(det)) * (front ? 1 : -1);   // tbn[0..1] *= faceDirection
+        N = normalize(T * s * mapN.x + B * s * mapN.y + N * mapN.z);
+    }
     if (flags & F_NORMAL_COLOR) {
         float3 vn = normalize(mul((float3x3)gView, N));
         return float4(vn * 0.5 + 0.5, alphaOut);

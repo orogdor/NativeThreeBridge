@@ -56,7 +56,7 @@ constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
-               F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
+               F_MIRRORED = 524288, F_NORMAL_MAP = 1048576;  // negative-determinant world matrix: reversed winding
 // Set here, not by JS: an alphaTest cut-out drawn with MSAA alpha-to-coverage.
 constexpr UINT F_ALPHA_COVERAGE = 8388608;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
@@ -449,21 +449,24 @@ void WebappWindow::initDevice() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
-    // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
-    D3D12_ROOT_PARAMETER params[3]{};
+    // t0 = colour map, t1 = normal map; s0 repeat, s1 clamp, s2 mirrored repeat.
+    D3D12_ROOT_PARAMETER params[4]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
         params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    D3D12_DESCRIPTOR_RANGE texRange{};
-    texRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    texRange.NumDescriptors = 1;
-    texRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &texRange;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_DESCRIPTOR_RANGE texRanges[2]{};
+    for (UINT i = 0; i < 2; i++) {
+        texRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        texRanges[i].NumDescriptors = 1;
+        texRanges[i].BaseShaderRegister = i;
+        texRanges[i].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        params[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2 + i].DescriptorTable.NumDescriptorRanges = 1;
+        params[2 + i].DescriptorTable.pDescriptorRanges = &texRanges[i];
+        params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
     D3D12_STATIC_SAMPLER_DESC samplers[3]{};
     const D3D12_TEXTURE_ADDRESS_MODE modes[3] = {D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                   D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
@@ -476,7 +479,7 @@ void WebappWindow::initDevice() {
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
+    rs.NumParameters = UINT(sizeof params / sizeof params[0]);
     rs.pParameters = params;
     rs.NumStaticSamplers = 3;
     rs.pStaticSamplers = samplers;
@@ -1217,7 +1220,7 @@ void WebappWindow::renderFrame() {
     ID3D12DescriptorHeap* texHeaps[] = {texHeap_.Get()};
     cmd_->SetDescriptorHeaps(1, texHeaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = textureHandle(0);
-    UINT64 boundTexture = ~0ull;
+    UINT64 boundTexture = ~0ull, boundNormalMap = ~0ull;
 
     UINT drawsThisFrame = 0;
     for (const auto& pass : passes_) {
@@ -1291,16 +1294,18 @@ void WebappWindow::renderFrame() {
             std::memcpy(dcb, d + 16, 16 * sizeof(float));
             dcb[16] = d[8]; dcb[17] = d[9]; dcb[18] = d[10]; dcb[19] = d[11];
             dcb[20] = d[12]; dcb[21] = d[13]; dcb[22] = d[14]; dcb[23] = d[15];
-            dcb[24] = d[6]; dcb[25] = d[7]; dcb[26] = float(drawFlags); dcb[27] = 0;
-            // uv transform rows (a c e | b d f) and alphaTest
+            dcb[24] = d[6]; dcb[25] = d[7]; dcb[26] = float(drawFlags); dcb[27] = d[54]; // normalScale.x
+            // uv transform rows (a c e | b d f), alphaTest, normalScale.y
             dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
-            dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
+            dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = d[55];
             std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
             std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
             cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
             ringOffset += kDrawCBBytes;
             const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
+            const D3D12_GPU_DESCRIPTOR_HANDLE nrm = (drawFlags & F_NORMAL_MAP) ? textureHandle(std::uint32_t(d[53])) : whiteTexture;
+            if (nrm.ptr != boundNormalMap) { cmd_->SetGraphicsRootDescriptorTable(3, nrm); boundNormalMap = nrm.ptr; }
 
             cmd_->IASetVertexBuffers(0, 2, views);
             if (g->second.indexCount) {

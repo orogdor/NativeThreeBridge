@@ -25,6 +25,8 @@ export const DrawFlags = {
   // matrixWorld has a negative determinant (mirrored, e.g. scale -1 in a GLTF):
   // the triangle winding is reversed, as Three.js' WebGLRenderer flips frontFace.
   MIRRORED: 524288,
+  NORMAL_MAP: 1048576,   // material.normalMap (tangent space, derivative-based frame like Three.js)
+  CAST_SHADOW: 2097152, RECEIVE_SHADOW: 4194304,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
@@ -696,8 +698,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
       if (m.fog !== false && (!(m.isShaderMaterial || m.isRawShaderMaterial) ||
           (m.fog && /#include\s+<fog_fragment>/.test(m.fragmentShader)))) flags |= DrawFlags.FOG;
-      if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
-        unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
+      if (m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
+        unsupported('Textures other than map and normalMap (envMap, aoMap …)', 'only the colour and normal maps are drawn');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) {
@@ -731,12 +733,25 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvt = _uvIdentity;
       uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
       const colorMap = m.map || shaderMap;
-      if (colorMap && base.record.hasUvs) {
-        const tex = this._textureRecord(colorMap);
-        if (tex) {
-          const map = colorMap;
-          textureId = tex.id;
-          flags |= DrawFlags.MAP;
+      let normalMapId = 0, normalScaleX = 1, normalScaleY = 1;
+      const normalTex = m.normalMap && base.record.hasUvs && !(flags & DrawFlags.UNLIT) ? this._textureRecord(m.normalMap) : null;
+      if (normalTex) {
+        normalMapId = normalTex.id;
+        flags |= DrawFlags.NORMAL_MAP;
+        normalScaleX = m.normalScale ? m.normalScale.x : 1;
+        normalScaleY = m.normalScale ? m.normalScale.y : 1;
+        if (m.normalMapType === THREE.ObjectSpaceNormalMap) unsupported('Object-space normal maps', 'treated as tangent space');
+      }
+      const colorTex = colorMap && base.record.hasUvs ? this._textureRecord(colorMap) : null;
+      if (colorTex) { textureId = colorTex.id; flags |= DrawFlags.MAP; }
+      // One uv transform is shared by both maps: the colour map's, or the normal map's when there is none.
+      const uvMap = colorTex ? colorMap : normalTex ? m.normalMap : null;
+      // A flipY uv transform mirrors v (D3D rows run top-down), and with it the
+      // derivative-based bitangent: undo that for the normal map.
+      if (normalTex && uvMap.flipY) normalScaleY = -normalScaleY;
+      if (uvMap) {
+        {
+          const map = uvMap;
           if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
           else if (map.wrapS === THREE.MirroredRepeatWrapping || map.wrapT === THREE.MirroredRepeatWrapping) flags |= DrawFlags.MAP_MIRROR;
           if (map.matrixAutoUpdate) map.updateMatrix();
@@ -757,6 +772,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
+        normalMapId, normalScaleX, normalScaleY,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
       if (globalThis.__ntDebugDraws) {
@@ -804,7 +820,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const value = d.colorStage?.uniforms[i]?.value;
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
-    p[o + 53] = p[o + 54] = p[o + 55] = 0;
+    p[o + 53] = d.normalMapId || 0; p[o + 54] = d.normalScaleX ?? 1; p[o + 55] = d.normalScaleY ?? 1;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {
