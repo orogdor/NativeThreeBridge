@@ -281,6 +281,7 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          NT_GPU_TIMING: '1'
         run: |
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
           $folder = (Resolve-Path test/fixtures/webapp-reload).Path
@@ -300,6 +301,18 @@ jobs:
               Write-Host $log
               throw "Webapp replace/reload failed"
             }
+            $deadline = (Get-Date).AddSeconds(10)
+            do {
+              $gpuSample = Get-Content dist/NativeThreeBridge-webapp-frames.csv | ConvertFrom-Csv |
+                Where-Object {
+                  [int]$_.gpu_timing_samples -gt 0 -and [double]$_.gpu_work_ms_avg -gt 0 -and
+                  [double]$_.gpu_work_ms_max -ge [double]$_.gpu_work_ms_avg
+                } | Select-Object -First 1
+              if (!$gpuSample) { Start-Sleep -Milliseconds 250 }
+              $p.Refresh()
+            } until ($gpuSample -or $p.HasExited -or (Get-Date) -ge $deadline)
+            if (!$gpuSample) { throw "DX12 frame CSV has no completed GPU timestamp samples" }
+            Write-Host ("DX12 timing verified: " + ($gpuSample | ConvertTo-Json -Compress))
           } finally {
             if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
             $p.WaitForExit()
