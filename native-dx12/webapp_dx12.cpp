@@ -53,7 +53,8 @@ constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
-               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096;
+               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
+               F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 
 std::wstring widen(const std::string& s) {
@@ -1027,7 +1028,10 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     const auto patch = colorPatches_.find(patchId);
     if (patch == colorPatches_.end()) patchId = 0;
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
-    const UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
+    UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
+    // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
+    // side that faces the camera is the other one (Three.js flips frontFace).
+    if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
     const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
                      ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
     auto found = pipelines_.find(key);
