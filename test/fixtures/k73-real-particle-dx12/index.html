@@ -1,0 +1,41 @@
+<!doctype html><html><head><title>K73 original particle GLSL native DX12</title></head><body>
+<canvas id="gl" data-native-webgl2-prototype width="800" height="600"></canvas>
+<script>
+const gl=document.getElementById('gl').getContext('webgl2');
+function shader(type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+const v=shader(gl.VERTEX_SHADER,"#version 300 es\n\nprecision highp float;\nlayout(location=0) in vec2 aC;\nlayout(location=1) in vec4 aPS;\nlayout(location=2) in vec4 aCol;\nlayout(location=3) in vec4 aDir;\nuniform mat4 uVP; uniform vec3 uR; uniform vec3 uU; uniform vec3 uCam; uniform float uFogDen;\nout vec4 vCol; out vec2 vUV; out float vF; out vec3 vS;\nvoid main(){\n  vec3 wp; vS = aPS.xyz*0.45;\n  if(aDir.w>0.0){\n    vec3 dd = normalize(aDir.xyz); vec3 tc = normalize(uCam-aPS.xyz);\n    vec3 r = normalize(cross(dd,tc));\n    wp = aPS.xyz + r*aC.x*aPS.w + dd*aC.y*aDir.w;\n  } else {\n    wp = aPS.xyz + (uR*aC.x + uU*aC.y)*aPS.w;\n  }\n  vUV = aC; vCol = aCol;\n  vF = 1.0-exp(-length(aPS.xyz-uCam)*uFogDen);\n  gl_Position = uVP*vec4(wp,1.0);\n}");
+const f=shader(gl.FRAGMENT_SHADER,"#version 300 es\n\nprecision highp float;\nin vec4 vCol; in vec2 vUV; in float vF; in vec3 vS; out vec4 oC;\nuniform float uAdd; uniform vec3 uFogCol;\nfloat ph(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }\nfloat pn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);\n  return mix(mix(ph(i),ph(i+vec2(1,0)),f.x), mix(ph(i+vec2(0,1)),ph(i+vec2(1,1)),f.x), f.y); }\nvoid main(){\n  float d = length(vUV);\n  if(uAdd>0.5){\n    float a = smoothstep(1.0, 0.0, d); a = a*a;\n    float core = smoothstep(0.45, 0.0, d);\n    oC = vec4((vCol.rgb*a + vec3(core*core*0.35))*vCol.a*(1.0-vF*0.8), 1.0);\n  } else {\n    // pehme \"puhviline\" suits/tolm: kaks oktaavi müra, mis liigub osakesega kaasa\n    vec2 q = vUV*1.6 + vS.xz + vec2(vS.y*0.7, -vS.y*0.4);\n    float n = pn(q*1.7)*0.65 + pn(q*3.9 + 4.1)*0.35;\n    float a = smoothstep(1.0, 0.15, d + (n - 0.5)*0.55);\n    float sh = 0.82 + 0.3*(n - 0.5) - 0.18*vUV.y*(-1.0);\n    oC = vec4(mix(vCol.rgb*sh, uFogCol, vF*0.8), vCol.a*a*a);\n  }\n}");
+const p=gl.createProgram();gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);
+if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(p));
+window.particleShaderLinked=true;gl.useProgram(p);
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,1,1,-1,-1,1,1,-1,1]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+const pool=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pool);gl.bufferData(gl.ARRAY_BUFFER,48*3,gl.DYNAMIC_DRAW);
+for(let j=0;j<3;j++){gl.enableVertexAttribArray(j+1);gl.vertexAttribPointer(j+1,4,gl.FLOAT,false,48,j*16);gl.vertexAttribDivisor(j+1,1);}
+const data=new Float32Array(36);
+for(let i=0;i<3;i++){
+ const o=i*12;
+ data.set([i*0.4-0.4,0,0,0.25+i*0.1],o);
+ data.set([0.8-0.2*i,0.3+0.2*i,0.2+i*0.2,0.6],o+4);
+ data.set([0,1,0,i===2?0.4:0],o+8);
+}
+gl.bufferSubData(gl.ARRAY_BUFFER,0,data,0,36);
+const I=new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+const u=(n)=>gl.getUniformLocation(p,n);
+gl.uniformMatrix4fv(u('uVP'),false,I);
+gl.uniform3fv(u('uR'),new Float32Array([1,0,0]));
+gl.uniform3fv(u('uU'),new Float32Array([0,1,0]));
+gl.uniform3fv(u('uCam'),new Float32Array([0,0,3]));
+gl.uniform3fv(u('uFogCol'),new Float32Array([0.5,0.4,0.3]));
+gl.uniform1f(u('uFogDen'),0.005);
+gl.uniform1f(u('uAdd'),0);
+gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);
+let frames=0;
+function frame(){gl.clearColor(0.04,0.06,0.1,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+gl.drawArraysInstanced(gl.TRIANGLES,0,6,3);window.particleDrawCount=gl.__nativeDraws;
+frames++;if(frames===10){data[0]=0.5;gl.bindBuffer(gl.ARRAY_BUFFER,pool);gl.bufferSubData(gl.ARRAY_BUFFER,0,data,0,36);}
+requestAnimationFrame(frame);}
+requestAnimationFrame(frame);
+</script></body></html>

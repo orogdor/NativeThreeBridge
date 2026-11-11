@@ -107,7 +107,8 @@ function normalizeGamePath(p) {
 // Recording sink with the same validation as the C++ __nt functions.
 export function createRecorder() {
   return {
-    geometries: new Map(), instances: new Map(), textures: new Map(), canvases: new Map(), passes: [], framePasses: [], titles: [], logs: [],
+    geometries: new Map(), instances: new Map(), textures: new Map(), depthTargets: new Map(),
+    canvases: new Map(), passes: [], framePasses: [], titles: [], logs: [],
     uploads: 0, instanceUploads: 0,
   };
 }
@@ -203,7 +204,8 @@ export async function runWebapp(root, options = {}) {
           alphaMax = Math.max(alphaMax, a);
         }
       }
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax });
+      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax,
+        firstPositions: Array.from(positions.slice(0, 9)), firstNormals: normals ? Array.from(normals.slice(0, 9)) : null });
     },
     // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
     // natively with WIC; here only the header is checked.
@@ -211,15 +213,39 @@ export async function runWebapp(root, options = {}) {
       view(data, 'texture data');
       let info;
       if (width > 0) {
-        if (data.length < width * height * 4) throw new RangeError('uploadTexture: pixel data too short');
-        info = { w: width, h: height, type: 'rgba' };
+        if ((flags & 4) !== 0) {
+          if (height < 1 || data.byteLength !== width * height * 16)
+            throw new RangeError('RGBA32F must be tightly packed float32 pixels');
+          const v = new DataView(data.buffer,data.byteOffset,data.byteLength);
+          info = {w:width,h:height,type:'rgba32f',first:[0,4,8,12].map(x=>v.getFloat32(x,true)),pixels:new Float32Array(data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength))};
+        } else {
+          if (data.byteLength < width * height * 4) throw new RangeError('uploadTexture: pixel data too short');
+          info = { w: width, h: height, type: 'rgba' };
+        }
       } else info = context.__ntHost.ui.sniffImage(data);
       if (!info) return false;
       rec.textures.set(id, { ...info, flags, bytes: data.length });
       rec.textureUploads = (rec.textureUploads || 0) + 1;
       return true;
     },
+    updateFloatTexture(id,x,y,w,h,bytes) {
+      const t=rec.textures.get(id);
+      if (!t || t.type!=='rgba32f' || !w || !h || x+w>t.w || y+h>t.h ||
+          bytes.byteLength!==w*h*16) return false;
+      const v=new Float32Array(bytes.buffer.slice(bytes.byteOffset,bytes.byteOffset+bytes.byteLength));
+      for(let row=0;row<h;row++)
+        t.pixels.set(v.subarray(row*w*4,(row+1)*w*4),((y+row)*t.w+x)*4);
+      rec.floatSubUploads=(rec.floatSubUploads||0)+1;
+      return true;
+    },
     releaseTexture(id) { rec.textures.delete(id); },
+    allocateDepthTarget(id, width, height) {
+      if (!id || width < 1 || height < 1 || width > 4096 || height > 4096)
+        return false;
+      rec.depthTargets.set(id, {width, height, format:'D32_FLOAT'});
+      return true;
+    },
+    releaseDepthTarget(id) { rec.depthTargets.delete(id); },
     // Canvas 2D command batches (executed by Direct2D in the engine).
     canvasCommands(id, width, height, ops, floats, strings) {
       view(ops, 'canvas commands');
@@ -269,6 +295,10 @@ export async function runWebapp(root, options = {}) {
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-shim.js'), 'utf8'), context, { filename: 'nt:webapp-shim.js' });
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-ui.js'), 'utf8'), context, { filename: 'nt:webapp-ui.js' });
   const host = context.__ntHost;
+  // Test-only fixture state injection: allows the same unmodified K73 game
+  // to boot with its existing user settings (e.g., postprocessing Off).
+  if (typeof options.preBootScript === 'string' && options.preBootScript.trim())
+    vm.runInContext(options.preBootScript, context, { filename: 'test:preboot-settings.js' });
   const settle = () => new Promise((r) => setImmediate(r));
 
   host.resize(width, height, 1);

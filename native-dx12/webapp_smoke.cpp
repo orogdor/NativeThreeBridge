@@ -31,6 +31,8 @@ void expect(bool ok, const char* what) {
 struct RecordingSink final : native_three::WebappRenderSink {
     std::unordered_map<std::uint32_t, std::uint32_t> geometryVertices;
     std::unordered_map<std::uint32_t, std::uint32_t> instanceCounts;
+    std::unordered_map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> textureSizes;
+    int textureUploads = 0;
     std::vector<std::vector<float>> framePasses, lastPasses;
     int uploads = 0, passes = 0, badDraws = 0, errors = 0;
     std::string title;
@@ -43,6 +45,21 @@ struct RecordingSink final : native_three::WebappRenderSink {
     void releaseGeometry(std::uint32_t id) override { geometryVertices.erase(id); }
     void uploadInstances(std::uint32_t id, const float*, const float*, std::uint32_t count) override { instanceCounts[id] = count; }
     void releaseInstances(std::uint32_t id) override { instanceCounts.erase(id); }
+    // Headless native sink must accept textures just as WebappWindow does.
+    // Previous smoke tests silently had no texture upload implementation and
+    // rejected a valid WebGL2-to-DX12 atlas even though the real engine can
+    // decode JPEG and copy tightly packed RGBA8 into GPU textures.
+    bool uploadTexture(std::uint32_t id, const std::uint8_t* bytes, std::size_t size,
+                       std::uint32_t width, std::uint32_t height, std::uint32_t) override {
+        if (!id || !bytes || !size || (width && (!height || size < std::size_t(width) * height * 4))) {
+            badDraws++;
+            return false;
+        }
+        textureSizes[id] = {width, height};
+        textureUploads++;
+        return true;
+    }
+    void releaseTexture(std::uint32_t id) override { textureSizes.erase(id); }
     void submitPass(const float* data, std::size_t floats) override {
         passes++;
         framePasses.emplace_back(data, data + floats);
@@ -51,6 +68,7 @@ struct RecordingSink final : native_three::WebappRenderSink {
         for (std::size_t i = 0; i < draws; i++, d += native_three::kWebappDrawFloats) {
             if (!geometryVertices.count(std::uint32_t(d[0]))) badDraws++;
             if (d[1] > 0 && !instanceCounts.count(std::uint32_t(d[1]))) badDraws++;
+            if ((std::uint32_t(d[3]) & 4096u) && !textureSizes.count(std::uint32_t(d[32]))) badDraws++;
         }
     }
     void setTitle(const std::string& t) override { title = t; }
@@ -118,6 +136,9 @@ int wmain(int argc, wchar_t** argv) {
     const bool expectBootError = argc > 3 && std::wcscmp(argv[3], L"expect-boot-error") == 0;
     const bool expectResize = argc > 3 && std::wcscmp(argv[3], L"expect-resize") == 0;
     const bool expectUi = argc > 3 && std::wcscmp(argv[3], L"expect-ui") == 0;
+    const bool expectTexture = argc > 3 && std::wcscmp(argv[3], L"expect-texture") == 0;
+    const bool expectDynamic = argc > 3 && std::wcscmp(argv[3], L"expect-dynamic-scripts") == 0;
+    const bool expectWebgl2Blocker = argc > 3 && std::wcscmp(argv[3], L"expect-webgl2-blocker") == 0;
     expect(compileShaders(), "webapp HLSL (VSMain/PSMain) compiles");
 
     std::string shim, error;
@@ -155,10 +176,23 @@ int wmain(int argc, wchar_t** argv) {
     std::printf("status: %s\n", status.c_str());
     std::printf("geometry uploads: %d, passes: %d, max draws in a pass: %zu, title: %s\n",
                 sink.uploads, sink.passes, maxDraws, sink.title.c_str());
+    std::printf("native DX12 texture uploads: %d\n", sink.textureUploads);
     std::printf("HTML/CSS UI: %d submits, last list %zu commands (%zu text, %zu images)\n",
                 sink.uiSubmits, sink.uiCommands, sink.uiTexts, sink.uiImages);
     expect(sink.uiValid, "every UI display list is well-formed");
-    if (expectBootError) {
+    if (expectWebgl2Blocker) {
+        expect(status.find("\"booted\":true") != std::string::npos, "K73 bootloader completed");
+        expect(status.find("canvas.getContext('webgl2')") != std::string::npos,
+               "K73 reached its unsupported WebGL2 graphics initialization");
+        expect(sink.title == "K73", "K73 game's JavaScript entry point ran");
+        expect(sink.passes == 0, "no fake rendering or misleading FPS when WebGL2 is absent");
+    } else if (expectDynamic) {
+        expect(status.find("\"booted\":true") != std::string::npos, "dynamic loader booted");
+        expect(status.find("Dynamic scripts ready") != std::string::npos, "both ordered dynamic scripts loaded and executed");
+        expect(sink.title == "Dynamic scripts ready", "dynamic loader completed and updated the page title");
+        expect(sink.errors == 1, "deliberately missing script reports one error");
+        expect(sink.passes == 0, "script fixture does not submit any 3D drawing");
+    } else if (expectBootError) {
         expect(status.find("\"bootError\":null") == std::string::npos, "broken import is reported as a boot error");
         expect(sink.passes == 0, "nothing was rendered by the failed module");
     } else {
@@ -168,7 +202,8 @@ int wmain(int argc, wchar_t** argv) {
         expect(sink.errors == 0, "no errors logged by the runtime");
         expect(sink.passes >= 290, "render() reached native almost every frame");
         expect(maxDraws >= std::size_t(minDraws), "expected number of draws per frame");
-        expect(sink.badDraws == 0, "every draw references uploaded geometry/instances");
+        expect(sink.badDraws == 0, "every draw references uploaded geometry/instances/textures");
+        if (expectTexture) expect(sink.textureUploads > 0, "K73 material atlas reaches native texture upload");
         expect(minDraws == 0 || sink.uploads > 0, "geometry reached native");
         if (expectUi) {
             expect(sink.uiSubmits >= 1, "HTML/CSS UI reached native");

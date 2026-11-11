@@ -30,7 +30,7 @@ SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
-                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144;
+                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144, F_K73_ATLAS = 1048576;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -126,9 +126,45 @@ float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
     float3 albedo = gColor.rgb * i.col.rgb;
-    float alphaOut = gColor.a * i.col.a;
+    // K73 uses vertex alpha as a material CLASS, not pixel transparency.
+    const bool k73atlas = (flags & F_K73_ATLAS) != 0;
+    float alphaOut = gColor.a * (k73atlas ? 1.0 : i.col.a);
     float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
-    if (flags & F_MAP) {
+    if (k73atlas && (flags & F_MAP)) {
+        // K73 v86 albedo is a vertically stacked 9-layer JPEG image, uploaded
+        // to the normal DX12 Texture2D backend. Remap triplanar coordinates
+        // from [0,1]x[0,1] each to one layer's vertical atlas stripe.
+        // The original shader also uses a normal-array map, dynamic PCF
+        // shadows and procedural microtexture; those remain future work.
+        const float m = i.col.a;
+        float layer = 2.0, scale = 1.2, amount = 1.0;
+        bool worldSpace = false;
+        if (m < 0.08) { amount = 0.6; }
+        else if (m < 0.16) { layer = 7.0; scale = 3.5; }
+        else if (m < 0.24) { layer = 6.0; scale = 4.0; amount = 0.7; }
+        else if (m < 0.35) { layer = 2.0; scale = 1.4; }
+        else if (m < 0.6) { layer = 5.0; scale = 1.8; }
+        else if (m < 0.785) { layer = 0.0; scale = 0.55; worldSpace = true; amount = 0.8; }
+        else if (m < 0.825) { layer = 4.0; scale = 1.6; amount = 0.8; }
+        else { layer = 3.0; scale = 1.3; amount = 0.9; }
+        float count = max(1.0, gReflection.x);
+        layer = min(layer, count - 1.0);
+        float3 p = (worldSpace ? i.world : i.localPosition) * scale;
+        float3 normalForAtlas = abs(normalize(worldSpace ? i.nrm : i.localNormal));
+        float3 weight = pow(normalForAtlas, 4.0);
+        weight /= max(0.00001, weight.x + weight.y + weight.z);
+        // Disallow filtering across layer boundaries by sampling the exact
+        // interior of a layer; no mipmaps in the vertical atlas.
+        float2 ax = float2(frac(p.z), (layer + frac(p.y)) / count);
+        float2 ay = float2(frac(p.x), (layer + frac(p.z)) / count);
+        float2 az = float2(frac(p.x), (layer + frac(p.y)) / count);
+        float3 sampleRGB = gMap.SampleLevel(gRepeat, ax, 0).rgb * weight.x
+                         + gMap.SampleLevel(gRepeat, ay, 0).rgb * weight.y
+                         + gMap.SampleLevel(gRepeat, az, 0).rgb * weight.z;
+        float cameraDistance = length(i.world - gCamera.xyz);
+        float nearFactor = 1.0 - smoothstep(22.0, 52.0, cameraDistance);
+        albedo *= lerp(float3(1.0, 1.0, 1.0), sampleRGB * 2.0, saturate(amount * nearFactor));
+    } else if (flags & F_MAP) {
         float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
                  : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
         albedo *= t.rgb;

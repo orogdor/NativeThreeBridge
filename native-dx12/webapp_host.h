@@ -43,6 +43,21 @@ public:
         return false;
     }
     virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // Update RGBA32F subrectangle. data is tightly packed width*height*16 bytes.
+    // Keep the underlying D3D12 texture and SRV slot stable across frames.
+    virtual bool updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                                    std::uint32_t w, std::uint32_t h,
+                                    const std::uint8_t* data, std::size_t bytes) {
+        (void)id; (void)x; (void)y; (void)w; (void)h; (void)data; (void)bytes;
+        return false;
+    }
+    // Allocate an independent offscreen DX12 depth-stencil target. WebGL2
+    // DEPTH_COMPONENT24 is stored as D32_FLOAT; sampling is a later stage.
+    virtual bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+        (void)id; (void)width; (void)height;
+        return false;
+    }
+    virtual void releaseDepthTarget(std::uint32_t id) { (void)id; }
     // Texture `id` from the current pixels of Canvas 2D surface `canvasId`.
     virtual bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
         (void)id; (void)canvasId; (void)flags;
@@ -109,7 +124,7 @@ inline std::size_t webappUiHeaderFloats(float version) {
 constexpr std::size_t kWebappPassHeaderFloats = 64;
 constexpr std::size_t kWebappLightFloats = 16;
 constexpr std::size_t kWebappDrawFloats = 56;
-constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
+constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2, kWebappTextureFloat32 = 4;
 constexpr std::size_t kWebappMaxLights = 16;
 
 // Game-folder path checks shared by the module loader and file reads.
@@ -152,7 +167,8 @@ public:
     std::optional<WebappPage> takeReload();
 
     void resize(int width, int height, double pixelRatio = 1.0);
-    void frame(double timeMs);
+    // uiTick controls CSS/UI layout and submit cadence; timers and game rAF still run every frame.
+    void frame(double timeMs, bool uiTick = true);
     void key(bool down, const std::string& key, const std::string& code, bool repeat,
              bool alt, bool ctrl, bool shift, bool meta);
     void pointer(const char* kind, double x, double y, int button);   // "down" | "up" | "move"

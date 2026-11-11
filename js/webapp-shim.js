@@ -356,6 +356,65 @@
     abort(reason = new Error('AbortError')) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = reason; this.signal.dispatchEvent(new Event('abort')); }
   }
 
+  // Dynamic <script src=...> loading, shared by V8 and QuickJS.
+  // A classic script appended by a loader must execute and fire 'load', or
+  // Promise.all(loadScript(...)) applications (including K73) never boot.
+  // Defer until the current JavaScript job finishes and retain insertion order
+  // even when each script has .async=false assigned as a DOM property.
+  const dynamicScriptQueue = [];
+  let parsingInitialDocument = false;
+  let dynamicScriptsRunning = false;
+  let dynamicScriptCount = 0;
+  function queueConnectedScripts(node) {
+    if (parsingInitialDocument || !node.isConnected) return;
+    const visit = (n) => {
+      if (n.nodeType === 1 && n.localName === 'script' && !n._ntScriptStarted) {
+        n._ntScriptStarted = true;
+        dynamicScriptQueue.push(n);
+      } else {
+        for (const c of n.childNodes || []) visit(c);
+      }
+    };
+    visit(node);
+    if (dynamicScriptQueue.length && !dynamicScriptsRunning) {
+      Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+  async function drainDynamicScripts() {
+    if (dynamicScriptsRunning) return;
+    dynamicScriptsRunning = true;
+    try {
+      while (dynamicScriptQueue.length) {
+        const element = dynamicScriptQueue.shift();
+        const type = (element.getAttribute('type') || '').trim().toLowerCase();
+        // JSON/import maps and data scripts are not JavaScript.
+        if (type && !['text/javascript', 'application/javascript', 'javascript', 'module'].includes(type)) continue;
+        const src = element.getAttribute('src');
+        try {
+          let source, name;
+          if (src) {
+            const path = toGamePath(src);
+            if (!path) throw new TypeError(`Dynamic script source is not a local game file: ${src}`);
+            source = nt.readText(path);
+            name = path;
+          } else {
+            source = element.textContent;
+            name = `dynamic-script-${++dynamicScriptCount}`;
+          }
+          if (type === 'module') await nt.evalModule(source, name);
+          else nt.evalScript(source, name);
+          element.dispatchEvent(new Event('load'));
+        } catch (e) {
+          reportError(`dynamic script ${src || '(inline)'}`, e);
+          element.dispatchEvent(new ErrorEvent('error', { message: String(e), error: e }));
+        }
+      }
+    } finally {
+      dynamicScriptsRunning = false;
+      if (dynamicScriptQueue.length) Promise.resolve().then(drainDynamicScripts);
+    }
+  }
+
   // ---------------------------------------------------------------- DOM
   const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
   const RAW_TAGS = new Set(['script', 'style', 'textarea', 'title']);
@@ -383,6 +442,9 @@
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       uiNotify('tree', this, child);
+      // Connected DOM-inserted classic/module scripts run asynchronously, in
+      // insertion order. Initial HTML parser scripts are handled by host.boot().
+      queueConnectedScripts(child);
       return child;
     }
     removeChild(child) {
@@ -828,6 +890,1195 @@
     get text() { return this.textContent; }
     set text(v) { this.textContent = v; }
   }
+  // Experimental raw WebGL2 commands -> the EXISTING native DX12 packet
+  // format. Deliberately opt-in and narrowly scoped: it does NOT claim to
+  // implement arbitrary WebGL2 or compile the complex GLSL used by K73.
+  // The native DX12 pass protocol transports IDs in Float32 fields.
+  // Values > 2**24 lose consecutive integer precision (70m/90m/95m
+  // previously caused resource-key aliasing and missing depth targets).
+  // Each resource category gets a separate float32-exact, bounded range.
+  const RAW_TEXTURE_ID_START = 7000000, RAW_TEXTURE_ID_END = 7999999;
+  const RAW_GEOMETRY_ID_START = 9000000, RAW_GEOMETRY_ID_END = 10999999;
+  const RAW_INSTANCE_ID_START = 11000000, RAW_INSTANCE_ID_END = 12999999;
+  let nextRawGeometryId = RAW_GEOMETRY_ID_START;
+  let nextRawInstanceId = RAW_INSTANCE_ID_START;
+  function checkedRawId(id, max, kind) {
+    if (id > max || new Float32Array([id])[0] !== id)
+      throw new RangeError('Native DX12 ' + kind + ' ID range exhausted or not float32-exact: ' + id);
+    return id;
+  }
+  function allocateRawGeometryId() {
+    return checkedRawId(nextRawGeometryId++, RAW_GEOMETRY_ID_END, 'geometry');
+  }
+  function allocateRawInstanceId() {
+    return checkedRawId(nextRawInstanceId++, RAW_INSTANCE_ID_END, 'instance');
+  }
+  function makeRawDx12Prototype(canvas) {
+    const ID = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+    const G = {
+      NO_ERROR: 0, FLOAT: 0x1406, UNSIGNED_BYTE: 0x1401, UNSIGNED_SHORT: 0x1403, UNSIGNED_INT: 0x1405,
+      ARRAY_BUFFER: 0x8892, ELEMENT_ARRAY_BUFFER: 0x8893, STATIC_DRAW: 0x88e4, DYNAMIC_DRAW: 0x88e8,
+      VERTEX_SHADER: 0x8b31, FRAGMENT_SHADER: 0x8b30,
+      COMPILE_STATUS: 0x8b81, LINK_STATUS: 0x8b82,
+      TRIANGLES: 4, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
+      TEXTURE_2D: 0x0de1, TEXTURE_2D_ARRAY: 0x8c1a, TEXTURE0: 0x84c0,
+      TEXTURE1: 0x84c1, TEXTURE2: 0x84c2, TEXTURE3: 0x84c3, TEXTURE4: 0x84c4, TEXTURE5: 0x84c5, TEXTURE6: 0x84c6, TEXTURE7: 0x84c7, TEXTURE8: 0x84c8, TEXTURE9: 0x84c9, TEXTURE10: 0x84ca, TEXTURE11: 0x84cb, TEXTURE12: 0x84cc, TEXTURE13: 0x84cd, TEXTURE14: 0x84ce, TEXTURE15: 0x84cf,
+      RGBA: 0x1908, RGBA8: 0x8058, RGBA32F: 0x8814,
+      BYTE: 0x1400,
+      TEXTURE_MIN_FILTER: 0x2801, TEXTURE_MAG_FILTER: 0x2800,
+      TEXTURE_WRAP_S: 0x2802, TEXTURE_WRAP_T: 0x2803,
+      TEXTURE_MAX_LEVEL: 0x813d,
+      LINEAR: 0x2601, NEAREST: 0x2600,
+      LINEAR_MIPMAP_LINEAR: 0x2703,
+      REPEAT: 0x2901, CLAMP_TO_EDGE: 0x812f,
+      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243, NONE: 0, BROWSER_DEFAULT_WEBGL: 0x9244,
+      DEPTH_COMPONENT24: 0x81a6, TEXTURE_COMPARE_MODE: 0x884c,
+      COMPARE_REF_TO_TEXTURE: 0x884e, TEXTURE_COMPARE_FUNC: 0x884d, LEQUAL: 0x0203,
+      FRAMEBUFFER: 0x8d40, DEPTH_ATTACHMENT: 0x8d00,
+      FRAMEBUFFER_COMPLETE: 0x8cd5, FRAMEBUFFER_INCOMPLETE_ATTACHMENT: 0x8cd6,
+      DEPTH_TEST: 0x0b71, CULL_FACE: 0x0b44, BLEND: 0x0be2,
+      POLYGON_OFFSET_FILL: 0x8037,
+      ZERO: 0, ONE: 1, SRC_ALPHA: 0x0302, ONE_MINUS_SRC_ALPHA: 0x0303,
+      FRONT: 0x0404, BACK: 0x0405, CCW: 0x0901, CW: 0x0900,
+    };
+    const state = { buffer: null, vao: { attributes: new Map(), elements: null },
+      program: null, clear: [0, 0, 0, 1], clearFlags: 3, cache: new WeakMap(), draws: 0,
+      activeTextureUnit: 0, textureUnits: Array.from({ length: 16 }, () => new Map()),
+      liveTextures: new Set(), textureUploads: 0, depthAllocations: 0,
+      framebuffers: new Set(), framebuffer: null,
+      // WebGL2 initial raster state. These values feed the DX12 PSO flags
+      // rather than silently treating all draw calls alike.
+      capabilities: new Set(), depthWrite: true,
+      blendSrc: G.ONE, blendDst: G.ZERO,
+      cullMode: G.BACK, frontWinding: G.CCW,
+      polygonFactor: 0, polygonUnits: 0,
+      instanceCache: new WeakMap(), sky: null };
+    const unsupportedRaw = (method) => {
+      throw new Error('NativeThreeBridge DX12 raw-WebGL2 prototype does not support: ' + method);
+    };
+    // Reuse NativeThreeBridge's existing nt.uploadTexture / DX12 Texture2D.
+    // A TEXTURE_2D_ARRAY with N layers is stored as a VERTICAL ATLAS:
+    // width x (height*N) RGBA8 pixels, or exactly the original JPEG atlas.
+    // This preserves layer data; the K73-specific HLSL profile remaps the
+    // triplanar layer coordinate, without creating a second GPU backend.
+    let nextRawTextureId = RAW_TEXTURE_ID_START;
+    function allocateRawTextureId() {
+      return checkedRawId(nextRawTextureId++, RAW_TEXTURE_ID_END, 'texture');
+    }
+    function boundTexture(target) {
+      if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY)
+        return unsupportedRaw('texture target 0x' + target.toString(16));
+      const texture = state.textureUnits[state.activeTextureUnit].get(target);
+      if (!texture || texture.deleted) throw Error('WebGL2 texture target has no live bound texture');
+      return texture;
+    }
+    function setTexturePixels(texture, width, height, layers, bytes, encoded = false) {
+      if (!Number.isInteger(width) || !Number.isInteger(height) || !Number.isInteger(layers) ||
+          width < 1 || height < 1 || layers < 1 || width > 8192 || height * layers > 16384)
+        throw new RangeError('Texture dimensions out of native DX12 range');
+      if (!encoded && (!(bytes instanceof Uint8Array) || bytes.byteLength !== width * height * layers * 4))
+        throw new RangeError('Expected tightly packed RGBA8 texture pixels for all layers');
+      const ok = nt.uploadTexture(texture.id, bytes, encoded ? 0 : width,
+        encoded ? 0 : height * layers, 0); // atlas mipmaps not safe across layers
+      if (!ok) throw Error('NativeThreeBridge DX12 texture upload failed');
+      texture.width = width; texture.height = height; texture.layers = layers;
+      texture.loaded = true; texture.encoded = encoded; texture.version++;
+      state.textureUploads++;
+    }
+    function imageBytesAndSize(image, width, height, layers) {
+      const src = image?._ntSource;
+      const w = image?.naturalWidth || image?.width, h = image?.naturalHeight || image?.height;
+      if (!src || w !== width || h !== height * layers)
+        throw new RangeError('Image dimensions do not match width x (height * layers) K73 atlas');
+      if (src.bytes) return new Uint8Array(src.bytes);
+      if (src.path) return new Uint8Array(nt.readBinary(src.path));
+      throw new TypeError('Texture image has no encoded JPEG/PNG byte source');
+    }
+    function setFloatTexture(texture, width, height, pixels, immutable = false) {
+      if (!Number.isInteger(width) || !Number.isInteger(height) ||
+          width < 1 || height < 1 || width > 4096 || height > 1024 ||
+          width * height > 1048576)
+        throw new RangeError('Native RGBA32F texture exceeds supported dimensions');
+      if (pixels !== null && !(pixels instanceof Float32Array))
+        return unsupportedRaw('RGBA32F pixels must be Float32Array or null');
+      if (pixels && pixels.length !== width * height * 4)
+        throw new RangeError('RGBA32F pixel array length');
+      const copy = pixels ? Float32Array.from(pixels) : new Float32Array(width * height * 4);
+      const bytes = new Uint8Array(copy.buffer, copy.byteOffset, copy.byteLength);
+      if (!nt.uploadTexture(texture.id, bytes, width, height, 4))
+        throw Error('Native RGBA32F GPU texture allocation failed');
+      texture.width = width; texture.height = height; texture.layers = 1;
+      texture.float32 = true; texture.floatPixels = copy; texture.loaded = true;
+      texture.immutable = immutable; texture.version++;
+      state.textureUploads++;
+    }
+    function setTexImage(target, level, format, width, height, layers, pixelFormat, pixelType, pixels) {
+      if (target === G.TEXTURE_2D && level === 0 && layers === 1 &&
+          format === G.RGBA32F && pixelFormat === G.RGBA && pixelType === G.FLOAT) {
+        const tex = boundTexture(target);
+        if (tex.immutable) return unsupportedRaw('texImage on immutable float texture');
+        setFloatTexture(tex, width, height, pixels, false);
+        return;
+      }
+      if (boundTexture(target).immutable) return unsupportedRaw('texImage on immutable texture storage');
+      if (level !== 0 || (format !== G.RGBA8 && format !== G.RGBA) ||
+          pixelFormat !== G.RGBA || pixelType !== G.UNSIGNED_BYTE)
+        return unsupportedRaw('texImage: only level-0 RGBA8/UNSIGNED_BYTE is supported');
+      const texture = boundTexture(target);
+      if (pixels?._ntSource) {
+        const bytes = imageBytesAndSize(pixels, width, height, layers);
+        setTexturePixels(texture, width, height, layers, bytes, true);
+      } else if (pixels instanceof Uint8Array) {
+        setTexturePixels(texture, width, height, layers, pixels, false);
+      } else if (pixels === null) {
+        // WebGL allows allocating with null pixels. Keep all bytes defined as
+        // transparent black, so uninitialised data never leak to the GPU.
+        setTexturePixels(texture, width, height, layers,
+          new Uint8Array(width * height * layers * 4), false);
+      } else {
+        return unsupportedRaw('texImage pixels: only Uint8Array, Image, or null');
+      }
+    }
+    function compileVertex(source) {
+      // K73's INST variant has exactly four per-instance matrix columns at
+      // locations 3..6 and a per-instance colour at 7. Route those attributes
+      // to NativeRenderer's real DX12 instancing buffer; never silently
+      // accept arbitrary GLSL or SKIN vertex shaders.
+      const instanced = /#define\s+INST\b/.test(source);
+      const skinned = /#define\s+SKIN\b/.test(source);
+      // K73 SKIN shader pair. Uniform-bone variant is supported through a
+      // CPU pose-to-geometry fallback until a dedicated GPU skin vertex shader
+      // is available. BONETEX / TINTTEX variants are rejected explicitly.
+      if (skinned && !instanced &&
+          !/#define\s+(?:BONETEX|TINTTEX)\b/.test(source) &&
+          /layout\s*\(location\s*=\s*3\)\s*in\s+vec4\s+aJ\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*4\)\s*in\s+vec4\s+aW\s*;/.test(source) &&
+          /uniform\s+vec4\s+uB\s*\[\s*96\s*\]\s*;/.test(source) &&
+          /mat4\s+boneM\s*\(\s*float\s+j\s*\)/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uModel\s*;/.test(source) &&
+          /gl_Position\s*=/.test(source) &&
+          /layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source)) {
+        const depth = /gl_Position\s*=\s*uVP\s*\*\s*\(\s*M\s*\*\s*vec4\s*\(\s*aPos\s*,\s*1\.0\s*\)\s*\)\s*;/.test(source);
+        const lit = /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source);
+        if (depth || lit) return {kind: depth ? 'k73-depth-skin' : 'k73-lit-skin',size:3};
+      }
+      // K73 v86 PART_VS billboard particles: four attributes and uVP.
+      // Exact GLSL is recognized; the native path uses GPU instanced quads.
+      if (!instanced && !skinned &&
+          /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec2\s+aC\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*1\s*\)\s*in\s+vec4\s+aPS\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*2\s*\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
+          /layout\s*\(\s*location\s*=\s*3\s*\)\s*in\s+vec4\s+aDir\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+vec3\s+uR\s*;/.test(source) &&
+          /uniform\s+vec3\s+uU\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*vec4\s*\(\s*wp\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return {kind: 'k73-part', size: 2};
+      // K73 full-screen sky vertex shader (clip-space aP).
+      // The native counterpart creates a low-resolution sky gradient mesh.
+      if (!instanced && !skinned &&
+          /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec2\s+aP\s*;/.test(source) &&
+          /out\s+vec2\s+vP\s*;/.test(source) &&
+          /vP\s*=\s*aP\s*;/.test(source) &&
+          /gl_Position\s*=\s*vec4\s*\(\s*aP\s*,\s*0\.0\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return { kind: 'k73-sky', size: 2 };
+      // K73 v86 depth-only vertex shader, including the exact INST variant.
+      // Compilation is profile recognition, not a claim of generic GLSL -> HLSL.
+      // Shadow framebuffer support is a separate, necessary stage.
+      if (!skinned &&
+          /layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uModel\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*\(\s*M\s*\*\s*vec4\s*\(\s*aPos\s*,\s*1\.0\s*\)\s*\)\s*;/.test(source)) {
+        const usesInstMatrix = /mat4\s+M\s*=\s*mat4\s*\(\s*aM0\s*,\s*aM1\s*,\s*aM2\s*,\s*aM3\s*\)\s*;/.test(source);
+        const usesModel = /mat4\s+M\s*=\s*uModel\s*;/.test(source);
+        const columns = [3, 4, 5, 6].every(i =>
+          new RegExp('layout\\s*\\(location\\s*=\\s*' + i +
+            '\\)\\s*in\\s+vec4\\s+aM' + (i - 3) + '\\s*;').test(source));
+        if (instanced ? (usesInstMatrix && columns) : usesModel)
+          return {kind: instanced ? 'k73-depth-inst' : 'k73-depth', size: 3};
+      }
+      if (/layout\s*\(location\s*=\s*0\)\s*in\s+vec3\s+aPos\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*1\)\s*in\s+vec3\s+aNor\s*;/.test(source) &&
+          /layout\s*\(location\s*=\s*2\)\s*in\s+vec4\s+aCol\s*;/.test(source) &&
+          /uniform\s+mat4\s+uVP\s*;/.test(source) &&
+          /gl_Position\s*=\s*uVP\s*\*\s*w\s*;/.test(source) && !skinned) {
+        if (instanced && ![3, 4, 5, 6, 7].every(i =>
+            new RegExp('layout\\s*\\(location\\s*=\\s*' + i + '\\)\\s*in\\s+vec4\\s+a' +
+              (i === 7 ? 'IC' : 'M' + (i - 3)) + '\\s*;').test(source))) return null;
+        return { kind: instanced ? 'k73-lit-inst' : 'k73-lit', size: 3 };
+      }
+      const attr = /layout\s*\(\s*location\s*=\s*0\s*\)\s*in\s+vec([23])\s+(\w+)\s*;/.exec(source);
+      if (!attr) return null;
+      // Avoid accepting arbitrary GLSL and silently rendering the wrong output.
+      const assignment = new RegExp('gl_Position\\s*=\\s*vec4\\s*\\(\\s*' + attr[2] + '\\s*,\\s*1(?:\\.0+)?\\s*\\)\\s*;');
+      if (!assignment.test(source)) return null;
+      if (/uniform\s+|texture\s*\(|gl_VertexID|gl_InstanceID|mat[234]\s/.test(source)) return null;
+      return { size: Number(attr[1]) };
+    }
+    function compileFragment(source) {
+      // Original K73 PART_FS uses a screen-space radial falloff and
+      // procedural smoke. Native unlit instancing currently approximates both.
+      if (!/#define\s+(?:INST|SKIN)\b/.test(source) &&
+          /in\s+vec4\s+vCol\s*;/.test(source) &&
+          /in\s+vec2\s+vUV\s*;/.test(source) &&
+          /in\s+float\s+vF\s*;/.test(source) &&
+          /uniform\s+float\s+uAdd\s*;/.test(source) &&
+          /uniform\s+vec3\s+uFogCol\s*;/.test(source) &&
+          /if\s*\(\s*uAdd\s*>\s*0\.5\s*\)/.test(source) &&
+          /oC\s*=\s*vec4\s*\(\s*mix\s*\(\s*vCol\.rgb\s*\*\s*sh\s*,\s*uFogCol\s*,\s*vF\s*\*\s*0\.8\s*\)\s*,\s*vCol\.a\s*\*\s*a\s*\*\s*a\s*\)\s*;/.test(source))
+        return {kind:'k73-part'};
+      // Original K73 procedural SKY_FS. Its atmospheric/planet/cloud code is
+      // not executable GLSL here: a verified native sky approximation is used.
+      if (!/#define\s+(?:INST|SKIN)\b/.test(source) &&
+          /in\s+vec2\s+vP\s*;/.test(source) &&
+          /uniform\s+mat4\s+uInvVP\s*;/.test(source) &&
+          /uniform\s+vec3\s+uCam\b/.test(source) &&
+          /uniform\s+vec3\s+uZen\b/.test(source) &&
+          /uniform\s+vec3\s+uHor\b/.test(source) &&
+          /uniform\s+vec3\s+uSunDir\b/.test(source) &&
+          /uniform\s+vec3\s+uFogCol\b/.test(source) &&
+          /vec4\s+a\s*=\s*uInvVP\s*\*\s*vec4\s*\(\s*vP\s*,\s*1\.0\s*,\s*1\.0\s*\)\s*;/.test(source) &&
+          /oC\s*=\s*vec4\s*\(\s*tm\s*\(\s*col\s*\*\s*uExposure\s*\)\s*,\s*1\.0\s*\)\s*;/.test(source))
+        return {kind: 'k73-sky'};
+      // K73 depth fragment: no colour output (depth-only pipeline).
+      // Reject other empty GLSL programs rather than claiming broad support.
+      if (/^\s*#version\s+300\s+es\s*(?:#define\s+(?:INST|SKIN)\s+1\s*)?precision\s+mediump\s+float\s*;\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(source))
+        return {kind: 'k73-depth'};
+      // K73 v86's LIT_FS uses triplanar detail, normal arrays, shadow PCF,
+      // custom exposure and fog. The native fixed HLSL material backend can
+      // currently only approximate its vertex colors, sun, tint and normals.
+      if (/in\s+vec4\s+vC\s*;/.test(source) &&
+          /uniform\s+vec4\s+uTint\s*;/.test(source) &&
+          /vec3\s+base\s*=\s*vC\.rgb\s*\*\s*uTint\.rgb\s*;/.test(source) &&
+          /uniform\s+vec3\s+uSunDir/.test(source) &&
+          /out\s+vec4\s+oC\s*;/.test(source) &&
+          (!/#define\s+SKIN\b/.test(source) ||
+           !/#define\s+(?:BONETEX|TINTTEX)\b/.test(source))) {
+        return { kind: /#define\s+SKIN\b/.test(source) ? 'k73-lit-skin' : 'k73-lit' };
+      }
+      const output = /\bout\s+vec4\s+(\w+)\s*;/.exec(source);
+      if (!output) return null;
+      const assignment = new RegExp('\\b' + output[1] + '\\s*=\\s*vec4\\s*\\(\\s*([^)]*)\\s*\\)\\s*;').exec(source);
+      if (!assignment) return null;
+      const nums = assignment[1].split(',').map(x => x.trim());
+      if (nums.length !== 4 || nums.some(x => !/^(?:\d+\.?\d*|\.\d+)$/.test(x))) return null;
+      if (/uniform\s+|texture\s*\(/.test(source)) return null;
+      const rgba = nums.map(Number);
+      return rgba.every(x => x >= 0 && x <= 1) ? rgba : null;
+    }
+    function k73MaterialAtlas() {
+      if (!['k73-lit', 'k73-lit-inst'].includes(state.program?.profile)) return null;
+      const unit = state.program.uniforms?.get('uMatA') ?? 6;
+      if (state.program.uniforms?.get('uMatOn') < 0.5) return null;
+      if (!Number.isInteger(unit) || unit < 0 || unit >= state.textureUnits.length) return null;
+      const texture = state.textureUnits[unit].get(G.TEXTURE_2D_ARRAY);
+      return texture?.loaded ? texture : null;
+    }
+    // K73 uses independent position, normal, and RGBA8 vertex-colour VBOs.
+    // Convert those existing WebGL attributes into NativeRenderer's exact
+    // interleaved geometry upload format, preserving optional index buffers.
+    function upload(first, count, indexType = 0, indexOffset = 0) {
+      const vao = state.vao, attrs = vao.attributes, pos = attrs.get(0);
+      if (!pos?.enabled || !pos.buffer || pos.type !== G.FLOAT ||
+          pos.size !== 3 && pos.size !== 2 || pos.normalized)
+        return unsupportedRaw('position attribute 0 must be FLOAT vec2/vec3');
+      const vertexIndices = [];
+      let maxVertex = first + count - 1;
+      if (indexType) {
+        const buf = vao.elements?.data;
+        const bytes = indexType === G.UNSIGNED_SHORT ? 2 : indexType === G.UNSIGNED_INT ? 4 : 0;
+        if (!buf || !bytes || buf.BYTES_PER_ELEMENT !== bytes || indexOffset % bytes)
+          return unsupportedRaw('drawElements requires aligned Uint16Array/Uint32Array index buffer');
+        const indexStart = indexOffset / bytes;
+        if (indexStart + count > buf.length) throw new RangeError('drawElements indexes outside index buffer');
+        for (let i = 0; i < count; i++) vertexIndices.push(buf[indexStart + i]);
+        maxVertex = vertexIndices.reduce((max, i) => Math.max(max, i), 0);
+      }
+      const numVertices = indexType ? maxVertex + 1 : count;
+      if (numVertices > 400000) throw new RangeError('DX12 prototype geometry too large');
+      function attributeData(i, vertex, expectedSize, defaultValues) {
+        const attr = attrs.get(i);
+        if (!attr?.enabled) return defaultValues;
+        if (!attr.buffer?.data || attr.size !== expectedSize) return unsupportedRaw('vertex attribute size/buffer ' + i);
+        if (attr.type !== G.FLOAT && attr.type !== G.UNSIGNED_BYTE)
+          return unsupportedRaw('attribute component type ' + i);
+        const data = attr.buffer.data;
+        const bytes = attr.type === G.FLOAT ? 4 : 1;
+        const stride = attr.stride || bytes * attr.size;
+        const start = attr.offset + vertex * stride;
+        if (start < 0 || start + bytes * attr.size > data.byteLength || start % bytes)
+          throw new RangeError('vertex attribute outside byte buffer: ' + i);
+        const view = new DataView(data.buffer, data.byteOffset + start, bytes * attr.size);
+        const v = [];
+        for (let c = 0; c < attr.size; c++) {
+          let x = attr.type === G.FLOAT ? view.getFloat32(c * bytes, true) : view.getUint8(c);
+          if (attr.normalized && attr.type === G.UNSIGNED_BYTE) x /= 255;
+          v.push(x);
+        }
+        return v;
+      }
+      const cacheKey = [first, count, indexType, indexOffset,
+        vao.elements?.version || 0, state.program?.profile || '',
+        !!k73MaterialAtlas(),
+        ...[0, 1, 2].flatMap(i => {
+          const a = attrs.get(i);
+          return a ? [a.buffer?.version, a.size, a.type, a.normalized, a.stride, a.offset] : [0];
+        }),
+      ].join(':');
+      const old = state.cache.get(vao);
+      if (old?.key === cacheKey) return old.id;
+      const positions = new Float32Array(numVertices * 3);
+      const normals = new Float32Array(numVertices * 3);
+      const colors = new Float32Array(numVertices * 4);
+      let hasNormals = false, hasColors = false;
+      for (let i = 0; i < numVertices; i++) {
+        const vertex = indexType ? i : first + i;
+        const p = attributeData(0, vertex, pos.size, [0, 0, 0]);
+        positions.set([p[0], p[1], p[2] || 0], i * 3);
+        const n = attributeData(1, vertex, 3, [0, 1, 0]);
+        normals.set(n, i * 3);
+        hasNormals ||= !!attrs.get(1)?.enabled;
+        const col = attributeData(2, vertex, 4, [1, 1, 1, 1]);
+        // K73 stores its material-class identifier in vertex-color alpha;
+        // it is NOT transparency. Native HLSL's vertex alpha controls pixel
+        // opacity, so pass opaque alpha until the material-class shader stage
+        // is separately translated.
+        if (state.program?.profile?.startsWith('k73-lit') && !k73MaterialAtlas()) col[3] = 1;
+        colors.set(col, i * 4);
+        hasColors ||= !!attrs.get(2)?.enabled;
+      }
+      if (old) nt.releaseGeometry(old.id);
+      const id = allocateRawGeometryId();
+      nt.uploadGeometry(id, positions, hasNormals ? normals : null,
+        hasColors ? colors : null,
+        indexType ? new Uint32Array(vertexIndices) : null, null);
+      state.cache.set(vao, { id, key: cacheKey });
+      return id;
+    }
+    // K73 uniform-bone fallback. Joint indices/weights are decoded from the
+    // original packed WebGL2 vertex buffers. Pose and morph weights are
+    // applied before uploading the *actual* animated geometry to DX12.
+    // Unlike simply accepting a SKIN GLSL profile, this moves vertices.
+    function uploadSkin(first, count, indexType = 0, indexOffset = 0) {
+      const vao = state.vao, attrs = vao.attributes;
+      if (!['k73-lit-skin','k73-depth-skin'].includes(state.program?.profile))
+        return unsupportedRaw('uploadSkin profile');
+      const u = state.program.uniforms || new Map();
+      const bones = u.get('uB');
+      if (!(bones instanceof Float32Array) || bones.length < 12 ||
+          bones.length % 12 || bones.length > 384)
+        return unsupportedRaw('K73 skin requires 1..32 joint matrices in uB');
+      const boneCount = bones.length / 12;
+      const get = (i, vertex, size) => {
+        const a = attrs.get(i);
+        if (!a?.enabled || !a.buffer?.data || a.size !== size || a.divisor)
+          return unsupportedRaw('K73 skin attribute '+i);
+        const bytes = a.type === G.FLOAT ? 4 : a.type === G.UNSIGNED_SHORT ? 2 : 1;
+        if (![G.FLOAT,G.UNSIGNED_SHORT,G.UNSIGNED_BYTE,G.BYTE].includes(a.type))
+          return unsupportedRaw('K73 skin attribute component '+i);
+        const offset = a.offset + vertex*(a.stride || size*bytes);
+        const buf = a.buffer.data;
+        if (offset < 0 || offset + size*bytes > buf.byteLength)
+          throw new RangeError('K73 skin attribute outside buffer '+i);
+        const view = new DataView(buf.buffer, buf.byteOffset+offset,size*bytes);
+        const out = [];
+        for(let k=0;k<size;k++) {
+          let x = a.type === G.FLOAT ? view.getFloat32(k*4,true)
+            : a.type === G.UNSIGNED_SHORT ? view.getUint16(k*2,true)
+            : a.type === G.BYTE ? view.getInt8(k) : view.getUint8(k);
+          if (a.normalized) x = a.type === G.UNSIGNED_SHORT ? x/65535 :
+            a.type === G.BYTE ? Math.max(-1,x/127) :
+            a.type === G.UNSIGNED_BYTE ? x/255 : x;
+          out.push(x);
+        }
+        return out;
+      };
+      // Strictly check exact K73 typed attribute layout.
+      const expected = [[0,3,G.FLOAT],[1,3,G.BYTE],[2,2,G.UNSIGNED_SHORT],
+                        [3,4,G.UNSIGNED_BYTE],[4,4,G.UNSIGNED_BYTE]];
+      for (const [idx,size,type] of expected) {
+        const a=attrs.get(idx);
+        if (!a?.enabled || a.size!==size || a.type!==type)
+          return unsupportedRaw('K73 packed skin attribute layout '+idx);
+      }
+      const elements = vao.elements?.data;
+      const indexed = !!indexType;
+      let indices = null;
+      if (indexed) {
+        const bytes = indexType===G.UNSIGNED_SHORT?2:indexType===G.UNSIGNED_INT?4:0;
+        if (!bytes || !elements || elements.BYTES_PER_ELEMENT!==bytes || indexOffset%bytes)
+          return unsupportedRaw('K73 skin index buffer type/alignment');
+        if (indexOffset/bytes+count>elements.length)
+          throw new RangeError('K73 skin indexes outside element buffer');
+        indices = Uint32Array.from(elements.subarray(indexOffset/bytes,indexOffset/bytes+count));
+      }
+      let maxVertex = indexed ? indices.reduce((m,x)=>Math.max(m,x),0) : first+count-1;
+      if (maxVertex>=120000) throw new RangeError('K73 skin geometry exceeds CPU fallback limit');
+      const numVertices=indexed?maxVertex+1:count;
+      const morphN=Math.max(0,Math.min(8,Number(u.get('uMorphN')||0)));
+      const morphUnit=u.get('uMorphTex')??5;
+      const morphTex=morphN && Number.isInteger(morphUnit)
+        ? state.textureUnits[morphUnit]?.get(G.TEXTURE_2D):null;
+      const morphWeights=u.get('uMW');
+      if (morphN && (!morphTex?.float32 || !morphTex.floatPixels ||
+          !morphWeights || morphWeights.length<8))
+        return unsupportedRaw('K73 skin morph requires RGBA32F texture and 8 weights');
+      const baseKey=[first,count,indexType,indexOffset,vao.elements?.version||0,
+        ...[0,1,2,3,4].flatMap(idx=>{
+          const a=attrs.get(idx);return [a.buffer?.version,a.size,a.type,a.stride,a.offset,a.normalized];
+        }),morphN,morphTex?.id||0,morphTex?.version||0].join(':');
+      const old=state.cache.get(vao);
+      if(old?.skinKey===baseKey && old.bones?.length===bones.length &&
+          old.bones.every((x,i)=>x===bones[i]) &&
+          (!morphN || old.morphWeights?.every((x,i)=>x===morphWeights[i])))
+        return old.id;
+      const positions=new Float32Array(numVertices*3);
+      const normals=new Float32Array(numVertices*3);
+      const colors=new Float32Array(numVertices*4);
+      const uvs=new Float32Array(numVertices*2);
+      for(let i=0;i<numVertices;i++){
+        const vertex=indexed?i:first+i;
+        const p=get(0,vertex,3), n=get(1,vertex,3), uv=get(2,vertex,2);
+        const joints=get(3,vertex,4),weights=get(4,vertex,4);
+        if(morphN){
+          const x=vertex%1024, row=Math.floor(vertex/1024)*8;
+          const image=morphTex.floatPixels;
+          for(let k=0;k<morphN;k++){
+            const weight=morphWeights[k];if(!weight)continue;
+            if(x>=morphTex.width || row+k>=morphTex.height)throw new RangeError('K73 morph texel outside RGBA32F texture');
+            const o=((row+k)*morphTex.width+x)*4;
+            p[0]+=image[o]*weight;p[1]+=image[o+1]*weight;p[2]+=image[o+2]*weight;
+          }
+        }
+        const outP=[0,0,0],outN=[0,0,0];
+        let weightSum=0;
+        for(let j=0;j<4;j++){
+          const w=weights[j];if(w<=0)continue;
+          const bone=joints[j]|0;
+          if(bone<0 || bone>=boneCount)throw new RangeError('K73 skin bone index outside uB');
+          const o=bone*12;
+          const a0=bones[o],a1=bones[o+1],a2=bones[o+2],ax=bones[o+3];
+          const b0=bones[o+4],b1=bones[o+5],b2=bones[o+6],by=bones[o+7];
+          const c0=bones[o+8],c1=bones[o+9],c2=bones[o+10],cz=bones[o+11];
+          outP[0]+=w*(a0*p[0]+a1*p[1]+a2*p[2]+ax);
+          outP[1]+=w*(b0*p[0]+b1*p[1]+b2*p[2]+by);
+          outP[2]+=w*(c0*p[0]+c1*p[1]+c2*p[2]+cz);
+          outN[0]+=w*(a0*n[0]+a1*n[1]+a2*n[2]);
+          outN[1]+=w*(b0*n[0]+b1*n[1]+b2*n[2]);
+          outN[2]+=w*(c0*n[0]+c1*n[1]+c2*n[2]);
+          weightSum+=w;
+        }
+        // Vertices with no joint weights retain their bind-pose positions.
+        if(weightSum===0){outP.splice(0,3,...p);outN.splice(0,3,...n);}
+        const len=Math.hypot(...outN)||1;
+        positions.set(outP,i*3);
+        normals.set(outN.map(x=>x/len),i*3);
+        colors.set([1,1,1,1],i*4);
+        uvs.set(uv,i*2);
+      }
+      const id=old?.id??allocateRawGeometryId();
+      nt.uploadGeometry(id,positions,normals,colors,indices,uvs);
+      state.cache.set(vao,{id,skinKey:baseKey,bones:Float32Array.from(bones),
+        morphWeights:morphN?Float32Array.from(morphWeights):null});
+      return id;
+    }
+    // Clip-space K73 sky proxy. Sample the original inverse-view-projection
+    // direction per grid vertex; use the existing unlit native DX12 shader,
+    // no extra WebGL context and no fake "GLSL compiler" result.
+    // Clouds, stars, giant planet and exact sun disk require a dedicated HLSL
+    // pixel shader later. This intentionally reports that limitation.
+    function skyGeometry() {
+      const u = state.program.uniforms || new Map();
+      const val = (name, fallback) => u.get(name) ?? fallback;
+      const inv = val('uInvVP', ID);
+      const cam = val('uCam', [0, 0, 0]);
+      const zen = val('uZen', [0.25, 0.22, 0.3]);
+      const hor = val('uHor', [0.75, 0.52, 0.38]);
+      const fog = val('uFogCol', [0.62, 0.44, 0.32]);
+      const sun = val('uSunDir', [0.4, 0.5, 0.3]);
+      const sunCol = val('uSunCol', [1.3, 0.95, 0.7]);
+      const exposure = Math.max(0.01, Number(val('uExposure', 1.5)));
+      const night = Math.max(0, Math.min(1, Number(val('uNight', 0))));
+      if (!inv || inv.length !== 16) return unsupportedRaw('K73 sky needs inverse view projection mat4');
+      const key = [...inv, ...cam, ...zen, ...hor, ...fog, ...sun, ...sunCol, exposure, night].join(',');
+      if (state.sky?.key === key) return state.sky.id;
+      // 24x16 grid: 425 vertices and 2304 indexes, independent of game size.
+      const cols = 24, rows = 16;
+      const positions = new Float32Array((cols + 1) * (rows + 1) * 3);
+      const colors = new Float32Array((cols + 1) * (rows + 1) * 4);
+      const indices = new Uint32Array(cols * rows * 6);
+      const clamp = x => Math.max(0, Math.min(1, x));
+      const tm = x => {
+        x = Math.max(0, x * exposure);
+        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+      };
+      const normalize = (x, y, z) => {
+        const len = Math.hypot(x, y, z) || 1;
+        return [x / len, y / len, z / len];
+      };
+      const sn = normalize(sun[0], sun[1], sun[2]);
+      for (let iy = 0; iy <= rows; iy++) for (let ix = 0; ix <= cols; ix++) {
+        const x = -1 + ix * 2 / cols;
+        const y = -1 + iy * 2 / rows;
+        const p = (iy * (cols + 1) + ix) * 3;
+        const c = (iy * (cols + 1) + ix) * 4;
+        positions.set([x, y, 0], p);
+        const wx = inv[0] * x + inv[4] * y + inv[8] + inv[12];
+        const wy = inv[1] * x + inv[5] * y + inv[9] + inv[13];
+        const wz = inv[2] * x + inv[6] * y + inv[10] + inv[14];
+        const ww = inv[3] * x + inv[7] * y + inv[11] + inv[15];
+        const w = Math.abs(ww) < 1e-7 ? (ww < 0 ? -1e-7 : 1e-7) : ww;
+        const dir = normalize(wx / w - cam[0], wy / w - cam[1], wz / w - cam[2]);
+        const h = dir[1];
+        const skyT = Math.pow(clamp(h), 0.55);
+        const fogT = Math.exp(-Math.max(h, 0) * 9) * 0.85;
+        const sd = Math.max(0, dir[0] * sn[0] + dir[1] * sn[1] + dir[2] * sn[2]);
+        const glow = Math.pow(sd, 24) * 0.28 + Math.pow(sd, 4) * 0.1;
+        for (let ch = 0; ch < 3; ch++) {
+          let v = hor[ch] * (1 - skyT) + zen[ch] * skyT;
+          if (h < 0) v = fog[ch] * (1 - 0.2 * clamp(-h * 3));
+          else v = v * (1 - fogT) + fog[ch] * fogT;
+          v += sunCol[ch] * glow;
+          // K73's original shader already uses nighttime colors via its
+          // dynamic environment uniforms; keep those rather than hardcoding.
+          colors[c + ch] = tm(v);
+        }
+        colors[c + 3] = 1;
+      }
+      let n = 0;
+      for (let iy = 0; iy < rows; iy++) for (let ix = 0; ix < cols; ix++) {
+        const a = iy * (cols + 1) + ix, b = a + 1, d = a + cols + 1, e = d + 1;
+        indices[n++] = a; indices[n++] = b; indices[n++] = d;
+        indices[n++] = b; indices[n++] = e; indices[n++] = d;
+      }
+      const id = state.sky?.id ?? allocateRawGeometryId();
+      nt.uploadGeometry(id, positions, null, colors, indices, null);
+      state.sky = {id, key, count: indices.length};
+      return id;
+    }
+    // K73 particle attribute 0 is a six-vertex billboard with aC.xy.
+    // Upload one local-space quad and let DX12 draw its N instances at once.
+    function particleGeometry(first, count) {
+      const vao = state.vao;
+      const a = vao.attributes.get(0);
+      if (!a?.enabled || a?.divisor || a.size !== 2 || a.type !== G.FLOAT ||
+          !a.buffer?.data || a.normalized || first !== 0 || count !== 6)
+        return unsupportedRaw('K73 particle quad needs 6 FLOAT vec2 vertices at attribute 0');
+      const key = [a.buffer.version, a.offset, a.stride, first, count].join(':');
+      let old = state.cache.get(vao);
+      if (old?.key === key) return old.id;
+      const stride = a.stride || 8;
+      const pos = new Float32Array(18);
+      for (let i=0;i<6;i++) {
+        const offset = a.offset + i * stride;
+        if (offset < 0 || offset + 8 > a.buffer.data.byteLength)
+          throw new RangeError('K73 particle quad attribute 0 outside buffer');
+        const v = new DataView(a.buffer.data.buffer,a.buffer.data.byteOffset+offset,8);
+        pos[i*3] = v.getFloat32(0,true);
+        pos[i*3+1] = v.getFloat32(4,true);
+      }
+      if (old) nt.releaseGeometry(old.id);
+      const id = allocateRawGeometryId();
+      nt.uploadGeometry(id,pos,null,null,null,null);
+      state.cache.set(vao,{id,key});
+      return id;
+    }
+    function particleRecord(count) {
+      if (state.program?.profile !== 'k73-part') return null;
+      if (!Number.isSafeInteger(count) || count < 0 || count > 100000)
+        return unsupportedRaw('K73 particle instance count');
+      const vao = state.vao;
+      const attrs = [1,2,3].map(i=>vao.attributes.get(i));
+      if (attrs.some(a=>!a?.enabled || a?.divisor !== 1 ||
+          !a.buffer?.data || a.size !== 4 || a.type !== G.FLOAT || a.normalized))
+        return unsupportedRaw('K73 particle instances require aPS/aCol/aDir FLOAT vec4 divisor 1');
+      const uniforms = state.program.uniforms || new Map();
+      const u = (key,defaultValue) => uniforms.get(key) ?? defaultValue;
+      const cam = u('uCam',[0,0,10]), right = u('uR',[1,0,0]), up = u('uU',[0,1,0]);
+      const additive = Number(u('uAdd',0)) > 0.5;
+      const key = [count, ...cam, ...right, ...up, additive,
+        ...attrs.flatMap(a=>[a.buffer.version,a.stride,a.offset])].join(':');
+      let record = state.instanceCache.get(vao);
+      if (record?.key === key) return record;
+      const matrices = new Float32Array(count*16);
+      const colors = new Float32Array(count*3);
+      let alphaTotal = 0;
+      const norm = (x,y,z) => {
+        const len = Math.hypot(x,y,z);
+        return len > 1e-7 ? [x/len,y/len,z/len] : [0,1,0];
+      };
+      const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],
+        a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+      function attrib(a,index) {
+        const offset = a.offset+index*(a.stride||16);
+        if (offset<0 || offset+16>a.buffer.data.byteLength)
+          throw new RangeError('K73 particle attribute outside buffer');
+        const view=new DataView(a.buffer.data.buffer,a.buffer.data.byteOffset+offset,16);
+        return [view.getFloat32(0,true),view.getFloat32(4,true),
+          view.getFloat32(8,true),view.getFloat32(12,true)];
+      }
+      for (let i=0;i<count;i++) {
+        const ps=attrib(attrs[0],i), color=attrib(attrs[1],i), dir=attrib(attrs[2],i);
+        const stretch=dir[3]>0;
+        const upward=stretch ? norm(dir[0],dir[1],dir[2]) : up;
+        const towards=norm(cam[0]-ps[0],cam[1]-ps[1],cam[2]-ps[2]);
+        const side=stretch ? norm(...cross(upward,towards)) : right;
+        const sx=ps[3],sy=stretch?dir[3]:ps[3];
+        const depth=norm(...cross(side,upward));
+        const o=i*16;
+        matrices.set([
+          side[0]*sx,side[1]*sx,side[2]*sx,0,
+          upward[0]*sy,upward[1]*sy,upward[2]*sy,0,
+          depth[0],depth[1],depth[2],0,
+          ps[0],ps[1],ps[2],1
+        ],o);
+        const opacity=Math.max(0,Math.min(1,color[3]));
+        colors.set([color[0]*(additive?opacity:1),
+          color[1]*(additive?opacity:1), color[2]*(additive?opacity:1)],i*3);
+        alphaTotal+=opacity;
+      }
+      if(!record) record={id:allocateRawInstanceId()};
+      nt.uploadInstances(record.id,matrices,colors,count);
+      record.count=count;record.key=key;
+      // DX12 instance colours currently carry RGB, not individual alphas.
+      // Pool-level mean opacity is explicit approximation, not per-pixel GLSL.
+      record.opacity=count?alphaTotal/count:1;
+      record.additive=additive;
+      state.instanceCache.set(vao,record);
+      return record;
+    }
+    function instanceRecord(count) {
+      if (!['k73-lit-inst', 'k73-depth-inst'].includes(state.program?.profile)) return null;
+      const vao = state.vao;
+      if (!Number.isInteger(count) || count < 0 || count > 250000)
+        return unsupportedRaw('invalid instance count');
+      const attrs = [3, 4, 5, 6, 7].map(i => vao.attributes.get(i));
+      if (attrs.some(a => !a?.enabled || !a.buffer?.data || a.divisor !== 1 ||
+            a.type !== G.FLOAT || a.size !== 4 || a.normalized))
+        return unsupportedRaw('K73 INST needs five FLOAT vec4 attributes with divisor=1');
+      const key = [count, ...attrs.flatMap(a =>
+        [a.buffer.version, a.stride, a.offset, a.buffer.data.byteLength])].join(':');
+      let old = state.instanceCache.get(vao);
+      if (old?.key === key) return old;
+      const matrices = new Float32Array(count * 16);
+      const colors = new Float32Array(count * 3);
+      for (let row = 0; row < count; row++) {
+        for (let col = 0; col < 5; col++) {
+          const a = attrs[col], stride = a.stride || 16;
+          const byteOffset = a.offset + row * stride;
+          if (byteOffset < 0 || byteOffset + 16 > a.buffer.data.byteLength)
+            throw new RangeError('K73 INST attribute data outside buffer');
+          const view = new DataView(a.buffer.data.buffer,
+            a.buffer.data.byteOffset + byteOffset, 16);
+          for (let c = 0; c < (col === 4 ? 3 : 4); c++) {
+            const value = view.getFloat32(c * 4, true);
+            if (col === 4) colors[row * 3 + c] = value;
+            else matrices[row * 16 + col * 4 + c] = value;
+          }
+        }
+      }
+      if (!old) old = { id: allocateRawInstanceId() };
+      nt.uploadInstances(old.id, matrices, colors, count);
+      old.key = key; old.count = count;
+      state.instanceCache.set(vao, old);
+      return old;
+    }
+    function submitRawPass(geometryId, count, profile, instances = null) {
+      const uniforms = state.program.uniforms || new Map();
+      const uniform = (name, fallback) => uniforms.get(name) ?? fallback;
+      const lit = profile === 'k73-lit' || profile === 'k73-lit-inst' || profile === 'k73-lit-skin';
+      const depth = profile === 'k73-depth' || profile === 'k73-depth-inst' || profile === 'k73-depth-skin';
+      const sky = profile === 'k73-sky';
+      const particle = profile === 'k73-part';
+      const transform = (lit || depth) ? uniform('uVP', ID) : ID;
+      const model = ['k73-lit','k73-depth','k73-lit-skin','k73-depth-skin'].includes(profile) ? uniform('uModel', ID) : ID;
+      const tint = lit ? uniform('uTint', [1, 1, 1, 1]) : depth || sky || particle ? [1, 1, 1, 1] : state.program.color;
+      const packet = new Float32Array(64 + (lit ? 16 : 0) + 56);
+      packet.set(ID, 0); packet.set(transform, 16);
+      packet.set(state.clear, 36);
+      const useLight = lit;
+      packet[35] = useLight ? 1 : 0;
+      if (useLight) {
+        const sky = uniform('uSkyCol', [0.3, 0.3, 0.35]);
+        packet[40] = sky[0] * 0.65; packet[41] = sky[1] * 0.65; packet[42] = sky[2] * 0.65;
+        const cam = uniform('uCam', [0, 0, 10]);
+        packet.set(cam.subarray ? cam.subarray(0, 3) : cam, 32);
+        const sun = uniform('uSunCol', [1, 1, 1]);
+        const dir = uniform('uSunDir', [0.4, 0.7, 0.6]);
+        packet[64] = 3; packet[65] = sun[0]; packet[66] = sun[1]; packet[67] = sun[2];
+        packet[72] = -dir[0]; packet[73] = -dir[1]; packet[74] = -dir[2];
+      }
+      packet[43] = 1; packet[44] = state.clearFlags;
+      if (state.framebuffer) {
+        const depthTexture = state.framebuffer.depth;
+        if (!depthTexture?.depth || !depthTexture.loaded ||
+            !depth)
+          return unsupportedRaw('depth framebuffer draws require K73 DEPTH shader and allocated depth texture');
+        // Native WebappWindow directs this pass to the real DSV instead of
+        // silently overwriting the game swap-chain framebuffer.
+        packet[55] = depthTexture.id;
+      }
+      packet[45] = canvas.width; packet[46] = canvas.height;
+      packet[47] = uniform('uExposure', 1);
+      const o = useLight ? 80 : 64;
+      packet[o] = geometryId;
+      packet[o + 1] = instances?.id || 0;
+      packet[o + 2] = instances?.count || 1;
+      const hasColors = !!state.vao.attributes.get(2)?.enabled;
+      const atlas = useLight ? k73MaterialAtlas() : null;
+      const skinAlbedo = profile === 'k73-lit-skin'
+        ? state.textureUnits[uniform('uAlb',1)]?.get(G.TEXTURE_2D) : null;
+      const raster = sky ? (2 | 32 | 64) :
+        (!state.capabilities.has(G.CULL_FACE) ? 2 : (state.cullMode === G.FRONT ? 4 : 0)) |
+        (!state.capabilities.has(G.DEPTH_TEST) ? 64 : 0) |
+        (!state.depthWrite ? 32 : 0) |
+        (state.capabilities.has(G.BLEND) ? 1 : 0) |
+        (state.capabilities.has(G.BLEND) && state.blendSrc === G.ONE &&
+         state.blendDst === G.ONE ? 4194304 : 0) |
+        (state.capabilities.has(G.POLYGON_OFFSET_FILL) ? 8388608 : 0) |
+        (state.frontWinding === G.CW ? 16777216 : 0);
+      packet[o + 3] = (useLight ? ((hasColors ? 8 : 0) | (instances ? 1024 : 0) |
+        (atlas ? 4096 | 1048576 : skinAlbedo?.loaded ? 4096 : 0)) :
+        sky ? (16 | 8 | 65536) :
+        particle ? (16 | 1024 | 65536) : 16) | raster;
+      if (skinAlbedo?.loaded) packet[o + 32] = skinAlbedo.id;
+      if (atlas) {
+        packet[o + 32] = atlas.id;         // Native DX12 texture slot
+        packet[o + 40] = atlas.layers;     // gReflection.x = atlas layer count
+      }
+      packet[o + 5] = count; packet[o + 6] = 1;
+      packet[o + 8] = tint[0]; packet[o + 9] = tint[1]; packet[o + 10] = tint[2];
+      packet[o + 11] = useLight ? (uniform('uAlpha', 1) * (tint[3] ?? 1)) :
+        particle ? (instances?.opacity ?? 1) : tint[3];
+      packet[o + 15] = -1;
+      if (useLight) {
+        const e = uniform('uEmis', [0, 0, 0]);
+        packet[o + 12] = e[0]; packet[o + 13] = e[1]; packet[o + 14] = e[2];
+      }
+      packet.set(model, o + 16);
+      packet[o + 34] = 1; packet[o + 37] = 1;
+      state.clearFlags = 0;
+      nt.submitPass(packet, packet.length);
+      state.draws++;
+    }
+    const gl = {
+      ...G, canvas,
+      get drawingBufferWidth() { return canvas.width; },
+      get drawingBufferHeight() { return canvas.height; },
+      getContextAttributes: () => ({ alpha: false, depth: true, stencil: false, antialias: false }),
+      getSupportedExtensions: () => [], getExtension: () => null, getError: () => 0,
+      createShader(type) {
+        if (type !== G.VERTEX_SHADER && type !== G.FRAGMENT_SHADER) return unsupportedRaw('createShader type');
+        return { type, source: '', compiled: false, payload: null };
+      },
+      shaderSource(shader, source) { shader.source = String(source); shader.compiled = false; },
+      compileShader(shader) {
+        shader.payload = shader.type === G.VERTEX_SHADER ? compileVertex(shader.source) : compileFragment(shader.source);
+        shader.compiled = !!shader.payload;
+      },
+      getShaderParameter(shader, key) { if (key !== G.COMPILE_STATUS) return unsupportedRaw('getShaderParameter'); return shader.compiled; },
+      getShaderInfoLog(shader) { return shader.compiled ? '' : 'Unsupported GLSL. DX12 prototype accepts only position vec2/vec3 and literal vec4 output.'; },
+      createProgram() { return { shaders: [], linked: false }; },
+      attachShader(program, shader) { program.shaders.push(shader); },
+      linkProgram(program) {
+        const vs = program.shaders.find(s => s.type === G.VERTEX_SHADER);
+        const fs = program.shaders.find(s => s.type === G.FRAGMENT_SHADER);
+        program.linked = !!(vs?.compiled && fs?.compiled);
+        program.color = program.linked && Array.isArray(fs.payload) ? fs.payload : null;
+        const litPair = ['k73-lit', 'k73-lit-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-lit';
+        const depthPair = ['k73-depth', 'k73-depth-inst'].includes(vs?.payload?.kind) && fs?.payload?.kind === 'k73-depth';
+        const skinLitPair = vs?.payload?.kind === 'k73-lit-skin' && fs?.payload?.kind === 'k73-lit-skin';
+        const skinDepthPair = vs?.payload?.kind === 'k73-depth-skin' && fs?.payload?.kind === 'k73-depth';
+        const skyPair = vs?.payload?.kind === 'k73-sky' && fs?.payload?.kind === 'k73-sky';
+        const particlePair = vs?.payload?.kind === 'k73-part' && fs?.payload?.kind === 'k73-part';
+        // An empty depth fragment is only valid with the exact K73 depth vertex profile.
+        program.linked &&= !!(litPair || depthPair || skinLitPair || skinDepthPair || skyPair || particlePair ||
+          (Array.isArray(fs?.payload) && Number.isInteger(vs?.payload?.size)));
+        program.profile = program.linked ? (litPair || depthPair || skinLitPair || skinDepthPair || skyPair || particlePair ? vs.payload.kind : 'constant') : 'invalid';
+        program.uniforms = new Map();
+        if (program.profile.startsWith('k73-lit')) unsupported('K73 advanced GLSL shading',
+          'K73 LIT_VS / LIT_FS mapped to existing native lighting; triplanar detail, PCF shadows and tone mapping are approximate');
+        if (program.profile.startsWith('k73-depth')) unsupported('K73 shadow depth framebuffer',
+          'DEPTH_VS/DEPTH_FS variants recognised, but actual off-screen shadow texture rendering needs FBO/DX12 depth target support');
+        if (program.profile === 'k73-sky') unsupported('K73 sky shader approximation',
+          'Sky gradient and broad sun glow use native unlit DX12 geometry; procedural clouds, stars, planet and precise GLSL atmosphere are not yet translated');
+        if (program.profile === 'k73-lit-skin' || program.profile === 'k73-depth-skin')
+          unsupported('K73 CPU skinning fallback',
+            'K73 uniform bones and morph offsets are processed on CPU and uploaded as animated geometry; dedicated HLSL GPU skinning is needed for performance and exact material appearance');
+        if (program.profile === 'k73-part') unsupported('K73 particle GLSL approximation',
+          'Particles use GPU-instanced billboard quads and per-pool opacity; exact smoke noise, radial soft alpha and additive blend need native HLSL and per-instance alpha');
+      },
+      getProgramParameter(program, key) { if (key !== G.LINK_STATUS) return unsupportedRaw('getProgramParameter'); return program.linked; },
+      getProgramInfoLog(program) { return program.linked ? '' : 'Unsupported or uncompiled GLSL stages'; },
+      useProgram(program) { if (!program?.linked) throw Error('Program must be linked'); state.program = program; },
+      getUniformLocation(program, name) { return program?.linked ? { program, name: String(name) } : null; },
+      uniformMatrix4fv(location, transpose, values) {
+        if (!location) return;
+        if (transpose || !ArrayBuffer.isView(values) || values.length !== 16)
+          return unsupportedRaw('uniformMatrix4fv requires one column-major matrix');
+        location.program.uniforms.set(location.name, Float32Array.from(values));
+      },
+      uniform4fv(location, values, srcOffset = 0, srcLength) {
+        if (!location) return;
+        // WebGL2 accepts both Float32Array and a regular JavaScript sequence.
+        // K73 passes ordinary arrays for mesh tints and typed subranges for
+        // bone matrices; refusing sequences aborts its main scene draw.
+        if (!(ArrayBuffer.isView(values) || Array.isArray(values)) ||
+            !Number.isInteger(srcOffset) || srcOffset < 0 ||
+            (srcLength !== undefined && (!Number.isInteger(srcLength) || srcLength < 1)))
+          return unsupportedRaw('uniform4fv source range');
+        const end = srcLength === undefined ? values.length : srcOffset + srcLength;
+        if (end > values.length || end-srcOffset < 4 || (end-srcOffset)%4)
+          return unsupportedRaw('uniform4fv vector array range');
+        const subset = ArrayBuffer.isView(values)
+          ? values.subarray(srcOffset, end) : values.slice(srcOffset, end);
+        location.program.uniforms.set(location.name, Float32Array.from(subset));
+      },
+      uniform3fv(location, values) {
+        if (!location) return;
+        if (!(ArrayBuffer.isView(values) || Array.isArray(values)) || values.length < 3)
+          return unsupportedRaw('uniform3fv');
+        location.program.uniforms.set(location.name, Float32Array.from(Array.from(values).slice(0, 3)));
+      },
+      uniform3f(location, x, y, z) { if (location) location.program.uniforms.set(location.name, Float32Array.of(x, y, z)); },
+      uniform1f(location, x) {
+        if (!location) return;
+        if (location.name === 'uShadowOn' && x > 0) {
+          unsupported('K73 DX12 shadow sampling',
+            'Native depth texture receives offscreen shadow draws, but PCF sampling is not yet bound to the lit HLSL pixel shader');
+          x = 0;
+        }
+        location.program.uniforms.set(location.name, Number(x));
+      },
+      uniform1i(location, x) { if (location) location.program.uniforms.set(location.name, Number(x)); },
+      createTexture() {
+        const t = { id: allocateRawTextureId(), target: null, width: 0, height: 0,
+          layers: 0, version: 0, loaded: false, deleted: false, parameters: new Map() };
+        state.liveTextures.add(t);
+        return t;
+      },
+      deleteTexture(t) {
+        if (!t || t.deleted) return;
+        if (t.loaded) {
+          if (t.depth) nt.releaseDepthTarget(t.id);
+          else nt.releaseTexture(t.id);
+        }
+        for (const fb of state.framebuffers) if (fb.depth === t) fb.depth = null;
+        t.deleted = true; t.loaded = false;
+        state.liveTextures.delete(t);
+        for (const unit of state.textureUnits) {
+          for (const [key, value] of unit) if (value === t) unit.delete(key);
+        }
+      },
+      activeTexture(unit) {
+        const index = unit - G.TEXTURE0;
+        if (!Number.isInteger(index) || index < 0 || index >= state.textureUnits.length)
+          return unsupportedRaw('activeTexture unit ' + unit);
+        state.activeTextureUnit = index;
+      },
+      bindTexture(target, t) {
+        if (target !== G.TEXTURE_2D && target !== G.TEXTURE_2D_ARRAY) return unsupportedRaw('bindTexture target');
+        const bindings = state.textureUnits[state.activeTextureUnit];
+        if (t === null) { bindings.delete(target); return; }
+        if (!state.liveTextures.has(t) || t.deleted) return unsupportedRaw('bindTexture invalid/deleted texture');
+        if (t.target !== null && t.target !== target) return unsupportedRaw('bindTexture immutable texture target');
+        t.target = target;
+        bindings.set(target, t);
+      },
+      // Immutable WebGL2 depth storage. Unlike an RGBA upload, this allocates
+      // a real D3D12 D32_FLOAT DSV resource (24-bit WebGL minimum retained)
+      // through the native bridge. No false CPU-only texture object is exposed.
+      texStorage2D(target, levels, format, width, height) {
+        if (target === G.TEXTURE_2D && levels === 1 && format === G.RGBA32F) {
+          const tex = boundTexture(target);
+          if (tex.immutable || tex.loaded) return unsupportedRaw('texStorage2D already initialized');
+          setFloatTexture(tex, width, height, null, true);
+          return;
+        }
+        if (target !== G.TEXTURE_2D || levels !== 1 || format !== G.DEPTH_COMPONENT24 ||
+            !Number.isInteger(width) || !Number.isInteger(height) ||
+            width < 1 || height < 1 || width > 4096 || height > 4096)
+          return unsupportedRaw('texStorage2D: only level-1 DEPTH_COMPONENT24 up to 4096 supported');
+        const t = boundTexture(target);
+        if (t.immutable || t.loaded) return unsupportedRaw('texStorage2D already initialized');
+        if (typeof nt.allocateDepthTarget !== 'function' ||
+            !nt.allocateDepthTarget(t.id, width, height))
+          throw Error('NativeThreeBridge DX12 depth render target allocation failed');
+        t.immutable = true; t.depth = true; t.loaded = true;
+        t.width = width; t.height = height; t.layers = 1; t.version++;
+        state.depthAllocations++;
+      },
+      texImage3D(target, level, internalFormat, width, height, depth, border, format, type, pixels) {
+        if (target !== G.TEXTURE_2D_ARRAY || border !== 0) return unsupportedRaw('texImage3D target/border');
+        setTexImage(target, level, internalFormat, width, height, depth, format, type, pixels);
+      },
+      texImage2D(...a) {
+        if (a.length === 9) {
+          const [target, level, internalFormat, width, height, border, format, type, pixels] = a;
+          if (target !== G.TEXTURE_2D || border !== 0) return unsupportedRaw('texImage2D target/border');
+          setTexImage(target, level, internalFormat, width, height, 1, format, type, pixels);
+        } else if (a.length === 6) {
+          const [target, level, internalFormat, format, type, pixels] = a;
+          if (target !== G.TEXTURE_2D || !pixels?._ntSource) return unsupportedRaw('texImage2D image');
+          setTexImage(target, level, internalFormat, pixels.naturalWidth || pixels.width,
+            pixels.naturalHeight || pixels.height, 1, format, type, pixels);
+        } else return unsupportedRaw('texImage2D overload');
+      },
+      texSubImage2D(target, level, x, y, w, h, format, type, pixels, srcOffset = 0) {
+        if (target !== G.TEXTURE_2D || level !== 0 || format !== G.RGBA ||
+            type !== G.FLOAT || !Number.isInteger(srcOffset) || srcOffset < 0)
+          return unsupportedRaw('texSubImage2D: RGBA32F level 0 only');
+        const tex = boundTexture(target);
+        if (!tex.float32 || !tex.floatPixels || !tex.loaded)
+          return unsupportedRaw('texSubImage2D: no allocated float texture');
+        if (![x,y,w,h].every(Number.isInteger) || x < 0 || y < 0 ||
+            w < 1 || h < 1 || x + w > tex.width || y + h > tex.height)
+          throw new RangeError('texSubImage2D rectangle outside float texture');
+        if (!(pixels instanceof Float32Array) || srcOffset + w * h * 4 > pixels.length)
+          throw new RangeError('texSubImage2D source range');
+        const region = new Float32Array(w * h * 4);
+        region.set(pixels.subarray(srcOffset, srcOffset + region.length));
+        for (let row = 0; row < h; row++) {
+          tex.floatPixels.set(region.subarray(row*w*4,(row+1)*w*4),
+            ((y+row)*tex.width+x)*4);
+        }
+        const bytes = new Uint8Array(region.buffer,region.byteOffset,region.byteLength);
+        if (!nt.updateFloatTexture(tex.id,x,y,w,h,bytes))
+          throw Error('Native DX12 RGBA32F subregion upload failed');
+        tex.version++; state.textureUploads++;
+      },
+      texParameteri(target, name, value) {
+        const t = boundTexture(target);
+        if (![G.TEXTURE_MIN_FILTER, G.TEXTURE_MAG_FILTER, G.TEXTURE_WRAP_S,
+              G.TEXTURE_WRAP_T, G.TEXTURE_MAX_LEVEL,
+              G.TEXTURE_COMPARE_MODE, G.TEXTURE_COMPARE_FUNC].includes(name))
+          return unsupportedRaw('texParameteri pname 0x' + name.toString(16));
+        if (name === G.TEXTURE_COMPARE_MODE && value !== G.COMPARE_REF_TO_TEXTURE && value !== G.NONE)
+          return unsupportedRaw('texParameteri invalid compare mode');
+        if (name === G.TEXTURE_COMPARE_FUNC && value !== G.LEQUAL)
+          return unsupportedRaw('texParameteri unsupported compare function');
+        t.parameters.set(name, value);
+      },
+      texParameterf(target, name, value) {
+        return unsupportedRaw('texParameterf extension 0x' + name.toString(16));
+      },
+      pixelStorei(name, value) {
+        if (name !== G.UNPACK_COLORSPACE_CONVERSION_WEBGL || (value !== G.NONE && value !== G.BROWSER_DEFAULT_WEBGL))
+          return unsupportedRaw('pixelStorei pname');
+        // JPEG colorspace is decoded natively by Windows WIC; the material
+        // atlas is already authored for this texture path.
+      },
+      generateMipmap(target) {
+        const t = boundTexture(target);
+        if (!t.loaded) throw Error('generateMipmap on incomplete texture');
+        if (t.layers > 1) unsupported('K73 texture-array mipmaps',
+          'Native DX12 vertical atlas retains full-resolution layers; mipmaps disabled to prevent cross-layer bleed');
+      },
+      get __nativeDepthAllocations() { return state.depthAllocations; },
+      createFramebuffer() {
+        const f = {depth: null, deleted: false, draw: null, read: null};
+        state.framebuffers.add(f);
+        return f;
+      },
+      deleteFramebuffer(f) {
+        if (!f || f.deleted) return;
+        if (state.framebuffer === f) state.framebuffer = null;
+        f.deleted = true; f.depth = null; state.framebuffers.delete(f);
+      },
+      bindFramebuffer(target, f) {
+        if (target !== G.FRAMEBUFFER) return unsupportedRaw('bindFramebuffer target');
+        if (f !== null && (!state.framebuffers.has(f) || f.deleted))
+          return unsupportedRaw('bindFramebuffer invalid framebuffer');
+        state.framebuffer = f;
+      },
+      framebufferTexture2D(target, attachment, textureTarget, tex, level) {
+        if (target !== G.FRAMEBUFFER || attachment !== G.DEPTH_ATTACHMENT ||
+            textureTarget !== G.TEXTURE_2D || level !== 0 || !state.framebuffer)
+          return unsupportedRaw('framebufferTexture2D only depth attachment 0');
+        if (tex !== null && (!state.liveTextures.has(tex) || !tex.depth || !tex.loaded))
+          return unsupportedRaw('framebufferTexture2D needs allocated depth texture');
+        state.framebuffer.depth = tex;
+      },
+      checkFramebufferStatus(target) {
+        if (target !== G.FRAMEBUFFER) return unsupportedRaw('checkFramebufferStatus target');
+        return !state.framebuffer || state.framebuffer.depth?.loaded
+          ? G.FRAMEBUFFER_COMPLETE : G.FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+      },
+      drawBuffers(buffers) {
+        if (!state.framebuffer || !Array.isArray(buffers) ||
+            buffers.length !== 1 || buffers[0] !== G.NONE)
+          return unsupportedRaw('drawBuffers: only depth-only framebuffer');
+        state.framebuffer.draw = G.NONE;
+      },
+      readBuffer(mode) {
+        if (!state.framebuffer || mode !== G.NONE)
+          return unsupportedRaw('readBuffer: only depth-only framebuffer');
+        state.framebuffer.read = G.NONE;
+      },
+      get __nativeTextureUploads() { return state.textureUploads; },
+      get __nativeTextureUnits() { return state.textureUnits; },
+      createBuffer() { return { data: null, version: 0 }; },
+      bindBuffer(target, buffer) {
+        if (target === G.ARRAY_BUFFER) state.buffer = buffer;
+        else if (target === G.ELEMENT_ARRAY_BUFFER) state.vao.elements = buffer;
+        else return unsupportedRaw('bindBuffer target');
+      },
+      bufferData(target, data) {
+        if (typeof data === 'number') {
+          if (!Number.isSafeInteger(data) || data < 0 || data > 256 * 1024 * 1024)
+            return unsupportedRaw('bufferData size');
+          data = new Uint8Array(data);
+        }
+        if (!ArrayBuffer.isView(data)) return unsupportedRaw('bufferData typed arrays or size');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        if (!dst) throw Error('No buffer bound for bufferData');
+        dst.data = new data.constructor(data); dst.version++;
+      },
+      bufferSubData(target, offset, data, sourceOffset = 0, length) {
+        if (!ArrayBuffer.isView(data) || !Number.isInteger(sourceOffset) || sourceOffset < 0)
+          return unsupportedRaw('bufferSubData data/sourceOffset');
+        const dst = target === G.ARRAY_BUFFER ? state.buffer :
+          target === G.ELEMENT_ARRAY_BUFFER ? state.vao.elements : null;
+        const elements = length === undefined ? data.length - sourceOffset : length;
+        if (!Number.isInteger(elements) || elements < 0 || sourceOffset + elements > data.length)
+          return unsupportedRaw('bufferSubData element range');
+        const byteCount = elements * data.BYTES_PER_ELEMENT;
+        if (!dst?.data || !Number.isInteger(offset) || offset < 0 ||
+            offset + byteCount > dst.data.byteLength) return unsupportedRaw('bufferSubData byte range');
+        new Uint8Array(dst.data.buffer, dst.data.byteOffset, dst.data.byteLength).set(
+          new Uint8Array(data.buffer, data.byteOffset +
+            sourceOffset * data.BYTES_PER_ELEMENT, byteCount), offset);
+        dst.version++;
+      },
+      createVertexArray() { return { attributes: new Map(), elements: null }; },
+      bindVertexArray(vao) { state.vao = vao || { attributes: new Map(), elements: null }; },
+      enableVertexAttribArray(index) {
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, enabled: true });
+      },
+      vertexAttribIPointer(index, size, type, stride, offset) {
+        if (type !== G.UNSIGNED_BYTE || size !== 4)
+          return unsupportedRaw('vertexAttribIPointer: only unsigned byte uvec4');
+        return this.vertexAttribPointer(index,size,type,false,stride,offset);
+      },
+      vertexAttribPointer(index, size, type, normalized, stride, offset) {
+        if (index < 0 || index > 7 || !state.buffer) return unsupportedRaw('vertexAttribPointer attribute ' + index);
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, buffer: state.buffer, size, type, normalized: !!normalized, stride, offset });
+      },
+      vertexAttribDivisor(index, divisor) {
+        if (index < 0 || index > 7 || (divisor !== 0 && divisor !== 1))
+          return unsupportedRaw('vertexAttribDivisor attribute/divisor');
+        const old = state.vao.attributes.get(index) || {};
+        state.vao.attributes.set(index, { ...old, divisor });
+      },
+      deleteBuffer(buffer) { if (buffer) { buffer.data = null; buffer.version++; } },
+      deleteVertexArray(vao) {
+        const rec = state.instanceCache.get(vao);
+        if (rec) { nt.releaseInstances(rec.id); state.instanceCache.delete(vao); }
+        const g = state.cache.get(vao);
+        if (g) { nt.releaseGeometry(g.id); state.cache.delete(vao); }
+        if (state.vao === vao) state.vao = { attributes: new Map(), elements: null };
+      },
+      enable(cap) {
+        if (![G.DEPTH_TEST, G.CULL_FACE, G.BLEND, G.POLYGON_OFFSET_FILL].includes(cap))
+          return unsupportedRaw('enable capability ' + cap);
+        state.capabilities.add(cap);
+      },
+      disable(cap) {
+        if (![G.DEPTH_TEST, G.CULL_FACE, G.BLEND, G.POLYGON_OFFSET_FILL].includes(cap))
+          return unsupportedRaw('disable capability ' + cap);
+        state.capabilities.delete(cap);
+      },
+      isEnabled(cap) { return state.capabilities.has(cap); },
+      depthMask(value) { state.depthWrite = !!value; },
+      cullFace(mode) {
+        if (mode !== G.BACK && mode !== G.FRONT) return unsupportedRaw('cullFace mode');
+        state.cullMode = mode;
+      },
+      frontFace(mode) {
+        if (mode !== G.CCW && mode !== G.CW) return unsupportedRaw('frontFace mode');
+        state.frontWinding = mode;
+      },
+      blendFunc(src, dst) {
+        if (!((src === G.SRC_ALPHA && dst === G.ONE_MINUS_SRC_ALPHA) ||
+              (src === G.ONE && dst === G.ONE) ||
+              (src === G.ONE && dst === G.ZERO)))
+          return unsupportedRaw('blendFunc combination');
+        state.blendSrc = src; state.blendDst = dst;
+      },
+      polygonOffset(factor, units) {
+        if (!Number.isFinite(factor) || !Number.isFinite(units))
+          return unsupportedRaw('polygonOffset non-finite');
+        // K73 only enables polygon offset during its depth-only shadow pass.
+        // Native DX12 uses its fixed DepthBias/SlopeScaledDepthBias profile.
+        state.polygonFactor = factor; state.polygonUnits = units;
+        if (factor !== 1.6 || units !== 3)
+          unsupported('K73 polygon offset approximation',
+            'Native D3D12 depth bias currently uses the K73 shadow profile factor=1.6, units=3');
+      },
+      viewport(x, y, w, h) {
+        const target = state.framebuffer?.depth;
+        const width = target?.width ?? canvas.width, height = target?.height ?? canvas.height;
+        if (x || y || w !== width || h !== height) return unsupportedRaw('partial viewport');
+      },
+      clearColor(r, g, b, a) { state.clear = [r, g, b, a]; },
+      clear(mask) {
+        if (mask & G.COLOR_BUFFER_BIT) state.clearFlags |= 1;
+        if (mask & G.DEPTH_BUFFER_BIT) state.clearFlags |= 2;
+      },
+      drawArrays(mode, first, count) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0) return unsupportedRaw('drawArrays primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        if (state.program.profile === 'k73-sky') {
+          if (first !== 0 || count !== 3) return unsupportedRaw('K73 sky requires fullscreen triangle');
+          const id = skyGeometry();
+          submitRawPass(id, state.sky.count, 'k73-sky');
+        } else {
+          const skin = state.program.profile==='k73-lit-skin' || state.program.profile==='k73-depth-skin';
+          submitRawPass(skin?uploadSkin(first,count):upload(first,count), count, state.program.profile);
+        }
+      },
+      drawElements(mode, count, type, offset) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3) return unsupportedRaw('drawElements primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        const skin = state.program.profile==='k73-lit-skin' || state.program.profile==='k73-depth-skin';
+        submitRawPass(skin?uploadSkin(0,count,type,offset):upload(0,count,type,offset),
+          count, state.program.profile);
+      },
+      drawArraysInstanced(mode, first, count, instanceCount) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3 || first < 0)
+          return unsupportedRaw('drawArraysInstanced primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        if (!instanceCount) return;
+        if (state.program.profile === 'k73-part') {
+          const geometryId=particleGeometry(first,count), instances=particleRecord(instanceCount);
+          submitRawPass(geometryId,count,'k73-part',instances);
+          return;
+        }
+        const instances = instanceRecord(instanceCount);
+        if (!instances) return unsupportedRaw('instanced shader profile mismatch');
+        submitRawPass(upload(first, count), count, state.program.profile, instances);
+      },
+      drawElementsInstanced(mode, count, type, offset, instanceCount) {
+        if (mode !== G.TRIANGLES || count < 3 || count % 3)
+          return unsupportedRaw('drawElementsInstanced primitive');
+        if (!state.program?.linked) throw Error('No linked shader program');
+        if (!instanceCount) return;
+        const instances = instanceRecord(instanceCount);
+        if (!instances) return unsupportedRaw('instanced shader profile mismatch');
+        submitRawPass(upload(0, count, type, offset), count, state.program.profile, instances);
+      },
+      get __nativeDraws() { return state.draws; },
+    };
+    return gl;
+  }
+
   class HTMLCanvasElement extends HTMLElement {
     constructor(tag = 'canvas', ns) { super(tag, ns); this._width = 300; this._height = 150; }
     get width() { return this._width; }
@@ -842,10 +2093,27 @@
     }
     getContext(kind, options) {
       if (kind === '2d') {
-        if (!this._ctx2d) this._ctx2d = new CanvasRenderingContext2D(this, options || {});
+        // Browser semantics: a canvas has one graphics-context family. Neither
+        // Three.js' native renderer nor the experimental raw WebGL2 bridge may
+        // silently be replaced by a 2D context.
+        if (this._nativeGL2 || this._ntRendererCanvas) return null;
+        if (!this._ctx2d) {
+          this._ctx2d = new CanvasRenderingContext2D(this, options || {});
+          this._ntGraphicsOwner = '2d';
+        }
         return this._ctx2d;
       }
-      // WebGL is never exposed: THREE.WebGLRenderer is the NativeRenderer.
+      if (kind === 'webgl2') {
+        // Raw WebGL2 is opt-in per canvas. The supported Three.js
+        // WebGLRenderer -> NativeRenderer path is entirely separate.
+        if (this._nativeGL2) return this._nativeGL2;
+        if (this._ctx2d || this._ntRendererCanvas ||
+            !this.hasAttribute('data-native-webgl2-prototype')) return null;
+        this._nativeGL2 = makeRawDx12Prototype(this);
+        this._ntRendererCanvas = true; // same compositor output, separate JS API
+        this._ntGraphicsOwner = 'raw-webgl2';
+        return this._nativeGL2;
+      }
       unsupported(`canvas.getContext('${kind}')`, 'use THREE.WebGLRenderer, which renders natively');
       return null;
     }
@@ -2443,7 +3711,10 @@
         for (const [key, value] of saved.session ?? []) sessionStorage.setItem(key, value);
         if (!persistentStorage) for (const [key, value] of saved.local ?? []) localStorage.setItem(key, value);
       }
-      parseDocument(String(html));
+      // Parser-inserted <script> tags run through host.boot(); scripts created
+      // by those scripts are dynamic and must be handled by our queue.
+      parsingInitialDocument = true;
+      try { parseDocument(String(html)); } finally { parsingInitialDocument = false; }
       document.readyState = 'interactive';
       const scripts = querySelectorAll(document, 'script');
       const imports = [];
@@ -2462,6 +3733,7 @@
         const type = (s.getAttribute('type') || 'text/javascript').toLowerCase().trim();
         const src = s.getAttribute('src');
         if (type === 'module') {
+          s._ntScriptStarted = true;
           if (src) {
             const path = toGamePath(src);
             if (path === null) { reportError('script', new Error(`External module script is not available offline: ${src}`)); continue; }
@@ -2470,6 +3742,7 @@
           continue;
         }
         if (!['text/javascript', 'application/javascript', 'javascript', ''].includes(type)) continue;
+        s._ntScriptStarted = true;
         try {
           if (src) {
             const path = toGamePath(src);
@@ -2498,8 +3771,9 @@
       const t = document.title;
       if (t) nt.setTitle(t);
     },
-    // Called by the engine once per displayed frame with a millisecond clock.
-    frame(timeMs) {
+    // Game timers and requestAnimationFrame run at the 3D rate; CSS/UI is separately scheduled.
+    // The default keeps existing Node test hosts and legacy callers compatible.
+    frame(timeMs, uiTick = true) {
       state.now = timeMs;
       state.frame++;
       const t0 = performance.now();
@@ -2513,7 +3787,7 @@
       const tRaf = performance.now();
       flushCanvases(); // Canvas 2D drawings of this frame -> native bitmaps
       const tCanvas = performance.now();
-      if (uiLayer) uiLayer.frame();
+      if (uiTick !== false && uiLayer) uiLayer.frame();
       const tUi = performance.now();
       if (tUi - t0 >= 90 && timeMs - (state.lastSlowFrameReport || -Infinity) >= 1000) {
         state.lastSlowFrameReport = timeMs;

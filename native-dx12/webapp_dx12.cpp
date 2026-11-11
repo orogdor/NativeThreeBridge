@@ -6,6 +6,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -17,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <share.h>
 #include <fstream>
 #include <map>
@@ -27,9 +29,11 @@
 #include <vector>
 
 #include "webapp_host.h"
+#include "webapp_dx12_guard.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
 #include "webapp_ui.h"
+#include "ui_cadence.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -53,7 +57,10 @@ constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
-               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096;
+               F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
+               F_DEPTH_ONLY = 2097152, F_ADDITIVE_BLEND = 4194304,
+               F_POLYGON_OFFSET = 8388608, F_FRONT_CW = 16777216;
+constexpr UINT kMaxOffscreenDepthTargets = 64;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 
 std::wstring widen(const std::string& s) {
@@ -105,11 +112,23 @@ struct Texture {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
     UINT width = 0, height = 0;
+    UINT64 allocationBytes = 0;
+    bool float32 = false;
+};
+struct DepthTarget {
+    ComPtr<ID3D12Resource> resource;
+    UINT slot = 0;
+    UINT width = 0, height = 0;
 };
 // A texture whose pixels still have to be copied on the GPU timeline.
 struct PendingTextureCopy {
     ComPtr<ID3D12Resource> texture, staging;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+};
+struct PendingFloatCopy {
+    ComPtr<ID3D12Resource> texture, staging;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{};
+    UINT x = 0, y = 0;
 };
 struct RetiredSlot {
     UINT slot;
@@ -161,13 +180,27 @@ public:
     void releaseGeometry(std::uint32_t id) override;
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
+    bool updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                            std::uint32_t w, std::uint32_t h,
+                            const std::uint8_t* data, std::size_t bytes) override;
     void releaseTexture(std::uint32_t id) override;
+    bool allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) override;
+    void releaseDepthTarget(std::uint32_t id) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
+        if (pendingPasses_.size() >= native_three::safety::kMaxPassesPerFrame ||
+            floats > 4'194'304 - pendingPassFloats_ ||
+            !native_three::safety::validPass(data, floats,
+                native_three::kWebappPassHeaderFloats, native_three::kWebappLightFloats,
+                native_three::kWebappDrawFloats, UINT(native_three::kWebappMaxLights))) {
+            if (invalidPacketWarnings_++ < 8) log("warn", "[dx12-safety] rejected malformed or oversized render packet");
+            return;
+        }
         pendingPasses_.emplace_back(data, data + floats);
+        pendingPassFloats_ += floats;
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
     void log(const std::string& level, const std::string& text) override;
@@ -217,6 +250,8 @@ public:
 
 private:
     void check(HRESULT hr, const char* what);
+    void reportDeviceLoss(const char* stage);
+    void waitForFenceValue(UINT64 value, const char* stage);
     void initDevice();
     void createSizeDependent();
     void releaseSizeDependent();
@@ -249,14 +284,26 @@ private:
     std::wstring pageTitle_ = L"Three.js webapp";
     std::wstring adapterName_ = L"GPU";
     int logErrors_ = 0;
+    unsigned invalidPacketWarnings_ = 0;
+    unsigned invalidDrawWarnings_ = 0;
+    bool flightLog_ = false;
+    UINT64 submissionSerial_ = 0;
     bool bootDialogShown_ = false;
 
+    D3D12_CPU_DESCRIPTOR_HANDLE depthViewHandle(UINT slot) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE view = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        view.ptr += SIZE_T(slot) * dsvStep_;
+        return view;
+    }
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<ID3D12Device> device_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_, dsvHeap_;
-    UINT rtvStep_ = 0;
+    UINT rtvStep_ = 0, dsvStep_ = 0;
+    UINT nextDepthSlot_ = 1;
+    std::vector<UINT> freeDepthSlots_;
+    std::unordered_map<std::uint32_t, DepthTarget> depthTargets_;
     ComPtr<ID3D12Resource> targets_[kFrameCount], depth_;
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
@@ -277,6 +324,7 @@ private:
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<PendingFloatCopy> pendingFloatCopies_;
     std::vector<UINT> freeSlots_;
     std::vector<RetiredSlot> retiredSlots_;
     ComPtr<ID3D12DescriptorHeap> texHeap_;
@@ -286,6 +334,7 @@ private:
     int textureFailures_ = 0;
     std::vector<Retired> retired_;
     std::vector<std::vector<float>> pendingPasses_, passes_;
+    std::size_t pendingPassFloats_ = 0;
     UINT lastDraws_ = 0;
 
     std::chrono::steady_clock::time_point uiStatsAt_ = std::chrono::steady_clock::now();
@@ -294,7 +343,7 @@ private:
         int frames = 0;
         double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
-        int forced = 0, full = 0, partial = 0, rasters = 0;
+        int forced = 0, full = 0, partial = 0, rasters = 0, uiTicks = 0;
     } perf_;
     std::FILE* perfCsv_ = nullptr;
     std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
@@ -306,6 +355,7 @@ private:
     bool cursorHidden_ = false;
     // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
     native_three::WebappUiRenderer ui_;
+    native_three::UiCadence uiCadence_{};
     bool uiReady_ = false, uiUpload_ = false, uiVisible_ = false;
     ComPtr<ID3D12Resource> uiTexture_, uiStaging_[kFrameCount];
     UINT64 uiStagingBytes_[kFrameCount] = {};
@@ -364,6 +414,7 @@ void WebappWindow::check(HRESULT hr, const char* what) {
     char text[512];
     std::snprintf(text, sizeof text, "%s failed (HRESULT 0x%08lX)", what, (unsigned long)hr);
     log("error", text);
+    if (device_) reportDeviceLoss(what);
     if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
         MessageBoxA(window_, text, "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
     ExitProcess(44);
@@ -378,10 +429,82 @@ void WebappWindow::log(const std::string& level, const std::string& text) {
     OutputDebugStringA(("[webapp " + level + "] " + text + "\n").c_str());
 }
 
+void WebappWindow::reportDeviceLoss(const char* stage) {
+    if (!device_) return;
+    const HRESULT reason = device_->GetDeviceRemovedReason();
+    char message[240];
+    std::snprintf(message, sizeof message, "[dx12-safety] %s: GetDeviceRemovedReason=0x%08lX",
+                  stage, static_cast<unsigned long>(reason));
+    log(FAILED(reason) ? "error" : "warn", message);
+    ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+    if (FAILED(device_.As(&dred))) {
+        log("warn", "[dx12-safety] DRED unavailable on this Windows version");
+        return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs{};
+    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
+        unsigned count = 0;
+        for (auto* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+             node && count++ < 16; node = node->pNext) {
+            const UINT last = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0u;
+            std::snprintf(message, sizeof message, "[dx12-dred] queue=%s list=%s completed=%u/%u",
+                          node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "?",
+                          node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "?",
+                          last, node->BreadcrumbCount);
+            log("error", message);
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT fault{};
+    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && fault.PageFaultVA != 0) {
+        std::snprintf(message, sizeof message, "[dx12-dred] page fault GPU virtual address=0x%llX",
+                      static_cast<unsigned long long>(fault.PageFaultVA));
+        log("error", message);
+    }
+}
+
+void WebappWindow::waitForFenceValue(UINT64 value, const char* stage) {
+    if (fence_->GetCompletedValue() >= value) return;
+    check(fence_->SetEventOnCompletion(value, fenceEvent_), "SetEventOnCompletion");
+    const DWORD result = WaitForSingleObject(fenceEvent_, native_three::safety::kFenceTimeoutMs);
+    if (result == WAIT_OBJECT_0 && fence_->GetCompletedValue() >= value) return;
+    char detail[256];
+    std::snprintf(detail, sizeof detail,
+                  "[dx12-safety] %s: GPU fence wait failed or exceeded %lu ms (wait=%lu, target=%llu, completed=%llu)",
+                  stage, static_cast<unsigned long>(native_three::safety::kFenceTimeoutMs),
+                  static_cast<unsigned long>(result), static_cast<unsigned long long>(value),
+                  static_cast<unsigned long long>(fence_->GetCompletedValue()));
+    log("error", detail);
+    reportDeviceLoss(stage);
+    // Never spin forever on a dead GPU; allow the OS to reclaim this process.
+    ExitProcess(45);
+}
+
 void WebappWindow::initDevice() {
+    // DRED must be configured BEFORE D3D12CreateDevice. It records breadcrumbs
+    // and allocation faults if the driver later reports a removed GPU.
+    ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+        dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+    }
+    char trace[8] = {};
+    flightLog_ = GetEnvironmentVariableA("NATIVETHREE_DX12_FLIGHTLOG", trace, sizeof trace) > 0 &&
+                 std::strcmp(trace, "1") == 0;
+    if (flightLog_)
+        log("info", "[dx12-safety] GPU submission flight recorder enabled (file flush per submission)");
+    char warp[8] = {};
+    const bool forceWarp = GetEnvironmentVariableA("NATIVETHREE_DX12_WARP", warp, sizeof warp) > 0 &&
+                           std::strcmp(warp, "1") == 0;
+    char debug[8] = {};
+    if (GetEnvironmentVariableA("NATIVETHREE_DX12_DEBUG", debug, sizeof debug) > 0 &&
+        std::strcmp(debug, "1") == 0) {
+        ComPtr<ID3D12Debug> layer;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&layer))))
+            layer->EnableDebugLayer(); // opt-in: substantial overhead, never auto-enabled
+    }
     check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)), "Create DXGI factory");
     ComPtr<IDXGIFactory6> factory6;
-    if (SUCCEEDED(factory_.As(&factory6))) {
+    if (!forceWarp && SUCCEEDED(factory_.As(&factory6))) {
         for (UINT i = 0;; i++) {
             ComPtr<IDXGIAdapter1> adapter;
             if (factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
@@ -396,12 +519,18 @@ void WebappWindow::initDevice() {
             }
         }
     }
-    if (!device_ && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)))) {
-        ComPtr<IDXGIAdapter> warp;
-        check(factory_->EnumWarpAdapter(IID_PPV_ARGS(&warp)), "Find WARP adapter");
-        check(D3D12CreateDevice(warp.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)), "Create DX12 device");
-        adapterName_ = L"WARP (software)";
+    if (!device_) {
+        if (!forceWarp && SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)))) {
+            adapterName_ = L"Default hardware adapter";
+        } else {
+            ComPtr<IDXGIAdapter> software;
+            check(factory_->EnumWarpAdapter(IID_PPV_ARGS(&software)), "Find WARP adapter");
+            check(D3D12CreateDevice(software.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)),
+                  "Create WARP DX12 device");
+            adapterName_ = L"WARP (software)";
+        }
     }
+    if (forceWarp) log("info", "[dx12-safety] WARP software rendering enabled (no dedicated GPU adapter)");
     D3D12_COMMAND_QUEUE_DESC q{};
     q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(device_->CreateCommandQueue(&q, IID_PPV_ARGS(&queue_)), "Create command queue");
@@ -424,9 +553,10 @@ void WebappWindow::initDevice() {
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_)), "RTV heap");
     rtvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    heap.NumDescriptors = 1;
+    heap.NumDescriptors = 1 + kMaxOffscreenDepthTargets;
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&dsvHeap_)), "DSV heap");
+    dsvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     for (UINT i = 0; i < kFrameCount; i++)
         check(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators_[i])), "Command allocator");
@@ -435,6 +565,7 @@ void WebappWindow::initDevice() {
     cmd_->Close();
     check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "Fence");
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fenceEvent_) check(HRESULT_FROM_WIN32(GetLastError()), "Create GPU fence event");
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
     // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
@@ -525,6 +656,7 @@ void WebappWindow::resetPage() {
     host_.shutdown();
     waitForGpu();
     pendingPasses_.clear();
+    pendingPassFloats_ = 0;
     passes_.clear();
     geometries_.clear();
     instances_.clear();
@@ -532,6 +664,7 @@ void WebappWindow::resetPage() {
     pipelines_.clear();
     colorPatches_.clear();
     ui_.resetPage();
+    uiCadence_.reset();
     uiUpload_ = uiVisible_ = false;
     lastDraws_ = 0;
     logErrors_ = 0;
@@ -553,12 +686,20 @@ bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std:
         FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
                                      WICBitmapPaletteTypeCustom)))
         return false;
-    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 16384 || h > 16384) return false;
+    if (FAILED(converter->GetSize(&w, &h)) ||
+        !native_three::safety::validTextureDimensions(w, h, 4)) return false;
     rgba.resize(std::size_t(w) * h * 4);
     return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
 }
 
 bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags) {
+    const bool inputFloat = (flags & native_three::kWebappTextureFloat32) != 0;
+    const unsigned inputBpp = inputFloat ? 16u : 4u;
+    if (!native_three::safety::validTextureDimensions(w, h, inputBpp) ||
+        rgba.size() != std::size_t(w) * h * inputBpp) {
+        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected oversized or incomplete texture");
+        return false;
+    }
     UINT slot = 0;
     if (id != 0) {
         if (freeSlots_.empty()) {
@@ -571,15 +712,20 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
         slot = freeSlots_.back();
         freeSlots_.pop_back();
     }
-    const bool srgb = (flags & native_three::kWebappTextureSrgb) != 0;
-    std::vector<std::vector<std::uint8_t>> levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    const bool float32 = (flags & native_three::kWebappTextureFloat32) != 0;
+    const bool srgb = !float32 && (flags & native_three::kWebappTextureSrgb) != 0;
+    const UINT bytesPerPixel = float32 ? 16 : 4;
+    std::vector<std::vector<std::uint8_t>> levels;
+    if (float32) levels.push_back(std::move(rgba)); // float data: no mips or quantisation
+    else levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = w;
     td.Height = h;
     td.DepthOrArraySize = 1;
     td.MipLevels = UINT16(levels.size());
-    td.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = float32 ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+        srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     td.SampleDesc.Count = 1;
     PendingTextureCopy copy;
     auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
@@ -590,6 +736,15 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     std::vector<UINT64> rowBytes(levels.size());
     UINT64 total = 0;
     device_->GetCopyableFootprints(&td, 0, UINT(levels.size()), 0, copy.layouts.data(), rows.data(), rowBytes.data(), &total);
+    UINT64 replacingBytes = 0;
+    const auto replaced = textures_.find(id);
+    if (replaced != textures_.end()) replacingBytes = replaced->second.allocationBytes;
+    if (!native_three::safety::validBufferBytes(total) ||
+        !native_three::safety::reserveTextureBudget(textureBytes_, replacingBytes, total)) {
+        if (id != 0) freeSlots_.push_back(slot);
+        if (textureFailures_++ < 8) log("warn", "[dx12-safety] rejected texture exceeding staging or 1 GiB live budget");
+        return false;
+    }
     copy.staging = uploadBuffer(nullptr, total);
     std::uint8_t* mapped = nullptr;
     D3D12_RANGE none{0, 0};
@@ -598,7 +753,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
         const auto& L = copy.layouts[m];
         const UINT lw = L.Footprint.Width;
         for (UINT y = 0; y < rows[m]; y++)
-            std::memcpy(mapped + L.Offset + std::size_t(y) * L.Footprint.RowPitch, levels[m].data() + std::size_t(y) * lw * 4, std::size_t(lw) * 4);
+            std::memcpy(mapped + L.Offset + std::size_t(y) * L.Footprint.RowPitch, levels[m].data() + std::size_t(y) * lw * bytesPerPixel, std::size_t(lw) * bytesPerPixel);
     }
     copy.staging->Unmap(0, nullptr);
 
@@ -617,8 +772,98 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     t.slot = slot;
     t.width = w;
     t.height = h;
+    t.allocationBytes = total;
+    t.float32 = float32;
     textureBytes_ += std::size_t(total);
     pendingCopies_.push_back(std::move(copy));
+    return true;
+}
+
+bool WebappWindow::allocateDepthTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+    if (!id || !device_ || width < 1 || height < 1 || width > 4096 || height > 4096) return false;
+    auto existing = depthTargets_.find(id);
+    if (existing != depthTargets_.end()) {
+        if (existing->second.width == width && existing->second.height == height) return true;
+        releaseDepthTarget(id);
+    }
+    UINT slot = 0;
+    if (!freeDepthSlots_.empty()) {
+        slot = freeDepthSlots_.back(); freeDepthSlots_.pop_back();
+    } else if (nextDepthSlot_ <= kMaxOffscreenDepthTargets) {
+        slot = nextDepthSlot_++;
+    } else {
+        log("warn", "[depth] maximum offscreen targets reached");
+        return false;
+    }
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height;
+    desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    // WebGL2 DEPTH_COMPONENT24 minimum precision is fulfilled by D32_FLOAT.
+    // HLSL sampler2DShadow PCF sampling still requires a separate shader stage.
+    desc.Format = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_D32_FLOAT;
+    clear.DepthStencil.Depth = 1.0f;
+    ComPtr<ID3D12Resource> texture;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    HRESULT hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+        &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&texture));
+    if (FAILED(hr)) {
+        freeDepthSlots_.push_back(slot);
+        log("warn", "[depth] D32_FLOAT allocation failed");
+        return false;
+    }
+    device_->CreateDepthStencilView(texture.Get(), nullptr, depthViewHandle(slot));
+    DepthTarget target{};
+    target.resource = texture;
+    target.slot = slot; target.width = width; target.height = height;
+    depthTargets_.emplace(id, std::move(target));
+    log("info", "[depth] allocated DX12 D32_FLOAT target " + std::to_string(id) +
+        " " + std::to_string(width) + "x" + std::to_string(height));
+    return true;
+}
+
+void WebappWindow::releaseDepthTarget(std::uint32_t id) {
+    auto it = depthTargets_.find(id);
+    if (it == depthTargets_.end()) return;
+    // Reuse DSV descriptors only after all in-flight GPU consumers finish.
+    waitForGpu();
+    freeDepthSlots_.push_back(it->second.slot);
+    depthTargets_.erase(it);
+}
+
+bool WebappWindow::updateFloatTexture(std::uint32_t id, std::uint32_t x, std::uint32_t y,
+                                         std::uint32_t w, std::uint32_t h,
+                                         const std::uint8_t* data, std::size_t bytes) {
+    auto it = textures_.find(id);
+    if (it == textures_.end() || !it->second.float32 || !it->second.resource ||
+        !w || !h || !data || x > it->second.width || y > it->second.height ||
+        w > it->second.width - x || h > it->second.height - y ||
+        bytes != std::size_t(w) * h * 16) return false;
+    // D3D12 requires the row pitch of an upload buffer to be 256-aligned.
+    const UINT rowPitch = (w * 16u + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+                          ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    PendingFloatCopy copy;
+    copy.texture = it->second.resource;
+    copy.x = x; copy.y = y;
+    copy.layout.Offset = 0;
+    copy.layout.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    copy.layout.Footprint.Width = w;
+    copy.layout.Footprint.Height = h;
+    copy.layout.Footprint.Depth = 1;
+    copy.layout.Footprint.RowPitch = rowPitch;
+    copy.staging = uploadBuffer(nullptr, UINT64(rowPitch) * h);
+    std::uint8_t* mapped = nullptr;
+    D3D12_RANGE none{0, 0};
+    check(copy.staging->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map RGBA32F staging");
+    for (UINT row = 0; row < h; row++)
+        std::memcpy(mapped + UINT64(row) * rowPitch,
+                    data + std::size_t(row) * w * 16, std::size_t(w) * 16);
+    copy.staging->Unmap(0, nullptr);
+    pendingFloatCopies_.push_back(std::move(copy));
     return true;
 }
 
@@ -627,6 +872,7 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
     retiredSlots_.push_back({it->second.slot, fenceValue_ + kFrameCount});
+    textureBytes_ -= std::size_t(it->second.allocationBytes);
     textures_.erase(it);
 }
 
@@ -636,8 +882,12 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
     std::vector<std::uint8_t> rgba;
     UINT w = width, h = height;
     if (width) {
-        if (width > 16384 || height > 16384 || bytes < std::size_t(width) * height * 4) return false;
-        rgba.assign(data, data + std::size_t(width) * height * 4);
+        const bool float32 = (flags & native_three::kWebappTextureFloat32) != 0;
+        const std::size_t bpp = float32 ? 16u : 4u;
+        if (!native_three::safety::validTextureDimensions(width, height, unsigned(bpp)) ||
+            (float32 && (width > 4096 || height > 1024)) ||
+            bytes < std::size_t(width) * height * bpp) return false;
+        rgba.assign(data, data + std::size_t(width) * height * bpp);
     } else if (!decodeImage(data, bytes, rgba, w, h)) {
         if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes) + " bytes; WebP needs the Windows WebP Image Extension)");
         return false;
@@ -655,7 +905,7 @@ bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId,
 
 // Copies queued texture pixels; runs at the start of a frame's command list.
 void WebappWindow::recordTextureCopies() {
-    if (pendingCopies_.empty()) return;
+    if (pendingCopies_.empty() && pendingFloatCopies_.empty()) return;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     for (auto& c : pendingCopies_) {
         for (UINT m = 0; m < UINT(c.layouts.size()); m++) {
@@ -676,7 +926,8 @@ void WebappWindow::recordTextureCopies() {
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         barriers.push_back(b);
     }
-    cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+    if (!barriers.empty())
+        cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
     for (auto& c : pendingCopies_) {
         retire(c.staging);
         // the texture itself stays referenced by textures_ (or is retired there)
@@ -684,6 +935,29 @@ void WebappWindow::recordTextureCopies() {
         retire(keep);
     }
     pendingCopies_.clear();
+    // Update an existing float texture without replacing its SRV descriptor
+    // (critical for many animated bone rows per frame).
+    for (auto& c : pendingFloatCopies_) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = c.texture.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd_->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+        dst.pResource = c.texture.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        src.pResource = c.staging.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = c.layout;
+        cmd_->CopyTextureRegion(&dst, c.x, c.y, 0, &src, nullptr);
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+        cmd_->ResourceBarrier(1, &barrier);
+        retire(c.staging);
+    }
+    pendingFloatCopies_.clear();
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE WebappWindow::textureHandle(std::uint32_t id) const {
@@ -889,11 +1163,8 @@ void WebappWindow::releaseSizeDependent() {
 void WebappWindow::waitForGpu() {
     if (!queue_ || !fence_) return;
     const UINT64 value = ++fenceValue_;
-    queue_->Signal(fence_.Get(), value);
-    if (fence_->GetCompletedValue() < value) {
-        fence_->SetEventOnCompletion(value, fenceEvent_);
-        WaitForSingleObject(fenceEvent_, INFINITE);
-    }
+    check(queue_->Signal(fence_.Get(), value), "Signal GPU fence");
+    waitForFenceValue(value, "waitForGpu/resize");
     collectRetired();
 }
 
@@ -913,6 +1184,8 @@ void WebappWindow::resize(UINT width, UINT height) {
 }
 
 ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes) {
+    if (!native_three::safety::validBufferBytes(bytes))
+        check(E_INVALIDARG, "DX12 upload buffer size limit");
     ComPtr<ID3D12Resource> buffer;
     auto heap = heapProps(D3D12_HEAP_TYPE_UPLOAD);
     auto desc = bufferDesc(bytes);
@@ -953,6 +1226,18 @@ void WebappWindow::collectRetired() {
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
                                   std::uint32_t colorChannels) {
+    if (!native_three::safety::validGeometry(p, vertexCount, idx, indexCount)) {
+        if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected oversized or invalid geometry");
+        return;
+    }
+    if (idx) {
+        for (std::uint32_t i = 0; i < indexCount; ++i) {
+            if (idx[i] >= vertexCount) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected out-of-range geometry index");
+                return;
+            }
+        }
+    }
     const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
@@ -989,6 +1274,10 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
 }
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
+    if (!native_three::safety::validInstances(m, count)) {
+        if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected excessive instance upload");
+        return;
+    }
     InstanceSet& set = instances_[id];
     set.count = count;
     set.cpu.resize(size_t(count) * 19);
@@ -1029,7 +1318,11 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
     const UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
     const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
+                     ((flags & F_DEPTH_ONLY) ? (1u << 30) : 0u) |
+                     ((flags & F_ADDITIVE_BLEND) ? (1u << 29) : 0u) |
+                     ((flags & F_POLYGON_OFFSET) ? (1u << 28) : 0u) |
+                     ((flags & F_FRONT_CW) ? (1u << 27) : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1048,22 +1341,28 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.pRootSignature = root_sig_.Get();
     d.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
     ID3DBlob* pixel = patchId ? patch->second.Get() : ps_.Get();
-    d.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+    d.PS = (flags & F_DEPTH_ONLY) ? D3D12_SHADER_BYTECODE{} :
+           D3D12_SHADER_BYTECODE{pixel->GetBufferPointer(), pixel->GetBufferSize()};
     d.InputLayout = {layout, UINT(sizeof layout / sizeof layout[0])};
     d.PrimitiveTopologyType = lines ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     d.RasterizerState.CullMode = cull == 1 ? D3D12_CULL_MODE_NONE : cull == 2 ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK;
-    d.RasterizerState.FrontCounterClockwise = TRUE; // Three.js / OpenGL winding
+    d.RasterizerState.FrontCounterClockwise = (flags & F_FRONT_CW) ? FALSE : TRUE;
     d.RasterizerState.DepthClipEnable = TRUE;
+    if (flags & F_POLYGON_OFFSET) {
+        // K73 shadow pass calls gl.polygonOffset(1.6, 3.0).
+        d.RasterizerState.DepthBias = 3;
+        d.RasterizerState.SlopeScaledDepthBias = 1.6f;
+    }
     auto& rt = d.BlendState.RenderTarget[0];
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     if (flags & F_TRANSPARENT) {
         rt.BlendEnable = TRUE;
-        rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.SrcBlend = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+        rt.DestBlend = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         rt.BlendOp = D3D12_BLEND_OP_ADD;
         rt.SrcBlendAlpha = D3D12_BLEND_ONE;
-        rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.DestBlendAlpha = (flags & F_ADDITIVE_BLEND) ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
         rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     } else {
         rt.SrcBlend = D3D12_BLEND_ONE;
@@ -1074,12 +1373,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
         rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     rt.LogicOp = D3D12_LOGIC_OP_NOOP;
-    d.DepthStencilState.DepthEnable = (flags & F_NO_DEPTH_TEST) ? FALSE : TRUE;
-    d.DepthStencilState.DepthWriteMask = (flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+    d.DepthStencilState.DepthEnable = (flags & F_DEPTH_ONLY) ? TRUE : ((flags & F_NO_DEPTH_TEST) ? FALSE : TRUE);
+    d.DepthStencilState.DepthWriteMask = (flags & F_DEPTH_ONLY) ? D3D12_DEPTH_WRITE_MASK_ALL :
+        ((flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL);
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     d.SampleMask = UINT_MAX;
-    d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.NumRenderTargets = (flags & F_DEPTH_ONLY) ? 0 : 1;
+    d.RTVFormats[0] = (flags & F_DEPTH_ONLY) ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
     d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     d.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
@@ -1099,8 +1399,7 @@ void WebappWindow::renderFrame() {
     const UINT frame = swap_->GetCurrentBackBufferIndex();
     if (fence_->GetCompletedValue() < frameFence_[frame]) {
         const auto waitStart = std::chrono::steady_clock::now();
-        fence_->SetEventOnCompletion(frameFence_[frame], fenceEvent_);
-        WaitForSingleObject(fenceEvent_, INFINITE);
+        waitForFenceValue(frameFence_[frame], "renderFrame/backbuffer reuse");
         fenceWaitMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
     }
     collectRetired();
@@ -1149,16 +1448,37 @@ void WebappWindow::renderFrame() {
     UINT64 boundTexture = ~0ull;
 
     UINT drawsThisFrame = 0;
+    UINT64 vertexWorkThisFrame = 0;
     for (const auto& pass : passes_) {
         const float* p = pass.data();
         const UINT lightCount = UINT(p[35]);
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
-        if (flags & P_CLEAR_COLOR) {
+        const std::uint32_t offscreenId = std::uint32_t(p[55]);
+        const bool offscreen = offscreenId != 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE passDsv = dsv;
+        if (offscreen) {
+            auto target = depthTargets_.find(offscreenId);
+            if (target == depthTargets_.end() || !target->second.resource) {
+                log("warn", "[depth] draw skipped: missing offscreen depth target");
+                continue;
+            }
+            passDsv = depthViewHandle(target->second.slot);
+            cmd_->OMSetRenderTargets(0, nullptr, FALSE, &passDsv);
+            D3D12_VIEWPORT pv{0, 0, float(target->second.width), float(target->second.height), 0, 1};
+            D3D12_RECT pr{0, 0, LONG(target->second.width), LONG(target->second.height)};
+            cmd_->RSSetViewports(1, &pv);
+            cmd_->RSSetScissorRects(1, &pr);
+        } else {
+            cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+            cmd_->RSSetViewports(1, &viewport);
+            cmd_->RSSetScissorRects(1, &scissor);
+        }
+        if ((flags & P_CLEAR_COLOR) && !offscreen) {
             const float clear[4] = {p[36], p[37], p[38], p[39]};
             cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
         }
-        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(passDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         // cbuffer Frame: view, projection, camera+lightCount, ambient+exposure, lights.
         float* fcb = reinterpret_cast<float*>(ring + ringOffset);
@@ -1178,12 +1498,27 @@ void WebappWindow::renderFrame() {
         ID3D12PipelineState* current = nullptr;
         D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
+            if (!native_three::safety::wholeNumber(d[0], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[1], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[2], native_three::safety::kMaxInstances) ||
+                !native_three::safety::wholeNumber(d[4], native_three::safety::kMaxGeometryIndices) ||
+                !native_three::safety::wholeNumber(d[5], native_three::safety::kMaxGeometryIndices) ||
+                !native_three::safety::wholeNumber(d[32], 16'777'216) ||
+                !native_three::safety::wholeNumber(d[48], 16)) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] rejected malformed draw parameters");
+                continue;
+            }
             auto g = geometries_.find(std::uint32_t(d[0]));
             if (g == geometries_.end() || !g->second.vertices) continue;
-            const UINT drawFlags = UINT(d[3]);
+            const UINT drawFlags = UINT(d[3]) | (offscreen ? F_DEPTH_ONLY : 0u);
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
+            const UINT available = g->second.indexCount ? g->second.indexCount : g->second.vertexCount;
+            if (!native_three::safety::validDraw(start, count, available, instanceCount)) {
+                if (invalidDrawWarnings_++ < 8) log("warn", "[dx12-safety] skipped draw beyond vertex/index buffer");
+                continue;
+            }
             D3D12_VERTEX_BUFFER_VIEW views[2] = {g->second.vbv, identityView_};
             if (d[1] > 0) {
                 auto it = instances_.find(std::uint32_t(d[1]));
@@ -1205,6 +1540,11 @@ void WebappWindow::renderFrame() {
                 views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
                 views[1].SizeInBytes = set.count * kInstanceStride;
                 views[1].StrideInBytes = kInstanceStride;
+            }
+            if (!native_three::safety::chargeDrawWork(vertexWorkThisFrame, count, instanceCount)) {
+                if (invalidDrawWarnings_++ < 8)
+                    log("warn", "[dx12-safety] skipped excessive per-frame vertex/instance workload");
+                continue;
             }
             ID3D12PipelineState* pso = pipeline(drawFlags, UINT(d[48]));
             if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
@@ -1245,6 +1585,13 @@ void WebappWindow::renderFrame() {
     }
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
+    // A depth-only K73 shadow pass binds zero colour targets. Restore the
+    // swap-chain RTV, viewport and scissor before composing HTML/CSS.
+    // Otherwise drawUi() executes with no colour target bound and the
+    // entire menu/HUD disappears as soon as shadow rendering succeeds.
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+    cmd_->RSSetViewports(1, &viewport);
+    cmd_->RSSetScissorRects(1, &scissor);
     if (uiReady_) {
         if (uiUpload_) uploadUi(frame);
         if (uiVisible_) drawUi(frame);
@@ -1254,13 +1601,33 @@ void WebappWindow::renderFrame() {
     cmd_->ResourceBarrier(1, &barrier);
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
+    const UINT64 serial = ++submissionSerial_;
+    if (flightLog_) {
+        char state[280];
+        std::snprintf(state, sizeof state,
+            "[dx12-flight] before-submit #%llu: backbuffer=%u passes=%zu draws=%u vertexWork=%llu geometries=%zu instances=%zu textureUploadMiB=%zu",
+            static_cast<unsigned long long>(serial), frame, passes_.size(), drawsThisFrame,
+            static_cast<unsigned long long>(vertexWorkThisFrame),
+            geometries_.size(), instances_.size(), textureBytes_ / (1024 * 1024));
+        log("info", state);
+    }
     queue_->ExecuteCommandLists(1, lists);
     const auto presentStart = std::chrono::steady_clock::now();
     const HRESULT present = swap_->Present(1, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
-    if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
+    check(present, "Present swap chain");
     frameFence_[frame] = ++fenceValue_;
-    queue_->Signal(fence_.Get(), frameFence_[frame]);
+    check(queue_->Signal(fence_.Get(), frameFence_[frame]), "Signal frame fence");
+    const HRESULT removed = device_->GetDeviceRemovedReason();
+    if (FAILED(removed)) check(removed, "GPU device lost after submission");
+    if (flightLog_) {
+        char state[160];
+        std::snprintf(state, sizeof state,
+                      "[dx12-flight] submitted #%llu: fence=%llu Present OK (GPU completion not implied)",
+                      static_cast<unsigned long long>(serial),
+                      static_cast<unsigned long long>(frameFence_[frame]));
+        log("info", state);
+    }
 }
 
 void WebappWindow::updateTitle(double fps) {
@@ -1321,17 +1688,21 @@ void WebappWindow::keyEvent(bool down, WPARAM vk, LPARAM lp) {
 LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_SIZE:
+        uiCadence_.force();
         minimized_ = wp == SIZE_MINIMIZED;
         if (!minimized_) resize(LOWORD(lp), HIWORD(lp));
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
+        uiCadence_.force();
         if (wp == VK_F4 && GetKeyState(VK_MENU) < 0) break; // Alt+F4 closes
         keyEvent(true, wp, lp);
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
+        uiCadence_.force();
         keyEvent(false, wp, lp);
         return 0;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
+        uiCadence_.force();
         SetCapture(hwnd);
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("down", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONDOWN ? 0 : msg == WM_MBUTTONDOWN ? 1 : 2);
@@ -1340,6 +1711,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+        uiCadence_.force();
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("up", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1351,6 +1723,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
         return 0;
     case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
+        uiCadence_.force();
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         const double delta = -double(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 100.0;
@@ -1363,8 +1736,8 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ ? nullptr : cursor_); return TRUE; }
         break;
-    case WM_SETFOCUS: host_.focus(true); return 0;
-    case WM_KILLFOCUS: host_.focus(false); return 0;
+    case WM_SETFOCUS: uiCadence_.force(); host_.focus(true); return 0;
+    case WM_KILLFOCUS: uiCadence_.force(); host_.focus(false); return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1376,9 +1749,9 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f,%d\n",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
-                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n);
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n, p.uiTicks);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1394,7 +1767,7 @@ int WebappWindow::run(HINSTANCE instance) {
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg,ui_ticks\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
@@ -1436,6 +1809,20 @@ int WebappWindow::run(HINSTANCE instance) {
     width_ = std::max<LONG>(1, client.right);
     height_ = std::max<LONG>(1, client.bottom);
     initDevice();
+
+    // Experimental UI/3D decoupling: 0 restores the exact legacy UI cadence.
+    // The 3D frame, timers and game rAF remain unrestricted by this setting.
+    double uiHz = 30.0;
+    char uiHzText[32] = {};
+    const DWORD uiHzChars = GetEnvironmentVariableA("NATIVE_THREE_UI_HZ", uiHzText, DWORD(sizeof(uiHzText)));
+    if (uiHzChars > 0 && uiHzChars < sizeof(uiHzText)) {
+        char* tail = nullptr;
+        const double value = std::strtod(uiHzText, &tail);
+        if (tail && tail != uiHzText && !*tail && std::isfinite(value) && value >= 0.0 && value <= 240.0)
+            uiHz = value;
+    }
+    uiCadence_.setHz(uiHz);
+    log("info", "[ui-cadence] " + std::to_string(uiHz) + " Hz (0 = legacy, input events force refresh)");
 
     gCrashPhase = "loading index.html and the game's JavaScript";
     log("info", "Starting JavaScript");
@@ -1489,14 +1876,17 @@ int WebappWindow::run(HINSTANCE instance) {
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
+        pendingPassFloats_ = 0;
         gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
-        host_.frame(ms);
+        const bool uiTick = uiCadence_.due(ms);
+        host_.frame(ms, uiTick);
         reload = host_.takeReload();
         if (reload) continue;
         const auto tJs = std::chrono::steady_clock::now();
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
-        if (uiReady_) {
+        if (uiReady_ && uiTick) {
+            perf_.uiTicks++;
             gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
             if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
             uiVisible_ = !ui_.empty();
