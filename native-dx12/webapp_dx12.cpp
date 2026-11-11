@@ -45,6 +45,7 @@ using native_three::WebappHost;
 namespace {
 
 constexpr UINT kFrameCount = 2;
+constexpr UINT kTimestampsPerFrame = 2;
 constexpr UINT kVertexFloats = 12;                    // position, normal, colour rgba, uv
 constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
@@ -218,6 +219,8 @@ public:
 private:
     void check(HRESULT hr, const char* what);
     void initDevice();
+    void initGpuTiming();
+    void collectGpuTiming();
     void createSizeDependent();
     void releaseSizeDependent();
     void resize(UINT width, UINT height);
@@ -264,6 +267,10 @@ private:
     HANDLE fenceEvent_ = nullptr;
     UINT64 fenceValue_ = 0;
     UINT64 frameFence_[kFrameCount] = {};
+    ComPtr<ID3D12QueryHeap> gpuQueries_;
+    ComPtr<ID3D12Resource> gpuQueryReadback_;
+    UINT64 gpuTimestampFrequency_ = 0;
+    bool gpuTimingPending_[kFrameCount] = {};
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3DBlob> vs_, ps_;
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
@@ -294,6 +301,8 @@ private:
         int frames = 0;
         double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
+        double gpuMs = 0, gpuMaxMs = 0;
+        unsigned gpuSamples = 0;
         int forced = 0, full = 0, partial = 0, rasters = 0;
     } perf_;
     std::FILE* perfCsv_ = nullptr;
@@ -405,6 +414,9 @@ void WebappWindow::initDevice() {
     D3D12_COMMAND_QUEUE_DESC q{};
     q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     check(device_->CreateCommandQueue(&q, IID_PPV_ARGS(&queue_)), "Create command queue");
+    wchar_t gpuTimingFlag[2] = {};
+    if (perfCsv_ && GetEnvironmentVariableW(L"NT_GPU_TIMING", gpuTimingFlag, 2) == 1 && gpuTimingFlag[0] == L'1')
+        initGpuTiming();
 
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = width_;
@@ -494,6 +506,48 @@ void WebappWindow::initDevice() {
 }
 
 // ------------------------------------------------------------- textures
+void WebappWindow::initGpuTiming() {
+    D3D12_QUERY_HEAP_DESC queries{};
+    queries.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    queries.Count = kFrameCount * kTimestampsPerFrame;
+    const auto heap = heapProps(D3D12_HEAP_TYPE_READBACK);
+    const auto buffer = bufferDesc(queries.Count * sizeof(UINT64));
+    if (FAILED(queue_->GetTimestampFrequency(&gpuTimestampFrequency_)) || !gpuTimestampFrequency_ ||
+        FAILED(device_->CreateQueryHeap(&queries, IID_PPV_ARGS(&gpuQueries_))) ||
+        FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&gpuQueryReadback_)))) {
+        gpuQueries_.Reset();
+        log("warn", "[frame-perf] GPU timestamps unavailable");
+    }
+}
+
+void WebappWindow::collectGpuTiming() {
+    if (!gpuQueries_) return;
+    const UINT64 completed = fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) return; // Device removed.
+
+    // Each back buffer has its own query pair. Only read pairs whose submission
+    // fence has completed. Timing never waits for an additional fence.
+    for (UINT frame = 0; frame < kFrameCount; frame++) {
+        if (!gpuTimingPending_[frame] || frameFence_[frame] > completed) continue;
+        gpuTimingPending_[frame] = false;
+        const UINT query = frame * kTimestampsPerFrame;
+        const D3D12_RANGE range{query * sizeof(UINT64), (query + kTimestampsPerFrame) * sizeof(UINT64)};
+        void* data = nullptr;
+        if (FAILED(gpuQueryReadback_->Map(0, &range, &data))) continue;
+        const auto* ticks = static_cast<const UINT64*>(data);
+        const UINT64 start = ticks[query], end = ticks[query + 1];
+        const D3D12_RANGE noWrites{0, 0};
+        gpuQueryReadback_->Unmap(0, &noWrites);
+        if (end <= start) continue;
+        const double ms = 1000.0 * (end - start) / gpuTimestampFrequency_;
+        perf_.gpuMs += ms;
+        perf_.gpuMaxMs = std::max(perf_.gpuMaxMs, ms);
+        perf_.gpuSamples++;
+    }
+}
+
 void WebappWindow::initTextures() {
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
     heap.NumDescriptors = kMaxTextures;
@@ -1103,6 +1157,7 @@ void WebappWindow::renderFrame() {
         WaitForSingleObject(fenceEvent_, INFINITE);
         fenceWaitMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
     }
+    collectGpuTiming();
     collectRetired();
 
     // Size the per-frame constant ring for this frame's passes and draws.
@@ -1122,6 +1177,8 @@ void WebappWindow::renderFrame() {
 
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
+    const UINT query = frame * kTimestampsPerFrame;
+    if (gpuQueries_) cmd_->EndQuery(gpuQueries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query);
     recordTextureCopies();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1252,6 +1309,11 @@ void WebappWindow::renderFrame() {
 
     std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
     cmd_->ResourceBarrier(1, &barrier);
+    if (gpuQueries_) {
+        cmd_->EndQuery(gpuQueries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query + 1);
+        cmd_->ResolveQueryData(gpuQueries_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query, kTimestampsPerFrame,
+                               gpuQueryReadback_.Get(), query * sizeof(UINT64));
+    }
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);
@@ -1260,7 +1322,8 @@ void WebappWindow::renderFrame() {
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
     if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
     frameFence_[frame] = ++fenceValue_;
-    queue_->Signal(fence_.Get(), frameFence_[frame]);
+    const HRESULT signal = queue_->Signal(fence_.Get(), frameFence_[frame]);
+    gpuTimingPending_[frame] = gpuQueries_ && SUCCEEDED(signal);
 }
 
 void WebappWindow::updateTitle(double fps) {
@@ -1376,9 +1439,13 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
                      p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n);
+        if (p.gpuSamples)
+            std::fprintf(perfCsv_, ",%u,%.3f,%.3f\n", p.gpuSamples, p.gpuMs / p.gpuSamples, p.gpuMaxMs);
+        else
+            std::fputs(",0,,\n", perfCsv_);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1394,7 +1461,8 @@ int WebappWindow::run(HINSTANCE instance) {
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg,"
+                   "gpu_timing_samples,gpu_work_ms_avg,gpu_work_ms_max\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
