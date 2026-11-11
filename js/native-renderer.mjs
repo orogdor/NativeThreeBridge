@@ -119,6 +119,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._textures = new WeakMap();   // THREE.Source -> { id, version, ok }
       this._patches = new WeakMap();    // material -> what its shader patch does to colours
       this._maskedGeometries = new WeakMap(); // geometry -> cached RGBA attribute-mask variants
+      this._skinned = new WeakMap();    // SkinnedMesh -> CPU-skinned geometry uploaded under its own id
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
       this._opaque = [];
       this._transparent = [];
@@ -255,6 +256,63 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
       Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
       return record;
+    }
+
+    // SkinnedMesh: the vertex shader's skinning (skinning_vertex /
+    // skinnormal_vertex) done on the CPU once per frame, uploaded as an
+    // ordinary geometry owned by this mesh. Positions stay in the mesh's
+    // local space, so matrixWorld is applied as usual.
+    _skinnedRecord(mesh) {
+      const geometry = mesh.geometry, skeleton = mesh.skeleton;
+      const base = this._geometryRecord(geometry);
+      if (!base) return null;
+      this._skinned ||= new WeakMap();
+      let rec = this._skinned.get(mesh);
+      if (!rec || rec.geometry !== geometry) {
+        if (rec) this._releaseSkinned(mesh, rec);
+        rec = { id: nextGeometryId++, geometry, key: '', bones: null, bind: null, frame: -1 };
+        this._skinned.set(mesh, rec);
+        this.info.memory.geometries++;
+        rec.onDispose = () => this._releaseSkinned(mesh, rec);
+        geometry.addEventListener('dispose', rec.onDispose);
+      }
+      const frame = this.info.render.frame;
+      if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+      const position = geometry.attributes.position, normal = geometry.attributes.normal;
+      const skinIndex = geometry.attributes.skinIndex, skinWeight = geometry.attributes.skinWeight;
+      if (rec.key !== base.key || rec.skinIndex !== skinIndex || rec.skinWeight !== skinWeight) {
+        rec.key = base.key; rec.skinIndex = skinIndex; rec.skinWeight = skinWeight;
+        rec.srcPos = toFloat3(position);
+        rec.srcNrm = normal ? toFloat3(normal) : computeNormals(THREE, position, geometry.index);
+        const n = position.count;
+        rec.idx = new Uint16Array(n * 4); rec.wgt = new Float32Array(n * 4);
+        for (let i = 0; i < n; i++) {
+          const o = i * 4;
+          rec.idx[o] = skinIndex.getX(i); rec.idx[o + 1] = skinIndex.getY(i); rec.idx[o + 2] = skinIndex.getZ(i); rec.idx[o + 3] = skinIndex.getW(i);
+          rec.wgt[o] = skinWeight.getX(i); rec.wgt[o + 1] = skinWeight.getY(i); rec.wgt[o + 2] = skinWeight.getZ(i); rec.wgt[o + 3] = skinWeight.getW(i);
+        }
+        rec.pos = new Float32Array(n * 3); rec.nrm = new Float32Array(n * 3);
+        rec.colors = geometry.attributes.color ? (geometry.attributes.color.itemSize === 4 ? toFloat4(geometry.attributes.color) : toFloat3(geometry.attributes.color)) : null;
+        rec.uvs = geometry.attributes.uv ? toFloat2(geometry.attributes.uv) : null;
+        rec.indices = geometry.index ? (geometry.index.array instanceof Uint32Array ? geometry.index.array : Uint32Array.from(geometry.index.array)) : null;
+        rec.bones = null;
+      }
+      const boneMatrices = skeleton.boneMatrices;
+      const bind = mesh.bindMatrix.elements;
+      if (rec.bones && rec.bones.length === boneMatrices.length && equalArrays(rec.bones, boneMatrices) && equalArrays(rec.bind, bind)) {
+        return Object.assign(rec, { hasColors: !!rec.colors, hasUvs: !!rec.uvs, vertexCount: position.count, indexCount: base.indexCount });
+      }
+      rec.bones = Float32Array.from(boneMatrices);
+      rec.bind = Float32Array.from(bind);
+      skinVertices(rec, boneMatrices, mesh.bindMatrix, mesh.bindMatrixInverse, THREE);
+      nt.uploadGeometry(rec.id, rec.pos, rec.nrm, rec.colors, rec.indices, rec.uvs);
+      return Object.assign(rec, { hasColors: !!rec.colors, hasUvs: !!rec.uvs, vertexCount: position.count, indexCount: base.indexCount });
+    }
+    _releaseSkinned(mesh, rec) {
+      rec.geometry.removeEventListener('dispose', rec.onDispose);
+      if (this._skinned.get(mesh) === rec) this._skinned.delete(mesh);
+      this.info.memory.geometries--;
+      nt.releaseGeometry(rec.id);
     }
 
     // A common onBeforeCompile pattern passes a float vertex attribute through a
@@ -617,10 +675,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!geometry || !geometry.isBufferGeometry || !geometry.attributes.position) return;
       if (mesh.isInstancedMesh && mesh.count === 0) return;
       if (mesh.frustumCulled && !_frustum.intersectsObject(mesh)) return;
-      if (mesh.isSkinnedMesh) unsupported('Skinned meshes (SkinnedMesh animation)', 'drawn in bind pose');
       if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
-      const record = this._geometryRecord(geometry);
+      const skinnable = mesh.isSkinnedMesh && mesh.skeleton && geometry.attributes.skinIndex && geometry.attributes.skinWeight;
+      if (mesh.isSkinnedMesh && !skinnable) unsupported('SkinnedMesh without skeleton or skin attributes', 'drawn in bind pose');
+      const record = skinnable ? this._skinnedRecord(mesh) : this._geometryRecord(geometry);
       if (!record) return;
       if (mesh.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender) mesh.onBeforeRender(this, null, camera, geometry, mesh.material, null);
       const instances = mesh.isInstancedMesh ? this._instanceRecord(mesh) : null;
@@ -967,6 +1026,47 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   }
 
   return { NativeRenderer };
+}
+
+function equalArrays(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Linear blend skinning exactly as Three.js' skinning shader chunks:
+// p' = bindInverse * sum(w_i * bone_i * bind * p), n' = (bindInverse * sum(w_i * bone_i) * bind) * n.
+// Each bone becomes M_i = bindInverse * bone_i * bind once per frame.
+export function skinVertices(rec, boneMatrices, bindMatrix, bindMatrixInverse, THREE) {
+  const bones = boneMatrices.length / 16;
+  if (!rec.combined || rec.combined.length !== bones * 16) rec.combined = new Float32Array(bones * 16);
+  const m = rec.combined, tmp = new THREE.Matrix4();
+  for (let b = 0; b < bones; b++) {
+    tmp.fromArray(boneMatrices, b * 16).premultiply(bindMatrixInverse).multiply(bindMatrix);
+    m.set(tmp.elements, b * 16);
+  }
+  const src = rec.srcPos, srcN = rec.srcNrm, idx = rec.idx, wgt = rec.wgt, pos = rec.pos, nrm = rec.nrm;
+  const n = src.length / 3;
+  for (let i = 0; i < n; i++) {
+    const x = src[i * 3], y = src[i * 3 + 1], z = src[i * 3 + 2];
+    const nx = srcN[i * 3], ny = srcN[i * 3 + 1], nz = srcN[i * 3 + 2];
+    let px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0;
+    for (let k = 0; k < 4; k++) {
+      const w = wgt[i * 4 + k];
+      if (w === 0) continue;
+      const o = idx[i * 4 + k] * 16;
+      if (o >= m.length) continue;
+      px += w * (m[o] * x + m[o + 4] * y + m[o + 8] * z + m[o + 12]);
+      py += w * (m[o + 1] * x + m[o + 5] * y + m[o + 9] * z + m[o + 13]);
+      pz += w * (m[o + 2] * x + m[o + 6] * y + m[o + 10] * z + m[o + 14]);
+      qx += w * (m[o] * nx + m[o + 4] * ny + m[o + 8] * nz);
+      qy += w * (m[o + 1] * nx + m[o + 5] * ny + m[o + 9] * nz);
+      qz += w * (m[o + 2] * nx + m[o + 6] * ny + m[o + 10] * nz);
+    }
+    pos[i * 3] = px; pos[i * 3 + 1] = py; pos[i * 3 + 2] = pz;
+    const len = Math.hypot(qx, qy, qz) || 1;
+    nrm[i * 3] = qx / len; nrm[i * 3 + 1] = qy / len; nrm[i * 3 + 2] = qz / len;
+  }
 }
 
 // Any BufferAttribute (interleaved, normalized, integer, itemSize 2..4) ->

@@ -53,3 +53,77 @@ test('the draw record carries normal map id and scale in its last three floats',
   assert.match(hlsl, new RegExp(`F_NORMAL_MAP = ${DrawFlags.NORMAL_MAP}\\b`));
   assert.ok(hlsl.length < 16000, 'shader stays below the MSVC string literal limit');
 });
+
+// Column-major 4x4 with the three Matrix4 methods skinVertices uses.
+class Mat4 {
+  constructor(e) { this.elements = e ? Float64Array.from(e) : Float64Array.from([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]); }
+  fromArray(a, o = 0) { for (let i = 0; i < 16; i++) this.elements[i] = a[o + i]; return this; }
+  static mul(a, b) {
+    const r = new Float64Array(16);
+    for (let c = 0; c < 4; c++) for (let row = 0; row < 4; row++) {
+      let v = 0;
+      for (let k = 0; k < 4; k++) v += a[k * 4 + row] * b[c * 4 + k];
+      r[c * 4 + row] = v;
+    }
+    return r;
+  }
+  multiply(m) { this.elements = Mat4.mul(this.elements, m.elements); return this; }
+  premultiply(m) { this.elements = Mat4.mul(m.elements, this.elements); return this; }
+}
+const translate = (x, y, z) => new Mat4([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+const rotZ90 = new Mat4([0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+
+test('CPU skinning matches Three.js linear blend skinning', async () => {
+  const { skinVertices } = await import('../js/native-renderer.mjs');
+  const rec = {
+    srcPos: new Float32Array([1, 0, 0, 0, 2, 0]), srcNrm: new Float32Array([1, 0, 0, 1, 0, 0]),
+    idx: new Uint16Array([0, 1, 0, 0, 1, 0, 0, 0]), wgt: new Float32Array([0.5, 0.5, 0, 0, 1, 0, 0, 0]),
+    pos: new Float32Array(6), nrm: new Float32Array(6),
+  };
+  const bones = new Float32Array(32);
+  bones.set(new Mat4().elements, 0);
+  bones.set(rotZ90.elements, 16);
+  skinVertices(rec, bones, new Mat4(), new Mat4(), { Matrix4: Mat4 });
+  // vertex 0: half identity, half rotated -> ((1,0,0) + (0,1,0)) / 2
+  assert.deepEqual(Array.from(rec.pos.slice(0, 3)).map((v) => +v.toFixed(5)), [0.5, 0.5, 0]);
+  // vertex 1: fully rotated (0,2,0) -> (-2,0,0); its normal (1,0,0) -> (0,1,0)
+  assert.deepEqual(Array.from(rec.pos.slice(3)).map((v) => +v.toFixed(5)), [-2, 0, 0]);
+  assert.deepEqual(Array.from(rec.nrm.slice(3)).map((v) => +v.toFixed(5)), [0, 1, 0]);
+
+  // A bind matrix moves the vertex into bone space and back: bindInverse * bone * bind.
+  const rec2 = { ...rec, pos: new Float32Array(6), nrm: new Float32Array(6), combined: null };
+  const bones2 = new Float32Array(32);
+  bones2.set(translate(0, 0, 3).elements, 0);
+  bones2.set(translate(0, 0, 3).elements, 16);
+  skinVertices(rec2, bones2, translate(5, 0, 0), translate(-5, 0, 0), { Matrix4: Mat4 });
+  assert.deepEqual(Array.from(rec2.pos.slice(0, 3)).map((v) => +v.toFixed(5)), [1, 0, 3]);
+});
+
+test('a skinned mesh is re-uploaded only when its bones move', () => {
+  const uploads = [];
+  class Unused {}
+  const { NativeRenderer } = createNativeRendererClasses({ Color: Unused, Matrix4: Mat4, Vector3: Unused, Frustum: Unused, Quaternion: Unused },
+    { uploadGeometry: (id, p) => uploads.push([id, Array.from(p)]), releaseGeometry() {} }, null, null);
+  const renderer = Object.create(NativeRenderer.prototype);
+  renderer.info = { render: { frame: 1 }, memory: { geometries: 0 } };
+  renderer._geometryRecord = () => ({ key: 'k', indexCount: 0 });
+  const attr = (values, itemSize) => ({ count: values.length / itemSize, itemSize, array: Float32Array.from(values),
+    getX: (i) => values[i * itemSize], getY: (i) => values[i * itemSize + 1], getZ: (i) => values[i * itemSize + 2], getW: (i) => values[i * itemSize + 3] });
+  const geometry = { attributes: { position: attr([1, 0, 0], 3), normal: attr([0, 1, 0], 3), skinIndex: attr([0, 0, 0, 0], 4), skinWeight: attr([1, 0, 0, 0], 4) },
+    index: null, addEventListener() {}, removeEventListener() {} };
+  const boneMatrices = Float32Array.from(translate(0, 2, 0).elements);
+  let updates = 0;
+  const skeleton = { boneMatrices, update() { updates++; } };
+  const mesh = { geometry, skeleton, bindMatrix: new Mat4(), bindMatrixInverse: new Mat4() };
+  const rec = renderer._skinnedRecord(mesh);
+  assert.deepEqual(uploads.at(-1)[1], [1, 2, 0]);
+  assert.equal(rec.vertexCount, 1);
+  renderer.info.render.frame = 2;
+  renderer._skinnedRecord(mesh);
+  assert.equal(uploads.length, 1, 'unchanged pose: no upload');
+  assert.equal(updates, 2, 'skeleton updated once per frame');
+  boneMatrices.set(translate(0, 5, 0).elements);
+  renderer.info.render.frame = 3;
+  renderer._skinnedRecord(mesh);
+  assert.deepEqual(uploads.at(-1)[1], [1, 5, 0]);
+});

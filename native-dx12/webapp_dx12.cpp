@@ -90,8 +90,17 @@ D3D12_RESOURCE_DESC bufferDesc(UINT64 bytes) {
     return d;
 }
 
+// An upload buffer a geometry used before, free again once `fence` completes.
+// Geometry re-sent every frame (CPU-skinned characters) reuses these instead
+// of creating a new committed resource per upload.
+struct PooledBuffer {
+    ComPtr<ID3D12Resource> resource;
+    UINT64 bytes = 0, fence = 0;
+};
 struct Geometry {
     ComPtr<ID3D12Resource> vertices, indices;
+    UINT64 vertexBytes = 0, indexBytes = 0;
+    std::vector<PooledBuffer> vertexPool, indexPool;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
     D3D12_INDEX_BUFFER_VIEW ibv{};
     UINT vertexCount = 0, indexCount = 0;
@@ -230,6 +239,9 @@ private:
     void resize(UINT width, UINT height);
     void waitForGpu();
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
+    void replaceBuffer(ComPtr<ID3D12Resource>& current, UINT64& currentBytes, std::vector<PooledBuffer>& pool,
+                       const void* data, UINT64 bytes);
+    void retirePool(std::vector<PooledBuffer>& pool);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
@@ -979,6 +991,41 @@ ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes
     return buffer;
 }
 
+void WebappWindow::replaceBuffer(ComPtr<ID3D12Resource>& current, UINT64& currentBytes, std::vector<PooledBuffer>& pool,
+                                 const void* data, UINT64 bytes) {
+    if (current) pool.push_back({current, currentBytes, fenceValue_ + kFrameCount});
+    current.Reset();
+    currentBytes = 0;
+    if (!bytes) return;
+    const UINT64 done = fence_ ? fence_->GetCompletedValue() : ~0ull;
+    for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->fence > done || it->bytes != bytes) continue;
+        current = it->resource;
+        pool.erase(it);
+        void* mapped = nullptr;
+        D3D12_RANGE none{0, 0};
+        check(current->Map(0, &none, &mapped), "Map pooled buffer");
+        std::memcpy(mapped, data, size_t(bytes));
+        current->Unmap(0, nullptr);
+        currentBytes = bytes;
+        break;
+    }
+    if (!current) {
+        current = uploadBuffer(data, bytes);
+        currentBytes = bytes;
+    }
+    // Keep only a few spares; older ones go through the normal retire list.
+    while (pool.size() > kFrameCount + 1) {
+        retired_.push_back({pool.front().resource, pool.front().fence});
+        pool.erase(pool.begin());
+    }
+}
+
+void WebappWindow::retirePool(std::vector<PooledBuffer>& pool) {
+    for (auto& b : pool) retired_.push_back({b.resource, b.fence});
+    pool.clear();
+}
+
 void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
     if (resource) retired_.push_back({resource, fenceValue_ + kFrameCount});
     resource.Reset();
@@ -1015,16 +1062,16 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
         o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
     }
     Geometry& g = geometries_[id];
-    retire(g.vertices);
-    retire(g.indices);
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
-    g.vertices = uploadBuffer(interleaved.data(), interleaved.size() * sizeof(float));
+    const UINT64 vertexBytes = UINT64(interleaved.size()) * sizeof(float);
+    replaceBuffer(g.vertices, g.vertexBytes, g.vertexPool, interleaved.data(), vertexBytes);
+    if (!g.vertices) return;
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
-    g.vbv.SizeInBytes = UINT(interleaved.size() * sizeof(float));
+    g.vbv.SizeInBytes = UINT(vertexBytes);
     g.vbv.StrideInBytes = kVertexStride;
-    if (idx && indexCount) {
-        g.indices = uploadBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t));
+    replaceBuffer(g.indices, g.indexBytes, g.indexPool, idx, idx && indexCount ? UINT64(indexCount) * sizeof(std::uint32_t) : 0);
+    if (g.indices) {
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);
         g.ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -1036,6 +1083,8 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
     if (it == geometries_.end()) return;
     retire(it->second.vertices);
     retire(it->second.indices);
+    retirePool(it->second.vertexPool);
+    retirePool(it->second.indexPool);
     geometries_.erase(it);
 }
 
