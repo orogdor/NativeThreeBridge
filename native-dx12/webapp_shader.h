@@ -27,10 +27,12 @@ cbuffer Draw : register(b1) {
     float4 gReflection; // sky RGB and blend strength
     float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
     float4 gColorStage; // live scalar uniforms from the translated color stage
+    float4 gStage;      // x: colour stage texture is flipY
 };
 Texture2D gMap : register(t0);
 Texture2D gNormalMap : register(t1);
 Texture2D<float> gShadowMap : register(t2);
+Texture2D gPatchMap : register(t3);   // the colour stage's own sampler2D
 SamplerComparisonState gShadowCmp : register(s3);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
@@ -156,6 +158,11 @@ void ShadowPS(VSOut i) {
     if (a < gUvU.w) discard;
 }
 
+float4 ntSamplePatch(float2 uv) {
+    if (gStage.x > 0) uv.y = 1 - uv.y;   // flipY images: GL v runs bottom-up
+    return gPatchMap.SampleLevel(gClamp, uv, 0);
+}
+
 // NT_COLOR_PATCH_FUNCTION
 
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
@@ -171,7 +178,8 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         alphaOut *= t.a;
     }
 #ifdef NT_COLOR_PATCH
-    albedo = nativeColorStage(i.localPosition, i.localNormal, float4(albedo, alphaOut));
+    { float4 staged = nativeColorStage(i.localPosition, i.localNormal, i.uv, float4(albedo, alphaOut));
+      albedo = staged.rgb; alphaOut = staged.a; }
 #endif
     // material.alphaTest: with MSAA alpha-to-coverage the cut-out edge is a
     // sharpened alpha ramp one pixel wide instead of a hard discard.

@@ -904,7 +904,22 @@
       }
       case 'word-wrap': set('overflow-wrap', v); return true;
       case 'columns': case 'column-count': case 'list-style': case 'outline': case 'transition': case 'animation':
-      case 'mask': case '-webkit-mask': case 'border-image': case 'scroll-margin': case 'scroll-padding':
+      case 'border-image': {
+        // <source> || <slice> [/ <width> [/ <outset>]] || <repeat>
+        const longhands = ['border-image-source', 'border-image-slice', 'border-image-width', 'border-image-outset', 'border-image-repeat'];
+        if (global || v.trim().toLowerCase() === 'none') { if (global) return all(longhands); set('border-image-source', 'none'); return true; }
+        let source = 'none';
+        const rest = v.replace(/(?:url|(?:repeating-)?(?:linear|radial|conic)-gradient)\((?:[^()]|\([^()]*\))*\)/i, (m) => { source = m; return ' '; });
+        const repeats = [];
+        const parts = rest.replace(/\b(stretch|repeat|round|space)\b/gi, (m) => { repeats.push(m.toLowerCase()); return ' '; }).split('/').map((x) => x.trim());
+        set('border-image-source', source);
+        set('border-image-slice', parts[0] || '100%');
+        set('border-image-width', parts[1] || '1');
+        set('border-image-outset', parts[2] || '0');
+        set('border-image-repeat', repeats.join(' ') || 'stretch');
+        return true;
+      }
+      case 'mask': case '-webkit-mask': case 'scroll-margin': case 'scroll-padding':
         return true; // not drawn
     }
     return false;
@@ -1438,6 +1453,7 @@ center{text-align:center}
   function inlineDecorated(box) {
     const cs = box.cs;
     if (lower(cs['background-image']) && lower(cs['background-image']) !== 'none') return true;
+    if (cs['border-image-source'] && lower(cs['border-image-source']) !== 'none') return true;
     const bg = parseColor(cs['background-color']);
     if (bg && bg[3] > 0) return true;
     for (const s of SIDES) {
@@ -2567,6 +2583,7 @@ center{text-align:center}
     if (b.anonText) return false;
     const cs = b.cs;
     if (b.pos !== 'static') return true;
+    if (cs['clip-path'] && lower(cs['clip-path']) !== 'none') return true;
     const zi = lower(cs['z-index']);
     if (zi && zi !== 'auto' && b.parent && (b.parent.inner === 'flex' || b.parent.inner === 'grid')) return true;
     if (b.alpha < 1 && (!b.parent || b.parent.alpha > b.alpha)) return true;
@@ -2685,7 +2702,45 @@ center{text-align:center}
     const c = parseColor(cs['background-color']);
     return (c && c[3] > 0) || (lower(cs['background-image']) && lower(cs['background-image']) !== 'none');
   }
+  // clip-path on the border box: inset() (with round), circle() and
+  // ellipse() exactly as a rounded rectangle; polygon()/path() by their bounds.
+  function clipPathRect(b) {
+    const v = b.cs && b.cs['clip-path'];
+    if (!v || lower(v) === 'none' || b.anonText) return null;
+    const m = /^\s*(inset|circle|ellipse|polygon)\(([^]*)\)/i.exec(v);
+    if (!m) return null;
+    const kind = m[1].toLowerCase(), args = m[2].trim(), fs = b.cs.__fs;
+    const len = (t, ref) => { const n = px(t, ref, fs); return Number.isNaN(n) ? 0 : n; };
+    if (kind === 'inset') {
+      const [box, round] = args.split(/\s+round\s+/i);
+      const t = splitTop(box, ' ').filter(Boolean);
+      const [it, ir, ib, il] = [t[0], t[1] ?? t[0], t[2] ?? t[0], t[3] ?? t[1] ?? t[0]].map((x, i) => len(x, i % 2 ? b.w : b.h));
+      const rr = round ? len(splitTop(round, ' ')[0], Math.min(b.w, b.h)) : 0;
+      return { x: b.x + il, y: b.y + it, w: Math.max(0, b.w - il - ir), h: Math.max(0, b.h - it - ib), r: rr };
+    }
+    const [shape, at] = args.split(/\s+at\s+|^at\s+/i);
+    const [cx, cy] = bgPos(at || '50% 50%', [b.w, b.h], [0, 0]);
+    if (kind === 'circle') {
+      const t = (shape || '').trim();
+      const ref = Math.hypot(b.w, b.h) / Math.SQRT2;
+      const R = !t || /closest-side/i.test(t) ? Math.min(cx, cy, b.w - cx, b.h - cy) : /farthest-side/i.test(t) ? Math.max(cx, cy, b.w - cx, b.h - cy) : len(t, ref);
+      return { x: b.x + cx - R, y: b.y + cy - R, w: 2 * R, h: 2 * R, r: R };
+    }
+    if (kind === 'ellipse') {
+      const t = splitTop((shape || '').trim(), ' ').filter(Boolean);
+      const rx = t[0] && !/side/i.test(t[0]) ? len(t[0], b.w) : Math.min(cx, b.w - cx);
+      const ry = t[1] && !/side/i.test(t[1]) ? len(t[1], b.h) : Math.min(cy, b.h - cy);
+      return { x: b.x + cx - rx, y: b.y + cy - ry, w: 2 * rx, h: 2 * ry, r: Math.min(rx, ry) };
+    }
+    const pts = splitTop(args.replace(/^\s*(nonzero|evenodd)\s*,/i, ''), ',').map((p) => splitTop(p.trim(), ' '));
+    if (!pts.length) return null;
+    const xs = pts.map((p) => len(p[0], b.w)), ys = pts.map((p) => len(p[1] ?? '0', b.h));
+    const x0 = Math.min(...xs), y0 = Math.min(...ys);
+    return { x: b.x + x0, y: b.y + y0, w: Math.max(...xs) - x0, h: Math.max(...ys) - y0, r: 0 };
+  }
   function paintContext(b, clipOuter) {
+    const shape = clipPathRect(b);
+    if (shape) clipOuter = clipIntersect(clipOuter, shape);
     paintOwn(b, clipOuter);
     b._clipInner = innerClip(b, clipOuter);
     const neg = [], zero = [], pos = [], flow = [];
@@ -2741,9 +2796,10 @@ center{text-align:center}
       }
       const bgCs = b === viewportRoot && b._propagatedBg ? b._propagatedBg : b._bgOnRoot ? null : cs;
       if (bgCs) paintBackground(b, bgCs, r, clip, alpha, current);
-      // border
+      // border (border-image replaces the styled border when its image is ready)
       const w = [b.bt, b.br, b.bb, b.bl];
-      if (w.some((v) => v > 0)) {
+      if (paintBorderImage(b, cs, clip, alpha)) { /* drawn */ }
+      else if (w.some((v) => v > 0)) {
         const cols = SIDES.map((s) => parseColor(cs[`border-${s}-color`] ?? 'currentcolor', current) || current);
         if (cols.some((c, i) => w[i] > 0 && c[3] > 0)) prim(clip, [OP.BORDER, b.x, b.y, b.w, b.h, ...r, ...w, ...cols.flatMap((c) => colorWithAlpha(c, alpha))]);
       }
@@ -2826,6 +2882,50 @@ center{text-align:center}
     if (Number.isNaN(w)) w = natural && nh ? (h * nw) / nh : area[0];
     if (Number.isNaN(h)) h = natural && nw ? (w * nh) / nw : area[1];
     return [w, h];
+  }
+  // CSS border-image as a nine-slice: corners keep their size, edges and the
+  // middle ('fill') are stretched (repeat/round/space are drawn stretched).
+  function paintBorderImage(b, cs, clip, alpha) {
+    const source = cs['border-image-source'];
+    if (!source || lower(source) === 'none' || !/^url\(/i.test(source.trim())) return false;
+    const src = cssUrl(source, cs, 'border-image-source');
+    const info = src ? imageSize(src) : null;
+    if (!info || !info.w || !info.h) return false;
+    const iw = info.w, ih = info.h;
+    const sideList = (spec) => { const t = splitTop(spec, ' ').filter(Boolean); return [t[0], t[1] ?? t[0], t[2] ?? t[0], t[3] ?? t[1] ?? t[0]]; };
+    let sliceSpec = cs['border-image-slice'] || '100%';
+    const fill = /\bfill\b/i.test(sliceSpec);
+    sliceSpec = sliceSpec.replace(/\bfill\b/ig, ' ').trim() || '100%';
+    const slices = sideList(sliceSpec).map((t, i) => {
+      const dim = i % 2 ? iw : ih;   // top/bottom slice heights, right/left widths
+      const n = /%$/.test(t) ? (parseFloat(t) / 100) * dim : parseFloat(t);
+      return Math.max(0, Math.min(dim, Number.isFinite(n) ? n : 0));
+    });
+    const borders = [b.bt, b.br, b.bb, b.bl];
+    const length = (t, i, auto) => {
+      if (lower(t) === 'auto') return auto;
+      if (/^[0-9.]+$/.test(t)) return parseFloat(t) * borders[i];
+      const n = px(t, i % 2 ? b.w : b.h, cs.__fs);
+      return Number.isNaN(n) ? borders[i] : n;
+    };
+    const widths = sideList(cs['border-image-width'] || '1').map((t, i) => Math.max(0, length(t, i, slices[i])));
+    const outs = sideList(cs['border-image-outset'] || '0').map((t, i) => Math.max(0, length(t, i, 0)));
+    const x = b.x - outs[3], y = b.y - outs[0], W = b.w + outs[1] + outs[3], H = b.h + outs[0] + outs[2];
+    if (W <= 0 || H <= 0) return true;
+    const f = Math.min(1, W / Math.max(1e-6, widths[1] + widths[3]), H / Math.max(1e-6, widths[0] + widths[2]));
+    const [wt, wr, wb, wl] = widths.map((v) => v * f);
+    const [st, sr, sb, sl] = slices;
+    const si = str(src);
+    const dx = [x, x + wl, x + W - wr, x + W], dy = [y, y + wt, y + H - wb, y + H];
+    const sx = [0, sl, iw - sr, iw], sy = [0, st, ih - sb, ih];
+    for (let row = 0; row < 3; row++) for (let col = 0; col < 3; col++) {
+      if (row === 1 && col === 1 && !fill) continue;
+      const dw = dx[col + 1] - dx[col], dh = dy[row + 1] - dy[row];
+      const sw = sx[col + 1] - sx[col], sh = sy[row + 1] - sy[row];
+      if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) continue;
+      prim(clip, [OP.IMAGE, dx[col], dy[row], dw, dh, si, sx[col], sy[row], sw, sh, alpha, 0, 1]);
+    }
+    return true;
   }
   function paintBackground(b, cs, r, clip, alpha, current) {
     const box = b === viewportRoot ? { x: 0, y: 0, w: Math.max(ctx.vw, b.w), h: Math.max(ctx.vh, b.h) } : b;
@@ -3264,7 +3364,8 @@ center{text-align:center}
     'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color', 'box-shadow', 'text-shadow', 'opacity',
     'cursor', 'outline', 'outline-color', 'outline-style', 'outline-width', 'filter', 'backdrop-filter', 'accent-color', 'caret-color',
     'text-decoration-line', 'text-decoration-color', '-webkit-text-fill-color', 'transition', 'animation', 'will-change', 'pointer-events',
-    'image-rendering', 'mix-blend-mode', 'visibility', 'object-position']);
+    'image-rendering', 'mix-blend-mode', 'visibility', 'object-position',
+    'border-image-source', 'border-image-slice', 'border-image-width', 'border-image-outset', 'border-image-repeat']);
   // 'none' | 'paint' | 'layout'
   function styleDiff(a, b, pa, pb) {
     if (!a) return 'layout';

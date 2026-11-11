@@ -536,17 +536,24 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const before = new Set(Object.keys(shader.uniforms));
         m.onBeforeCompile(shader, this);
         const added = Object.entries(shader.uniforms).filter(([k, u]) => !before.has(k) && u && u.value && u.value.isColor);
-        if (nt.registerColorPatch && !m.transparent) {
+        if (nt.registerColorPatch) {
           const stage = translateColorStage(shader);
-          if (stage) {
+          // A transparent surface keeps the colour stage only when the stage
+          // also computes its alpha (otherwise the older opacity rules apply).
+          if (stage && (!m.transparent || stage.alpha)) {
             let id = colorPatches.get(stage.source);
             if (id === undefined && colorPatches.size < 16) {
               id = colorPatches.size + 1;
               if (!nt.registerColorPatch(id, stage.source)) id = 0;
               colorPatches.set(stage.source, id);
             }
-            if (id) info.colorStage = { id, uniforms: stage.uniforms };
+            if (id) info.colorStage = { id, uniforms: stage.uniforms, sampler: stage.sampler };
           }
+        }
+        // Diagnostics (tests and tools): which patches could not be translated.
+        if (!info.colorStage && globalThis.__ntDebugPatches) {
+          globalThis.__ntDebugPatches.push({ type: m.type, transparent: !!m.transparent, uniforms: Object.keys(shader.uniforms).filter((k) => !before.has(k)),
+            fragment: shader.fragmentShader, vertex: shader.vertexShader });
         }
         const palette = new Map(added);
         info.colors = diffusePalette(shader.fragmentShader, palette);
@@ -556,7 +563,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         // Alpha cut out by a texture of the patch's own (fog-of-war masks, reveal effects):
         // drawing the surface whole would cover the scene, so it is left out.
         const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
-        if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
+        if (!info.colorStage && maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
         info.alphaRamp = attributeAlphaRamp(shader.vertexShader, shader.fragmentShader);
         if (info.alphaRamp) {
           info.colorRamp = attributeColorRamp(shader.vertexShader, shader.fragmentShader, info.alphaRamp.attribute, palette);
@@ -931,12 +938,19 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
+        stageTextureId: 0, stageFlipY: false,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         normalMapId, normalScaleX, normalScaleY,
         material: m, batchable: !base.instances && !mesh.isSprite && !mesh.isLine && !(flags & DrawFlags.TRANSPARENT),
         shadow: ((flags & DrawFlags.CAST_SHADOW) ? ShadowDraw.CAST : 0) | (base.shadowOnly ? ShadowDraw.ONLY : 0),
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
+      // The colour stage's own texture (fog-of-war masks and similar).
+      const stageMap = colorStage?.sampler?.value;
+      if (stageMap && stageMap.isTexture) {
+        const tex = this._textureRecord(stageMap);
+        if (tex) { draw.stageTextureId = tex.id; draw.stageFlipY = !!stageMap.flipY; }
+      }
       if (globalThis.__ntDebugDraws) {
         const g = mesh.geometry, c = g.attributes.color;
         globalThis.__ntDebugDraws.push({
@@ -983,7 +997,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
     p[o + 53] = d.normalMapId || 0; p[o + 54] = d.normalScaleX ?? 1; p[o + 55] = d.normalScaleY ?? 1;
-    p[o + 56] = d.shadow || 0; p[o + 57] = p[o + 58] = p[o + 59] = 0;
+    p[o + 56] = d.shadow || 0; p[o + 57] = d.stageTextureId || 0; p[o + 58] = d.stageFlipY ? 1 : 0; p[o + 59] = 0;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {
@@ -1032,19 +1046,32 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   }
   // Translate a pure colour stage with local position/normal, scalar uniforms
   // and small math helpers. Everything outside this stage stays in native HLSL.
+  // Translates the GLSL a material's onBeforeCompile adds to the fragment
+  // shader into an HLSL "colour stage" the engine runs per pixel. Supported:
+  // helper functions over float/vecN, varyings set from position / normal /
+  // uv (or a swizzle of them), up to four float uniforms, one sampler2D, and
+  // code inserted after <map_fragment> or <color_fragment> that writes
+  // diffuseColor.rgb and/or diffuseColor.a (=, *=, +=, -=). Anything else
+  // (loops, branches, other built-ins) keeps the older approximations.
   function translateColorStage(shader) {
     const clean = (source) => source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
     const fragment = clean(shader.fragmentShader);
     const vertex = clean(shader.vertexShader);
     let helpers = fragment.match(/#include <common>([^#]*)#include/)?.[1].trim();
-    const body = fragment.match(/#include <color_fragment>([^#]*)#include/)?.[1].trim();
-    if (helpers === undefined || !body || !/\bdiffuseColor\.rgb\s*=(?!=)/.test(body) || body.length + helpers.length > 12000) return null;
+    // Inserted code: after <map_fragment> (before vertex colours) or after <color_fragment>.
+    const after = (chunk) => fragment.match(new RegExp(`#include <${chunk}>([^#]*)#include`))?.[1].trim() || '';
+    const mapBody = after('map_fragment'), colorBody = after('color_fragment');
+    const body = [mapBody, colorBody].filter(Boolean).join('\n');
+    const writes = /\bdiffuseColor\.(?:rgb|a)\s*[*+\-/]?=(?!=)/;
+    if (helpers === undefined || !body || !writes.test(body) || body.length + helpers.length > 12000) return null;
     const declarations = [], uniforms = [];
-    let supported = true;
-    helpers = helpers.replace(/\bvarying\s+vec3\s+(\w+)\s*;/g, (_, name) => {
-      const init = new RegExp(`\\b${name}\\s*=\\s*(position|normalize\\(\\s*objectNormal\\s*\\))\\s*;`).exec(vertex);
-      if (init) declarations.push(`float3 ${name} = ${init[1] === 'position' ? 'ntPosition' : 'ntNormal'};`);
-      else supported = false;
+    let sampler = null, supported = true;
+    helpers = helpers.replace(/\bvarying\s+(vec[234]|float)\s+(\w+)\s*;/g, (_, type, name) => {
+      const init = new RegExp(`\\b${name}\\s*=\\s*(position|normalize\\(\\s*objectNormal\\s*\\)|objectNormal|uv)(\\.[xyzw]{1,4})?\\s*;`).exec(vertex);
+      if (!init) { supported = false; return ''; }
+      const src = init[1] === 'position' ? 'ntPosition' : init[1] === 'uv' ? 'ntUv' : 'ntNormal';
+      const hlslType = type === 'float' ? 'float' : type.replace('vec', 'float');
+      declarations.push(`${hlslType} ${name} = ${src}${init[2] || ''};`);
       return '';
     }).replace(/\buniform\s+float\s+(\w+)\s*;/g, (_, name) => {
       if (uniforms.length >= 4 || !Number.isFinite(shader.uniforms[name]?.value)) supported = false;
@@ -1053,8 +1080,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         uniforms.push(shader.uniforms[name]);
       }
       return '';
+    }).replace(/\buniform\s+sampler2D\s+(\w+)\s*;/g, (_, name) => {
+      if (sampler || !shader.uniforms[name]?.value?.isTexture) supported = false;
+      else sampler = { name, uniform: shader.uniforms[name] };
+      return '';
     }).trim();
-    if (!supported || !declarations.length) return null;
+    if (!supported || (!declarations.length && !sampler)) return null;
     const type = '(?:float|vec[234])';
     const functions = new RegExp(`\\b${type}\\s+([A-Za-z_]\\w*)\\s*\\([^()]*\\)\\s*\\{[^{}]*\\}`, 'g');
     const names = [...helpers.matchAll(functions)].map((m) => m[1]);
@@ -1062,12 +1093,25 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const text = helpers + '\n' + body;
     if (/[^\w\s.,;(){}+*/%<>!=?:&|\-]/.test(text) || /[{}]/.test(body) ||
         /\b(?:for|while|do|if|switch|discard|register|static|uniform|varying|layout)\b/.test(text) ||
-        /\breturn\b/.test(body) || /\bdiffuseColor\s*\.(?!rgb\b)[A-Za-z_]/.test(body)) return null;
+        /\breturn\b/.test(body) || /\bdiffuseColor\s*\.(?!rgb\b|a\b)[A-Za-z_]/.test(body) ||
+        /\bdiffuseColor\s*(?:[*+\-/]?=)/.test(body)) return null;
     const calls = new Set(['vec2', 'vec3', 'vec4', 'float', 'abs', 'min', 'max', 'clamp', 'mix', 'smoothstep',
-      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp', ...names]);
+      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp', 'texture2D', 'texture', ...names]);
     for (const [, name] of text.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name) && name !== 'return') return null;
-    const hlsl = (source) => source.replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\(/g, 'lerp(').replace(/\bfract\(/g, 'frac(');
-    return { source: `${hlsl(helpers)}\nfloat3 nativeColorStage(float3 ntPosition, float3 ntNormal, float4 diffuseColor) {\n${declarations.join('\n')}\n${hlsl(body)}\nreturn diffuseColor.rgb;\n}`, uniforms };
+    // Samplers may only be read through texture2D()/texture() with the one declared sampler.
+    for (const [, name] of text.matchAll(/\btexture(?:2D)?\s*\(\s*([A-Za-z_]\w*)/g)) if (!sampler || name !== sampler.name) return null;
+    let hlsl = (source) => source.replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\(/g, 'lerp(').replace(/\bfract\(/g, 'frac(');
+    if (sampler) {
+      const base = hlsl;
+      hlsl = (source) => base(source).replace(new RegExp(`\\btexture(?:2D)?\\s*\\(\\s*${sampler.name}\\s*,`, 'g'), 'ntSamplePatch(');
+    }
+    // HLSL does not allow writing to a component of the input argument in all
+    // compilers, so the stage works on a local copy.
+    return {
+      source: `${hlsl(helpers)}\nfloat4 nativeColorStage(float3 ntPosition, float3 ntNormal, float2 ntUv, float4 ntDiffuse) {\nfloat4 diffuseColor = ntDiffuse;\n${declarations.join('\n')}\n${hlsl(body)}\nreturn diffuseColor;\n}`,
+      uniforms, sampler: sampler ? sampler.uniform : null,
+      alpha: /\bdiffuseColor\.a\s*[*+\-/]?=(?!=)/.test(body),
+    };
   }
 
   // Only replace albedo when the fragment actually assigns a palette to it.

@@ -512,16 +512,16 @@ void WebappWindow::initDevice() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
-    // t0 = colour map, t1 = normal map, t2 = shadow map;
+    // t0 = colour map, t1 = normal map, t2 = shadow map, t3 = colour stage texture;
     // s0 repeat, s1 clamp, s2 mirrored repeat, s3 shadow comparison.
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[6]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
         params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    D3D12_DESCRIPTOR_RANGE texRanges[3]{};
-    for (UINT i = 0; i < 3; i++) {
+    D3D12_DESCRIPTOR_RANGE texRanges[4]{};
+    for (UINT i = 0; i < 4; i++) {
         texRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         texRanges[i].NumDescriptors = 1;
         texRanges[i].BaseShaderRegister = i;
@@ -1477,11 +1477,13 @@ void WebappWindow::renderFrame() {
     ID3D12DescriptorHeap* texHeaps[] = {texHeap_.Get()};
     cmd_->SetDescriptorHeaps(1, texHeaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = textureHandle(0);
-    UINT64 boundTexture = ~0ull, boundNormalMap = ~0ull;
+    UINT64 boundTexture = ~0ull, boundNormalMap = ~0ull, boundStageMap = ~0ull;
 
     UINT drawsThisFrame = 0;
     const D3D12_GPU_DESCRIPTOR_HANDLE shadowHandle = textureHandleForSlot(kShadowSlot);
     cmd_->SetGraphicsRootDescriptorTable(4, shadowHandle);
+    cmd_->SetGraphicsRootDescriptorTable(5, whiteTexture);   // colour stage texture until a draw sets one
+    boundStageMap = whiteTexture.ptr;
     auto setShadowState = [&](D3D12_RESOURCE_STATES state) {
         if (shadowState_ == state) return;
         D3D12_RESOURCE_BARRIER b = transition(shadowMap_.Get(), shadowState_, state);
@@ -1544,6 +1546,7 @@ void WebappWindow::renderFrame() {
         dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = d[55];
         std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
         std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
+        dcb[48] = d[58]; dcb[49] = dcb[50] = dcb[51] = 0;  // gStage: colour stage texture flipY
         cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
         ringOffset += kDrawCBBytes;
     };
@@ -1657,6 +1660,8 @@ void WebappWindow::renderFrame() {
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
             const D3D12_GPU_DESCRIPTOR_HANDLE nrm = (drawFlags & F_NORMAL_MAP) ? textureHandle(std::uint32_t(d[53])) : whiteTexture;
             if (nrm.ptr != boundNormalMap) { cmd_->SetGraphicsRootDescriptorTable(3, nrm); boundNormalMap = nrm.ptr; }
+            const D3D12_GPU_DESCRIPTOR_HANDLE stage = d[57] > 0 ? textureHandle(std::uint32_t(d[57])) : whiteTexture;
+            if (stage.ptr != boundStageMap) { cmd_->SetGraphicsRootDescriptorTable(5, stage); boundStageMap = stage.ptr; }
             if (issue(pr)) drawsThisFrame++;
         }
     }

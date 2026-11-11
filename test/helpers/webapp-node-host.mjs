@@ -272,6 +272,7 @@ export async function runWebapp(root, options = {}) {
   const settle = () => new Promise((r) => setImmediate(r));
 
   host.resize(width, height, 1);
+  if (options.setup) options.setup(context);
   host.boot(readGameFile('index.html').toString('utf8'));
   for (let i = 0; i < 20 && !host.state.booted && !host.state.bootError; i++) await settle();
   let t = 0;
