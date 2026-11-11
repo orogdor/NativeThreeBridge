@@ -169,3 +169,40 @@ test('native and shader code agree on the shadow layout', () => {
   assert.match(hlsl, /void ShadowPS\(VSOut i\)/);
   assert.match(cpp, /"ShadowPS"/);
 });
+
+test('repeated opaque meshes are merged into one instanced draw', async () => {
+  const uploads = [];
+  class Unused {}
+  const { NativeRenderer } = createNativeRendererClasses({ Color: Unused, Matrix4: Unused, Vector3: Unused, Frustum: Unused, Quaternion: Unused },
+    { uploadInstances: (id, m, c, n) => uploads.push({ id, m: Array.from(m), n }), releaseInstances() {} }, null, null);
+  const renderer = Object.create(NativeRenderer.prototype);
+  const { AUTO_INSTANCE_MIN } = await import('../js/native-renderer.mjs');
+  const grass = { id: 1 }, rock = { id: 2 };
+  const draw = (material, x, extra = {}) => ({ geometryId: 3, start: 0, count: 6, flags: 0, shadow: 0, renderOrder: 0, material, batchable: true,
+    instanceId: 0, instanceCount: 1, matrix: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, 0, 0, 1], ...extra });
+  const draws = [];
+  for (let i = 0; i < AUTO_INSTANCE_MIN; i++) draws.push(draw(grass, i));
+  draws.push(draw(rock, 99), draw(grass, 50, { flags: DrawFlags.MIRRORED }), draw(grass, 60, { batchable: false }));
+  const out = renderer._autoInstance(draws);
+  assert.equal(out.length, 4, 'one merged grass draw + rock + mirrored grass + unbatchable');
+  assert.equal(out[0].instanceCount, AUTO_INSTANCE_MIN);
+  assert.equal(out[0].instanceId, uploads[0].id);
+  assert.deepEqual(uploads[0].m.filter((_, k) => k % 16 === 12), [...Array(AUTO_INSTANCE_MIN).keys()], 'world matrices become instance matrices');
+  assert.deepEqual(Array.from(out[0].matrix), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  // A second render() in the same frame gets its own instance buffer.
+  const again = renderer._autoInstance(draws);
+  assert.notEqual(again[0].instanceId, out[0].instanceId);
+  await Promise.resolve();
+  const nextFrame = renderer._autoInstance(draws);
+  assert.equal(nextFrame[0].instanceId, out[0].instanceId, 'reused next frame');
+  assert.equal(renderer._autoInstance(draws.slice(0, 3)).length, 3, 'small lists are left alone');
+});
+
+test('THREE.LOD picks its level for the camera', () => {
+  const renderer = makeRenderer();
+  let updated = 0;
+  const camera = { layers: { mask: 1 } };
+  const lod = { isLOD: true, autoUpdate: true, visible: true, layers: { test: () => true }, children: [], update(c) { assert.equal(c, camera); updated++; } };
+  renderer._collect(lod, camera, [], [], [], [0, 0, 0]);
+  assert.equal(updated, 1);
+});

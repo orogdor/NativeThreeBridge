@@ -125,6 +125,11 @@ void mul4(const float* a, const float* b, float* r) {
 struct Geometry {
     ComPtr<ID3D12Resource> vertices, indices;
     UINT64 vertexBytes = 0, indexBytes = 0;
+    // First upload: copied into GPU memory (default heap). A geometry that is
+    // sent again (skinning, animated buffers) stays in upload memory and
+    // reuses pooled buffers instead.
+    bool resident = false;
+    UINT uploads = 0;
     std::vector<PooledBuffer> vertexPool, indexPool;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
     D3D12_INDEX_BUFFER_VIEW ibv{};
@@ -151,6 +156,12 @@ struct Texture {
 struct PendingTextureCopy {
     ComPtr<ID3D12Resource> texture, staging;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+};
+// A vertex/index buffer copy into GPU memory, recorded at the next frame start.
+struct PendingBufferCopy {
+    ComPtr<ID3D12Resource> buffer, staging;
+    UINT64 bytes = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 };
 struct RetiredSlot {
     UINT slot;
@@ -338,6 +349,8 @@ private:
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<PendingBufferCopy> pendingBufferCopies_;
+    ComPtr<ID3D12Resource> residentBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state);
     std::vector<UINT> freeSlots_;
     std::vector<RetiredSlot> retiredSlots_;
     ComPtr<ID3D12DescriptorHeap> texHeap_;
@@ -596,6 +609,7 @@ void WebappWindow::initTextures() {
 
 void WebappWindow::resetTextures() {
     pendingCopies_.clear();
+    pendingBufferCopies_.clear();
     retired_.clear();
     retiredSlots_.clear();
     textures_.clear();
@@ -741,6 +755,27 @@ bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId,
 
 // Copies queued texture pixels; runs at the start of a frame's command list.
 void WebappWindow::recordTextureCopies() {
+    if (!pendingBufferCopies_.empty()) {
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        for (auto& c : pendingBufferCopies_) {
+            // Created in COMMON: the copy promotes it to COPY_DEST.
+            cmd_->CopyBufferRegion(c.buffer.Get(), 0, c.staging.Get(), 0, c.bytes);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = c.buffer.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = c.state;
+            barriers.push_back(b);
+        }
+        cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+        for (auto& c : pendingBufferCopies_) {
+            retire(c.staging);
+            ComPtr<ID3D12Resource> keep = c.buffer;   // alive until this frame is done
+            retire(keep);
+        }
+        pendingBufferCopies_.clear();
+    }
     if (pendingCopies_.empty()) return;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     for (auto& c : pendingCopies_) {
@@ -1055,6 +1090,21 @@ ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes
     return buffer;
 }
 
+ComPtr<ID3D12Resource> WebappWindow::residentBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state) {
+    ComPtr<ID3D12Resource> buffer;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = bufferDesc(bytes);
+    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           IID_PPV_ARGS(&buffer)), "Geometry buffer");
+    PendingBufferCopy copy;
+    copy.buffer = buffer;
+    copy.staging = uploadBuffer(data, bytes);
+    copy.bytes = bytes;
+    copy.state = state;
+    pendingBufferCopies_.push_back(std::move(copy));
+    return buffer;
+}
+
 void WebappWindow::replaceBuffer(ComPtr<ID3D12Resource>& current, UINT64& currentBytes, std::vector<PooledBuffer>& pool,
                                  const void* data, UINT64 bytes) {
     if (current) pool.push_back({current, currentBytes, fenceValue_ + kFrameCount});
@@ -1129,12 +1179,37 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
     const UINT64 vertexBytes = UINT64(interleaved.size()) * sizeof(float);
+    const UINT64 indexBytes = idx && indexCount ? UINT64(indexCount) * sizeof(std::uint32_t) : 0;
+    if (g.uploads++ == 0 && vertexBytes) {
+        g.resident = true;
+        g.vertices = residentBuffer(interleaved.data(), vertexBytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        g.vertexBytes = vertexBytes;
+        g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
+        g.vbv.SizeInBytes = UINT(vertexBytes);
+        g.vbv.StrideInBytes = kVertexStride;
+        if (indexBytes) {
+            g.indices = residentBuffer(idx, indexBytes, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+            g.indexBytes = indexBytes;
+            g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
+            g.ibv.SizeInBytes = UINT(indexBytes);
+            g.ibv.Format = DXGI_FORMAT_R32_UINT;
+        }
+        return;
+    }
+    if (g.resident) {
+        // Sent again: from now on it lives in upload memory (pooled buffers
+        // must be mappable, so the GPU-memory ones are simply retired).
+        retire(g.vertices);
+        retire(g.indices);
+        g.vertexBytes = g.indexBytes = 0;
+        g.resident = false;
+    }
     replaceBuffer(g.vertices, g.vertexBytes, g.vertexPool, interleaved.data(), vertexBytes);
     if (!g.vertices) return;
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
     g.vbv.SizeInBytes = UINT(vertexBytes);
     g.vbv.StrideInBytes = kVertexStride;
-    replaceBuffer(g.indices, g.indexBytes, g.indexPool, idx, idx && indexCount ? UINT64(indexCount) * sizeof(std::uint32_t) : 0);
+    replaceBuffer(g.indices, g.indexBytes, g.indexPool, idx, indexBytes);
     if (g.indices) {
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);

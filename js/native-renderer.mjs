@@ -15,6 +15,9 @@ export const PASS_HEADER_FLOATS = 96;   // [56..94]: shadow-casting light (see r
 export const LIGHT_FLOATS = 16;
 export const DRAW_FLOATS = 60;          // [56]: ShadowDraw bits
 export const MAX_LIGHTS = 16;
+// Opaque meshes sharing geometry and material are merged into one instanced
+// draw once at least this many are visible (renderer.autoInstancing = false turns it off).
+export const AUTO_INSTANCE_MIN = 8;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
 export const DrawFlags = {
@@ -44,6 +47,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _projScreen = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
   const _shadowFrustum = new THREE.Frustum();
+  const _identityElements = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
   const _shadowScreen = new THREE.Matrix4();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -260,6 +264,58 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
       Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
       return record;
+    }
+
+    // Merges opaque draws of the same geometry range and material (and the
+    // same per-mesh flags) into one instanced draw whose instance matrices are
+    // the meshes' world matrices. Groups are keyed per render() call within a
+    // frame, so a second render() (minimap, split screen) never overwrites the
+    // instances of the first before the engine draws them.
+    _autoInstance(draws) {
+      if (draws.length < AUTO_INSTANCE_MIN) return draws;
+      const groups = new Map();
+      for (const d of draws) {
+        if (!d.batchable) continue;
+        const key = `${d.geometryId}|${d.start}|${d.count}|${d.flags}|${d.shadow}|${d.material.id}|${d.renderOrder}`;
+        const list = groups.get(key);
+        if (list) list.push(d); else groups.set(key, [d]);
+      }
+      let merged = false;
+      for (const list of groups.values()) if (list.length >= AUTO_INSTANCE_MIN) { merged = true; break; }
+      if (!merged) return draws;
+      this._autoGroups ||= new Map();
+      this._autoTick = (this._autoTick || 0) + 1;
+      if (!this._autoSlotReset) {
+        this._autoSlotReset = true;
+        Promise.resolve().then(() => { this._autoSlot = 0; this._autoSlotReset = false; });
+      }
+      const slot = this._autoSlot = (this._autoSlot || 0) + 1;
+      const out = [];
+      const emitted = new Set();
+      for (const d of draws) {
+        if (!d.batchable) { out.push(d); continue; }
+        const key = `${d.geometryId}|${d.start}|${d.count}|${d.flags}|${d.shadow}|${d.material.id}|${d.renderOrder}`;
+        const list = groups.get(key);
+        if (list.length < AUTO_INSTANCE_MIN) { out.push(d); continue; }
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        const slotKey = `${slot}#${key}`;
+        let rec = this._autoGroups.get(slotKey);
+        if (!rec) { rec = { id: nextInstanceId++, matrices: null, tick: 0 }; this._autoGroups.set(slotKey, rec); }
+        rec.tick = this._autoTick;
+        const n = list.length;
+        if (!rec.matrices || rec.matrices.length < n * 16) rec.matrices = new Float32Array(Math.ceil(n * 1.5) * 16);
+        for (let i = 0; i < n; i++) rec.matrices.set(list[i].matrix, i * 16);
+        nt.uploadInstances(rec.id, rec.matrices.subarray(0, n * 16), null, n);
+        out.push({ ...d, instanceId: rec.id, instanceCount: n, matrix: _identityElements });
+      }
+      // Forget groups that have not been drawn for a while.
+      if ((this._autoTick & 63) === 0) {
+        for (const [k, rec] of this._autoGroups) {
+          if (this._autoTick - rec.tick > 120) { nt.releaseInstances(rec.id); this._autoGroups.delete(k); }
+        }
+      }
+      return out;
     }
 
     // SkinnedMesh: the vertex shader's skinning (skinning_vertex /
@@ -547,9 +603,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
         transparent.sort((a, b) => a.renderOrder - b.renderOrder || b.z - a.z);
       }
+      const solid = this.autoInstancing === false ? opaque : this._autoInstance(opaque);
 
       // ---- pass header
-      const drawCount = opaque.length + transparent.length;
+      const drawCount = solid.length + transparent.length;
       const lightCount = Math.min(lights.length, MAX_LIGHTS);
       if (lights.length > MAX_LIGHTS) warnOnce('too-many-lights', `Only the first ${MAX_LIGHTS} lights are used (scene has ${lights.length})`);
       const floats = PASS_HEADER_FLOATS + lightCount * LIGHT_FLOATS + drawCount * DRAW_FLOATS;
@@ -602,7 +659,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
       let o = PASS_HEADER_FLOATS;
       for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) writeLight(p, o, lights[i]);
-      for (const d of opaque) { writeDraw(p, o, d); o += DRAW_FLOATS; }
+      for (const d of solid) { writeDraw(p, o, d); o += DRAW_FLOATS; }
       for (const d of transparent) { writeDraw(p, o, d); o += DRAW_FLOATS; }
 
       this.info.render.calls += drawCount;
@@ -614,6 +671,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (object.visible === false) return;
       const layerVisible = object.layers.test(camera.layers);
       if (layerVisible) {
+        // THREE.LOD: show only the level for this camera distance (WebGLRenderer does the same).
+        if (object.isLOD && object.autoUpdate === true) object.update(camera);
         if (object.isLight) this._addLight(object, lights, ambient);
         else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent, false);
         else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
@@ -874,6 +933,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         opacity, reflection, reflectionMask, colorStage,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         normalMapId, normalScaleX, normalScaleY,
+        material: m, batchable: !base.instances && !mesh.isSprite && !mesh.isLine && !(flags & DrawFlags.TRANSPARENT),
         shadow: ((flags & DrawFlags.CAST_SHADOW) ? ShadowDraw.CAST : 0) | (base.shadowOnly ? ShadowDraw.ONLY : 0),
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
