@@ -22,6 +22,9 @@ export const DrawFlags = {
   NO_DEPTH_WRITE: 32, NO_DEPTH_TEST: 64, LINES: 128, LINE_STRIP: 256,
   NORMAL_COLOR: 512, INSTANCE_COLORS: 1024, FLAT: 2048,
   MAP: 4096, MAP_REPEAT: 8192, MAP_MIRROR: 16384, FAR_DEPTH: 32768, NO_TONE_MAP: 65536, FOG: 131072, FRESNEL: 262144,
+  // matrixWorld has a negative determinant (mirrored, e.g. scale -1 in a GLTF):
+  // the triangle winding is reversed, as Three.js' WebGLRenderer flips frontFace.
+  MIRRORED: 524288,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
@@ -655,6 +658,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.depthTest === false) flags |= DrawFlags.NO_DEPTH_TEST;
       if (m.flatShading) flags |= DrawFlags.FLAT;
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
+      if (!mesh.isSprite && mesh.matrixWorld.determinant() < 0) flags |= DrawFlags.MIRRORED;
       let roughness = 1, metalness = 0, shininess = -1;
       let color = m.color || null, opacity = m.opacity ?? 1;
       let shaderMap = null, reflection = null, reflectionMask = false, colorStage = null;

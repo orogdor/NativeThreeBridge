@@ -30,7 +30,8 @@ SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
-                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144;
+                  F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
+                  F_MIRRORED = 524288;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -143,6 +144,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
     if (dot(flatN, V) < 0) flatN = -flatN;
     float3 N = normalize(i.nrm);
+    if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
     if (!front) N = -N;
     if (flags & F_FLAT) N = flatN;
     if (flags & F_NORMAL_COLOR) {
