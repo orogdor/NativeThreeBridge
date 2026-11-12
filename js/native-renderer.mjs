@@ -532,6 +532,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (object.visible === false) return;
       const layerVisible = object.layers.test(camera.layers);
       if (layerVisible) {
+        // Three.js updates LOD before visiting its children. Kuningriigid's
+        // Sapling trees use this callback to reveal or populate instanced meshes.
+        if (object.isLOD && object.autoUpdate !== false) object.update(camera);
         if (object.isLight) this._addLight(object, lights, ambient);
         else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
         else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');

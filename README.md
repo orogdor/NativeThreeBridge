@@ -1,3 +1,7 @@
+# NativeThreeBridge v0.32.17 — Sapling trees update their LODs in native webapps
+
+The native webapp scene traversal now calls `LOD.update(camera)` before visiting children when `autoUpdate` is enabled, matching Three.js WebGLRenderer. This allows Kuningriigid's Sapling tree levels and scene-level instanced forest batches to become visible; before the fix, tree LOD callbacks never ran. Hidden LODs and `autoUpdate=false` are still respected. A regression fixture verifies that four spawned tree instances reach the native DX12 draw packet, in addition to unit tests for static/dynamic cases.
+
 # NativeThreeBridge v0.32.16 — mirrored GLTF meshes drawn the right way round
 
 GLTF models often mirror part of a mesh with a negative scale. Three.js flips the front face for a mesh whose world matrix has a negative determinant; the engine did not, so the side facing the camera was culled and double-sided surfaces were lit from the wrong side (thatch roofs and hair cards looked shredded). Such draws now carry `DrawFlags.MIRRORED`: the DX12 pipeline swaps back/front culling and the pixel shader inverts `SV_IsFrontFace`. Not yet: per-instance mirroring inside an `InstancedMesh`. Test: `test/webapp-mirrored-mesh.test.mjs`.
