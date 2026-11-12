@@ -21,8 +21,12 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <condition_variable>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -228,6 +232,11 @@ private:
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
     void renderFrame();
+    // The worker submits the previous frame while V8 computes the next one.
+    void startRenderThread(bool forced);
+    void waitRenderThread();
+    void submitRenderThread();
+    void stopRenderThread();
     void updateTitle(double fps);
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
     void initUi();
@@ -246,6 +255,15 @@ private:
     UINT width_ = 1280, height_ = 720;
     bool minimized_ = false;
     WebappHost host_;
+    std::recursive_mutex gfxMutex_; // protects DX12 resource changes by V8 and renderer
+    std::mutex logMutex_;
+    std::thread renderThread_;
+    std::mutex renderStateMutex_;
+    std::condition_variable renderCv_;
+    bool renderStop_ = false, renderPending_ = false, renderBusy_ = false;
+    bool asyncDisabled_ = false, asyncForced_ = false;
+    std::exception_ptr renderError_;
+    double completedRenderMs_ = 0;
     std::FILE* log_ = nullptr;
     std::wstring pageTitle_ = L"Three.js webapp";
     std::wstring adapterName_ = L"GPU";
@@ -371,6 +389,7 @@ void WebappWindow::check(HRESULT hr, const char* what) {
 }
 
 void WebappWindow::log(const std::string& level, const std::string& text) {
+    std::lock_guard<std::mutex> lock(logMutex_);
     if (level == "error") logErrors_++;
     if (log_) {
         std::fprintf(log_, "[%s] %s\n", level.c_str(), text.c_str());
@@ -523,6 +542,7 @@ void WebappWindow::resetTextures() {
 }
 
 void WebappWindow::resetPage() {
+    stopRenderThread();
     host_.shutdown();
     waitForGpu();
     pendingPasses_.clear();
@@ -624,6 +644,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
 }
 
 void WebappWindow::releaseTexture(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = textures_.find(id);
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
@@ -633,6 +654,7 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
 
 bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                                  std::uint32_t height, std::uint32_t flags) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0) return false;
     std::vector<std::uint8_t> rgba;
     UINT w = width, h = height;
@@ -647,6 +669,7 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
 }
 
 bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0 || !uiReady_) return false;
     std::vector<std::uint8_t> rgba;
     UINT w = 0, h = 0;
@@ -902,6 +925,7 @@ void WebappWindow::resize(UINT width, UINT height) {
     width = std::max<UINT>(1, width);
     height = std::max<UINT>(1, height);
     if (width == width_ && height == height_) return;
+    waitRenderThread(); // worker must finish its Present before DXGI resize
     width_ = width;
     height_ = height;
     if (swap_) {
@@ -935,6 +959,7 @@ void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
 }
 
 void WebappWindow::releaseInstances(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = instances_.find(id);
     if (it == instances_.end()) return;
     for (auto& buffer : it->second.gpu) retire(buffer);
@@ -954,6 +979,7 @@ void WebappWindow::collectRetired() {
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
                                   std::uint32_t colorChannels) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
@@ -982,6 +1008,7 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
 }
 
 void WebappWindow::releaseGeometry(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = geometries_.find(id);
     if (it == geometries_.end()) return;
     retire(it->second.vertices);
@@ -990,6 +1017,7 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
 }
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     InstanceSet& set = instances_[id];
     set.count = count;
     set.cpu.resize(size_t(count) * 19);
@@ -1004,6 +1032,7 @@ void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float
 }
 
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (!id || id > 16 || source.size() > 16000 || colorPatches_.count(id)) return false;
     if (source.find_first_of("#[]\\\"'") != std::string::npos) return false;
     static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|discard|clip)\b)");
@@ -1097,6 +1126,69 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     ID3D12PipelineState* raw = pso.Get();
     pipelines_[key] = pso;
     return raw;
+}
+
+// Experimental adaptive render worker. JavaScript, DOM and Three.js callbacks
+// remain on their sole V8 thread; only DX12 submission is parallelized.
+// At most one frame can be outstanding, so hot reload and resize are safe.
+void WebappWindow::startRenderThread(bool forced) {
+    if (renderThread_.joinable()) return;
+    renderStop_ = renderPending_ = renderBusy_ = false;
+    renderError_ = nullptr;
+    completedRenderMs_ = 0;
+    renderThread_ = std::thread([this] {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(renderStateMutex_);
+            renderCv_.wait(lock, [this] { return renderStop_ || renderPending_; });
+            if (renderStop_) break;
+            renderPending_ = false;
+            renderBusy_ = true;
+            lock.unlock();
+            const auto begin = std::chrono::steady_clock::now();
+            std::exception_ptr error;
+            try {
+                std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+                renderFrame();
+            } catch (...) { error = std::current_exception(); }
+            const auto done = std::chrono::steady_clock::now();
+            lock.lock();
+            completedRenderMs_ = std::chrono::duration<double, std::milli>(done - begin).count();
+            renderError_ = error;
+            renderBusy_ = false;
+            lock.unlock();
+            renderCv_.notify_all();
+        }
+    });
+    log("info", std::string("[async-render] enabled ") +
+        (forced ? "by NTB_ASYNC_RENDER=1" : "automatically from scene complexity") +
+        "; V8 and DX12 use separate CPU threads");
+}
+
+void WebappWindow::waitRenderThread() {
+    if (!renderThread_.joinable()) return;
+    std::unique_lock<std::mutex> lock(renderStateMutex_);
+    renderCv_.wait(lock, [this] { return !renderBusy_ && !renderPending_; });
+    if (renderError_) {
+        lock.unlock();
+        log("error", "[async-render] DX12 worker failed");
+        ExitProcess(44);
+    }
+}
+void WebappWindow::submitRenderThread() {
+    std::lock_guard<std::mutex> lock(renderStateMutex_);
+    renderPending_ = true;
+    renderCv_.notify_one();
+}
+void WebappWindow::stopRenderThread() {
+    if (!renderThread_.joinable()) return;
+    waitRenderThread();
+    {
+        std::lock_guard<std::mutex> lock(renderStateMutex_);
+        renderStop_ = true;
+    }
+    renderCv_.notify_one();
+    renderThread_.join();
+    renderStop_ = renderPending_ = renderBusy_ = false;
 }
 
 void WebappWindow::renderFrame() {
@@ -1449,6 +1541,11 @@ int WebappWindow::run(HINSTANCE instance) {
         return 45;
     }
     log("info", "index.html parsed, scripts started");
+    char asyncMode[8] = {};
+    GetEnvironmentVariableA("NTB_ASYNC_RENDER", asyncMode, sizeof(asyncMode));
+    asyncDisabled_ = std::strcmp(asyncMode, "0") == 0;
+    asyncForced_ = std::strcmp(asyncMode, "1") == 0;
+    if (asyncForced_) startRenderThread(true);
     ShowWindow(window_, SW_SHOW);
     SetForegroundWindow(window_);
 
@@ -1470,11 +1567,13 @@ int WebappWindow::run(HINSTANCE instance) {
                 PostQuitMessage(45);
             }
             reload.reset();
+            if (asyncForced_) startRenderThread(true);
             pageStart = statStart = std::chrono::steady_clock::now();
             frameNumber = statFrames = 0;
         }
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
+                stopRenderThread();
                 waitForGpu();
                 host_.shutdown();
                 gActive = nullptr;
@@ -1498,6 +1597,19 @@ int WebappWindow::run(HINSTANCE instance) {
         reload = host_.takeReload();
         if (reload) continue;
         const auto tJs = std::chrono::steady_clock::now();
+        using msd = std::chrono::duration<double, std::milli>;
+        const bool alreadyAsync = renderThread_.joinable();
+        double previousRenderMs = 0, previousFenceMs = 0, previousPresentMs = 0, asyncWaitMs = 0;
+        if (alreadyAsync) {
+            // Next V8 frame is ready; finish the previous GPU frame before
+            // touching the UI raster buffer or swapping render packets.
+            const auto waitBegin = std::chrono::steady_clock::now();
+            waitRenderThread();
+            asyncWaitMs = msd(std::chrono::steady_clock::now() - waitBegin).count();
+            previousRenderMs = completedRenderMs_;
+            previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
+            previousPresentMs = presentMs_; presentMs_ = 0;
+        }
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
         if (uiReady_) {
@@ -1507,7 +1619,18 @@ int WebappWindow::run(HINSTANCE instance) {
             gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         }
         const auto tRaster = std::chrono::steady_clock::now();
-        renderFrame();
+        // Auto-select only nontrivial scenes on machines with spare cores.
+        if (!asyncDisabled_ && !alreadyAsync && !asyncForced_ && frameNumber >= 20 &&
+            std::thread::hardware_concurrency() >= 4 && lastDraws_ >= 128 &&
+            msd(tJs - now).count() >= 8.0)
+            startRenderThread(false);
+        const bool threaded = renderThread_.joinable();
+        if (threaded) submitRenderThread();
+        else {
+            renderFrame();
+            previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
+            previousPresentMs = presentMs_; presentMs_ = 0;
+        }
         const auto tEnd = std::chrono::steady_clock::now();
         {
             using msd = std::chrono::duration<double, std::milli>;
@@ -1516,10 +1639,11 @@ int WebappWindow::run(HINSTANCE instance) {
             perf_.frameMs += frameMs;
             perf_.frameMax = std::max(perf_.frameMax, frameMs);
             perf_.jsMs += msd(tJs - now).count();
-            perf_.rasterMs += msd(tRaster - tJs).count();
-            perf_.renderMs += msd(tEnd - tRaster).count();
-            perf_.fenceMs += fenceWaitMs_;
-            perf_.presentMs += presentMs_;
+            perf_.rasterMs += msd(tRaster - tJs).count() - asyncWaitMs;
+            // Worker timing belongs to the prior frame and overlaps current V8.
+            perf_.renderMs += threaded ? previousRenderMs + asyncWaitMs : msd(tEnd - tRaster).count();
+            perf_.fenceMs += previousFenceMs;
+            perf_.presentMs += previousPresentMs;
             // Attribute visible stalls to JavaScript, UI rasterisation or DX12.
             // Throttle warnings so an already slow scene cannot flood the log.
             static auto lastSlowFrameLog = std::chrono::steady_clock::time_point{};
@@ -1530,7 +1654,6 @@ int WebappWindow::run(HINSTANCE instance) {
                     " ms; DX12 " + std::to_string(msd(tEnd - tRaster).count()) + " ms");
                 lastSlowFrameLog = tEnd;
             }
-            fenceWaitMs_ = 0;
             const double since = std::chrono::duration<double>(tEnd - perfAt_).count();
             if (since >= 1.0) {
                 writePerfRow(std::chrono::duration<double>(tEnd - start).count(), since);

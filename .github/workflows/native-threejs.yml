@@ -281,6 +281,7 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          NTB_ASYNC_RENDER: '1' # test worker lifecycle across two reloads
         run: |
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
           $folder = (Resolve-Path test/fixtures/webapp-reload).Path
