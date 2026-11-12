@@ -7,7 +7,7 @@ import { readFileSync } from 'node:fs';
 const src = readFileSync(new URL('../native-dx12/webapp_dx12.cpp', import.meta.url), 'utf8');
 test('V8 is never entered from the DX12 worker', () => {
   const block = src.slice(src.indexOf('void WebappWindow::startRenderThread'), src.indexOf('void WebappWindow::renderFrame'));
-  assert.match(block, /renderFrame\(\)/);
+  assert.match(block, /renderFrame\(&gpuLock\)/);
   assert.doesNotMatch(block, /host_\.frame|host_\.start|host_\.pointer/);
 });
 test('render worker is drained for hot reload, exit and resize', () => {
@@ -28,6 +28,11 @@ test('fallback and adaptive modes exist and resource paths are serialized', () =
 test('worker obtains the native resource snapshot before V8 frame N+1', () => {
   assert.match(src, /renderStarted_ = true;/);
   assert.match(src, /renderCv_\.wait\(lock, \[this\] \{ return renderStarted_/);
+});
+
+test('DX12 fences submitted geometry before releasing the resource lock for Present', () => {
+  const frame = src.slice(src.indexOf('void WebappWindow::renderFrame'), src.indexOf('void WebappWindow::updateTitle'));
+  assert.match(frame, /recordGeometryCopies\(\)[\s\S]*DrawIndexedInstanced\([\s\S]*ExecuteCommandLists\([\s\S]*queue_->Signal\([\s\S]*resourceLock->unlock\(\)[\s\S]*swap_->Present\(/);
 });
 
 test('native UI raster runs independently and publishes immutable frames', () => {

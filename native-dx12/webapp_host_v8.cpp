@@ -461,7 +461,8 @@ void ntUploadGeometry(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (uvs && nU != std::size_t(vertexCount) * 2) return self->throwError("range", "Geometry uvs must be 2 floats per vertex");
     for (std::size_t i = 0; i < nI; i++)
         if (indices[i] >= vertexCount) return self->throwError("range", "Geometry index out of range");
-    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI), uvs, colorChannels);
+    if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI),
+                                              uvs, colorChannels, info.Length() >= 7 && info[6]->IsTrue());
 }
 void ntUploadTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
