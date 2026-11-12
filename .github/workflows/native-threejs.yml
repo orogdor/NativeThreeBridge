@@ -281,6 +281,8 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          NTB_ASYNC_RENDER: '1' # test worker lifecycle across two reloads
+          NTB_ASYNC_UI: '1' # also test independent Direct2D/UI worker across reloads
         run: |
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
           $folder = (Resolve-Path test/fixtures/webapp-reload).Path
@@ -309,6 +311,8 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          NTB_ASYNC_UI: '1'
+          NTB_ASYNC_RENDER: '1'
         run: |
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing

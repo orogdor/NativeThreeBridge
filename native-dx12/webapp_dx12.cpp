@@ -21,8 +21,13 @@
 #include <fstream>
 #include <map>
 #include <regex>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -153,6 +158,9 @@ std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base,
 class WebappWindow final : public native_three::WebappRenderSink {
 public:
     explicit WebappWindow(std::filesystem::path root) : root_(std::move(root)) {}
+    // initUi() starts a worker before V8 boots. Drain it also on early boot
+    // failure, not just on the normal WM_QUIT/reload paths.
+    ~WebappWindow() { stopRenderThread(); stopUiThread(); }
     int run(HINSTANCE instance);
 
     // ---- WebappRenderSink
@@ -177,7 +185,25 @@ public:
         perf_.forced += forced; perf_.full += full; perf_.partial += partial;
     }
     void submitUi(const float* data, std::size_t floats, const std::string& strings) override {
-        if (uiReady_) ui_.setDisplayList(data, floats, strings);
+        if (!uiReady_) return;
+        if (!uiThreadOn_) { ui_.setDisplayList(data, floats, strings); return; }
+        // The worker consumes the newest display list. If intermediate
+        // dirty-rect updates were dropped, force a full redraw to preserve
+        // correctness for CSS animations and rapidly changing panels.
+        std::vector<float> list(data, data + floats);
+        {
+            std::lock_guard<std::mutex> lock(uiRequestMutex_);
+            if (uiPendingList_ && list.size() >= 8 && list[0] == 2.0f) {
+                list[6] = -1.0f; list[7] = -1.0f;
+            }
+            uiPendingFloats_ = std::move(list);
+            uiPendingStrings_ = strings;
+            uiPendingList_ = true;
+            uiRenderRequest_ = true;
+            uiRequestW_ = width_;
+            uiRequestH_ = height_;
+        }
+        uiRequestCv_.notify_one();
     }
     void setCursor(const std::string& css) override {
         LPCWSTR id = IDC_ARROW;
@@ -197,21 +223,34 @@ public:
     }
     void canvasCommands(std::uint32_t id, std::uint32_t w, std::uint32_t h, const float* ops, std::size_t floats,
                         const std::string& strings) override {
-        if (uiReady_) ui_.canvasCommands(id, w, h, ops, floats, strings);
+        if (uiReady_) {
+            std::lock_guard<std::mutex> uiLock(uiMutex_);
+            ui_.canvasCommands(id, w, h, ops, floats, strings);
+        }
     }
     bool canvasRead(std::uint32_t id, std::int32_t x, std::int32_t y, std::uint32_t w, std::uint32_t h,
                     std::vector<std::uint8_t>& rgba) override {
-        return uiReady_ && ui_.canvasRead(id, x, y, w, h, rgba);
+        if (!uiReady_) return false;
+        std::lock_guard<std::mutex> uiLock(uiMutex_);
+        return ui_.canvasRead(id, x, y, w, h, rgba);
     }
     void canvasWrite(std::uint32_t id, std::uint32_t cw, std::uint32_t ch, std::int32_t x, std::int32_t y, std::uint32_t w,
                      std::uint32_t h, const std::uint8_t* rgba) override {
-        if (uiReady_) ui_.canvasWrite(id, cw, ch, x, y, w, h, rgba);
+        if (uiReady_) {
+            std::lock_guard<std::mutex> uiLock(uiMutex_);
+            ui_.canvasWrite(id, cw, ch, x, y, w, h, rgba);
+        }
     }
     void registerImage(const std::string& key, const std::uint8_t* bytes, std::size_t n) override {
-        if (uiReady_) ui_.registerImage(key, bytes, n);
+        if (uiReady_) {
+            std::lock_guard<std::mutex> uiLock(uiMutex_);
+            ui_.registerImage(key, bytes, n);
+        }
     }
     double measureText(const std::string& families, double size, int weight, bool italic, const std::string& text) override {
-        return uiReady_ ? ui_.measureText(families, size, weight, italic, text) : -1.0;
+        if (!uiReady_) return -1.0;
+        std::lock_guard<std::mutex> uiLock(uiMutex_);
+        return ui_.measureText(families, size, weight, italic, text);
     }
 
     LRESULT handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -228,6 +267,15 @@ private:
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
     void renderFrame();
+    // The worker submits the previous frame while V8 computes the next one.
+    void startRenderThread(bool forced);
+    void waitRenderThread();
+    void submitRenderThread();
+    void stopRenderThread();
+    // Independent native UI raster cadence; V8 DOM stays on the JS thread.
+    void startUiThread();
+    void stopUiThread();
+    void requestUiRender();
     void updateTitle(double fps);
     void keyEvent(bool down, WPARAM vk, LPARAM lp);
     void initUi();
@@ -246,6 +294,40 @@ private:
     UINT width_ = 1280, height_ = 720;
     bool minimized_ = false;
     WebappHost host_;
+    std::recursive_mutex gfxMutex_; // protects DX12 resource changes by V8 and renderer
+    std::mutex logMutex_;
+    std::thread renderThread_;
+    std::mutex renderStateMutex_;
+    std::condition_variable renderCv_;
+    bool renderStop_ = false, renderPending_ = false, renderBusy_ = false, renderStarted_ = false;
+    bool asyncDisabled_ = false, asyncForced_ = false;
+    std::exception_ptr renderError_;
+    double completedRenderMs_ = 0;
+
+    // The asynchronous UI worker owns rasterization. All existing native
+    // Canvas/DirectWrite access is serialized with that worker. Completed
+    // bitmaps are immutable snapshots for the DX12 render thread.
+    struct UiFrame {
+        std::vector<std::uint8_t> bgra;
+        UINT width = 0, height = 0, stride = 0;
+        std::uint64_t sequence = 0;
+        bool visible = false;
+    };
+    std::mutex uiMutex_;
+    std::mutex uiRequestMutex_;
+    std::condition_variable uiRequestCv_;
+    std::thread uiThread_;
+    bool uiThreadOn_ = false, uiStop_ = false, uiRenderRequest_ = false;
+    bool uiPendingList_ = false;
+    std::vector<float> uiPendingFloats_;
+    std::string uiPendingStrings_;
+    UINT uiRequestW_ = 0, uiRequestH_ = 0;
+    std::mutex uiPublishedMutex_;
+    std::shared_ptr<const UiFrame> uiPublished_;
+    std::shared_ptr<const UiFrame> uiUploading_;
+    std::uint64_t uiLastUploadSequence_ = 0;
+    std::atomic<std::uint64_t> uiRastersDone_{0}, uiRasterUs_{0};
+    std::uint64_t uiRastersAccounted_ = 0, uiRasterUsAccounted_ = 0;
     std::FILE* log_ = nullptr;
     std::wstring pageTitle_ = L"Three.js webapp";
     std::wstring adapterName_ = L"GPU";
@@ -371,6 +453,7 @@ void WebappWindow::check(HRESULT hr, const char* what) {
 }
 
 void WebappWindow::log(const std::string& level, const std::string& text) {
+    std::lock_guard<std::mutex> lock(logMutex_);
     if (level == "error") logErrors_++;
     if (log_) {
         std::fprintf(log_, "[%s] %s\n", level.c_str(), text.c_str());
@@ -523,6 +606,7 @@ void WebappWindow::resetTextures() {
 }
 
 void WebappWindow::resetPage() {
+    stopRenderThread();
     host_.shutdown();
     waitForGpu();
     pendingPasses_.clear();
@@ -532,8 +616,22 @@ void WebappWindow::resetPage() {
     resetTextures();
     pipelines_.clear();
     colorPatches_.clear();
-    ui_.resetPage();
+    stopUiThread();
+    {
+        std::lock_guard<std::mutex> uiLock(uiMutex_);
+        ui_.resetPage();
+    }
+    {
+        std::lock_guard<std::mutex> publishLock(uiPublishedMutex_);
+        uiPublished_.reset();
+    }
+    uiUploading_.reset();
+    uiLastUploadSequence_ = 0;
+    uiRastersDone_ = 0;
+    uiRasterUs_ = 0;
+    uiRastersAccounted_ = uiRasterUsAccounted_ = 0;
     uiUpload_ = uiVisible_ = false;
+    if (uiThreadOn_) startUiThread();
     lastDraws_ = 0;
     logErrors_ = 0;
     bootDialogShown_ = false;
@@ -624,6 +722,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
 }
 
 void WebappWindow::releaseTexture(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = textures_.find(id);
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
@@ -633,6 +732,7 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
 
 bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                                  std::uint32_t height, std::uint32_t flags) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0) return false;
     std::vector<std::uint8_t> rgba;
     UINT w = width, h = height;
@@ -647,6 +747,7 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
 }
 
 bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0 || !uiReady_) return false;
     std::vector<std::uint8_t> rgba;
     UINT w = 0, h = 0;
@@ -700,6 +801,11 @@ void WebappWindow::initUi() {
     uiReady_ = ui_.init(root_, error);
     if (!error.empty()) log(uiReady_ ? "warn" : "error", "HTML/CSS UI layer: " + error);
     if (!uiReady_) return;
+    char uiMode[8] = {};
+    GetEnvironmentVariableA("NTB_ASYNC_UI", uiMode, sizeof(uiMode));
+    // Default to the independent UI raster on multi-core hardware.
+    uiThreadOn_ = std::strcmp(uiMode, "1") == 0 ||
+        (std::strcmp(uiMode, "0") != 0 && std::thread::hardware_concurrency() >= 4);
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
     heap.NumDescriptors = kFrameCount;
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -767,13 +873,16 @@ void WebappWindow::initUi() {
     d.SampleDesc.Count = 1;
     check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&uiPso_)), "Create UI overlay pipeline");
     log("info", "HTML/CSS UI layer ready (Direct2D + DirectWrite + WIC)");
+    if (uiThreadOn_) startUiThread();
 }
 
 // Copies the last Direct2D raster into the overlay texture (this frame's
 // staging buffer is free: renderFrame waited for its fence).
 void WebappWindow::uploadUi(UINT frame) {
-    const std::uint8_t* px = ui_.pixels();
-    const UINT w = ui_.width(), h = ui_.height();
+    const std::shared_ptr<const UiFrame> frameData = uiThreadOn_ ? uiUploading_ : nullptr;
+    const std::uint8_t* px = frameData ? frameData->bgra.data() : ui_.pixels();
+    const UINT w = frameData ? frameData->width : ui_.width();
+    const UINT h = frameData ? frameData->height : ui_.height();
     uiUpload_ = false;
     if (!px || !w || !h) return;
     D3D12_RESOURCE_BARRIER barrier{};
@@ -811,7 +920,7 @@ void WebappWindow::uploadUi(UINT frame) {
     std::uint8_t* mapped = nullptr;
     D3D12_RANGE none{0, 0};
     check(uiStaging_[frame]->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map UI staging buffer");
-    const UINT srcStride = ui_.stride();
+    const UINT srcStride = frameData ? frameData->stride : ui_.stride();
     for (UINT y = 0; y < h; y++) std::memcpy(mapped + std::size_t(y) * pitch, px + std::size_t(y) * srcStride, std::size_t(w) * 4);
     uiStaging_[frame]->Unmap(0, nullptr);
     D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -902,6 +1011,7 @@ void WebappWindow::resize(UINT width, UINT height) {
     width = std::max<UINT>(1, width);
     height = std::max<UINT>(1, height);
     if (width == width_ && height == height_) return;
+    waitRenderThread(); // worker must finish its Present before DXGI resize
     width_ = width;
     height_ = height;
     if (swap_) {
@@ -911,6 +1021,7 @@ void WebappWindow::resize(UINT width, UINT height) {
         createSizeDependent();
     }
     host_.resize((int)width_, (int)height_, 1.0);
+    if (uiThreadOn_) requestUiRender();
 }
 
 ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes) {
@@ -935,6 +1046,7 @@ void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
 }
 
 void WebappWindow::releaseInstances(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = instances_.find(id);
     if (it == instances_.end()) return;
     for (auto& buffer : it->second.gpu) retire(buffer);
@@ -954,6 +1066,7 @@ void WebappWindow::collectRetired() {
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
                                   std::uint32_t colorChannels) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
     for (std::uint32_t v = 0; v < vertexCount; v++) {
@@ -982,6 +1095,7 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
 }
 
 void WebappWindow::releaseGeometry(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = geometries_.find(id);
     if (it == geometries_.end()) return;
     retire(it->second.vertices);
@@ -990,6 +1104,7 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
 }
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     InstanceSet& set = instances_[id];
     set.count = count;
     set.cpu.resize(size_t(count) * 19);
@@ -1004,6 +1119,7 @@ void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float
 }
 
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (!id || id > 16 || source.size() > 16000 || colorPatches_.count(id)) return false;
     if (source.find_first_of("#[]\\\"'") != std::string::npos) return false;
     static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|discard|clip)\b)");
@@ -1097,6 +1213,174 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     ID3D12PipelineState* raw = pso.Get();
     pipelines_[key] = pso;
     return raw;
+}
+
+// Experimental adaptive render worker. JavaScript, DOM and Three.js callbacks
+// remain on their sole V8 thread; only DX12 submission is parallelized.
+// At most one frame can be outstanding, so hot reload and resize are safe.
+// This worker does not enter V8 or DX12. It produces immutable UI frames
+// with its own cadence; the GPU consumes the latest completed frame without
+// synchronizing with the current Direct2D drawing operation.
+void WebappWindow::startUiThread() {
+    if (!uiReady_ || !uiThreadOn_ || uiThread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(uiRequestMutex_);
+        uiStop_ = false;
+        uiRenderRequest_ = true;
+        uiRequestW_ = width_;
+        uiRequestH_ = height_;
+    }
+    uiThread_ = std::thread([this] {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (;;) {
+            std::vector<float> display;
+            std::string strings;
+            bool replaceList = false;
+            UINT w = 0, h = 0;
+            {
+                std::unique_lock<std::mutex> lock(uiRequestMutex_);
+                uiRequestCv_.wait(lock, [this] { return uiStop_ || uiRenderRequest_ || uiPendingList_; });
+                if (uiStop_) break;
+                replaceList = uiPendingList_;
+                if (replaceList) {
+                    display.swap(uiPendingFloats_);
+                    strings.swap(uiPendingStrings_);
+                    uiPendingList_ = false;
+                }
+                w = uiRequestW_;
+                h = uiRequestH_;
+                uiRenderRequest_ = false;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            std::shared_ptr<UiFrame> bitmap;
+            {
+                std::lock_guard<std::mutex> uiLock(uiMutex_);
+                if (replaceList) ui_.setDisplayList(display.data(), display.size(), strings);
+                if (ui_.render(w, h)) {
+                    bitmap = std::make_shared<UiFrame>();
+                    bitmap->width = ui_.width();
+                    bitmap->height = ui_.height();
+                    bitmap->stride = ui_.stride();
+                    bitmap->visible = !ui_.empty();
+                    const std::uint8_t* pixels = ui_.pixels();
+                    if (pixels && bitmap->height && bitmap->stride)
+                        bitmap->bgra.assign(pixels, pixels + std::size_t(bitmap->height) * bitmap->stride);
+                }
+            }
+            if (bitmap) {
+                {
+                    std::lock_guard<std::mutex> publishLock(uiPublishedMutex_);
+                    bitmap->sequence = uiPublished_ ? uiPublished_->sequence + 1 : 1;
+                    uiPublished_ = std::move(bitmap);
+                }
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                uiRasterUs_.fetch_add(std::uint64_t(std::max<std::int64_t>(0, us)), std::memory_order_relaxed);
+                uiRastersDone_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (SUCCEEDED(com)) CoUninitialize();
+    });
+    uiRequestCv_.notify_one();
+    log("info", "[async-ui] independent Direct2D raster worker enabled; latest UI bitmap reused by 3D");
+}
+
+void WebappWindow::requestUiRender() {
+    if (!uiThreadOn_ || !uiThread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(uiRequestMutex_);
+        uiRequestW_ = width_;
+        uiRequestH_ = height_;
+        uiRenderRequest_ = true;
+    }
+    uiRequestCv_.notify_one();
+}
+
+void WebappWindow::stopUiThread() {
+    if (!uiThread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(uiRequestMutex_);
+        uiStop_ = true;
+    }
+    uiRequestCv_.notify_one();
+    uiThread_.join();
+    {
+        std::lock_guard<std::mutex> lock(uiRequestMutex_);
+        uiStop_ = uiRenderRequest_ = uiPendingList_ = false;
+        uiPendingFloats_.clear();
+        uiPendingStrings_.clear();
+    }
+}
+
+void WebappWindow::startRenderThread(bool forced) {
+    if (renderThread_.joinable()) return;
+    renderStop_ = renderPending_ = renderBusy_ = false;
+    renderError_ = nullptr;
+    completedRenderMs_ = 0;
+    renderThread_ = std::thread([this] {
+        for (;;) {
+            std::unique_lock<std::mutex> lock(renderStateMutex_);
+            renderCv_.wait(lock, [this] { return renderStop_ || renderPending_; });
+            if (renderStop_) break;
+            renderPending_ = false;
+            renderBusy_ = true;
+            lock.unlock();
+            const auto begin = std::chrono::steady_clock::now();
+            std::exception_ptr error;
+            try {
+                std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+                // Freeze the native resource snapshot before the producer can
+                // start its next V8 frame and upload updated instance buffers.
+                {
+                    std::lock_guard<std::mutex> signal(renderStateMutex_);
+                    renderStarted_ = true;
+                }
+                renderCv_.notify_all();
+                renderFrame();
+            } catch (...) { error = std::current_exception(); }
+            const auto done = std::chrono::steady_clock::now();
+            lock.lock();
+            completedRenderMs_ = std::chrono::duration<double, std::milli>(done - begin).count();
+            renderError_ = error;
+            renderBusy_ = false;
+            lock.unlock();
+            renderCv_.notify_all();
+        }
+    });
+    log("info", std::string("[async-render] enabled ") +
+        (forced ? "by NTB_ASYNC_RENDER=1" : "automatically from scene complexity") +
+        "; V8 and DX12 use separate CPU threads");
+}
+
+void WebappWindow::waitRenderThread() {
+    if (!renderThread_.joinable()) return;
+    std::unique_lock<std::mutex> lock(renderStateMutex_);
+    renderCv_.wait(lock, [this] { return !renderBusy_ && !renderPending_; });
+    if (renderError_) {
+        lock.unlock();
+        log("error", "[async-render] DX12 worker failed");
+        ExitProcess(44);
+    }
+}
+void WebappWindow::submitRenderThread() {
+    std::unique_lock<std::mutex> lock(renderStateMutex_);
+    renderStarted_ = false;
+    renderPending_ = true;
+    renderCv_.notify_one();
+    // Wait only for worker ownership of the resource mutex, NOT for GPU
+    // completion. V8 then overlaps scene simulation with native DX12.
+    renderCv_.wait(lock, [this] { return renderStarted_ || (!renderBusy_ && !renderPending_); });
+}
+void WebappWindow::stopRenderThread() {
+    if (!renderThread_.joinable()) return;
+    waitRenderThread();
+    {
+        std::lock_guard<std::mutex> lock(renderStateMutex_);
+        renderStop_ = true;
+    }
+    renderCv_.notify_one();
+    renderThread_.join();
+    renderStop_ = renderPending_ = renderBusy_ = renderStarted_ = false;
 }
 
 void WebappWindow::renderFrame() {
@@ -1250,7 +1534,21 @@ void WebappWindow::renderFrame() {
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
     if (uiReady_) {
-        if (uiUpload_) uploadUi(frame);
+        if (uiThreadOn_) {
+            std::lock_guard<std::mutex> lock(uiPublishedMutex_);
+            if (uiPublished_ && uiPublished_->sequence != uiLastUploadSequence_) {
+                uiUploading_ = uiPublished_;
+                uiVisible_ = uiUploading_->visible;
+                uiUpload_ = true;
+            }
+        }
+        if (uiUpload_) {
+            uploadUi(frame);
+            if (uiThreadOn_ && uiUploading_) {
+                uiLastUploadSequence_ = uiUploading_->sequence;
+                uiUploading_.reset();
+            }
+        }
         if (uiVisible_) drawUi(frame);
     }
 
@@ -1449,6 +1747,11 @@ int WebappWindow::run(HINSTANCE instance) {
         return 45;
     }
     log("info", "index.html parsed, scripts started");
+    char asyncMode[8] = {};
+    GetEnvironmentVariableA("NTB_ASYNC_RENDER", asyncMode, sizeof(asyncMode));
+    asyncDisabled_ = std::strcmp(asyncMode, "0") == 0;
+    asyncForced_ = std::strcmp(asyncMode, "1") == 0;
+    if (asyncForced_) startRenderThread(true);
     ShowWindow(window_, SW_SHOW);
     SetForegroundWindow(window_);
 
@@ -1470,11 +1773,14 @@ int WebappWindow::run(HINSTANCE instance) {
                 PostQuitMessage(45);
             }
             reload.reset();
+            if (asyncForced_) startRenderThread(true);
             pageStart = statStart = std::chrono::steady_clock::now();
             frameNumber = statFrames = 0;
         }
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
+                stopRenderThread();
+                stopUiThread();
                 waitForGpu();
                 host_.shutdown();
                 gActive = nullptr;
@@ -1498,16 +1804,42 @@ int WebappWindow::run(HINSTANCE instance) {
         reload = host_.takeReload();
         if (reload) continue;
         const auto tJs = std::chrono::steady_clock::now();
+        using msd = std::chrono::duration<double, std::milli>;
+        const bool alreadyAsync = renderThread_.joinable();
+        double previousRenderMs = 0, previousFenceMs = 0, previousPresentMs = 0, asyncWaitMs = 0;
+        if (alreadyAsync) {
+            // Next V8 frame is ready; finish the previous GPU frame before
+            // touching the UI raster buffer or swapping render packets.
+            const auto waitBegin = std::chrono::steady_clock::now();
+            waitRenderThread();
+            asyncWaitMs = msd(std::chrono::steady_clock::now() - waitBegin).count();
+            previousRenderMs = completedRenderMs_;
+            previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
+            previousPresentMs = presentMs_; presentMs_ = 0;
+        }
         gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
         if (uiReady_) {
             gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
-            if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
-            uiVisible_ = !ui_.empty();
+            if (!uiThreadOn_) {
+                if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
+                uiVisible_ = !ui_.empty();
+            } // Otherwise UI publishes at its own pace in the worker.
             gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
         }
         const auto tRaster = std::chrono::steady_clock::now();
-        renderFrame();
+        // Auto-select only nontrivial scenes on machines with spare cores.
+        if (!asyncDisabled_ && !alreadyAsync && !asyncForced_ && frameNumber >= 20 &&
+            std::thread::hardware_concurrency() >= 4 && lastDraws_ >= 128 &&
+            msd(tJs - now).count() >= 8.0)
+            startRenderThread(false);
+        const bool threaded = renderThread_.joinable();
+        if (threaded) submitRenderThread();
+        else {
+            renderFrame();
+            previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
+            previousPresentMs = presentMs_; presentMs_ = 0;
+        }
         const auto tEnd = std::chrono::steady_clock::now();
         {
             using msd = std::chrono::duration<double, std::milli>;
@@ -1516,10 +1848,20 @@ int WebappWindow::run(HINSTANCE instance) {
             perf_.frameMs += frameMs;
             perf_.frameMax = std::max(perf_.frameMax, frameMs);
             perf_.jsMs += msd(tJs - now).count();
-            perf_.rasterMs += msd(tRaster - tJs).count();
-            perf_.renderMs += msd(tEnd - tRaster).count();
-            perf_.fenceMs += fenceWaitMs_;
-            perf_.presentMs += presentMs_;
+            if (uiThreadOn_) {
+                const auto done = uiRastersDone_.load(std::memory_order_relaxed);
+                const auto us = uiRasterUs_.load(std::memory_order_relaxed);
+                if (done >= uiRastersAccounted_ && us >= uiRasterUsAccounted_) {
+                    perf_.rasters += int(done - uiRastersAccounted_);
+                    perf_.rasterMs += double(us - uiRasterUsAccounted_) / 1000.0;
+                    uiRastersAccounted_ = done;
+                    uiRasterUsAccounted_ = us;
+                }
+            } else perf_.rasterMs += msd(tRaster - tJs).count() - asyncWaitMs;
+            // Worker timing belongs to the prior frame and overlaps current V8.
+            perf_.renderMs += threaded ? previousRenderMs + asyncWaitMs : msd(tEnd - tRaster).count();
+            perf_.fenceMs += previousFenceMs;
+            perf_.presentMs += previousPresentMs;
             // Attribute visible stalls to JavaScript, UI rasterisation or DX12.
             // Throttle warnings so an already slow scene cannot flood the log.
             static auto lastSlowFrameLog = std::chrono::steady_clock::time_point{};
@@ -1530,7 +1872,6 @@ int WebappWindow::run(HINSTANCE instance) {
                     " ms; DX12 " + std::to_string(msd(tEnd - tRaster).count()) + " ms");
                 lastSlowFrameLog = tEnd;
             }
-            fenceWaitMs_ = 0;
             const double since = std::chrono::duration<double>(tEnd - perfAt_).count();
             if (since >= 1.0) {
                 writePerfRow(std::chrono::duration<double>(tEnd - start).count(), since);
@@ -1547,7 +1888,11 @@ int WebappWindow::run(HINSTANCE instance) {
         }
         if (uiReady_ && std::chrono::duration<double>(now - uiStatsAt_).count() >= 5.0) {
             uiStatsAt_ = now;
-            const std::string stats = ui_.stats();
+            std::string stats;
+            {
+                std::lock_guard<std::mutex> uiLock(uiMutex_);
+                stats = ui_.stats();
+            }
             if (stats != uiLastStats_) { log("info", stats); uiLastStats_ = stats; }
         }
         if (frameNumber == 1 || frameNumber == 60 || frameNumber % 600 == 0) {
@@ -1555,7 +1900,11 @@ int WebappWindow::run(HINSTANCE instance) {
             std::snprintf(line, sizeof line, "frame %d: %u draws, %zu geometries, %zu instance sets",
                           frameNumber, lastDraws_, geometries_.size(), instances_.size());
             log("info", line);
-            if (uiReady_) log("info", ui_.stats());
+            if (uiReady_) {
+                std::string stats;
+                { std::lock_guard<std::mutex> uiLock(uiMutex_); stats = ui_.stats(); }
+                log("info", stats);
+            }
         }
         if (frameNumber == 30 && !bootDialogShown_) {
             const std::string status = host_.statusJson();

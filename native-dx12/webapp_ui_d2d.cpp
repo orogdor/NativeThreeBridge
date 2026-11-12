@@ -935,7 +935,7 @@ bool WebappUiRenderer::init(const std::filesystem::path& gameRoot, std::string& 
     s.root = gameRoot;
     const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     s.comInit = co == S_OK || co == S_FALSE;
-    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, s.d2d.GetAddressOf()))) { error = "Direct2D factory unavailable"; return false; }
+    if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, s.d2d.GetAddressOf()))) { error = "Direct2D factory unavailable"; return false; }
     if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(s.dwrite.GetAddressOf())))) {
         error = "DirectWrite factory unavailable";
         s.d2d.Reset();
