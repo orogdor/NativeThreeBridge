@@ -8,6 +8,8 @@ Image quality and speed of the webapp renderer (Game2):
 - **Shadows.** With `renderer.shadowMap.enabled`, the first `castShadow` directional or spot light renders a shadow map from `light.shadow.camera` (`mapSize`, `bias`, `normalBias`, `radius`, `intensity`); `receiveShadow` surfaces sample it with 3x3 PCF. Casters outside the camera view still cast; cut-outs cast cut-out shadows. Not yet: point light shadows, more than one shadow-casting light.
 - **Speed.** `THREE.LOD` draws only the level for the camera distance (all levels were drawn). Opaque meshes sharing geometry and material are merged into one instanced draw when 8 or more are visible (`renderer.autoInstancing = false` turns it off). Geometry is copied into GPU memory once instead of being read from upload memory every frame. `NT_VSYNC=0` presents without vsync for measuring.
 
+- **Webapp compatibility (Kuningriigid).** `onBeforeCompile` patches that sample their own texture and write alpha (fog of war) are translated; CSS `border-image`, `clip-path` and correct stacking for positioned `z-index:auto` boxes; a real `MutationObserver`; `dataset` reflected to `data-*` attributes; `querySelector`/`matches`/`closest` with the full CSS matcher (`:scope`, `:is`, `:not`, `+`, `~`).
+
 Pass header is 96 floats (shadow light at [56..94]), draw records 60 floats (normal map at [53..55], shadow bits at [56]). Tests: `test/webapp-render-features.test.mjs`.
 
 # NativeThreeBridge v0.32.16 — mirrored GLTF meshes drawn the right way round
