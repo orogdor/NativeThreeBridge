@@ -29,3 +29,23 @@ test('worker obtains the native resource snapshot before V8 frame N+1', () => {
   assert.match(src, /renderStarted_ = true;/);
   assert.match(src, /renderCv_\.wait\(lock, \[this\] \{ return renderStarted_/);
 });
+
+test('native UI raster runs independently and publishes immutable frames', () => {
+  assert.match(src, /void WebappWindow::startUiThread\(\)/);
+  assert.match(src, /std::shared_ptr<const UiFrame> uiPublished_/);
+  assert.match(src, /uiPublished_ = std::move\(bitmap\)/);
+  assert.match(src, /NTB_ASYNC_UI/);
+  assert.match(src, /void WebappWindow::stopUiThread\(\)/);
+});
+test('native Canvas and text layout are serialized with UI raster', () => {
+  for (const name of ['canvasCommands', 'canvasRead', 'canvasWrite', 'registerImage', 'measureText']) {
+    const p = src.indexOf(' ' + name + '(');
+    assert(p >= 0, name);
+    assert.match(src.slice(p, p + 800), /uiLock\(uiMutex_\)/);
+  }
+});
+test('UI raster worker uses no V8 callbacks or DX12 command recording', () => {
+  const worker = src.slice(src.indexOf('void WebappWindow::startUiThread() {'), src.indexOf('void WebappWindow::requestUiRender()'));
+  assert.match(worker, /ui_\.render/);
+  assert.doesNotMatch(worker, /host_\.|renderFrame\(|queue_->|cmd_->/);
+});
