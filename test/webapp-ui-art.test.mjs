@@ -111,3 +111,20 @@ test('clip-path circle wider than a non-square box still clips round', { skip },
   assert.deepEqual(clip.slice(0, 4).map((v) => Math.round(v * 10) / 10), [104.8, 300, 130.4, 120]);
   assert.equal(Math.round(clip[4]), 60);
 });
+
+test('getElementById stays correct with its lookup cache', { skip }, async () => {
+  const { context } = await runWebapp(fixture, { frames: 2, width: 1280, height: 720 });
+  const doc = context.document;
+  const a = doc.createElement('div'); a.id = 'cache-probe'; doc.body.append(a);
+  assert.equal(doc.getElementById('cache-probe'), a);
+  assert.equal(doc.getElementById('cache-probe'), a, 'cached hit');
+  a.remove();
+  assert.equal(doc.getElementById('cache-probe'), null, 'removed element is not returned');
+  doc.body.append(a);
+  a.id = 'renamed';
+  assert.equal(doc.getElementById('cache-probe'), null, 'renamed element is not returned');
+  assert.equal(doc.getElementById('renamed'), a);
+  const b = doc.createElement('span'); b.setAttribute('id', 'cache-probe'); a.append(b);
+  assert.equal(doc.getElementById('cache-probe'), b, 'a new element with the id is found');
+  a.remove();
+});

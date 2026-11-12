@@ -1514,7 +1514,21 @@
     createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
     createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     createEvent() { return new Event(''); }
-    getElementById(id) { return findFirst(this, (e) => e.getAttribute('id') === id); }
+    // Ids are looked up through a cache that is re-validated on every hit
+    // (same id, still connected to this document); misses scan the tree.
+    getElementById(id) {
+      id = String(id);
+      const cache = this._idCache || (this._idCache = new Map());
+      const hit = cache.get(id);
+      if (hit && hit._attrs.get('id') === id) {
+        let n = hit;
+        while (n && n !== this) n = n.parentNode;
+        if (n === this) return hit;
+      }
+      const found = findFirst(this, (e) => e._attrs.get('id') === id);
+      if (found) cache.set(id, found); else cache.delete(id);
+      return found;
+    }
     querySelector(s) { return querySelectorAll(this, s)[0] || null; }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
