@@ -83,3 +83,20 @@ test('MutationObserver delivers childList and filtered attribute records', { ski
   assert.ok(records.filter((r) => r === 'childList:::1:0').length >= 2, 'the decorator\'s own append is observed too');
   assert.ok(!records.some((r) => r.includes('title')), 'attributeFilter excludes other attributes');
 });
+
+test('DOM queries use the full selector matcher (:scope, :is, :not, sibling combinators)', { skip }, async () => {
+  const { context } = await runWebapp(fixture, { frames: 2, width: 1280, height: 720 });
+  const doc = context.document;
+  const box = doc.createElement('div');
+  box.innerHTML = '<span data-r="a"></span><p class="x"><span data-r="b"></span></p><i class="y"></i><b></b>';
+  doc.body.append(box);
+  assert.equal(box.querySelectorAll(':scope > span[data-r]').length, 1, ':scope > only matches children');
+  assert.equal(box.querySelectorAll('span[data-r]').length, 2);
+  assert.equal(box.querySelectorAll(':is(p, i).x, i.y').length, 2);
+  assert.equal(box.querySelectorAll('*:not(.x, .y)').length, 3);
+  assert.equal(box.querySelector('p + i').className, 'y');
+  assert.equal(box.querySelectorAll('span ~ b').length, 1);
+  assert.equal(box.querySelector('i').matches(':scope.y'), true);
+  assert.equal(box.querySelector('[data-r=b]').closest(':not(span)'), box.querySelector('p'));
+  box.remove();
+});

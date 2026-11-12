@@ -781,7 +781,10 @@
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
     getElementsByClassName(c) { return querySelectorAll(this, c.split(/\s+/).filter(Boolean).map((x) => '.' + x).join('')); }
-    matches(s) { return parseSelectorGroups(s).some((g) => matchComplex(this, g)); }
+    matches(s) {
+      const full = uiLayer ? uiLayer.selectorMatches(this, s, this) : null;
+      return full ?? parseSelectorGroups(s).some((g) => matchComplex(this, g));
+    }
     closest(s) { for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (n.matches(s)) return n; return null; }
     _fullView() { return this.localName === 'canvas' || this.localName === 'body' || this.localName === 'html'; }
     // Real layout boxes from the UI layer; full-window fallback without it.
@@ -1596,11 +1599,19 @@
     return false;
   }
   function querySelectorAll(root, selector) {
-    const groups = parseSelectorGroups(selector), out = [];
+    const out = [];
+    // Prefer the UI layer's full CSS matcher; :scope is the queried element.
+    const scope = root.nodeType === 1 ? root : null;
+    let test = null;
+    if (uiLayer && uiLayer.selectorMatches) {
+      const probe = uiLayer.selectorMatches(document.documentElement, selector, scope);
+      if (probe !== null) test = (c) => uiLayer.selectorMatches(c, selector, scope);
+    }
+    if (!test) { const groups = parseSelectorGroups(selector); test = (c) => groups.some((g) => matchComplex(c, g)); }
     (function walk(node) {
       for (const c of node.childNodes) {
         if (c.nodeType !== 1) continue;
-        if (groups.some((g) => matchComplex(c, g))) out.push(c);
+        if (test(c)) out.push(c);
         walk(c);
       }
     })(root);

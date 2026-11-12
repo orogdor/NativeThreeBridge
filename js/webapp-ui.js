@@ -537,7 +537,7 @@
       }
       case 'empty': return !el.childNodes.some((n) => n.nodeType === 1 || (n.nodeType === 3 && n.data.length));
       case 'root': return el === document.documentElement;
-      case 'scope': return el === document.documentElement;
+      case 'scope': return el === (queryScope || document.documentElement);
       case 'hover': return !!interact.hover && isInChain(el, interact.hover);
       case 'active': return !!interact.active && isInChain(el, interact.active);
       case 'focus': return document.activeElement === el && el !== document.body;
@@ -585,6 +585,8 @@
     }
     return false;
   }
+  // The element querySelector/matches/closest run from (:scope), else the root.
+  let queryScope = null;
   function matchSelector(el, sel) {
     if (sel.never) return false;
     return matchFrom(el, sel.parts, sel.parts.length - 1);
@@ -3983,6 +3985,16 @@ center{text-align:center}
       return el && el._ntStyle ? el._ntStyle : null;
     },
     matchMedia: mediaMatches,
+    // DOM selector matching with the full CSS matcher (:is, :not, :has,
+    // :scope, sibling combinators …). null = selector the parser rejects.
+    selectorMatches(el, text, scope) {
+      const list = parseSelectorList(String(text));
+      if (!list.length) return null;
+      const previous = queryScope;
+      queryScope = scope || null;
+      try { return list.some((sel) => !sel.pseudoEl && matchSelector(el, sel)); }
+      finally { queryScope = previous; }
+    },
     imageSize(src) { return imageSize(src); },
     parseColor(text) { const c = parseColor(text); return c ? c.slice() : null; },
     sniffImage(bytes) { try { return bytes ? sniffImage(bytes) : null; } catch { return null; } },
