@@ -1,0 +1,149 @@
+name: Compare engine versions on Kuningriigid
+
+# Runs the released engine and a branch build on the same Kuningriigid world
+# (Math.random seeded in the test copy) and reports screenshots and FPS.
+# Screenshots are also printed into the log (BEGIN-SHOT/END-SHOT, base64 JPEG)
+# for tools without artifact access.
+# Push to bench/** (or dispatch) to run; the new engine is the latest
+# successful Windows package built from NEW_BRANCH.
+on:
+  push:
+    branches: ['bench/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  compare:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OLD_TAG: v0.32.16
+      NEW_BRANCH: feature/render-quality-speed
+      SEED: '20261112'
+      MEASURE_SECONDS: '30'
+    steps:
+      - name: Fetch both engines
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg, old, new | Out-Null
+          gh release download $env:OLD_TAG -R '${{ github.repository }}' -p NativeThreeBridge-Windows-x64.zip -D pkg/old
+          $runId = gh run list -R '${{ github.repository }}' -b $env:NEW_BRANCH -w 'native-threejs.yml' -s success -L 1 --json databaseId -q '.[0].databaseId'
+          if (!$runId) { $runId = (gh api "repos/${{ github.repository }}/actions/runs?branch=$($env:NEW_BRANCH)&status=success&per_page=20" | ConvertFrom-Json).workflow_runs | Where-Object { $_.name -like '*Windows*' } | Select-Object -First 1 -ExpandProperty id }
+          Write-Host "new engine from run $runId"
+          gh run download $runId -R '${{ github.repository }}' -n NativeThreeBridge-Windows-x64 -D pkg/new
+          Expand-Archive pkg/old/NativeThreeBridge-Windows-x64.zip -DestinationPath old -Force
+          Expand-Archive pkg/new/NativeThreeBridge-Windows-x64.zip -DestinationPath new -Force
+          Write-Host "old: $(Get-Content old/engine-version.txt)  new: $(Get-Content new/engine-version.txt)"
+      - name: Prepare a deterministic Kuningriigid copy
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/orogdor/Kuningriigid.git game
+          Write-Host "Kuningriigid $(git -C game rev-parse --short HEAD)"
+          # Same seed -> same generated world and the same simulation in both engines.
+          $seed = $env:SEED
+          $boot = "<script>(function(){var a=$seed>>>0;Math.random=function(){a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};})();</script>"
+          $html = Get-Content game/index.html -Raw
+          $html = [regex]::Replace($html, '<head>', "<head>$boot", 1)
+          Set-Content game/index.html $html -NoNewline
+      - name: Run, screenshot and measure
+        shell: pwsh
+        env:
+          CI: '1'
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class BenchInput {
+            [DllImport("user32.dll")]
+            public static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+          }
+          '@
+          function Save-Screen($file) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save($file)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          function Print-Shot($file, $name) {
+            $img = [System.Drawing.Image]::FromFile($file)
+            $ms = New-Object System.IO.MemoryStream
+            $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+            $ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+            $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), 85L
+            $img.Save($ms, $codec, $ep)
+            $img.Dispose()
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            Write-Host "BEGIN-SHOT $name"
+            for ($i = 0; $i -lt $b64.Length; $i += 4000) { Write-Host ("SHOT " + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i))) }
+            Write-Host "END-SHOT $name"
+          }
+          function Click($p, $x, $y) {
+            $at = [IntPtr](($y -shl 16) -bor $x)
+            [void][BenchInput]::PostMessage($p.MainWindowHandle, 0x201, [IntPtr]1, $at)
+            Start-Sleep -Milliseconds 100
+            [void][BenchInput]::PostMessage($p.MainWindowHandle, 0x202, [IntPtr]::Zero, $at)
+          }
+          New-Item -ItemType Directory -Force shots | Out-Null
+          $folder = (Resolve-Path game).Path
+          $measure = [int]$env:MEASURE_SECONDS
+          $runs = @(
+            @{ name = 'old'; dir = 'old'; env = @{} },
+            @{ name = 'new'; dir = 'new'; env = @{} },
+            @{ name = 'new-msaa1'; dir = 'new'; env = @{ NT_MSAA = '1' } }
+          )
+          $rows = @()
+          foreach ($r in $runs) {
+            # Fresh storage: the seeded world is generated the same way each run.
+            Remove-Item -Recurse -Force "$folder.native-storage" -ErrorAction SilentlyContinue
+            $dir = (Resolve-Path $r.dir).Path
+            Remove-Item "$dir/NativeThreeBridge-webapp-frames.csv", "$dir/NativeThreeBridge-webapp-log.txt" -ErrorAction SilentlyContinue
+            foreach ($k in $r.env.Keys) { Set-Item "env:$k" $r.env[$k] }
+            $p = Start-Process -FilePath "$dir/NativeThree-Engine.exe" -ArgumentList '--webapp', $folder -WorkingDirectory $dir -PassThru
+            foreach ($k in $r.env.Keys) { Remove-Item "env:$k" }
+            Start-Sleep -Seconds 45
+            Save-Screen "shots/$($r.name)-menu.png"
+            $p.Refresh()
+            # Continue Game in the start menu (standard runner window, as in the build workflow).
+            if (!$p.HasExited -and $p.MainWindowHandle -ne 0) { Click $p 752 175 }
+            Start-Sleep -Seconds 15
+            Save-Screen "shots/$($r.name)-world.png"
+            $start = Get-Date
+            Start-Sleep -Seconds $measure
+            Save-Screen "shots/$($r.name)-world-later.png"
+            $p.Refresh()
+            $title = $p.MainWindowTitle
+            if (!$p.HasExited) { Stop-Process -Id $p.Id -Force }
+            $p.WaitForExit()
+            Start-Sleep -Seconds 1
+            Copy-Item "$dir/NativeThreeBridge-webapp-log.txt" "shots/$($r.name)-log.txt" -ErrorAction SilentlyContinue
+            $csv = Import-Csv "$dir/NativeThreeBridge-webapp-frames.csv"
+            Copy-Item "$dir/NativeThreeBridge-webapp-frames.csv" "shots/$($r.name)-frames.csv"
+            $window = $csv | Select-Object -Last ($measure - 2)
+            $avg = { param($col) [math]::Round((($window | ForEach-Object { [double]$_.$col }) | Measure-Object -Average).Average, 2) }
+            $rows += [pscustomobject]@{
+              run = $r.name; fps = (& $avg 'fps'); frame_ms = (& $avg 'frame_ms_avg'); frame_ms_max = [math]::Round((($window | ForEach-Object { [double]$_.frame_ms_max }) | Measure-Object -Maximum).Maximum, 1)
+              js_ms = (& $avg 'js_ms_avg'); render_ms = (& $avg 'render_ms_avg'); gpu_wait_ms = (& $avg 'gpu_wait_ms_avg'); ui_ms = [math]::Round((& $avg 'ui_style_ms_avg') + (& $avg 'ui_layout_ms_avg') + (& $avg 'ui_paint_ms_avg'), 2)
+              draws = (& $avg 'draws'); title = $title
+            }
+            Write-Host "---- $($r.name): $title"
+            Get-Content "shots/$($r.name)-log.txt" -ErrorAction SilentlyContinue | Select-String -Pattern 'Antialiasing|\[error\]|Not supported|crash' | Select-Object -First 25
+          }
+          Write-Host "==== RESULTS"
+          $rows | Format-Table run, fps, frame_ms, frame_ms_max, js_ms, render_ms, gpu_wait_ms, ui_ms, draws -AutoSize | Out-String -Width 200 | Write-Host
+          foreach ($row in $rows) { Write-Host ("RESULT " + ($row | ConvertTo-Json -Compress)) }
+          foreach ($f in Get-ChildItem shots -Filter *.png) { Print-Shot $f.FullName $f.BaseName }
+      - name: Upload screenshots and frame logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-comparison
+          path: shots/
+          if-no-files-found: ignore
