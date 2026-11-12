@@ -56,3 +56,18 @@ test('a positioned z-index:auto box does not trap its z-indexed children below a
   assert.ok(frame >= 0 && portrait >= 0, order.join(' '));
   assert.ok(portrait > frame, 'z-index:2 portrait paints after the z-index:1 frame');
 });
+
+test('element.dataset is reflected to data-* attributes (and CSS follows it)', { skip }, async () => {
+  const { context } = await runWebapp(fixture, { frames: 3, width: 1280, height: 720 });
+  const flag = context.document.getElementById('flag');
+  assert.equal(flag.getAttribute('data-state'), 'on');
+  assert.equal(flag.getAttribute('data-panel-kind'), 'build');
+  assert.equal(context.document.querySelector('[data-panel-kind=build]'), flag);
+  assert.equal(flag.getBoundingClientRect().width, 50);
+  assert.deepEqual(Object.keys(flag.dataset).sort(), ['panelKind', 'state']);
+  delete flag.dataset.state;
+  assert.equal(flag.hasAttribute('data-state'), false);
+  assert.equal('state' in flag.dataset, false);
+  flag.setAttribute('data-x-y', '1');
+  assert.equal(flag.dataset.xY, '1');
+});

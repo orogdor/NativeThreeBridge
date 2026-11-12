@@ -638,6 +638,24 @@
     return out;
   }
 
+  // element.dataset as a DOMStringMap: reads and writes go to the data-*
+  // attributes, so CSS like [data-kind=build] follows script changes.
+  const dataAttr = (key) => 'data-' + String(key).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+  const dataKey = (attr) => attr.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  function makeDataset(el) {
+    return new Proxy({}, {
+      get(_, key) { return typeof key === 'string' ? (el.getAttribute(dataAttr(key)) ?? undefined) : undefined; },
+      set(_, key, value) { if (typeof key === 'string') el.setAttribute(dataAttr(key), value); return true; },
+      deleteProperty(_, key) { if (typeof key === 'string') el.removeAttribute(dataAttr(key)); return true; },
+      has(_, key) { return typeof key === 'string' && el.hasAttribute(dataAttr(key)); },
+      ownKeys() { return [...el._attrs.keys()].filter((n) => n.startsWith('data-')).map(dataKey); },
+      getOwnPropertyDescriptor(_, key) {
+        const v = typeof key === 'string' ? el.getAttribute(dataAttr(key)) : null;
+        return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
+      },
+    });
+  }
+
   class Element extends Node {
     constructor(tagName, namespaceURI = 'http://www.w3.org/1999/xhtml') {
       const lower = String(tagName).toLowerCase();
@@ -646,7 +664,7 @@
       this._attrs = new Map();
       this.style = makeStyle(this);
       this.classList = new DOMTokenList(this);
-      this.dataset = {};
+      this.dataset = makeDataset(this);
     }
     get id() { return this.getAttribute('id') || ''; }
     set id(v) { this.setAttribute('id', v); }
@@ -656,7 +674,6 @@
     getAttribute(n) { n = String(n).toLowerCase(); return this._attrs.has(n) ? this._attrs.get(n) : null; }
     setAttribute(n, v) {
       n = String(n).toLowerCase(); v = String(v); this._attrs.set(n, v);
-      if (n.startsWith('data-')) this.dataset[n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
       if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
       uiNotify('attr', this, n);

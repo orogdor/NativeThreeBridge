@@ -13,3 +13,6 @@ body{margin:0;width:1280px;height:720px}
 #sel-frame{position:absolute;inset:0;width:100%;height:100%;z-index:1}
 #sel-head{position:absolute;inset:0}
 #sel-portrait{position:absolute;left:25%;top:25%;width:50%;height:50%;z-index:2}
+/* Kuningriigid V309: the menu layout follows menu.dataset.kind = 'build'. */
+#flag{position:absolute;left:0;top:600px;width:10px;height:10px}
+#flag[data-state=on][data-panel-kind="build"]{width:50px}
