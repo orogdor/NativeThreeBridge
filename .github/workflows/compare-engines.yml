@@ -18,7 +18,7 @@ permissions:
 jobs:
   compare:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       GH_TOKEN: ${{ github.token }}
       OLD_TAG: v0.32.16
@@ -31,7 +31,12 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force pkg, old, new | Out-Null
           gh release download $env:OLD_TAG -R '${{ github.repository }}' -p NativeThreeBridge-Windows-x64.zip -D pkg/old
-          $runId = gh run list -R '${{ github.repository }}' -b $env:NEW_BRANCH -w 'native-threejs.yml' -s success -L 1 --json databaseId -q '.[0].databaseId'
+          $head = gh api "repos/${{ github.repository }}/commits/$($env:NEW_BRANCH)" -q .sha
+          for ($i = 0; $i -lt 60; $i++) {
+            $runId = gh run list -R '${{ github.repository }}' -b $env:NEW_BRANCH -w 'native-threejs.yml' -c $head -s success -L 1 --json databaseId -q '.[0].databaseId'
+            if ($runId) { break }
+            Write-Host "waiting for the $($env:NEW_BRANCH) build of $head"; Start-Sleep -Seconds 30
+          }
           if (!$runId) { $runId = (gh api "repos/${{ github.repository }}/actions/runs?branch=$($env:NEW_BRANCH)&status=success&per_page=20" | ConvertFrom-Json).workflow_runs | Where-Object { $_.name -like '*Windows*' } | Select-Object -First 1 -ExpandProperty id }
           Write-Host "new engine from run $runId"
           gh run download $runId -R '${{ github.repository }}' -n NativeThreeBridge-Windows-x64 -D pkg/new
@@ -49,6 +54,12 @@ jobs:
           $html = Get-Content game/index.html -Raw
           $html = [regex]::Replace($html, '<head>', "<head>$boot", 1)
           Set-Content game/index.html $html -NoNewline
+          # The world seed itself: other code calls Math.random a varying number
+          # of times before the world is made, so pin the seed directly too.
+          $civ = Get-Content game/civilization.js -Raw
+          $pinned = $civ.Replace('createGame(Math.floor(Math.random()*2147483647))', "createGame($seed)")
+          if ($pinned -eq $civ) { throw 'World seed expression not found in civilization.js' }
+          Set-Content game/civilization.js $pinned -NoNewline
       - name: Run, screenshot and measure
         shell: pwsh
         env:
@@ -97,7 +108,9 @@ jobs:
           $runs = @(
             @{ name = 'old'; dir = 'old'; env = @{} },
             @{ name = 'new'; dir = 'new'; env = @{} },
-            @{ name = 'new-msaa1'; dir = 'new'; env = @{ NT_MSAA = '1' } }
+            @{ name = 'new-msaa1'; dir = 'new'; env = @{ NT_MSAA = '1' } },
+            @{ name = 'new-noshadow'; dir = 'new'; env = @{ NT_SHADOWS = '0' } },
+            @{ name = 'new-msaa1-noshadow'; dir = 'new'; env = @{ NT_MSAA = '1'; NT_SHADOWS = '0' } }
           )
           $rows = @()
           foreach ($r in $runs) {
