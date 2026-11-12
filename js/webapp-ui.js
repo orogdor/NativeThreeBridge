@@ -2744,8 +2744,18 @@ center{text-align:center}
     const x0 = Math.min(...xs), y0 = Math.min(...ys);
     return { x: b.x + x0, y: b.y + y0, w: Math.max(...xs) - x0, h: Math.max(...ys) - y0, r: 0 };
   }
+  // The clip-path shape clamped to the border box; a radius that no longer
+  // fits is reduced so a circle wider than a non-square box stays round.
+  function clampedClipPath(b) {
+    const s = clipPathRect(b);
+    if (!s) return null;
+    const x = Math.max(s.x, b.x), y = Math.max(s.y, b.y);
+    const w = Math.max(0, Math.min(s.x + s.w, b.x + b.w) - x), h = Math.max(0, Math.min(s.y + s.h, b.y + b.h) - y);
+    if (w >= b.w - 0.01 && h >= b.h - 0.01 && s.r <= 0.01 && s.x <= b.x && s.y <= b.y) return null;
+    return { x, y, w, h, r: Math.min(s.r, w / 2, h / 2) };
+  }
   function paintContext(b, clipOuter) {
-    const shape = clipPathRect(b);
+    const shape = clampedClipPath(b);
     if (shape) clipOuter = clipIntersect(clipOuter, shape);
     paintOwn(b, clipOuter);
     b._clipInner = innerClip(b, clipOuter);

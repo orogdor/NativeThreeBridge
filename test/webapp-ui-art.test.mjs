@@ -100,3 +100,14 @@ test('DOM queries use the full selector matcher (:scope, :is, :not, sibling comb
   assert.equal(box.querySelector('[data-r=b]').closest(':not(span)'), box.querySelector('p'));
   box.remove();
 });
+
+test('clip-path circle wider than a non-square box still clips round', { skip }, async () => {
+  const { rec } = await runWebapp(fixture, { frames: 3, width: 1280, height: 720 });
+  let clip = null;
+  decodeUi(rec.ui.floats, (op, a) => { if (op === CLIP && a[0] > 100 && a[0] < 110 && near(a[1], 300)) clip = Array.from(a.slice(0, 5)); });
+  // circle(50%) of a 140x120 box: R = 50% of sqrt((140^2 + 120^2) / 2) = 65.2,
+  // clamped to the box height -> 130.4 x 120 with radius 60 (was square before).
+  assert.ok(clip, 'minimap host clip emitted');
+  assert.deepEqual(clip.slice(0, 4).map((v) => Math.round(v * 10) / 10), [104.8, 300, 130.4, 120]);
+  assert.equal(Math.round(clip[4]), 60);
+});

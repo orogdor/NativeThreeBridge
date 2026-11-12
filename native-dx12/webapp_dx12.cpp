@@ -330,6 +330,7 @@ private:
     void ensureShadowMap(UINT size);
     ID3D12PipelineState* shadowPipeline(UINT flags, bool alphaTested);
     bool vsync_ = true;   // NT_VSYNC=0: present without waiting for the display
+    bool shadowsOn_ = true;   // NT_SHADOWS=0: skip shadow maps (quality/speed switch)
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
     ComPtr<ID3D12Fence> fence_;
@@ -578,6 +579,9 @@ void WebappWindow::initDevice() {
     {
         char env[8] = {};
         if (GetEnvironmentVariableA("NT_VSYNC", env, sizeof env) > 0 && env[0] == '0') vsync_ = false;
+        char shadowEnv[8] = {};
+        if (GetEnvironmentVariableA("NT_SHADOWS", shadowEnv, sizeof shadowEnv) > 0 && shadowEnv[0] == '0') shadowsOn_ = false;
+        log("info", std::string("Shadows: ") + (shadowsOn_ ? "on" : "off (NT_SHADOWS=0)"));
     }
 
     const float identity[19] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1};
@@ -1417,7 +1421,7 @@ void WebappWindow::renderFrame() {
     UINT64 needed = 0;
     UINT shadowWanted = 0;
     for (const auto& pass : passes_) {
-        const bool shadows = pass[88] > 0;
+        const bool shadows = shadowsOn_ && pass[88] > 0;
         needed += (shadows ? 2 : 1) * (kFrameCBBytes + UINT64(pass[43]) * kDrawCBBytes);
         if (shadows) shadowWanted = std::max(shadowWanted, std::clamp<UINT>(UINT(pass[91]), 256, 4096));
     }
@@ -1571,7 +1575,7 @@ void WebappWindow::renderFrame() {
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
         const float* firstDraw = p + native_three::kWebappPassHeaderFloats + lightCount * native_three::kWebappLightFloats;
-        const bool shadows = p[88] > 0 && shadowSize_ > 1;
+        const bool shadows = shadowsOn_ && p[88] > 0 && shadowSize_ > 1;
 
         // ---- shadow pass: depth from the light into the shadow map
         float shadowVP[16] = {};
