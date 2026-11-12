@@ -7,5 +7,15 @@
 <div id="selection"><img id="sel-frame" src="img/panel.png" alt=""><div id="sel-head"><img id="sel-portrait" src="img/portrait.png" alt=""></div></div>
 <div id="portrait-box"><img id="portrait" src="img/portrait.png" alt=""></div>
 <div id="flag"></div>
-<script type="module">window.ready = true; const flag = document.getElementById('flag'); flag.dataset.state = 'on'; flag.dataset.panelKind = 'build'; const tick = () => requestAnimationFrame(tick); tick();</script>
+<script type="module">window.ready = true; const flag = document.getElementById('flag'); flag.dataset.state = 'on'; flag.dataset.panelKind = 'build';
+window.__mo = [];
+const mo = new MutationObserver((records) => {
+  for (const r of records) window.__mo.push([r.type, r.attributeName, r.oldValue, r.addedNodes.length, r.removedNodes.length].join(':'));
+  // Like Kuningriigid's card decorator: change the tree from inside the callback.
+  for (const b of flag.querySelectorAll('button:not(.decorated)')) { b.classList.add('decorated'); b.append(document.createElement('span')); }
+});
+mo.observe(flag, { childList: true, subtree: true, attributeFilter: ['hidden'], attributeOldValue: true });
+const card = document.createElement('button'); flag.append(card);
+flag.hidden = true; flag.hidden = false;
+flag.title = 'not observed'; const tick = () => requestAnimationFrame(tick); tick();</script>
 </body></html>

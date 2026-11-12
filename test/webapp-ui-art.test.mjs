@@ -71,3 +71,15 @@ test('element.dataset is reflected to data-* attributes (and CSS follows it)', {
   flag.setAttribute('data-x-y', '1');
   assert.equal(flag.dataset.xY, '1');
 });
+
+test('MutationObserver delivers childList and filtered attribute records', { skip }, async () => {
+  const { context } = await runWebapp(fixture, { frames: 3, width: 1280, height: 720 });
+  const records = [...context.__mo];
+  // [type, attributeName, oldValue, added, removed]
+  assert.deepEqual(records.slice(0, 3), ['childList:::1:0', 'attributes:hidden::0:0', 'attributes:hidden::0:0']);
+  const card = context.document.querySelector('#flag > button');
+  assert.ok(card.classList.contains('decorated'));
+  assert.equal(card.children.length, 1, 'the callback ran once per new button, not in a loop');
+  assert.ok(records.filter((r) => r === 'childList:::1:0').length >= 2, 'the decorator\'s own append is observed too');
+  assert.ok(!records.some((r) => r.includes('title')), 'attributeFilter excludes other attributes');
+});

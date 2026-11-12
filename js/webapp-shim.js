@@ -22,6 +22,43 @@
   // HTML/CSS UI layer (js/webapp-ui.js) installs itself as __ntHost.ui.
   let uiLayer = null;
   const uiNotify = (kind, node, name) => { if (uiLayer) uiLayer.invalidate(kind, node, name); };
+
+  // ------------------------------------------------------------ MutationObserver
+  // Records are queued per observer and delivered in a microtask, as in DOM.
+  const mutationObservers = new Set();
+  function queueMutation(type, target, extra) {
+    if (!mutationObservers.size) return;
+    for (const observer of mutationObservers) {
+      let interested = false, oldValue = false;
+      for (const [node, o] of observer._targets) {
+        if (node !== target && !(o.subtree && node.contains && node.contains(target))) continue;
+        if (type === 'childList' && !o.childList) continue;
+        if (type === 'attributes') {
+          if (!o.attributes) continue;
+          if (o.attributeFilter && !o.attributeFilter.includes(extra.attributeName)) continue;
+          if (o.attributeOldValue) oldValue = true;
+        }
+        if (type === 'characterData') { if (!o.characterData) continue; if (o.characterDataOldValue) oldValue = true; }
+        interested = true;
+      }
+      if (!interested) continue;
+      observer._records.push({
+        type, target, addedNodes: [], removedNodes: [], previousSibling: null, nextSibling: null,
+        attributeName: null, attributeNamespace: null, ...extra, oldValue: oldValue ? extra.oldValue ?? null : null,
+      });
+      if (!observer._scheduled) {
+        observer._scheduled = true;
+        queueMicrotask(() => {
+          observer._scheduled = false;
+          const records = observer.takeRecords();
+          if (records.length) {
+            try { observer._callback.call(observer, records, observer); }
+            catch (error) { reportError('MutationObserver callback', error); }
+          }
+        });
+      }
+    }
+  }
   const state = {
     width: 1280, height: 720, pixelRatio: 1,
     now: 0, frame: 0,
@@ -383,17 +420,28 @@
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       uiNotify('tree', this, child);
+      if (mutationObservers.size) queueMutation('childList', this, { addedNodes: [child], previousSibling: child.previousSibling, nextSibling: child.nextSibling });
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
-      if (i >= 0) { this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this, child); }
+      if (i >= 0) {
+        const previousSibling = this.childNodes[i - 1] || null, nextSibling = this.childNodes[i + 1] || null;
+        this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this, child);
+        if (mutationObservers.size) queueMutation('childList', this, { removedNodes: [child], previousSibling, nextSibling });
+      }
       return child;
     }
     replaceChild(newChild, oldChild) { this.insertBefore(newChild, oldChild); return this.removeChild(oldChild); }
     contains(node) { for (let n = node; n; n = n.parentNode) if (n === this) return true; return false; }
     get textContent() { return this.childNodes.map((c) => c.textContent).join(''); }
-    set textContent(v) { const hadElements = this.childNodes.some((c) => c.nodeType === 1); for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; uiNotify('tree', this, hadElements ? null : undefined); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
+    set textContent(v) {
+      const removed = this.childNodes;
+      const hadElements = removed.some((c) => c.nodeType === 1); for (const c of removed) c.parentNode = null; this.childNodes = [];
+      uiNotify('tree', this, hadElements ? null : undefined);
+      if (removed.length && mutationObservers.size) queueMutation('childList', this, { removedNodes: removed.slice() });
+      if (v !== '' && v != null) this.appendChild(new Text(String(v)));
+    }
     cloneNode(deep) {
       const copy = this._shallowClone();
       if (deep) for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
@@ -539,7 +587,11 @@
   class Text extends Node {
     constructor(data = '') { super(3, '#text'); this._data = String(data); }
     get data() { return this._data; }
-    set data(v) { v = String(v); if (v === this._data) return; this._data = v; uiNotify('text', this); }
+    set data(v) {
+      v = String(v); if (v === this._data) return;
+      const oldValue = this._data; this._data = v; uiNotify('text', this);
+      if (mutationObservers.size) queueMutation('characterData', this, { oldValue });
+    }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
     get nodeValue() { return this.data; }
@@ -673,7 +725,10 @@
     get attributes() { return [...this._attrs].map(([name, value]) => ({ name, value })); }
     getAttribute(n) { n = String(n).toLowerCase(); return this._attrs.has(n) ? this._attrs.get(n) : null; }
     setAttribute(n, v) {
-      n = String(n).toLowerCase(); v = String(v); this._attrs.set(n, v);
+      n = String(n).toLowerCase(); v = String(v);
+      const oldValue = this._attrs.has(n) ? this._attrs.get(n) : null;
+      this._attrs.set(n, v);
+      if (mutationObservers.size) queueMutation('attributes', this, { attributeName: n, oldValue });
       if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
       uiNotify('attr', this, n);
@@ -683,7 +738,9 @@
     removeAttribute(n) {
       n = String(n).toLowerCase();
       if (!this._attrs.has(n)) return;
+      const oldValue = this._attrs.get(n);
       this._attrs.delete(n);
+      if (mutationObservers.size) queueMutation('attributes', this, { attributeName: n, oldValue });
       if (n === 'style') this.style._setSilently('');
       uiNotify('attr', this, n);
     }
@@ -2116,7 +2173,24 @@
       try { this._cb(entries, this); } catch (e) { reportError('ResizeObserver', e); }
     }
   }
-  class MutationObserver { observe() {} disconnect() {} takeRecords() { return []; } }
+  class MutationObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('MutationObserver callback must be a function');
+      this._callback = callback; this._targets = new Map(); this._records = []; this._scheduled = false;
+    }
+    observe(target, options = {}) {
+      if (!target || typeof target.nodeType !== 'number') throw new TypeError('MutationObserver.observe target must be a Node');
+      const o = { ...options };
+      if ((o.attributeOldValue || o.attributeFilter) && o.attributes === undefined) o.attributes = true;
+      if (o.characterDataOldValue && o.characterData === undefined) o.characterData = true;
+      if (!o.childList && !o.attributes && !o.characterData) throw new TypeError('MutationObserver.observe needs childList, attributes or characterData');
+      if (o.attributeFilter) o.attributeFilter = [...o.attributeFilter].map((a) => String(a).toLowerCase());
+      this._targets.set(target, o);
+      mutationObservers.add(this);
+    }
+    disconnect() { this._targets.clear(); this._records = []; mutationObservers.delete(this); }
+    takeRecords() { const r = this._records; this._records = []; return r; }
+  }
   class IntersectionObserver {
     constructor(cb) { this._cb = cb; }
     observe(el) { setTimeout(() => this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1 }], this), 0); }
