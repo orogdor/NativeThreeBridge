@@ -326,6 +326,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const geometry = mesh.geometry, skeleton = mesh.skeleton;
       const base = this._geometryRecord(geometry);
       if (!base) return null;
+      if (nt.supportsSkinning && nt.supportsSkinning() && skeleton.bones.length <= 256) return this._gpuSkinnedRecord(mesh, base);
       this._skinned ||= new WeakMap();
       let rec = this._skinned.get(mesh);
       if (!rec || rec.geometry !== geometry) {
@@ -367,6 +368,51 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       skinVertices(rec, boneMatrices, mesh.bindMatrix, mesh.bindMatrixInverse, THREE);
       nt.uploadGeometry(rec.id, rec.pos, rec.nrm, rec.colors, rec.indices, rec.uvs);
       return Object.assign(rec, { hasColors: !!rec.colors, hasUvs: !!rec.uvs, vertexCount: position.count, indexCount: base.indexCount });
+    }
+    // GPU skinning: the geometry is uploaded once as usual plus its bone
+    // indices/weights; each frame only the bone palette (bindMatrixInverse *
+    // boneMatrix * bindMatrix per bone, as skinning_vertex) is sent.
+    _gpuSkinnedRecord(mesh, base) {
+      const geometry = mesh.geometry, skeleton = mesh.skeleton;
+      const skinIndex = geometry.attributes.skinIndex, skinWeight = geometry.attributes.skinWeight;
+      this._skinData ||= new WeakMap();
+      const sent = this._skinData.get(geometry);
+      if (!sent || sent.key !== base.key || sent.id !== base.id || sent.index !== skinIndex || sent.weight !== skinWeight ||
+          sent.indexVersion !== skinIndex.version || sent.weightVersion !== skinWeight.version) {
+        const n = geometry.attributes.position.count, data = new Float32Array(n * 8);
+        for (let i = 0; i < n; i++) {
+          const o = i * 8;
+          data[o] = skinIndex.getX(i); data[o + 1] = skinIndex.getY(i); data[o + 2] = skinIndex.getZ(i); data[o + 3] = skinIndex.getW(i);
+          data[o + 4] = skinWeight.getX(i); data[o + 5] = skinWeight.getY(i); data[o + 6] = skinWeight.getZ(i); data[o + 7] = skinWeight.getW(i);
+        }
+        nt.uploadSkin(base.id, data, n);
+        this._skinData.set(geometry, { key: base.key, id: base.id, index: skinIndex, weight: skinWeight,
+          indexVersion: skinIndex.version, weightVersion: skinWeight.version });
+      }
+      this._palettes ||= new WeakMap();
+      let pal = this._palettes.get(mesh);
+      if (!pal) {
+        pal = { id: nextInstanceId++, bones: null, bind: null, palette: null, mesh };
+        this._palettes.set(mesh, pal);
+        pal.onDispose = () => { nt.releaseBones(pal.id); geometry.removeEventListener('dispose', pal.onDispose); this._palettes.delete(mesh); };
+        geometry.addEventListener('dispose', pal.onDispose);
+      }
+      const frame = this.info.render.frame;
+      if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+      const boneMatrices = skeleton.boneMatrices, bind = mesh.bindMatrix.elements;
+      if (!(pal.bones && pal.bones.length === boneMatrices.length && equalArrays(pal.bones, boneMatrices) && equalArrays(pal.bind, bind))) {
+        pal.bones = Float32Array.from(boneMatrices);
+        pal.bind = Float32Array.from(bind);
+        const count = boneMatrices.length / 16;
+        if (!pal.palette || pal.palette.length !== count * 16) pal.palette = new Float32Array(count * 16);
+        const m = new THREE.Matrix4();
+        for (let b = 0; b < count; b++) {
+          m.fromArray(boneMatrices, b * 16).premultiply(mesh.bindMatrixInverse).multiply(mesh.bindMatrix);
+          pal.palette.set(m.elements, b * 16);
+        }
+        nt.uploadBones(pal.id, pal.palette, count);
+      }
+      return { ...base, bonesId: pal.id };
     }
     _releaseSkinned(mesh, rec) {
       rec.geometry.removeEventListener('dispose', rec.onDispose);
@@ -941,7 +987,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         stageTextureId: 0, stageFlipY: false,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         normalMapId, normalScaleX, normalScaleY,
-        material: m, batchable: !base.instances && !mesh.isSprite && !mesh.isLine && !(flags & DrawFlags.TRANSPARENT),
+        bonesId: base.record.bonesId || 0,
+        material: m, batchable: !base.instances && !base.record.bonesId && !mesh.isSprite && !mesh.isLine && !(flags & DrawFlags.TRANSPARENT),
         shadow: ((flags & DrawFlags.CAST_SHADOW) ? ShadowDraw.CAST : 0) | (base.shadowOnly ? ShadowDraw.ONLY : 0),
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
@@ -997,7 +1044,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
     p[o + 53] = d.normalMapId || 0; p[o + 54] = d.normalScaleX ?? 1; p[o + 55] = d.normalScaleY ?? 1;
-    p[o + 56] = d.shadow || 0; p[o + 57] = d.stageTextureId || 0; p[o + 58] = d.stageFlipY ? 1 : 0; p[o + 59] = 0;
+    p[o + 56] = d.shadow || 0; p[o + 57] = d.stageTextureId || 0; p[o + 58] = d.stageFlipY ? 1 : 0; p[o + 59] = d.bonesId || 0;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {

@@ -559,6 +559,37 @@ void ntReleaseInstances(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseInstances(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntUploadSkin(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "uploadSkin(geometryId, data, vertexCount)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), count = info[2]->Uint32Value(ctx).FromMaybe(0);
+    const float* data;
+    std::size_t n;
+    if (!typedView(self, info[1], data, n, false, "data")) return;
+    if (n < std::size_t(count) * 8) return self->throwError("range", "Skin data smaller than vertexCount * 8");
+    if (self->sink) self->sink->uploadSkin(id, data, count);
+}
+void ntUploadBones(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "uploadBones(id, matrices, count)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), count = info[2]->Uint32Value(ctx).FromMaybe(0);
+    const float* data;
+    std::size_t n;
+    if (!typedView(self, info[1], data, n, false, "matrices")) return;
+    if (n < std::size_t(count) * 16) return self->throwError("range", "Bone palette smaller than count * 16");
+    if (self->sink) self->sink->uploadBones(id, data, count);
+}
+void ntReleaseBones(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() >= 1 && self->sink)
+        self->sink->releaseBones(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
+}
+void ntSupportsSkinning(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    info.GetReturnValue().Set(v8::Boolean::New(self->isolate, self->sink && self->sink->supportsSkinning()));
+}
 void ntRegisterColorPatch(const v8::FunctionCallbackInfo<v8::Value>& info) {
     auto* self = Impl::fromInfo(info);
     if (info.Length() < 2 || !self->sink || !info[1]->IsString()) return;
@@ -673,6 +704,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
+        {"uploadSkin", ntUploadSkin}, {"uploadBones", ntUploadBones}, {"releaseBones", ntReleaseBones},
+        {"supportsSkinning", ntSupportsSkinning},
         {"registerColorPatch", ntRegisterColorPatch},
         {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},

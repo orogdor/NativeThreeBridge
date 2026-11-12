@@ -260,6 +260,10 @@ export async function runWebapp(root, options = {}) {
       rec.instances.set(id, { count, hasColors: !!colors, first: Array.from(matrices.slice(0, 16)) });
     },
     releaseInstances(id) { rec.instances.delete(id); },
+    supportsSkinning() { return options.gpuSkinning !== false; },
+    uploadSkin(id, data, count) { (rec.skins ||= new Map()).set(id, { data: Float32Array.from(data.subarray(0, count * 8)), count }); },
+    uploadBones(id, matrices, count) { (rec.bones ||= new Map()).set(id, Float32Array.from(matrices.subarray(0, count * 16))); rec.boneUploads = (rec.boneUploads || 0) + 1; },
+    releaseBones(id) { rec.bones?.delete(id); },
     submitUi(packet, floats, strings) {
       if (floats > packet.length || (packet[0] !== 1 && packet[0] !== 2)) throw new RangeError('submitUi: bad packet');
       rec.uiSubmits = (rec.uiSubmits || 0) + 1;

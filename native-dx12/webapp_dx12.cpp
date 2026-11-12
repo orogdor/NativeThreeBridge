@@ -110,7 +110,12 @@ const D3D12_INPUT_ELEMENT_DESC kInputLayout[] = {
     {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
     {"IROW", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
     {"ICOLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    // Slot 2: GPU skinning (zeros with stride 0 for geometry without skin).
+    {"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
 };
+constexpr UINT kSkinStride = 32;          // float4 indices + float4 weights
+constexpr UINT kMaxBones = 256;           // cbuffer Bones
 
 // Column-major 4x4 product (OpenGL/Three.js element order): r = a * b.
 void mul4(const float* a, const float* b, float* r) {
@@ -130,6 +135,9 @@ struct Geometry {
     // reuses pooled buffers instead.
     bool resident = false;
     UINT uploads = 0;
+    ComPtr<ID3D12Resource> skin;              // slot 2 for GPU skinning
+    D3D12_VERTEX_BUFFER_VIEW skinView{};
+    UINT skinVertices = 0;
     std::vector<PooledBuffer> vertexPool, indexPool;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
     D3D12_INDEX_BUFFER_VIEW ibv{};
@@ -216,6 +224,13 @@ public:
     void releaseTexture(std::uint32_t id) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
+    bool supportsSkinning() const override { return true; }
+    void uploadSkin(std::uint32_t geometryId, const float* data, std::uint32_t vertexCount) override;
+    void uploadBones(std::uint32_t id, const float* matrices, std::uint32_t count) override;
+    void releaseBones(std::uint32_t id) override { bones_.erase(id); }
+    std::map<std::uint32_t, std::vector<float>> bones_;
+    ComPtr<ID3D12Resource> noSkin_;            // 32 zero bytes read with stride 0
+    D3D12_VERTEX_BUFFER_VIEW noSkinView_{};
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
@@ -515,7 +530,7 @@ void WebappWindow::initDevice() {
     // Root signature: b0 = frame constants, b1 = per-draw constants,
     // t0 = colour map, t1 = normal map, t2 = shadow map, t3 = colour stage texture;
     // s0 repeat, s1 clamp, s2 mirrored repeat, s3 shadow comparison.
-    D3D12_ROOT_PARAMETER params[6]{};
+    D3D12_ROOT_PARAMETER params[7]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
@@ -544,6 +559,9 @@ void WebappWindow::initDevice() {
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   // b2: bone palette
+    params[6].Descriptor.ShaderRegister = 2;
+    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     rs.NumParameters = UINT(sizeof params / sizeof params[0]);
     rs.pParameters = params;
     samplers[3].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
@@ -589,6 +607,13 @@ void WebappWindow::initDevice() {
     identityView_.BufferLocation = identityInstance_->GetGPUVirtualAddress();
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
+    {
+        const float zeros[8] = {};
+        noSkin_ = uploadBuffer(zeros, sizeof zeros);
+        noSkinView_.BufferLocation = noSkin_->GetGPUVirtualAddress();
+        noSkinView_.SizeInBytes = sizeof zeros;
+        noSkinView_.StrideInBytes = 0;
+    }
     chooseMsaa();
     createSizeDependent();
     initTextures();
@@ -1149,6 +1174,26 @@ void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
     resource.Reset();
 }
 
+void WebappWindow::uploadSkin(std::uint32_t geometryId, const float* data, std::uint32_t vertexCount) {
+    auto it = geometries_.find(geometryId);
+    if (it == geometries_.end()) return;
+    Geometry& g = it->second;
+    retire(g.skin);
+    g.skinVertices = 0;
+    if (!vertexCount) return;
+    const UINT64 bytes = UINT64(vertexCount) * kSkinStride;
+    g.skin = residentBuffer(data, bytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    g.skinView.BufferLocation = g.skin->GetGPUVirtualAddress();
+    g.skinView.SizeInBytes = UINT(bytes);
+    g.skinView.StrideInBytes = kSkinStride;
+    g.skinVertices = vertexCount;
+}
+
+void WebappWindow::uploadBones(std::uint32_t id, const float* matrices, std::uint32_t count) {
+    count = std::min(count, kMaxBones);
+    bones_[id].assign(matrices, matrices + std::size_t(count) * 16);
+}
+
 void WebappWindow::releaseInstances(std::uint32_t id) {
     auto it = instances_.find(id);
     if (it == instances_.end()) return;
@@ -1228,6 +1273,7 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
     retire(it->second.indices);
     retirePool(it->second.vertexPool);
     retirePool(it->second.indexPool);
+    retire(it->second.skin);
     geometries_.erase(it);
 }
 
@@ -1423,6 +1469,13 @@ void WebappWindow::renderFrame() {
     for (const auto& pass : passes_) {
         const bool shadows = shadowsOn_ && pass[88] > 0;
         needed += (shadows ? 2 : 1) * (kFrameCBBytes + UINT64(pass[43]) * kDrawCBBytes);
+        // Bone palettes of skinned draws (once per pass they are drawn in).
+        const float* d = pass.data() + native_three::kWebappPassHeaderFloats + UINT(pass[35]) * native_three::kWebappLightFloats;
+        for (UINT i = 0, n = UINT(pass[43]); i < n; i++, d += native_three::kWebappDrawFloats) {
+            if (d[59] <= 0) continue;
+            auto b = bones_.find(std::uint32_t(d[59]));
+            if (b != bones_.end()) needed += (shadows ? 2 : 1) * ((UINT64(b->second.size() * sizeof(float)) + 255) & ~255ull);
+        }
         if (shadows) shadowWanted = std::max(shadowWanted, std::clamp<UINT>(UINT(pass[91]), 256, 4096));
     }
     // Sized before recording: a shadow map is never replaced mid-frame.
@@ -1487,6 +1540,7 @@ void WebappWindow::renderFrame() {
     const D3D12_GPU_DESCRIPTOR_HANDLE shadowHandle = textureHandleForSlot(kShadowSlot);
     cmd_->SetGraphicsRootDescriptorTable(4, shadowHandle);
     cmd_->SetGraphicsRootDescriptorTable(5, whiteTexture);   // colour stage texture until a draw sets one
+    cmd_->SetGraphicsRootConstantBufferView(6, ringGpu);      // bone palette; read only by skinned draws
     boundStageMap = whiteTexture.ptr;
     auto setShadowState = [&](D3D12_RESOURCE_STATES state) {
         if (shadowState_ == state) return;
@@ -1503,7 +1557,9 @@ void WebappWindow::renderFrame() {
     // instance buffer for this frame, and the Draw constant buffer.
     struct Prepared {
         Geometry* g = nullptr;
-        D3D12_VERTEX_BUFFER_VIEW views[2]{};
+        D3D12_VERTEX_BUFFER_VIEW views[3]{};
+        const std::vector<float>* bones = nullptr;
+        bool skinned = false;
         UINT instanceCount = 1, start = 0, count = 0;
     };
     auto prepare = [&](const float* d, Prepared& out) -> bool {
@@ -1515,6 +1571,16 @@ void WebappWindow::renderFrame() {
         out.instanceCount = std::max<UINT>(1, UINT(d[2]));
         out.views[0] = g->second.vbv;
         out.views[1] = identityView_;
+        out.views[2] = noSkinView_;
+        out.skinned = false;
+        if (d[59] > 0 && g->second.skin && g->second.skinVertices >= g->second.vertexCount) {
+            auto b = bones_.find(std::uint32_t(d[59]));
+            if (b != bones_.end() && !b->second.empty()) {
+                out.views[2] = g->second.skinView;
+                out.bones = &b->second;
+                out.skinned = true;
+            }
+        }
         if (d[1] > 0) {
             auto it = instances_.find(std::uint32_t(d[1]));
             if (it == instances_.end() || it->second.count == 0) return false;
@@ -1538,7 +1604,14 @@ void WebappWindow::renderFrame() {
         }
         return true;
     };
-    auto writeDrawCB = [&](const float* d, UINT drawFlags) {
+    auto writeDrawCB = [&](const float* d, UINT drawFlags, const Prepared& pr) {
+        if (pr.skinned) {
+            // cbuffer Bones: this draw's palette in the frame ring.
+            const UINT bytes = UINT(pr.bones->size() * sizeof(float));
+            std::memcpy(ring + ringOffset, pr.bones->data(), bytes);
+            cmd_->SetGraphicsRootConstantBufferView(6, ringGpu + ringOffset);
+            ringOffset += (bytes + 255) & ~255u;
+        }
         // cbuffer Draw: model, colour+opacity, emissive+shininess, params.
         float* dcb = reinterpret_cast<float*>(ring + ringOffset);
         std::memcpy(dcb, d + 16, 16 * sizeof(float));
@@ -1550,12 +1623,13 @@ void WebappWindow::renderFrame() {
         dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = d[55];
         std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
         std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
-        dcb[48] = d[58]; dcb[49] = dcb[50] = dcb[51] = 0;  // gStage: colour stage texture flipY
+        dcb[48] = d[58]; dcb[49] = dcb[50] = 0;  // gStage: colour stage texture flipY
+        dcb[51] = pr.skinned ? 1.0f : 0.0f;      // gStage.w: GPU skinning with cbuffer Bones
         cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
         ringOffset += kDrawCBBytes;
     };
     auto issue = [&](const Prepared& pr) -> bool {
-        cmd_->IASetVertexBuffers(0, 2, pr.views);
+        cmd_->IASetVertexBuffers(0, 3, pr.views);
         if (pr.g->indexCount) {
             const UINT n = std::min(pr.count, pr.g->indexCount > pr.start ? pr.g->indexCount - pr.start : 0u);
             if (!n) return false;
@@ -1606,7 +1680,7 @@ void WebappWindow::renderFrame() {
                 const bool alphaTested = d[33] > 0 && (drawFlags & F_MAP);
                 ID3D12PipelineState* pso = shadowPipeline(drawFlags, alphaTested);
                 if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
-                writeDrawCB(d, drawFlags);
+                writeDrawCB(d, drawFlags, pr);
                 if (alphaTested) {
                     const D3D12_GPU_DESCRIPTOR_HANDLE tex = textureHandle(std::uint32_t(d[32]));
                     if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
@@ -1659,7 +1733,7 @@ void WebappWindow::renderFrame() {
                                                   : (drawFlags & F_LINES)    ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                                                              : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
             if (wanted != topology) { cmd_->IASetPrimitiveTopology(wanted); topology = wanted; }
-            writeDrawCB(d, drawFlags);
+            writeDrawCB(d, drawFlags, pr);
             const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
             const D3D12_GPU_DESCRIPTOR_HANDLE nrm = (drawFlags & F_NORMAL_MAP) ? textureHandle(std::uint32_t(d[53])) : whiteTexture;

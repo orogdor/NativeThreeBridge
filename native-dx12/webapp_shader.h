@@ -27,8 +27,9 @@ cbuffer Draw : register(b1) {
     float4 gReflection; // sky RGB and blend strength
     float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
     float4 gColorStage; // live scalar uniforms from the translated color stage
-    float4 gStage;      // x: colour stage texture is flipY
+    float4 gStage;      // x: colour stage texture is flipY, w: skinned
 };
+cbuffer Bones : register(b2) { float4x4 gBones[256]; };
 Texture2D gMap : register(t0);
 Texture2D gNormalMap : register(t1);
 Texture2D<float> gShadowMap : register(t2);
@@ -46,6 +47,7 @@ struct VSIn {
     float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
     float4 r0 : IROW0; float4 r1 : IROW1; float4 r2 : IROW2; float4 r3 : IROW3;
     float3 icol : ICOLOR;
+    float4 bi : BLENDINDICES; float4 bw : BLENDWEIGHT;
 };
 struct VSOut {
     float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0; float fogDepth : TEXCOORD1;
@@ -64,7 +66,14 @@ VSOut VSMain(VSIn i) {
     VSOut o;
     uint flags = (uint)gParams.z;
     float4x4 instT = float4x4(i.r0, i.r1, i.r2, i.r3);      // rows = instance matrix columns
-    float4 local = mul(float4(i.pos, 1), instT);
+    float3 pos = i.pos, nrm = i.nrm;
+    if (gStage.w > 0) {   // skinning_vertex: sum of weighted bone palette matrices
+        float4x4 s = gBones[(uint)i.bi.x] * i.bw.x + gBones[(uint)i.bi.y] * i.bw.y
+                   + gBones[(uint)i.bi.z] * i.bw.z + gBones[(uint)i.bi.w] * i.bw.w;
+        pos = mul(s, float4(pos, 1)).xyz;
+        nrm = mul((float3x3)s, nrm);
+    }
+    float4 local = mul(float4(pos, 1), instT);
     float4 world = mul(gModel, local);
     float4 view = mul(gView, world);
     float4 clip = mul(gProj, view);
@@ -78,7 +87,7 @@ VSOut VSMain(VSIn i) {
     o.uv = float2(dot(gUvU.xyz, uv1), dot(gUvV.xyz, uv1));
     o.world = world.xyz;
     float3x3 w = mul((float3x3)gModel, transpose((float3x3)instT));
-    o.nrm = cofactorNormal(w, i.nrm);
+    o.nrm = cofactorNormal(w, nrm);
     float4 c = (flags & F_VERTEX_COLORS) ? i.col : float4(1, 1, 1, 1);   // rgba vertex colours: alpha too
     if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;

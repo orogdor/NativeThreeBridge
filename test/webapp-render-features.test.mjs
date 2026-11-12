@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createNativeRendererClasses, DrawFlags, DRAW_FLOATS } from '../js/native-renderer.mjs';
+import { createNativeRendererClasses, DrawFlags, DRAW_FLOATS, skinVertices } from '../js/native-renderer.mjs';
 
 // Minimal stand-ins: _queue only needs a few THREE constants and a texture lookup.
 function makeRenderer() {
@@ -205,4 +205,57 @@ test('THREE.LOD picks its level for the camera', () => {
   const lod = { isLOD: true, autoUpdate: true, visible: true, layers: { test: () => true }, children: [], update(c) { assert.equal(c, camera); updated++; } };
   renderer._collect(lod, camera, [], [], [], [0, 0, 0]);
   assert.equal(updated, 1);
+});
+
+test('GPU skinning: weights are sent once, only the bone palette changes per pose', () => {
+  const calls = { geometry: 0, skin: [], bones: [] };
+  class Unused {}
+  const { NativeRenderer } = createNativeRendererClasses({ Color: Unused, Matrix4: Mat4, Vector3: Unused, Frustum: Unused, Quaternion: Unused }, {
+    supportsSkinning: () => true,
+    uploadSkin: (id, data, n) => calls.skin.push([id, Array.from(data), n]),
+    uploadBones: (id, m, n) => calls.bones.push([id, Array.from(m), n]),
+    releaseBones() {}, uploadGeometry() { calls.geometry++; }, releaseGeometry() {},
+  }, null, null);
+  const renderer = Object.create(NativeRenderer.prototype);
+  renderer.info = { render: { frame: 1 }, memory: { geometries: 0 } };
+  renderer._geometryRecord = () => ({ id: 42, key: 'k', indexCount: 0, hasUvs: false });
+  const attr = (values, itemSize) => ({ count: values.length / itemSize, itemSize, version: 0,
+    getX: (i) => values[i * itemSize], getY: (i) => values[i * itemSize + 1], getZ: (i) => values[i * itemSize + 2], getW: (i) => values[i * itemSize + 3] });
+  const geometry = { attributes: { position: attr([1, 0, 0, 0, 2, 0], 3), skinIndex: attr([0, 1, 0, 0, 1, 0, 0, 0], 4), skinWeight: attr([0.5, 0.5, 0, 0, 1, 0, 0, 0], 4) },
+    index: null, addEventListener() {}, removeEventListener() {} };
+  const boneMatrices = new Float32Array(32);
+  boneMatrices.set(new Mat4().elements, 0);
+  boneMatrices.set(rotZ90.elements, 16);
+  const skeleton = { bones: [{}, {}], boneMatrices, update() {} };
+  const mesh = { geometry, skeleton, bindMatrix: translate(5, 0, 0), bindMatrixInverse: translate(-5, 0, 0) };
+  const rec = renderer._gpuSkinnedRecord(mesh, renderer._geometryRecord());
+  assert.equal(rec.id, 42, 'draws the shared geometry');
+  assert.ok(rec.bonesId > 0);
+  assert.deepEqual(calls.skin, [[42, [0, 1, 0, 0, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], 2]]);
+  // palette[b] = bindMatrixInverse * bone_b * bindMatrix, as the CPU path uses.
+  const expected = { combined: null, srcPos: new Float32Array(0), srcNrm: new Float32Array(0), idx: new Uint16Array(0), wgt: new Float32Array(0), pos: new Float32Array(0), nrm: new Float32Array(0) };
+  skinVertices(expected, boneMatrices, mesh.bindMatrix, mesh.bindMatrixInverse, { Matrix4: Mat4 });
+  assert.deepEqual(calls.bones[0][1].map((v) => +v.toFixed(5)), Array.from(expected.combined).map((v) => +v.toFixed(5)));
+  renderer.info.render.frame = 2;
+  renderer._gpuSkinnedRecord(mesh, renderer._geometryRecord());
+  assert.equal(calls.skin.length, 1, 'weights not re-sent');
+  assert.equal(calls.bones.length, 1, 'unchanged pose: no palette upload');
+  boneMatrices.set(translate(0, 3, 0).elements, 0);
+  renderer.info.render.frame = 3;
+  renderer._gpuSkinnedRecord(mesh, renderer._geometryRecord());
+  assert.equal(calls.bones.length, 2, 'new pose: palette re-sent');
+  assert.equal(calls.geometry, 0, 'vertices are never re-uploaded');
+});
+
+test('native skinning layout: slot 2 weights, b2 palette, gStage.w flag, record [59]', () => {
+  const cpp = readFileSync(new URL('../native-dx12/webapp_dx12.cpp', import.meta.url), 'utf8');
+  const hlsl = readFileSync(new URL('../native-dx12/webapp_shader.h', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../js/native-renderer.mjs', import.meta.url), 'utf8');
+  assert.match(cpp, /"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0,/);
+  assert.match(cpp, /"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16,/);
+  assert.match(cpp, /kMaxBones = 256/);
+  assert.match(hlsl, /cbuffer Bones : register\(b2\) \{ float4x4 gBones\[256\]; \};/);
+  assert.match(hlsl, /float4 bi : BLENDINDICES; float4 bw : BLENDWEIGHT;/);
+  assert.match(cpp, /dcb\[51\] = pr\.skinned \? 1\.0f : 0\.0f;/);
+  assert.match(src, /p\[o \+ 59\] = d\.bonesId \|\| 0;/);
 });
