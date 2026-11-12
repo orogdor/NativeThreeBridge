@@ -260,7 +260,7 @@ private:
     std::thread renderThread_;
     std::mutex renderStateMutex_;
     std::condition_variable renderCv_;
-    bool renderStop_ = false, renderPending_ = false, renderBusy_ = false;
+    bool renderStop_ = false, renderPending_ = false, renderBusy_ = false, renderStarted_ = false;
     bool asyncDisabled_ = false, asyncForced_ = false;
     std::exception_ptr renderError_;
     double completedRenderMs_ = 0;
@@ -1148,6 +1148,13 @@ void WebappWindow::startRenderThread(bool forced) {
             std::exception_ptr error;
             try {
                 std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+                // Freeze the native resource snapshot before the producer can
+                // start its next V8 frame and upload updated instance buffers.
+                {
+                    std::lock_guard<std::mutex> signal(renderStateMutex_);
+                    renderStarted_ = true;
+                }
+                renderCv_.notify_all();
                 renderFrame();
             } catch (...) { error = std::current_exception(); }
             const auto done = std::chrono::steady_clock::now();
@@ -1175,9 +1182,13 @@ void WebappWindow::waitRenderThread() {
     }
 }
 void WebappWindow::submitRenderThread() {
-    std::lock_guard<std::mutex> lock(renderStateMutex_);
+    std::unique_lock<std::mutex> lock(renderStateMutex_);
+    renderStarted_ = false;
     renderPending_ = true;
     renderCv_.notify_one();
+    // Wait only for worker ownership of the resource mutex, NOT for GPU
+    // completion. V8 then overlaps scene simulation with native DX12.
+    renderCv_.wait(lock, [this] { return renderStarted_ || (!renderBusy_ && !renderPending_); });
 }
 void WebappWindow::stopRenderThread() {
     if (!renderThread_.joinable()) return;
@@ -1188,7 +1199,7 @@ void WebappWindow::stopRenderThread() {
     }
     renderCv_.notify_one();
     renderThread_.join();
-    renderStop_ = renderPending_ = renderBusy_ = false;
+    renderStop_ = renderPending_ = renderBusy_ = renderStarted_ = false;
 }
 
 void WebappWindow::renderFrame() {

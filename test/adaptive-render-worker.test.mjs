@@ -24,3 +24,8 @@ test('fallback and adaptive modes exist and resource paths are serialized', () =
     assert.match(src.slice(p, p + 1100), /gpuLock\(gfxMutex_\)/);
   }
 });
+
+test('worker obtains the native resource snapshot before V8 frame N+1', () => {
+  assert.match(src, /renderStarted_ = true;/);
+  assert.match(src, /renderCv_\.wait\(lock, \[this\] \{ return renderStarted_/);
+});
