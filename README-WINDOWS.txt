@@ -1,4 +1,4 @@
-NativeThreeBridge v0.32.1 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.32.20 - KAKS MÄNGU, ÜKS ENGINE
 ==================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -12,6 +12,13 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.32.20 TEST: Three.js veebirakenduste staatiline geomeetria joonistatakse
+DX12 GPU-lokaalsest mälust. Dünaamilise geomeetria üleslaadimine jätkub
+voogedastusmälust. Eraldi DX12 renderduslõime kasutamisel võib JavaScript
+järgmise kaadri andmeid saata eelmise kaadri kuvamise ooteajal.
+Testimiseks paki Windowsi ZIP eraldi kausta. UpdateEngine.exe valib
+jätkuvalt uusima stabiilse versiooni.
 
 v0.32.1 PARANDUS: onBeforeCompile materjalides, mille tipuatribuut juhib
 smoothstep-läbipaistvust, tõlgitakse mask nüüd RGBA tipuvärvideks.

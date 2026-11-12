@@ -9,10 +9,22 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, 1, .1, 100);
 camera.position.z = 5;
 const phase = sessionStorage.getItem('phase');
-scene.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial({
+const geometry = new THREE.BoxGeometry();
+const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
   color: phase === 'verify' ? 0x22aa55 : 0x8844cc,
-})));
-renderer.setAnimationLoop(() => renderer.render(scene, camera));
+}));
+scene.add(mesh);
+let frames = 0;
+renderer.setAnimationLoop(() => {
+  if (++frames === 3) geometry.attributes.position.needsUpdate = true;
+  if (frames === 5) {
+    mesh.geometry = new THREE.BoxGeometry();
+    mesh.geometry.attributes.position.setUsage(THREE.DynamicDrawUsage);
+    geometry.dispose();
+  }
+  if (frames === 7) mesh.geometry.attributes.position.needsUpdate = true;
+  renderer.render(scene, camera);
+});
 setTimeout(() => {
   if (!phase) {
     localStorage.setItem('world', JSON.stringify({ seed: 73142, type: 'continents' }));

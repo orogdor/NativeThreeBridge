@@ -45,6 +45,17 @@ test('geometry and instance buffers cross to native once, not every frame', { sk
   assert.equal(rec.uploads, 6);
   assert.equal(rec.geometries.size, 6);
   assert.equal(rec.instanceUploads, 1);
+  assert.ok([...rec.geometries.values()].every(geometry => geometry.gpuLocal),
+    'ordinary static meshes request GPU-local buffers');
+});
+
+test('geometry placement follows Three.js usage after a buffer replacement', { skip }, async () => {
+  const fixture = fileURLToPath(new URL('./fixtures/webapp-reload', import.meta.url));
+  const { rec, status } = await runWebapp(fixture, { frames: 9 });
+  assert.deepEqual(status.errors, []);
+  assert.equal(rec.uploads, 4, 'initial and changed data for both geometries');
+  assert.equal(rec.geometries.size, 1, 'the old buffer was released');
+  assert.equal([...rec.geometries.values()][0].gpuLocal, false, 'dynamic geometry keeps the streaming path');
 });
 
 test('pointer drag, wheel, keyboard and resize reach the webapp like in a browser', { skip }, async () => {

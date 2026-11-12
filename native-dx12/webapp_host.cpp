@@ -284,7 +284,8 @@ JSValue jsUploadGeometry(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
         if (indices[i] >= vertexCount) return JS_ThrowRangeError(ctx, "Geometry index out of range");
     if (self->sink)
         self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices,
-                                   static_cast<std::uint32_t>(nIndices), uvs, colorChannels);
+                                   static_cast<std::uint32_t>(nIndices), uvs, colorChannels,
+                                   argc >= 7 && JS_IsBool(argv[6]) && JS_ToBool(ctx, argv[6]) == 1);
     return JS_UNDEFINED;
 }
 JSValue jsUploadTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {

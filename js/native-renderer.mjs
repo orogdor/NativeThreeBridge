@@ -250,7 +250,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvs = uv ? toFloat2(uv) : null;
       let indices = null;
       if (index) indices = index.array instanceof Uint32Array ? index.array : Uint32Array.from(index.array);
-      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
+      const gpuLocal = [position, normal, color, uv, index].every(attribute =>
+        !attribute || (attribute.isInterleavedBufferAttribute ? attribute.data.usage : attribute.usage) === THREE.StaticDrawUsage);
+      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs, gpuLocal);
       Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
       return record;
     }

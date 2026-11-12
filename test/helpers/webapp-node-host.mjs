@@ -185,7 +185,7 @@ export async function runWebapp(root, options = {}) {
       rec.colorPatches.set(id, source);
       return true;
     },
-    uploadGeometry(id, positions, normals, colors, indices, uvs) {
+    uploadGeometry(id, positions, normals, colors, indices, uvs, gpuLocal = false) {
       view(positions, 'positions');
       if (positions.length % 3) throw new RangeError('positions not 3 per vertex');
       if (normals && normals.length !== positions.length) throw new RangeError('normals length');
@@ -203,7 +203,7 @@ export async function runWebapp(root, options = {}) {
           alphaMax = Math.max(alphaMax, a);
         }
       }
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax });
+      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax, gpuLocal });
     },
     // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
     // natively with WIC; here only the header is checked.

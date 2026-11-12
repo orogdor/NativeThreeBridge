@@ -95,6 +95,11 @@ struct Geometry {
     D3D12_INDEX_BUFFER_VIEW ibv{};
     UINT vertexCount = 0, indexCount = 0;
 };
+struct GeometryCopy {
+    ComPtr<ID3D12Resource> destination, staging;
+    UINT64 bytes = 0;
+    D3D12_RESOURCE_STATES drawState = D3D12_RESOURCE_STATE_COMMON;
+};
 struct InstanceSet {
     std::vector<float> cpu;   // count * 19 floats
     UINT count = 0;
@@ -166,7 +171,7 @@ public:
     // ---- WebappRenderSink
     void uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                         std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
-                        std::uint32_t colorChannels) override;
+                        std::uint32_t colorChannels, bool gpuLocal) override;
     void releaseGeometry(std::uint32_t id) override;
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
@@ -266,7 +271,8 @@ private:
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
-    void renderFrame();
+    void renderFrame(std::unique_lock<std::recursive_mutex>* resourceLock = nullptr);
+    void recordGeometryCopies();
     // The worker submits the previous frame while V8 computes the next one.
     void startRenderThread(bool forced);
     void waitRenderThread();
@@ -357,6 +363,7 @@ private:
     D3D12_VERTEX_BUFFER_VIEW identityView_{};
 
     std::unordered_map<std::uint32_t, Geometry> geometries_;
+    std::unordered_map<std::uint32_t, std::vector<GeometryCopy>> pendingGeometryCopies_;
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
@@ -611,6 +618,7 @@ void WebappWindow::resetPage() {
     waitForGpu();
     pendingPasses_.clear();
     passes_.clear();
+    pendingGeometryCopies_.clear();
     geometries_.clear();
     instances_.clear();
     resetTextures();
@@ -1065,7 +1073,7 @@ void WebappWindow::collectRetired() {
 
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
-                                  std::uint32_t colorChannels) {
+                                  std::uint32_t colorChannels, bool gpuLocal) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
     std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
@@ -1078,16 +1086,33 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
         o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
     }
     Geometry& g = geometries_[id];
+    // Replacements and disposals can happen before the next rendered frame.
+    // Cancel those copies while they still belong to the CPU.
+    pendingGeometryCopies_.erase(id);
     retire(g.vertices);
     retire(g.indices);
+    auto makeBuffer = [&](const void* data, UINT64 bytes, D3D12_RESOURCE_STATES drawState) {
+        if (!gpuLocal || !bytes) return uploadBuffer(data, bytes);
+        ComPtr<ID3D12Resource> destination;
+        const auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        const auto desc = bufferDesc(bytes);
+        // Streaming buffers remain valid if a device runs short of local memory.
+        if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination))))
+            return uploadBuffer(data, bytes);
+        pendingGeometryCopies_[id].push_back({destination, uploadBuffer(data, bytes), bytes, drawState});
+        return destination;
+    };
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
-    g.vertices = uploadBuffer(interleaved.data(), interleaved.size() * sizeof(float));
+    g.vertices = makeBuffer(interleaved.data(), interleaved.size() * sizeof(float),
+                            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
     g.vbv.SizeInBytes = UINT(interleaved.size() * sizeof(float));
     g.vbv.StrideInBytes = kVertexStride;
     if (idx && indexCount) {
-        g.indices = uploadBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t));
+        g.indices = makeBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t),
+                               D3D12_RESOURCE_STATE_INDEX_BUFFER);
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);
         g.ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -1098,9 +1123,29 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     auto it = geometries_.find(id);
     if (it == geometries_.end()) return;
+    pendingGeometryCopies_.erase(id);
     retire(it->second.vertices);
     retire(it->second.indices);
     geometries_.erase(it);
+}
+
+void WebappWindow::recordGeometryCopies() {
+    if (pendingGeometryCopies_.empty()) return;
+    std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(pendingGeometryCopies_.size() * 2);
+    for (auto& entry : pendingGeometryCopies_) {
+        for (auto& copy : entry.second) {
+            cmd_->CopyBufferRegion(copy.destination.Get(), 0, copy.staging.Get(), 0, copy.bytes);
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition = {copy.destination.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                  D3D12_RESOURCE_STATE_COPY_DEST, copy.drawState};
+            barriers.push_back(barrier);
+            retired_.push_back({std::move(copy.staging), fenceValue_ + 1});
+        }
+    }
+    cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+    pendingGeometryCopies_.clear();
 }
 
 void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) {
@@ -1328,7 +1373,7 @@ void WebappWindow::startRenderThread(bool forced) {
             const auto begin = std::chrono::steady_clock::now();
             std::exception_ptr error;
             try {
-                std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+                std::unique_lock<std::recursive_mutex> gpuLock(gfxMutex_);
                 // Freeze the native resource snapshot before the producer can
                 // start its next V8 frame and upload updated instance buffers.
                 {
@@ -1336,7 +1381,7 @@ void WebappWindow::startRenderThread(bool forced) {
                     renderStarted_ = true;
                 }
                 renderCv_.notify_all();
-                renderFrame();
+                renderFrame(&gpuLock);
             } catch (...) { error = std::current_exception(); }
             const auto done = std::chrono::steady_clock::now();
             lock.lock();
@@ -1383,7 +1428,7 @@ void WebappWindow::stopRenderThread() {
     renderStop_ = renderPending_ = renderBusy_ = renderStarted_ = false;
 }
 
-void WebappWindow::renderFrame() {
+void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceLock) {
     const UINT frame = swap_->GetCurrentBackBufferIndex();
     if (fence_->GetCompletedValue() < frameFence_[frame]) {
         const auto waitStart = std::chrono::steady_clock::now();
@@ -1410,6 +1455,7 @@ void WebappWindow::renderFrame() {
 
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
+    recordGeometryCopies();
     recordTextureCopies();
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1557,12 +1603,15 @@ void WebappWindow::renderFrame() {
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);
+    frameFence_[frame] = ++fenceValue_;
+    check(queue_->Signal(fence_.Get(), frameFence_[frame]), "Signal frame resources");
+    // The recorded frame owns its resources through the fence. V8 can upload
+    // the next frame's resources while Present waits for the display.
+    if (resourceLock) resourceLock->unlock();
     const auto presentStart = std::chrono::steady_clock::now();
     const HRESULT present = swap_->Present(1, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
     if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
-    frameFence_[frame] = ++fenceValue_;
-    queue_->Signal(fence_.Get(), frameFence_[frame]);
 }
 
 void WebappWindow::updateTitle(double fps) {
