@@ -13,31 +13,41 @@ cbuffer Frame : register(b0) {
     float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
     float4 gFogColor;
     float4 gFog;      // mode, near or density, far
+    float4x4 gShadowVP; // shadow-casting light: projection * view
+    float4 gShadow;     // enabled, bias, normalBias, 1 / map size
+    float4 gShadow2;    // radius, intensity, light index
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
     float4 gColor;    // linear rgb, opacity
     float4 gEmissive; // linear rgb, w shininess (<0: physical)
-    float4 gParams;   // roughness, metalness, flags, unused
+    float4 gParams;   // roughness, metalness, flags, normalScale.x
     float4 gUvU;      // u' = dot(xyz, (u, v, 1)); w alphaTest
-    float4 gUvV;      // v' = dot(xyz, (u, v, 1))
+    float4 gUvV;      // v' = dot(xyz, (u, v, 1)); w normalScale.y
     float4 gReflection; // sky RGB and blend strength
     float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
     float4 gColorStage; // live scalar uniforms from the translated color stage
+    float4 gStage;      // x: colour stage texture is flipY, w: skinned
 };
+cbuffer Bones : register(b2) { float4x4 gBones[256]; };
 Texture2D gMap : register(t0);
+Texture2D gNormalMap : register(t1);
+Texture2D<float> gShadowMap : register(t2);
+Texture2D gPatchMap : register(t3);   // the colour stage's own sampler2D
+SamplerComparisonState gShadowCmp : register(s3);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
-                  F_MIRRORED = 524288;
+                  F_MIRRORED = 524288, F_NORMAL_MAP = 1048576, F_RECEIVE_SHADOW = 4194304, F_ALPHA_COVERAGE = 8388608;
 static const float PI = 3.14159265;
 
 struct VSIn {
     float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0;
     float4 r0 : IROW0; float4 r1 : IROW1; float4 r2 : IROW2; float4 r3 : IROW3;
     float3 icol : ICOLOR;
+    float4 bi : BLENDINDICES; float4 bw : BLENDWEIGHT;
 };
 struct VSOut {
     float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0; float fogDepth : TEXCOORD1;
@@ -56,7 +66,14 @@ VSOut VSMain(VSIn i) {
     VSOut o;
     uint flags = (uint)gParams.z;
     float4x4 instT = float4x4(i.r0, i.r1, i.r2, i.r3);      // rows = instance matrix columns
-    float4 local = mul(float4(i.pos, 1), instT);
+    float3 pos = i.pos, nrm = i.nrm;
+    if (gStage.w > 0) {   // skinning_vertex: sum of weighted bone palette matrices
+        float4x4 s = gBones[(uint)i.bi.x] * i.bw.x + gBones[(uint)i.bi.y] * i.bw.y
+                   + gBones[(uint)i.bi.z] * i.bw.z + gBones[(uint)i.bi.w] * i.bw.w;
+        pos = mul(s, float4(pos, 1)).xyz;
+        nrm = mul((float3x3)s, nrm);
+    }
+    float4 local = mul(float4(pos, 1), instT);
     float4 world = mul(gModel, local);
     float4 view = mul(gView, world);
     float4 clip = mul(gProj, view);
@@ -70,7 +87,7 @@ VSOut VSMain(VSIn i) {
     o.uv = float2(dot(gUvU.xyz, uv1), dot(gUvV.xyz, uv1));
     o.world = world.xyz;
     float3x3 w = mul((float3x3)gModel, transpose((float3x3)instT));
-    o.nrm = cofactorNormal(w, i.nrm);
+    o.nrm = cofactorNormal(w, nrm);
     float4 c = (flags & F_VERTEX_COLORS) ? i.col : float4(1, 1, 1, 1);   // rgba vertex colours: alpha too
     if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;
@@ -122,6 +139,39 @@ float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
     return float4(color, alpha);
 }
 
+// Three.js getShadow (PCF): position offset along the geometry normal by
+// normalBias, depth biased by bias; 3x3 hardware-filtered taps.
+float shadowFactor(float3 world, float3 geoN) {
+    float4 c = mul(gShadowVP, float4(world + geoN * gShadow.z, 1));
+    float3 ndc = c.xyz / c.w;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    float z = ndc.z * 0.5 + 0.5 + gShadow.y;
+    if (any(uv < 0) || any(uv > 1) || z > 1) return 1;
+    float2 texel = gShadow.w * max(gShadow2.x, 1);
+    float sum = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            sum += gShadowMap.SampleCmpLevelZero(gShadowCmp, uv + float2(x, y) * texel, z);
+    return lerp(1, sum / 9, saturate(gShadow2.y));
+}
+
+// Shadow pass for alphaTest cut-outs: no colour, only the discard.
+void ShadowPS(VSOut i) {
+    uint flags = (uint)gParams.z;
+    float2 dx = ddx(i.uv), dy = ddy(i.uv);
+    float a = gColor.a * i.col.a;
+    if (flags & F_MAP) {
+        a *= (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, dx, dy).a
+           : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, dx, dy).a : gMap.SampleGrad(gClamp, i.uv, dx, dy).a;
+    }
+    if (a < gUvU.w) discard;
+}
+
+float4 ntSamplePatch(float2 uv) {
+    if (gStage.x > 0) uv.y = 1 - uv.y;   // flipY images: GL v runs bottom-up
+    return gPatchMap.SampleLevel(gClamp, uv, 0);
+}
+
 // NT_COLOR_PATCH_FUNCTION
 
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
@@ -129,6 +179,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     float3 albedo = gColor.rgb * i.col.rgb;
     float alphaOut = gColor.a * i.col.a;
     float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
+    float3 posDx = ddx(i.world), posDy = ddy(i.world);
     if (flags & F_MAP) {
         float4 t = (flags & F_MAP_REPEAT) ? gMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
                  : (flags & F_MAP_MIRROR) ? gMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
@@ -136,17 +187,40 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         alphaOut *= t.a;
     }
 #ifdef NT_COLOR_PATCH
-    albedo = nativeColorStage(i.localPosition, i.localNormal, float4(albedo, alphaOut));
+    { float4 staged = nativeColorStage(i.localPosition, i.localNormal, i.uv, float4(albedo, alphaOut));
+      albedo = staged.rgb; alphaOut = staged.a; }
 #endif
-    if (alphaOut < gUvU.w) discard;   // material.alphaTest
+    // material.alphaTest: with MSAA alpha-to-coverage the cut-out edge is a
+    // sharpened alpha ramp one pixel wide instead of a hard discard.
+    float alphaWidth = max(fwidth(alphaOut), 1e-4);
+    if (flags & F_ALPHA_COVERAGE) alphaOut = saturate((alphaOut - gUvU.w) / alphaWidth + 0.5);
+    else if (alphaOut < gUvU.w) discard;
     if (flags & F_UNLIT) return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     float3 V = normalize(gCamera.xyz - i.world);
-    float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
+    float3 flatN = normalize(cross(posDx, posDy));
     if (dot(flatN, V) < 0) flatN = -flatN;
     float3 N = normalize(i.nrm);
     if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
     if (!front) N = -N;
     if (flags & F_FLAT) N = flatN;
+    const float3 geoN = N;
+    const bool shadowed = gShadow.x > 0 && (flags & F_RECEIVE_SHADOW);
+    if (flags & F_NORMAL_MAP) {
+        // Three.js getTangentFrame (no tangent attribute); D3D's ddy runs down
+        // the screen, GLSL's dFdy up, hence the negated y derivatives.
+        float4 nt = (flags & F_MAP_REPEAT) ? gNormalMap.SampleGrad(gRepeat, i.uv, uvDx, uvDy)
+                  : (flags & F_MAP_MIRROR) ? gNormalMap.SampleGrad(gMirror, i.uv, uvDx, uvDy) : gNormalMap.SampleGrad(gClamp, i.uv, uvDx, uvDy);
+        float3 mapN = nt.xyz * 2 - 1;
+        mapN.xy *= float2(gParams.w, gUvV.w);
+        float3 q0 = posDx, q1 = -posDy;
+        float2 st0 = uvDx, st1 = -uvDy;
+        float3 q1perp = cross(q1, N), q0perp = cross(N, q0);
+        float3 T = q1perp * st0.x + q0perp * st1.x;
+        float3 B = q1perp * st0.y + q0perp * st1.y;
+        float det = max(dot(T, T), dot(B, B));
+        float s = (det == 0 ? 0 : rsqrt(det)) * (front ? 1 : -1);   // tbn[0..1] *= faceDirection
+        N = normalize(T * s * mapN.x + B * s * mapN.y + N * mapN.z);
+    }
     if (flags & F_NORMAL_COLOR) {
         float3 vn = normalize(mul((float3x3)gView, N));
         return float4(vn * 0.5 + 0.5, alphaOut);
@@ -181,6 +255,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
             if (cutoff > 0) { float r = saturate(1 - pow(dist / cutoff, 4)); attenuation *= r * r; }
             if (type == 5) attenuation *= smoothstep(d.x, d.y, dot(-L, c.xyz));
         }
+        if (shadowed && li == (uint)gShadow2.z) attenuation *= shadowFactor(i.world, geoN);
         float nl = saturate(dot(N, L));
         if (nl <= 0 || attenuation <= 0) continue;
         float3 irradiance = color * (nl * attenuation);

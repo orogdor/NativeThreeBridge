@@ -8,13 +8,16 @@
 //   * InstancedMesh matrices/colours only when they change,
 //   * textures once per image (encoded bytes are decoded natively),
 //   * one compact Float32Array "pass" per render() call: camera, lights and
-//     a 56-float record per visible draw.
+//     a 60-float record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
-export const PASS_HEADER_FLOATS = 64;
+export const PASS_HEADER_FLOATS = 96;   // [56..94]: shadow-casting light (see render())
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 56;
+export const DRAW_FLOATS = 60;          // [56]: ShadowDraw bits
 export const MAX_LIGHTS = 16;
+// Opaque meshes sharing geometry and material are merged into one instanced
+// draw once at least this many are visible (renderer.autoInstancing = false turns it off).
+export const AUTO_INSTANCE_MIN = 8;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
 export const DrawFlags = {
@@ -25,12 +28,16 @@ export const DrawFlags = {
   // matrixWorld has a negative determinant (mirrored, e.g. scale -1 in a GLTF):
   // the triangle winding is reversed, as Three.js' WebGLRenderer flips frontFace.
   MIRRORED: 524288,
+  NORMAL_MAP: 1048576,   // material.normalMap (tangent space, derivative-based frame like Three.js)
+  CAST_SHADOW: 2097152, RECEIVE_SHADOW: 4194304,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
 // Pass header [48]: tone mapping curve (same numbers as THREE.*ToneMapping).
 export const ToneMapping = { NONE: 0, LINEAR: 1, REINHARD: 2, CINEON: 3, ACES: 4, AGX: 6, NEUTRAL: 7 };
 export const PassFlags = { CLEAR_COLOR: 1, CLEAR_DEPTH: 2 };
+// Draw record [56]: drawn into the shadow map / only there (outside the camera view).
+export const ShadowDraw = { CAST: 1, ONLY: 2 };
 
 // `shaders`: { ShaderLib, UniformsUtils } from three.module.js (not in three.core.js).
 export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHost, shaders = {}) {
@@ -39,6 +46,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
   const _projScreen = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
+  const _shadowFrustum = new THREE.Frustum();
+  const _identityElements = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const _shadowScreen = new THREE.Matrix4();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
   const _color = new THREE.Color();
@@ -117,6 +127,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._textures = new WeakMap();   // THREE.Source -> { id, version, ok }
       this._patches = new WeakMap();    // material -> what its shader patch does to colours
       this._maskedGeometries = new WeakMap(); // geometry -> cached RGBA attribute-mask variants
+      this._skinned = new WeakMap();    // SkinnedMesh -> CPU-skinned geometry uploaded under its own id
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
       this._opaque = [];
       this._transparent = [];
@@ -253,6 +264,161 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs);
       Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
       return record;
+    }
+
+    // Merges opaque draws of the same geometry range and material (and the
+    // same per-mesh flags) into one instanced draw whose instance matrices are
+    // the meshes' world matrices. Groups are keyed per render() call within a
+    // frame, so a second render() (minimap, split screen) never overwrites the
+    // instances of the first before the engine draws them.
+    _autoInstance(draws) {
+      if (draws.length < AUTO_INSTANCE_MIN) return draws;
+      const groups = new Map();
+      for (const d of draws) {
+        if (!d.batchable) continue;
+        const key = `${d.geometryId}|${d.start}|${d.count}|${d.flags}|${d.shadow}|${d.material.id}|${d.renderOrder}`;
+        const list = groups.get(key);
+        if (list) list.push(d); else groups.set(key, [d]);
+      }
+      let merged = false;
+      for (const list of groups.values()) if (list.length >= AUTO_INSTANCE_MIN) { merged = true; break; }
+      if (!merged) return draws;
+      this._autoGroups ||= new Map();
+      this._autoTick = (this._autoTick || 0) + 1;
+      if (!this._autoSlotReset) {
+        this._autoSlotReset = true;
+        Promise.resolve().then(() => { this._autoSlot = 0; this._autoSlotReset = false; });
+      }
+      const slot = this._autoSlot = (this._autoSlot || 0) + 1;
+      const out = [];
+      const emitted = new Set();
+      for (const d of draws) {
+        if (!d.batchable) { out.push(d); continue; }
+        const key = `${d.geometryId}|${d.start}|${d.count}|${d.flags}|${d.shadow}|${d.material.id}|${d.renderOrder}`;
+        const list = groups.get(key);
+        if (list.length < AUTO_INSTANCE_MIN) { out.push(d); continue; }
+        if (emitted.has(key)) continue;
+        emitted.add(key);
+        const slotKey = `${slot}#${key}`;
+        let rec = this._autoGroups.get(slotKey);
+        if (!rec) { rec = { id: nextInstanceId++, matrices: null, tick: 0 }; this._autoGroups.set(slotKey, rec); }
+        rec.tick = this._autoTick;
+        const n = list.length;
+        if (!rec.matrices || rec.matrices.length < n * 16) rec.matrices = new Float32Array(Math.ceil(n * 1.5) * 16);
+        for (let i = 0; i < n; i++) rec.matrices.set(list[i].matrix, i * 16);
+        nt.uploadInstances(rec.id, rec.matrices.subarray(0, n * 16), null, n);
+        out.push({ ...d, instanceId: rec.id, instanceCount: n, matrix: _identityElements });
+      }
+      // Forget groups that have not been drawn for a while.
+      if ((this._autoTick & 63) === 0) {
+        for (const [k, rec] of this._autoGroups) {
+          if (this._autoTick - rec.tick > 120) { nt.releaseInstances(rec.id); this._autoGroups.delete(k); }
+        }
+      }
+      return out;
+    }
+
+    // SkinnedMesh: the vertex shader's skinning (skinning_vertex /
+    // skinnormal_vertex) done on the CPU once per frame, uploaded as an
+    // ordinary geometry owned by this mesh. Positions stay in the mesh's
+    // local space, so matrixWorld is applied as usual.
+    _skinnedRecord(mesh) {
+      const geometry = mesh.geometry, skeleton = mesh.skeleton;
+      const base = this._geometryRecord(geometry);
+      if (!base) return null;
+      if (nt.supportsSkinning && nt.supportsSkinning() && skeleton.bones.length <= 256) return this._gpuSkinnedRecord(mesh, base);
+      this._skinned ||= new WeakMap();
+      let rec = this._skinned.get(mesh);
+      if (!rec || rec.geometry !== geometry) {
+        if (rec) this._releaseSkinned(mesh, rec);
+        rec = { id: nextGeometryId++, geometry, key: '', bones: null, bind: null, frame: -1 };
+        this._skinned.set(mesh, rec);
+        this.info.memory.geometries++;
+        rec.onDispose = () => this._releaseSkinned(mesh, rec);
+        geometry.addEventListener('dispose', rec.onDispose);
+      }
+      const frame = this.info.render.frame;
+      if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+      const position = geometry.attributes.position, normal = geometry.attributes.normal;
+      const skinIndex = geometry.attributes.skinIndex, skinWeight = geometry.attributes.skinWeight;
+      if (rec.key !== base.key || rec.skinIndex !== skinIndex || rec.skinWeight !== skinWeight) {
+        rec.key = base.key; rec.skinIndex = skinIndex; rec.skinWeight = skinWeight;
+        rec.srcPos = toFloat3(position);
+        rec.srcNrm = normal ? toFloat3(normal) : computeNormals(THREE, position, geometry.index);
+        const n = position.count;
+        rec.idx = new Uint16Array(n * 4); rec.wgt = new Float32Array(n * 4);
+        for (let i = 0; i < n; i++) {
+          const o = i * 4;
+          rec.idx[o] = skinIndex.getX(i); rec.idx[o + 1] = skinIndex.getY(i); rec.idx[o + 2] = skinIndex.getZ(i); rec.idx[o + 3] = skinIndex.getW(i);
+          rec.wgt[o] = skinWeight.getX(i); rec.wgt[o + 1] = skinWeight.getY(i); rec.wgt[o + 2] = skinWeight.getZ(i); rec.wgt[o + 3] = skinWeight.getW(i);
+        }
+        rec.pos = new Float32Array(n * 3); rec.nrm = new Float32Array(n * 3);
+        rec.colors = geometry.attributes.color ? (geometry.attributes.color.itemSize === 4 ? toFloat4(geometry.attributes.color) : toFloat3(geometry.attributes.color)) : null;
+        rec.uvs = geometry.attributes.uv ? toFloat2(geometry.attributes.uv) : null;
+        rec.indices = geometry.index ? (geometry.index.array instanceof Uint32Array ? geometry.index.array : Uint32Array.from(geometry.index.array)) : null;
+        rec.bones = null;
+      }
+      const boneMatrices = skeleton.boneMatrices;
+      const bind = mesh.bindMatrix.elements;
+      if (rec.bones && rec.bones.length === boneMatrices.length && equalArrays(rec.bones, boneMatrices) && equalArrays(rec.bind, bind)) {
+        return Object.assign(rec, { hasColors: !!rec.colors, hasUvs: !!rec.uvs, vertexCount: position.count, indexCount: base.indexCount });
+      }
+      rec.bones = Float32Array.from(boneMatrices);
+      rec.bind = Float32Array.from(bind);
+      skinVertices(rec, boneMatrices, mesh.bindMatrix, mesh.bindMatrixInverse, THREE);
+      nt.uploadGeometry(rec.id, rec.pos, rec.nrm, rec.colors, rec.indices, rec.uvs);
+      return Object.assign(rec, { hasColors: !!rec.colors, hasUvs: !!rec.uvs, vertexCount: position.count, indexCount: base.indexCount });
+    }
+    // GPU skinning: the geometry is uploaded once as usual plus its bone
+    // indices/weights; each frame only the bone palette (bindMatrixInverse *
+    // boneMatrix * bindMatrix per bone, as skinning_vertex) is sent.
+    _gpuSkinnedRecord(mesh, base) {
+      const geometry = mesh.geometry, skeleton = mesh.skeleton;
+      const skinIndex = geometry.attributes.skinIndex, skinWeight = geometry.attributes.skinWeight;
+      this._skinData ||= new WeakMap();
+      const sent = this._skinData.get(geometry);
+      if (!sent || sent.key !== base.key || sent.id !== base.id || sent.index !== skinIndex || sent.weight !== skinWeight ||
+          sent.indexVersion !== skinIndex.version || sent.weightVersion !== skinWeight.version) {
+        const n = geometry.attributes.position.count, data = new Float32Array(n * 8);
+        for (let i = 0; i < n; i++) {
+          const o = i * 8;
+          data[o] = skinIndex.getX(i); data[o + 1] = skinIndex.getY(i); data[o + 2] = skinIndex.getZ(i); data[o + 3] = skinIndex.getW(i);
+          data[o + 4] = skinWeight.getX(i); data[o + 5] = skinWeight.getY(i); data[o + 6] = skinWeight.getZ(i); data[o + 7] = skinWeight.getW(i);
+        }
+        nt.uploadSkin(base.id, data, n);
+        this._skinData.set(geometry, { key: base.key, id: base.id, index: skinIndex, weight: skinWeight,
+          indexVersion: skinIndex.version, weightVersion: skinWeight.version });
+      }
+      this._palettes ||= new WeakMap();
+      let pal = this._palettes.get(mesh);
+      if (!pal) {
+        pal = { id: nextInstanceId++, bones: null, bind: null, palette: null, mesh };
+        this._palettes.set(mesh, pal);
+        pal.onDispose = () => { nt.releaseBones(pal.id); geometry.removeEventListener('dispose', pal.onDispose); this._palettes.delete(mesh); };
+        geometry.addEventListener('dispose', pal.onDispose);
+      }
+      const frame = this.info.render.frame;
+      if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+      const boneMatrices = skeleton.boneMatrices, bind = mesh.bindMatrix.elements;
+      if (!(pal.bones && pal.bones.length === boneMatrices.length && equalArrays(pal.bones, boneMatrices) && equalArrays(pal.bind, bind))) {
+        pal.bones = Float32Array.from(boneMatrices);
+        pal.bind = Float32Array.from(bind);
+        const count = boneMatrices.length / 16;
+        if (!pal.palette || pal.palette.length !== count * 16) pal.palette = new Float32Array(count * 16);
+        const m = new THREE.Matrix4();
+        for (let b = 0; b < count; b++) {
+          m.fromArray(boneMatrices, b * 16).premultiply(mesh.bindMatrixInverse).multiply(mesh.bindMatrix);
+          pal.palette.set(m.elements, b * 16);
+        }
+        nt.uploadBones(pal.id, pal.palette, count);
+      }
+      return { ...base, bonesId: pal.id };
+    }
+    _releaseSkinned(mesh, rec) {
+      rec.geometry.removeEventListener('dispose', rec.onDispose);
+      if (this._skinned.get(mesh) === rec) this._skinned.delete(mesh);
+      this.info.memory.geometries--;
+      nt.releaseGeometry(rec.id);
     }
 
     // A common onBeforeCompile pattern passes a float vertex attribute through a
@@ -416,17 +582,24 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const before = new Set(Object.keys(shader.uniforms));
         m.onBeforeCompile(shader, this);
         const added = Object.entries(shader.uniforms).filter(([k, u]) => !before.has(k) && u && u.value && u.value.isColor);
-        if (nt.registerColorPatch && !m.transparent) {
+        if (nt.registerColorPatch) {
           const stage = translateColorStage(shader);
-          if (stage) {
+          // A transparent surface keeps the colour stage only when the stage
+          // also computes its alpha (otherwise the older opacity rules apply).
+          if (stage && (!m.transparent || stage.alpha)) {
             let id = colorPatches.get(stage.source);
             if (id === undefined && colorPatches.size < 16) {
               id = colorPatches.size + 1;
               if (!nt.registerColorPatch(id, stage.source)) id = 0;
               colorPatches.set(stage.source, id);
             }
-            if (id) info.colorStage = { id, uniforms: stage.uniforms };
+            if (id) info.colorStage = { id, uniforms: stage.uniforms, sampler: stage.sampler };
           }
+        }
+        // Diagnostics (tests and tools): which patches could not be translated.
+        if (!info.colorStage && globalThis.__ntDebugPatches) {
+          globalThis.__ntDebugPatches.push({ type: m.type, transparent: !!m.transparent, uniforms: Object.keys(shader.uniforms).filter((k) => !before.has(k)),
+            fragment: shader.fragmentShader, vertex: shader.vertexShader });
         }
         const palette = new Map(added);
         info.colors = diffusePalette(shader.fragmentShader, palette);
@@ -436,7 +609,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         // Alpha cut out by a texture of the patch's own (fog-of-war masks, reveal effects):
         // drawing the surface whole would cover the scene, so it is left out.
         const maskTextures = Object.entries(shader.uniforms).some(([k, u]) => !before.has(k) && u && u.value && u.value.isTexture);
-        if (maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
+        if (!info.colorStage && maskTextures && m.transparent && /diffuseColor\.a\s*(\*=|=)|gl_FragColor\.a\s*(\*=|=)/.test(shader.fragmentShader)) info.hide = true;
         info.alphaRamp = attributeAlphaRamp(shader.vertexShader, shader.fragmentShader);
         if (info.alphaRamp) {
           info.colorRamp = attributeColorRamp(shader.vertexShader, shader.fragmentShader, info.alphaRamp.attribute, palette);
@@ -466,15 +639,27 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
+      this._shadowCandidates = this.shadowMap.enabled ? [] : null;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      const shadow = this.shadowMap.enabled ? this._shadowLight(lights) : null;
+      if (shadow) {
+        // Casters outside the camera view can still throw shadows into it.
+        _shadowScreen.multiplyMatrices(shadow.light.shadow.camera.projectionMatrix, shadow.light.shadow.camera.matrixWorldInverse);
+        _shadowFrustum.setFromProjectionMatrix(_shadowScreen, shadow.light.shadow.camera.coordinateSystem);
+        for (const mesh of this._shadowCandidates) {
+          if (!mesh.frustumCulled || _shadowFrustum.intersectsObject(mesh)) this._addMesh(mesh, camera, opaque, transparent, true);
+        }
+      }
+      this._shadowCandidates = null;
 
       if (this.sortObjects) {
         opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
         transparent.sort((a, b) => a.renderOrder - b.renderOrder || b.z - a.z);
       }
+      const solid = this.autoInstancing === false ? opaque : this._autoInstance(opaque);
 
       // ---- pass header
-      const drawCount = opaque.length + transparent.length;
+      const drawCount = solid.length + transparent.length;
       const lightCount = Math.min(lights.length, MAX_LIGHTS);
       if (lights.length > MAX_LIGHTS) warnOnce('too-many-lights', `Only the first ${MAX_LIGHTS} lights are used (scene has ${lights.length})`);
       const floats = PASS_HEADER_FLOATS + lightCount * LIGHT_FLOATS + drawCount * DRAW_FLOATS;
@@ -517,10 +702,17 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         p[53] = fog.isFogExp2 ? fog.density : fog.near;
         p[54] = fog.far ?? 0;
       }
+      if (shadow) {
+        const sh = shadow.light.shadow;
+        p.set(sh.camera.matrixWorldInverse.elements, 56);
+        p.set(sh.camera.projectionMatrix.elements, 72);
+        p[88] = 1; p[89] = sh.bias; p[90] = sh.normalBias; p[91] = Math.max(sh.mapSize.x, sh.mapSize.y);
+        p[92] = sh.radius; p[93] = sh.intensity ?? 1; p[94] = shadow.index;
+      }
 
       let o = PASS_HEADER_FLOATS;
       for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) writeLight(p, o, lights[i]);
-      for (const d of opaque) { writeDraw(p, o, d); o += DRAW_FLOATS; }
+      for (const d of solid) { writeDraw(p, o, d); o += DRAW_FLOATS; }
       for (const d of transparent) { writeDraw(p, o, d); o += DRAW_FLOATS; }
 
       this.info.render.calls += drawCount;
@@ -532,8 +724,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (object.visible === false) return;
       const layerVisible = object.layers.test(camera.layers);
       if (layerVisible) {
+        // THREE.LOD: show only the level for this camera distance (WebGLRenderer does the same).
+        if (object.isLOD && object.autoUpdate === true) object.update(camera);
         if (object.isLight) this._addLight(object, lights, ambient);
-        else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
+        else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent, false);
         else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
         else if (object.isSprite) this._addSprite(object, camera, opaque, transparent);
       }
@@ -541,13 +735,28 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       for (let i = 0; i < children.length; i++) this._collect(children[i], camera, opaque, transparent, lights, ambient);
     }
 
+    // The first directional or spot light with castShadow (among the lights
+    // actually sent) gets the shadow map, as WebGLShadowMap would render it.
+    _shadowLight(lights) {
+      const n = Math.min(lights.length, MAX_LIGHTS);
+      let found = null;
+      for (let i = 0; i < n; i++) {
+        const light = lights[i].light;
+        if (!light || !light.castShadow || !light.shadow) continue;
+        if (!light.isDirectionalLight && !light.isSpotLight) { unsupported('Point light shadows', 'drawn without shadows'); continue; }
+        if (found) { unsupported('More than one shadow-casting light', 'only the first casts shadows'); break; }
+        found = { light, index: i };
+      }
+      if (found) found.light.shadow.updateMatrices(found.light);
+      return found;
+    }
+
     _addLight(light, lights, ambient) {
       const c = light.color, k = light.intensity;
       if (light.isAmbientLight) { ambient[0] += c.r * k; ambient[1] += c.g * k; ambient[2] += c.b * k; return; }
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
-      if (light.castShadow) unsupported('Shadow maps in webapps', 'lights work, shadows are not rendered yet');
-      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
+      const rec = { light, type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
       if (light.isHemisphereLight) {
@@ -610,15 +819,19 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return this._spriteMatrices[i] || (this._spriteMatrices[i] = new THREE.Matrix4());
     }
 
-    _addMesh(mesh, camera, opaque, transparent) {
+    _addMesh(mesh, camera, opaque, transparent, shadowOnly) {
       const geometry = mesh.geometry;
       if (!geometry || !geometry.isBufferGeometry || !geometry.attributes.position) return;
       if (mesh.isInstancedMesh && mesh.count === 0) return;
-      if (mesh.frustumCulled && !_frustum.intersectsObject(mesh)) return;
-      if (mesh.isSkinnedMesh) unsupported('Skinned meshes (SkinnedMesh animation)', 'drawn in bind pose');
+      if (!shadowOnly && mesh.frustumCulled && !_frustum.intersectsObject(mesh)) {
+        if (mesh.castShadow && this._shadowCandidates && !mesh.isLine) this._shadowCandidates.push(mesh);
+        return;
+      }
       if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
-      const record = this._geometryRecord(geometry);
+      const skinnable = mesh.isSkinnedMesh && mesh.skeleton && geometry.attributes.skinIndex && geometry.attributes.skinWeight;
+      if (mesh.isSkinnedMesh && !skinnable) unsupported('SkinnedMesh without skeleton or skin attributes', 'drawn in bind pose');
+      const record = skinnable ? this._skinnedRecord(mesh) : this._geometryRecord(geometry);
       if (!record) return;
       if (mesh.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender) mesh.onBeforeRender(this, null, camera, geometry, mesh.material, null);
       const instances = mesh.isInstancedMesh ? this._instanceRecord(mesh) : null;
@@ -626,7 +839,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const z = _vec.z;
       const total = record.indexCount || record.vertexCount;
       const range = geometry.drawRange;
-      const base = { mesh, record, instances, z };
+      const base = { mesh, record, instances, z, shadowOnly: !!shadowOnly };
       if (Array.isArray(mesh.material)) {
         const groups = geometry.groups.length ? geometry.groups : [{ start: 0, count: total, materialIndex: 0 }];
         for (const group of groups) {
@@ -659,6 +872,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.flatShading) flags |= DrawFlags.FLAT;
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
       if (!mesh.isSprite && mesh.matrixWorld.determinant() < 0) flags |= DrawFlags.MIRRORED;
+      if (mesh.receiveShadow) flags |= DrawFlags.RECEIVE_SHADOW;
+      if (mesh.castShadow && !mesh.isLine) flags |= DrawFlags.CAST_SHADOW;
       let roughness = 1, metalness = 0, shininess = -1;
       let color = m.color || null, opacity = m.opacity ?? 1;
       let shaderMap = null, reflection = null, reflectionMask = false, colorStage = null;
@@ -696,8 +911,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
       if (m.fog !== false && (!(m.isShaderMaterial || m.isRawShaderMaterial) ||
           (m.fog && /#include\s+<fog_fragment>/.test(m.fragmentShader)))) flags |= DrawFlags.FOG;
-      if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
-        unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
+      if (m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
+        unsupported('Textures other than map and normalMap (envMap, aoMap …)', 'only the colour and normal maps are drawn');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) {
@@ -731,12 +946,25 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvt = _uvIdentity;
       uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
       const colorMap = m.map || shaderMap;
-      if (colorMap && base.record.hasUvs) {
-        const tex = this._textureRecord(colorMap);
-        if (tex) {
-          const map = colorMap;
-          textureId = tex.id;
-          flags |= DrawFlags.MAP;
+      let normalMapId = 0, normalScaleX = 1, normalScaleY = 1;
+      const normalTex = m.normalMap && base.record.hasUvs && !(flags & DrawFlags.UNLIT) ? this._textureRecord(m.normalMap) : null;
+      if (normalTex) {
+        normalMapId = normalTex.id;
+        flags |= DrawFlags.NORMAL_MAP;
+        normalScaleX = m.normalScale ? m.normalScale.x : 1;
+        normalScaleY = m.normalScale ? m.normalScale.y : 1;
+        if (m.normalMapType === THREE.ObjectSpaceNormalMap) unsupported('Object-space normal maps', 'treated as tangent space');
+      }
+      const colorTex = colorMap && base.record.hasUvs ? this._textureRecord(colorMap) : null;
+      if (colorTex) { textureId = colorTex.id; flags |= DrawFlags.MAP; }
+      // One uv transform is shared by both maps: the colour map's, or the normal map's when there is none.
+      const uvMap = colorTex ? colorMap : normalTex ? m.normalMap : null;
+      // A flipY uv transform mirrors v (D3D rows run top-down), and with it the
+      // derivative-based bitangent: undo that for the normal map.
+      if (normalTex && uvMap.flipY) normalScaleY = -normalScaleY;
+      if (uvMap) {
+        {
+          const map = uvMap;
           if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
           else if (map.wrapS === THREE.MirroredRepeatWrapping || map.wrapT === THREE.MirroredRepeatWrapping) flags |= DrawFlags.MAP_MIRROR;
           if (map.matrixAutoUpdate) map.updateMatrix();
@@ -756,9 +984,20 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
+        stageTextureId: 0, stageFlipY: false,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
+        normalMapId, normalScaleX, normalScaleY,
+        bonesId: base.record.bonesId || 0,
+        material: m, batchable: !base.instances && !base.record.bonesId && !mesh.isSprite && !mesh.isLine && !(flags & DrawFlags.TRANSPARENT),
+        shadow: ((flags & DrawFlags.CAST_SHADOW) ? ShadowDraw.CAST : 0) | (base.shadowOnly ? ShadowDraw.ONLY : 0),
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
+      // The colour stage's own texture (fog-of-war masks and similar).
+      const stageMap = colorStage?.sampler?.value;
+      if (stageMap && stageMap.isTexture) {
+        const tex = this._textureRecord(stageMap);
+        if (tex) { draw.stageTextureId = tex.id; draw.stageFlipY = !!stageMap.flipY; }
+      }
       if (globalThis.__ntDebugDraws) {
         const g = mesh.geometry, c = g.attributes.color;
         globalThis.__ntDebugDraws.push({
@@ -804,7 +1043,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const value = d.colorStage?.uniforms[i]?.value;
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
-    p[o + 53] = p[o + 54] = p[o + 55] = 0;
+    p[o + 53] = d.normalMapId || 0; p[o + 54] = d.normalScaleX ?? 1; p[o + 55] = d.normalScaleY ?? 1;
+    p[o + 56] = d.shadow || 0; p[o + 57] = d.stageTextureId || 0; p[o + 58] = d.stageFlipY ? 1 : 0; p[o + 59] = d.bonesId || 0;
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {
@@ -853,19 +1093,32 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   }
   // Translate a pure colour stage with local position/normal, scalar uniforms
   // and small math helpers. Everything outside this stage stays in native HLSL.
+  // Translates the GLSL a material's onBeforeCompile adds to the fragment
+  // shader into an HLSL "colour stage" the engine runs per pixel. Supported:
+  // helper functions over float/vecN, varyings set from position / normal /
+  // uv (or a swizzle of them), up to four float uniforms, one sampler2D, and
+  // code inserted after <map_fragment> or <color_fragment> that writes
+  // diffuseColor.rgb and/or diffuseColor.a (=, *=, +=, -=). Anything else
+  // (loops, branches, other built-ins) keeps the older approximations.
   function translateColorStage(shader) {
     const clean = (source) => source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
     const fragment = clean(shader.fragmentShader);
     const vertex = clean(shader.vertexShader);
     let helpers = fragment.match(/#include <common>([^#]*)#include/)?.[1].trim();
-    const body = fragment.match(/#include <color_fragment>([^#]*)#include/)?.[1].trim();
-    if (helpers === undefined || !body || !/\bdiffuseColor\.rgb\s*=(?!=)/.test(body) || body.length + helpers.length > 12000) return null;
+    // Inserted code: after <map_fragment> (before vertex colours) or after <color_fragment>.
+    const after = (chunk) => fragment.match(new RegExp(`#include <${chunk}>([^#]*)#include`))?.[1].trim() || '';
+    const mapBody = after('map_fragment'), colorBody = after('color_fragment');
+    const body = [mapBody, colorBody].filter(Boolean).join('\n');
+    const writes = /\bdiffuseColor\.(?:rgb|a)\s*[*+\-/]?=(?!=)/;
+    if (helpers === undefined || !body || !writes.test(body) || body.length + helpers.length > 12000) return null;
     const declarations = [], uniforms = [];
-    let supported = true;
-    helpers = helpers.replace(/\bvarying\s+vec3\s+(\w+)\s*;/g, (_, name) => {
-      const init = new RegExp(`\\b${name}\\s*=\\s*(position|normalize\\(\\s*objectNormal\\s*\\))\\s*;`).exec(vertex);
-      if (init) declarations.push(`float3 ${name} = ${init[1] === 'position' ? 'ntPosition' : 'ntNormal'};`);
-      else supported = false;
+    let sampler = null, supported = true;
+    helpers = helpers.replace(/\bvarying\s+(vec[234]|float)\s+(\w+)\s*;/g, (_, type, name) => {
+      const init = new RegExp(`\\b${name}\\s*=\\s*(position|normalize\\(\\s*objectNormal\\s*\\)|objectNormal|uv)(\\.[xyzw]{1,4})?\\s*;`).exec(vertex);
+      if (!init) { supported = false; return ''; }
+      const src = init[1] === 'position' ? 'ntPosition' : init[1] === 'uv' ? 'ntUv' : 'ntNormal';
+      const hlslType = type === 'float' ? 'float' : type.replace('vec', 'float');
+      declarations.push(`${hlslType} ${name} = ${src}${init[2] || ''};`);
       return '';
     }).replace(/\buniform\s+float\s+(\w+)\s*;/g, (_, name) => {
       if (uniforms.length >= 4 || !Number.isFinite(shader.uniforms[name]?.value)) supported = false;
@@ -874,8 +1127,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         uniforms.push(shader.uniforms[name]);
       }
       return '';
+    }).replace(/\buniform\s+sampler2D\s+(\w+)\s*;/g, (_, name) => {
+      if (sampler || !shader.uniforms[name]?.value?.isTexture) supported = false;
+      else sampler = { name, uniform: shader.uniforms[name] };
+      return '';
     }).trim();
-    if (!supported || !declarations.length) return null;
+    if (!supported || (!declarations.length && !sampler)) return null;
     const type = '(?:float|vec[234])';
     const functions = new RegExp(`\\b${type}\\s+([A-Za-z_]\\w*)\\s*\\([^()]*\\)\\s*\\{[^{}]*\\}`, 'g');
     const names = [...helpers.matchAll(functions)].map((m) => m[1]);
@@ -883,12 +1140,25 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const text = helpers + '\n' + body;
     if (/[^\w\s.,;(){}+*/%<>!=?:&|\-]/.test(text) || /[{}]/.test(body) ||
         /\b(?:for|while|do|if|switch|discard|register|static|uniform|varying|layout)\b/.test(text) ||
-        /\breturn\b/.test(body) || /\bdiffuseColor\s*\.(?!rgb\b)[A-Za-z_]/.test(body)) return null;
+        /\breturn\b/.test(body) || /\bdiffuseColor\s*\.(?!rgb\b|a\b)[A-Za-z_]/.test(body) ||
+        /\bdiffuseColor\s*(?:[*+\-/]?=)/.test(body)) return null;
     const calls = new Set(['vec2', 'vec3', 'vec4', 'float', 'abs', 'min', 'max', 'clamp', 'mix', 'smoothstep',
-      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp', ...names]);
+      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp', 'texture2D', 'texture', ...names]);
     for (const [, name] of text.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name) && name !== 'return') return null;
-    const hlsl = (source) => source.replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\(/g, 'lerp(').replace(/\bfract\(/g, 'frac(');
-    return { source: `${hlsl(helpers)}\nfloat3 nativeColorStage(float3 ntPosition, float3 ntNormal, float4 diffuseColor) {\n${declarations.join('\n')}\n${hlsl(body)}\nreturn diffuseColor.rgb;\n}`, uniforms };
+    // Samplers may only be read through texture2D()/texture() with the one declared sampler.
+    for (const [, name] of text.matchAll(/\btexture(?:2D)?\s*\(\s*([A-Za-z_]\w*)/g)) if (!sampler || name !== sampler.name) return null;
+    let hlsl = (source) => source.replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\(/g, 'lerp(').replace(/\bfract\(/g, 'frac(');
+    if (sampler) {
+      const base = hlsl;
+      hlsl = (source) => base(source).replace(new RegExp(`\\btexture(?:2D)?\\s*\\(\\s*${sampler.name}\\s*,`, 'g'), 'ntSamplePatch(');
+    }
+    // HLSL does not allow writing to a component of the input argument in all
+    // compilers, so the stage works on a local copy.
+    return {
+      source: `${hlsl(helpers)}\nfloat4 nativeColorStage(float3 ntPosition, float3 ntNormal, float2 ntUv, float4 ntDiffuse) {\nfloat4 diffuseColor = ntDiffuse;\n${declarations.join('\n')}\n${hlsl(body)}\nreturn diffuseColor;\n}`,
+      uniforms, sampler: sampler ? sampler.uniform : null,
+      alpha: /\bdiffuseColor\.a\s*[*+\-/]?=(?!=)/.test(body),
+    };
   }
 
   // Only replace albedo when the fragment actually assigns a palette to it.
@@ -951,6 +1221,47 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   }
 
   return { NativeRenderer };
+}
+
+function equalArrays(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// Linear blend skinning exactly as Three.js' skinning shader chunks:
+// p' = bindInverse * sum(w_i * bone_i * bind * p), n' = (bindInverse * sum(w_i * bone_i) * bind) * n.
+// Each bone becomes M_i = bindInverse * bone_i * bind once per frame.
+export function skinVertices(rec, boneMatrices, bindMatrix, bindMatrixInverse, THREE) {
+  const bones = boneMatrices.length / 16;
+  if (!rec.combined || rec.combined.length !== bones * 16) rec.combined = new Float32Array(bones * 16);
+  const m = rec.combined, tmp = new THREE.Matrix4();
+  for (let b = 0; b < bones; b++) {
+    tmp.fromArray(boneMatrices, b * 16).premultiply(bindMatrixInverse).multiply(bindMatrix);
+    m.set(tmp.elements, b * 16);
+  }
+  const src = rec.srcPos, srcN = rec.srcNrm, idx = rec.idx, wgt = rec.wgt, pos = rec.pos, nrm = rec.nrm;
+  const n = src.length / 3;
+  for (let i = 0; i < n; i++) {
+    const x = src[i * 3], y = src[i * 3 + 1], z = src[i * 3 + 2];
+    const nx = srcN[i * 3], ny = srcN[i * 3 + 1], nz = srcN[i * 3 + 2];
+    let px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0;
+    for (let k = 0; k < 4; k++) {
+      const w = wgt[i * 4 + k];
+      if (w === 0) continue;
+      const o = idx[i * 4 + k] * 16;
+      if (o >= m.length) continue;
+      px += w * (m[o] * x + m[o + 4] * y + m[o + 8] * z + m[o + 12]);
+      py += w * (m[o + 1] * x + m[o + 5] * y + m[o + 9] * z + m[o + 13]);
+      pz += w * (m[o + 2] * x + m[o + 6] * y + m[o + 10] * z + m[o + 14]);
+      qx += w * (m[o] * nx + m[o + 4] * ny + m[o + 8] * nz);
+      qy += w * (m[o + 1] * nx + m[o + 5] * ny + m[o + 9] * nz);
+      qz += w * (m[o + 2] * nx + m[o + 6] * ny + m[o + 10] * nz);
+    }
+    pos[i * 3] = px; pos[i * 3 + 1] = py; pos[i * 3 + 2] = pz;
+    const len = Math.hypot(qx, qy, qz) || 1;
+    nrm[i * 3] = qx / len; nrm[i * 3 + 1] = qy / len; nrm[i * 3 + 2] = qz / len;
+  }
 }
 
 // Any BufferAttribute (interleaved, normalized, integer, itemSize 2..4) ->

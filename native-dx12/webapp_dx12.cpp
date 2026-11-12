@@ -16,7 +16,9 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <share.h>
 #include <fstream>
 #include <map>
@@ -48,14 +50,21 @@ constexpr UINT kFrameCount = 2;
 constexpr UINT kVertexFloats = 12;                    // position, normal, colour rgba, uv
 constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
+constexpr UINT kShadowSlot = kMaxTextures - 1;       // reserved SRV slot: shadow map
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
-constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
+constexpr UINT kFrameCBBytes = 1536;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
-               F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
+               F_MIRRORED = 524288, F_NORMAL_MAP = 1048576, F_FAR_DEPTH = 32768;
+// Draw record [56] (js ShadowDraw): drawn into the shadow map / only there.
+constexpr UINT S_CAST = 1, S_ONLY = 2;  // negative-determinant world matrix: reversed winding
+// Set here, not by JS: an alphaTest cut-out drawn with MSAA alpha-to-coverage.
+constexpr UINT F_ALPHA_COVERAGE = 8388608;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
+constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -84,8 +93,52 @@ D3D12_RESOURCE_DESC bufferDesc(UINT64 bytes) {
     return d;
 }
 
+// An upload buffer a geometry used before, free again once `fence` completes.
+// Geometry re-sent every frame (CPU-skinned characters) reuses these instead
+// of creating a new committed resource per upload.
+struct PooledBuffer {
+    ComPtr<ID3D12Resource> resource;
+    UINT64 bytes = 0, fence = 0;
+};
+const D3D12_INPUT_ELEMENT_DESC kInputLayout[] = {
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"IROW", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    {"IROW", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    {"IROW", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    {"ICOLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    // Slot 2: GPU skinning (zeros with stride 0 for geometry without skin).
+    {"BLENDINDICES", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+};
+constexpr UINT kSkinStride = 32;          // float4 indices + float4 weights
+constexpr UINT kMaxBones = 256;           // cbuffer Bones
+
+// Column-major 4x4 product (OpenGL/Three.js element order): r = a * b.
+void mul4(const float* a, const float* b, float* r) {
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float v = 0;
+            for (int k = 0; k < 4; k++) v += a[k * 4 + row] * b[c * 4 + k];
+            r[c * 4 + row] = v;
+        }
+}
+
 struct Geometry {
     ComPtr<ID3D12Resource> vertices, indices;
+    UINT64 vertexBytes = 0, indexBytes = 0;
+    // First upload: copied into GPU memory (default heap). A geometry that is
+    // sent again (skinning, animated buffers) stays in upload memory and
+    // reuses pooled buffers instead.
+    bool resident = false;
+    UINT uploads = 0;
+    ComPtr<ID3D12Resource> skin;              // slot 2 for GPU skinning
+    D3D12_VERTEX_BUFFER_VIEW skinView{};
+    UINT skinVertices = 0;
+    std::vector<PooledBuffer> vertexPool, indexPool;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
     D3D12_INDEX_BUFFER_VIEW ibv{};
     UINT vertexCount = 0, indexCount = 0;
@@ -111,6 +164,12 @@ struct Texture {
 struct PendingTextureCopy {
     ComPtr<ID3D12Resource> texture, staging;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+};
+// A vertex/index buffer copy into GPU memory, recorded at the next frame start.
+struct PendingBufferCopy {
+    ComPtr<ID3D12Resource> buffer, staging;
+    UINT64 bytes = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
 };
 struct RetiredSlot {
     UINT slot;
@@ -165,6 +224,13 @@ public:
     void releaseTexture(std::uint32_t id) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
+    bool supportsSkinning() const override { return true; }
+    void uploadSkin(std::uint32_t geometryId, const float* data, std::uint32_t vertexCount) override;
+    void uploadBones(std::uint32_t id, const float* matrices, std::uint32_t count) override;
+    void releaseBones(std::uint32_t id) override { bones_.erase(id); }
+    std::map<std::uint32_t, std::vector<float>> bones_;
+    ComPtr<ID3D12Resource> noSkin_;            // 32 zero bytes read with stride 0
+    D3D12_VERTEX_BUFFER_VIEW noSkinView_{};
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
@@ -224,6 +290,9 @@ private:
     void resize(UINT width, UINT height);
     void waitForGpu();
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
+    void replaceBuffer(ComPtr<ID3D12Resource>& current, UINT64& currentBytes, std::vector<PooledBuffer>& pool,
+                       const void* data, UINT64 bytes);
+    void retirePool(std::vector<PooledBuffer>& pool);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
@@ -238,6 +307,7 @@ private:
     bool createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags);
     void recordTextureCopies();
     D3D12_GPU_DESCRIPTOR_HANDLE textureHandle(std::uint32_t id) const;
+    D3D12_GPU_DESCRIPTOR_HANDLE textureHandleForSlot(UINT slot) const;
     void uploadUi(UINT frame);
     void drawUi(UINT frame);
 
@@ -259,6 +329,23 @@ private:
     ComPtr<ID3D12DescriptorHeap> rtvHeap_, dsvHeap_;
     UINT rtvStep_ = 0;
     ComPtr<ID3D12Resource> targets_[kFrameCount], depth_;
+    // Multisampled scene target (msaa_ > 1), resolved into the back buffer
+    // before the HTML/CSS UI is drawn. NT_MSAA=1/2/4/8 overrides the default 4.
+    UINT msaa_ = 1;
+    ComPtr<ID3D12Resource> msaaColor_;
+    void chooseMsaa();
+    // Shadow map of the first shadow-casting directional/spot light: depth
+    // rendered from the light, sampled with a comparison sampler (PCF).
+    ComPtr<ID3D12Resource> shadowMap_;
+    UINT shadowSize_ = 0;
+    D3D12_RESOURCE_STATES shadowState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    UINT dsvStep_ = 0;
+    ComPtr<ID3DBlob> shadowPs_;
+    std::map<UINT, ComPtr<ID3D12PipelineState>> shadowPipelines_;
+    void ensureShadowMap(UINT size);
+    ID3D12PipelineState* shadowPipeline(UINT flags, bool alphaTested);
+    bool vsync_ = true;   // NT_VSYNC=0: present without waiting for the display
+    bool shadowsOn_ = true;   // NT_SHADOWS=0: skip shadow maps (quality/speed switch)
     ComPtr<ID3D12CommandAllocator> allocators_[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> cmd_;
     ComPtr<ID3D12Fence> fence_;
@@ -278,6 +365,8 @@ private:
     std::unordered_map<std::uint32_t, InstanceSet> instances_;
     std::unordered_map<std::uint32_t, Texture> textures_;
     std::vector<PendingTextureCopy> pendingCopies_;
+    std::vector<PendingBufferCopy> pendingBufferCopies_;
+    ComPtr<ID3D12Resource> residentBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state);
     std::vector<UINT> freeSlots_;
     std::vector<RetiredSlot> retiredSlots_;
     ComPtr<ID3D12DescriptorHeap> texHeap_;
@@ -293,7 +382,7 @@ private:
     // NativeThreeBridge-webapp-frames.csv: one summary row per second.
     struct Perf {
         int frames = 0;
-        double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
+        double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0, inputMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
         int forced = 0, full = 0, partial = 0, rasters = 0;
     } perf_;
@@ -301,6 +390,12 @@ private:
     std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
     double fenceWaitMs_ = 0;
     double presentMs_ = 0;
+    // Mouse moves are coalesced like a browser does (one pointermove per
+    // frame, flushed before any other input so the order stays the same).
+    bool moveQueued_ = false;
+    int moveX_ = 0, moveY_ = 0;
+    double inputMs_ = 0;
+    void flushMove();
     void writePerfRow(double atSeconds, double seconds);
     std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -421,13 +516,14 @@ void WebappWindow::initDevice() {
     factory_->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER);
 
     D3D12_DESCRIPTOR_HEAP_DESC heap{};
-    heap.NumDescriptors = kFrameCount;
+    heap.NumDescriptors = kFrameCount + 1;   // back buffers + multisampled scene target
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&rtvHeap_)), "RTV heap");
     rtvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    heap.NumDescriptors = 1;
+    heap.NumDescriptors = 2;   // scene depth, shadow map
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&dsvHeap_)), "DSV heap");
+    dsvStep_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
     for (UINT i = 0; i < kFrameCount; i++)
         check(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocators_[i])), "Command allocator");
@@ -438,36 +534,50 @@ void WebappWindow::initDevice() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
-    // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
-    D3D12_ROOT_PARAMETER params[3]{};
+    // t0 = colour map, t1 = normal map, t2 = shadow map, t3 = colour stage texture;
+    // s0 repeat, s1 clamp, s2 mirrored repeat, s3 shadow comparison.
+    D3D12_ROOT_PARAMETER params[7]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
         params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    D3D12_DESCRIPTOR_RANGE texRange{};
-    texRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    texRange.NumDescriptors = 1;
-    texRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &texRange;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC samplers[3]{};
+    D3D12_DESCRIPTOR_RANGE texRanges[4]{};
+    for (UINT i = 0; i < 4; i++) {
+        texRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        texRanges[i].NumDescriptors = 1;
+        texRanges[i].BaseShaderRegister = i;
+        texRanges[i].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        params[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2 + i].DescriptorTable.NumDescriptorRanges = 1;
+        params[2 + i].DescriptorTable.pDescriptorRanges = &texRanges[i];
+        params[2 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_STATIC_SAMPLER_DESC samplers[4]{};
     const D3D12_TEXTURE_ADDRESS_MODE modes[3] = {D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                   D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
     for (UINT i = 0; i < 3; i++) {
         samplers[i].Filter = D3D12_FILTER_ANISOTROPIC;
-        samplers[i].MaxAnisotropy = 4;
+        samplers[i].MaxAnisotropy = 16;   // sharp textures at grazing angles (ground, roads)
         samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW = modes[i];
         samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
         samplers[i].ShaderRegister = i;
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   // b2: bone palette
+    params[6].Descriptor.ShaderRegister = 2;
+    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rs.NumParameters = UINT(sizeof params / sizeof params[0]);
     rs.pParameters = params;
-    rs.NumStaticSamplers = 3;
+    samplers[3].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    samplers[3].AddressU = samplers[3].AddressV = samplers[3].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[3].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    samplers[3].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;   // lit when reference <= stored depth
+    samplers[3].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[3].ShaderRegister = 3;
+    samplers[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rs.NumStaticSamplers = 4;
     rs.pStaticSamplers = samplers;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> blob, error;
@@ -483,14 +593,37 @@ void WebappWindow::initDevice() {
         if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
         check(hr, stage ? "Compile webapp pixel shader" : "Compile webapp vertex shader");
     }
+    {
+        ComPtr<ID3DBlob> err;
+        const HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr, "ShadowPS",
+                                      "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, shadowPs_.ReleaseAndGetAddressOf(), err.GetAddressOf());
+        if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
+        check(hr, "Compile webapp shadow pixel shader");
+    }
+    {
+        char env[8] = {};
+        if (GetEnvironmentVariableA("NT_VSYNC", env, sizeof env) > 0 && env[0] == '0') vsync_ = false;
+        char shadowEnv[8] = {};
+        if (GetEnvironmentVariableA("NT_SHADOWS", shadowEnv, sizeof shadowEnv) > 0 && shadowEnv[0] == '0') shadowsOn_ = false;
+        log("info", std::string("Shadows: ") + (shadowsOn_ ? "on" : "off (NT_SHADOWS=0)"));
+    }
 
     const float identity[19] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1};
     identityInstance_ = uploadBuffer(identity, sizeof identity);
     identityView_.BufferLocation = identityInstance_->GetGPUVirtualAddress();
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
+    {
+        const float zeros[8] = {};
+        noSkin_ = uploadBuffer(zeros, sizeof zeros);
+        noSkinView_.BufferLocation = noSkin_->GetGPUVirtualAddress();
+        noSkinView_.SizeInBytes = sizeof zeros;
+        noSkinView_.StrideInBytes = 0;
+    }
+    chooseMsaa();
     createSizeDependent();
     initTextures();
+    ensureShadowMap(1);   // keeps the shadow SRV slot valid before any light casts shadows
     initUi();
 }
 
@@ -511,13 +644,14 @@ void WebappWindow::initTextures() {
 
 void WebappWindow::resetTextures() {
     pendingCopies_.clear();
+    pendingBufferCopies_.clear();
     retired_.clear();
     retiredSlots_.clear();
     textures_.clear();
     textureBytes_ = 0;
     textureFailures_ = 0;
     freeSlots_.clear();
-    for (UINT slot = kMaxTextures - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
+    for (UINT slot = kShadowSlot - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
     // slot 0: 1x1 white, bound for untextured draws
     createTexture(0, std::vector<std::uint8_t>(4, 255), 1, 1, 0);
 }
@@ -656,6 +790,27 @@ bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId,
 
 // Copies queued texture pixels; runs at the start of a frame's command list.
 void WebappWindow::recordTextureCopies() {
+    if (!pendingBufferCopies_.empty()) {
+        std::vector<D3D12_RESOURCE_BARRIER> barriers;
+        for (auto& c : pendingBufferCopies_) {
+            // Created in COMMON: the copy promotes it to COPY_DEST.
+            cmd_->CopyBufferRegion(c.buffer.Get(), 0, c.staging.Get(), 0, c.bytes);
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = c.buffer.Get();
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            b.Transition.StateAfter = c.state;
+            barriers.push_back(b);
+        }
+        cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+        for (auto& c : pendingBufferCopies_) {
+            retire(c.staging);
+            ComPtr<ID3D12Resource> keep = c.buffer;   // alive until this frame is done
+            retire(keep);
+        }
+        pendingBufferCopies_.clear();
+    }
     if (pendingCopies_.empty()) return;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
     for (auto& c : pendingCopies_) {
@@ -685,6 +840,12 @@ void WebappWindow::recordTextureCopies() {
         retire(keep);
     }
     pendingCopies_.clear();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE WebappWindow::textureHandleForSlot(UINT slot) const {
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = texHeap_->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += UINT64(slot) * texStep_;
+    return gpu;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE WebappWindow::textureHandle(std::uint32_t id) const {
@@ -762,8 +923,8 @@ void WebappWindow::initUi() {
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     d.SampleMask = UINT_MAX;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    d.RTVFormats[0] = kColorFormat;
+    d.DSVFormat = DXGI_FORMAT_UNKNOWN;   // drawn on the back buffer with no depth buffer bound
     d.SampleDesc.Count = 1;
     check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&uiPso_)), "Create UI overlay pipeline");
     log("info", "HTML/CSS UI layer ready (Direct2D + DirectWrite + WIC)");
@@ -857,6 +1018,26 @@ void WebappWindow::drawUi(UINT frame) {
     cmd_->DrawInstanced(3, 1, 0, 0);
 }
 
+void WebappWindow::chooseMsaa() {
+    UINT wanted = 4;
+    char env[8] = {};
+    if (GetEnvironmentVariableA("NT_MSAA", env, sizeof env) > 0) wanted = UINT(std::atoi(env));
+    msaa_ = 1;
+    for (UINT n : {8u, 4u, 2u}) {
+        if (n > wanted) continue;
+        bool ok = true;
+        for (DXGI_FORMAT f : {kColorFormat, kDepthFormat}) {
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS q{};
+            q.Format = f;
+            q.SampleCount = n;
+            if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &q, sizeof q)) || q.NumQualityLevels == 0)
+                ok = false;
+        }
+        if (ok) { msaa_ = n; break; }
+    }
+    log("info", "Antialiasing: " + (msaa_ > 1 ? std::to_string(msaa_) + "x MSAA" : std::string("off")));
+}
+
 void WebappWindow::createSizeDependent() {
     for (UINT i = 0; i < kFrameCount; i++) {
         check(swap_->GetBuffer(i, IID_PPV_ARGS(&targets_[i])), "Get back buffer");
@@ -870,8 +1051,8 @@ void WebappWindow::createSizeDependent() {
     d.Height = height_;
     d.DepthOrArraySize = 1;
     d.MipLevels = 1;
-    d.Format = DXGI_FORMAT_D32_FLOAT;
-    d.SampleDesc.Count = 1;
+    d.Format = kDepthFormat;
+    d.SampleDesc.Count = msaa_;
     d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE clear{};
     clear.Format = DXGI_FORMAT_D32_FLOAT;
@@ -880,11 +1061,26 @@ void WebappWindow::createSizeDependent() {
     check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE,
                                            &clear, IID_PPV_ARGS(&depth_)), "Depth buffer");
     device_->CreateDepthStencilView(depth_.Get(), nullptr, dsvHeap_->GetCPUDescriptorHandleForHeapStart());
+    if (msaa_ > 1) {
+        D3D12_RESOURCE_DESC c = d;
+        c.Format = kColorFormat;
+        c.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE black{};
+        black.Format = kColorFormat;
+        black.Color[3] = 1.0f;
+        // Starts (and ends every frame) as the resolve source.
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &c, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                               &black, IID_PPV_ARGS(&msaaColor_)), "Multisampled colour target");
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(kFrameCount) * rtvStep_;
+        device_->CreateRenderTargetView(msaaColor_.Get(), nullptr, rtv);
+    }
 }
 
 void WebappWindow::releaseSizeDependent() {
     for (auto& t : targets_) t.Reset();
     depth_.Reset();
+    msaaColor_.Reset();
 }
 
 void WebappWindow::waitForGpu() {
@@ -929,9 +1125,79 @@ ComPtr<ID3D12Resource> WebappWindow::uploadBuffer(const void* data, UINT64 bytes
     return buffer;
 }
 
+ComPtr<ID3D12Resource> WebappWindow::residentBuffer(const void* data, UINT64 bytes, D3D12_RESOURCE_STATES state) {
+    ComPtr<ID3D12Resource> buffer;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = bufferDesc(bytes);
+    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                           IID_PPV_ARGS(&buffer)), "Geometry buffer");
+    PendingBufferCopy copy;
+    copy.buffer = buffer;
+    copy.staging = uploadBuffer(data, bytes);
+    copy.bytes = bytes;
+    copy.state = state;
+    pendingBufferCopies_.push_back(std::move(copy));
+    return buffer;
+}
+
+void WebappWindow::replaceBuffer(ComPtr<ID3D12Resource>& current, UINT64& currentBytes, std::vector<PooledBuffer>& pool,
+                                 const void* data, UINT64 bytes) {
+    if (current) pool.push_back({current, currentBytes, fenceValue_ + kFrameCount});
+    current.Reset();
+    currentBytes = 0;
+    if (!bytes) return;
+    const UINT64 done = fence_ ? fence_->GetCompletedValue() : ~0ull;
+    for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->fence > done || it->bytes != bytes) continue;
+        current = it->resource;
+        pool.erase(it);
+        void* mapped = nullptr;
+        D3D12_RANGE none{0, 0};
+        check(current->Map(0, &none, &mapped), "Map pooled buffer");
+        std::memcpy(mapped, data, size_t(bytes));
+        current->Unmap(0, nullptr);
+        currentBytes = bytes;
+        break;
+    }
+    if (!current) {
+        current = uploadBuffer(data, bytes);
+        currentBytes = bytes;
+    }
+    // Keep only a few spares; older ones go through the normal retire list.
+    while (pool.size() > kFrameCount + 1) {
+        retired_.push_back({pool.front().resource, pool.front().fence});
+        pool.erase(pool.begin());
+    }
+}
+
+void WebappWindow::retirePool(std::vector<PooledBuffer>& pool) {
+    for (auto& b : pool) retired_.push_back({b.resource, b.fence});
+    pool.clear();
+}
+
 void WebappWindow::retire(ComPtr<ID3D12Resource>& resource) {
     if (resource) retired_.push_back({resource, fenceValue_ + kFrameCount});
     resource.Reset();
+}
+
+void WebappWindow::uploadSkin(std::uint32_t geometryId, const float* data, std::uint32_t vertexCount) {
+    auto it = geometries_.find(geometryId);
+    if (it == geometries_.end()) return;
+    Geometry& g = it->second;
+    retire(g.skin);
+    g.skinVertices = 0;
+    if (!vertexCount) return;
+    const UINT64 bytes = UINT64(vertexCount) * kSkinStride;
+    g.skin = residentBuffer(data, bytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    g.skinView.BufferLocation = g.skin->GetGPUVirtualAddress();
+    g.skinView.SizeInBytes = UINT(bytes);
+    g.skinView.StrideInBytes = kSkinStride;
+    g.skinVertices = vertexCount;
+}
+
+void WebappWindow::uploadBones(std::uint32_t id, const float* matrices, std::uint32_t count) {
+    count = std::min(count, kMaxBones);
+    bones_[id].assign(matrices, matrices + std::size_t(count) * 16);
 }
 
 void WebappWindow::releaseInstances(std::uint32_t id) {
@@ -965,16 +1231,41 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
         o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
     }
     Geometry& g = geometries_[id];
-    retire(g.vertices);
-    retire(g.indices);
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
-    g.vertices = uploadBuffer(interleaved.data(), interleaved.size() * sizeof(float));
+    const UINT64 vertexBytes = UINT64(interleaved.size()) * sizeof(float);
+    const UINT64 indexBytes = idx && indexCount ? UINT64(indexCount) * sizeof(std::uint32_t) : 0;
+    if (g.uploads++ == 0 && vertexBytes) {
+        g.resident = true;
+        g.vertices = residentBuffer(interleaved.data(), vertexBytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        g.vertexBytes = vertexBytes;
+        g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
+        g.vbv.SizeInBytes = UINT(vertexBytes);
+        g.vbv.StrideInBytes = kVertexStride;
+        if (indexBytes) {
+            g.indices = residentBuffer(idx, indexBytes, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+            g.indexBytes = indexBytes;
+            g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
+            g.ibv.SizeInBytes = UINT(indexBytes);
+            g.ibv.Format = DXGI_FORMAT_R32_UINT;
+        }
+        return;
+    }
+    if (g.resident) {
+        // Sent again: from now on it lives in upload memory (pooled buffers
+        // must be mappable, so the GPU-memory ones are simply retired).
+        retire(g.vertices);
+        retire(g.indices);
+        g.vertexBytes = g.indexBytes = 0;
+        g.resident = false;
+    }
+    replaceBuffer(g.vertices, g.vertexBytes, g.vertexPool, interleaved.data(), vertexBytes);
+    if (!g.vertices) return;
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
-    g.vbv.SizeInBytes = UINT(interleaved.size() * sizeof(float));
+    g.vbv.SizeInBytes = UINT(vertexBytes);
     g.vbv.StrideInBytes = kVertexStride;
-    if (idx && indexCount) {
-        g.indices = uploadBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t));
+    replaceBuffer(g.indices, g.indexBytes, g.indexPool, idx, indexBytes);
+    if (g.indices) {
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);
         g.ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -986,6 +1277,9 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
     if (it == geometries_.end()) return;
     retire(it->second.vertices);
     retire(it->second.indices);
+    retirePool(it->second.vertexPool);
+    retirePool(it->second.indexPool);
+    retire(it->second.skin);
     geometries_.erase(it);
 }
 
@@ -1032,22 +1326,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
     // side that faces the camera is the other one (Three.js flips frontFace).
     if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
-    const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+    const bool coverage = (flags & F_ALPHA_COVERAGE) && !lines && msaa_ > 1;
+    const UINT key = (patchId << 7) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
+                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) | (coverage ? 64u : 0u);
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
-    const D3D12_INPUT_ELEMENT_DESC layout[] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-        {"IROW", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-        {"IROW", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-        {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-        {"IROW", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-        {"ICOLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
-    };
+    const auto& layout = kInputLayout;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.pRootSignature = root_sig_.Get();
     d.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
@@ -1081,11 +1366,13 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.DepthStencilState.DepthEnable = (flags & F_NO_DEPTH_TEST) ? FALSE : TRUE;
     d.DepthStencilState.DepthWriteMask = (flags & F_NO_DEPTH_WRITE) ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    d.BlendState.AlphaToCoverageEnable = coverage ? TRUE : FALSE;
     d.SampleMask = UINT_MAX;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    d.SampleDesc.Count = 1;
+    d.RTVFormats[0] = kColorFormat;
+    d.DSVFormat = kDepthFormat;
+    d.SampleDesc.Count = msaa_;
+    d.RasterizerState.MultisampleEnable = msaa_ > 1 ? TRUE : FALSE;
     ComPtr<ID3D12PipelineState> pso;
     const auto hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
     if (FAILED(hr) && patchId) {
@@ -1097,6 +1384,79 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     ID3D12PipelineState* raw = pso.Get();
     pipelines_[key] = pso;
     return raw;
+}
+
+void WebappWindow::ensureShadowMap(UINT size) {
+    size = std::clamp<UINT>(size, 1, 8192);
+    if (shadowMap_ && size == shadowSize_) return;
+    if (shadowMap_) waitForGpu();   // the SRV slot is rewritten below
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = size;
+    d.Height = size;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = 1;
+    d.Format = DXGI_FORMAT_R32_TYPELESS;   // D32_FLOAT as depth target, R32_FLOAT when sampled
+    d.SampleDesc.Count = 1;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = kDepthFormat;
+    clear.DepthStencil.Depth = 1.0f;
+    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    shadowMap_.Reset();
+    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                                           IID_PPV_ARGS(&shadowMap_)), "Shadow map");
+    shadowState_ = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    shadowSize_ = size;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = kDepthFormat;
+    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+    dsvHandle.ptr += dsvStep_;
+    device_->CreateDepthStencilView(shadowMap_.Get(), &dsv, dsvHandle);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(kShadowSlot) * texStep_;
+    device_->CreateShaderResourceView(shadowMap_.Get(), &srv, cpu);
+}
+
+// Depth-only pipeline for the shadow pass. Like WebGLShadowMap, single-sided
+// materials render their other side into the map (less shadow acne).
+ID3D12PipelineState* WebappWindow::shadowPipeline(UINT flags, bool alphaTested) {
+    D3D12_CULL_MODE cull = (flags & F_DOUBLE) ? D3D12_CULL_MODE_NONE
+                         : (flags & F_BACK)   ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_FRONT;
+    if ((flags & F_MIRRORED) && cull != D3D12_CULL_MODE_NONE)
+        cull = cull == D3D12_CULL_MODE_FRONT ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_FRONT;
+    const UINT key = (alphaTested ? 1u : 0u) | (UINT(cull) << 1);
+    auto found = shadowPipelines_.find(key);
+    if (found != shadowPipelines_.end()) return found->second.Get();
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+    d.pRootSignature = root_sig_.Get();
+    d.VS = {vs_->GetBufferPointer(), vs_->GetBufferSize()};
+    if (alphaTested) d.PS = {shadowPs_->GetBufferPointer(), shadowPs_->GetBufferSize()};
+    d.InputLayout = {kInputLayout, UINT(sizeof kInputLayout / sizeof kInputLayout[0])};
+    d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    d.RasterizerState.CullMode = cull;
+    d.RasterizerState.FrontCounterClockwise = TRUE;
+    d.RasterizerState.DepthClipEnable = TRUE;
+    d.RasterizerState.SlopeScaledDepthBias = 1.0f;
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+    d.DepthStencilState.DepthEnable = TRUE;
+    d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    d.SampleMask = UINT_MAX;
+    d.NumRenderTargets = 0;
+    d.DSVFormat = kDepthFormat;
+    d.SampleDesc.Count = 1;
+    ComPtr<ID3D12PipelineState> pso;
+    check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)), "Create shadow pipeline");
+    shadowPipelines_[key] = pso;
+    return pso.Get();
 }
 
 void WebappWindow::renderFrame() {
@@ -1111,8 +1471,21 @@ void WebappWindow::renderFrame() {
 
     // Size the per-frame constant ring for this frame's passes and draws.
     UINT64 needed = 0;
-    for (const auto& pass : passes_)
-        needed += kFrameCBBytes + UINT64(pass[43]) * kDrawCBBytes;
+    UINT shadowWanted = 0;
+    for (const auto& pass : passes_) {
+        const bool shadows = shadowsOn_ && pass[88] > 0;
+        needed += (shadows ? 2 : 1) * (kFrameCBBytes + UINT64(pass[43]) * kDrawCBBytes);
+        // Bone palettes of skinned draws (once per pass they are drawn in).
+        const float* d = pass.data() + native_three::kWebappPassHeaderFloats + UINT(pass[35]) * native_three::kWebappLightFloats;
+        for (UINT i = 0, n = UINT(pass[43]); i < n; i++, d += native_three::kWebappDrawFloats) {
+            if (d[59] <= 0) continue;
+            auto b = bones_.find(std::uint32_t(d[59]));
+            if (b != bones_.end()) needed += (shadows ? 2 : 1) * ((UINT64(b->second.size() * sizeof(float)) + 255) & ~255ull);
+        }
+        if (shadows) shadowWanted = std::max(shadowWanted, std::clamp<UINT>(UINT(pass[91]), 256, 4096));
+    }
+    // Sized before recording: a shadow map is never replaced mid-frame.
+    if (shadowWanted) ensureShadowMap(shadowWanted);
     if (ringBytes_[frame] < needed || !ring_[frame]) {
         retire(ring_[frame]);
         ringBytes_[frame] = std::max<UINT64>(needed * 3 / 2, 1u << 20);
@@ -1127,15 +1500,32 @@ void WebappWindow::renderFrame() {
     check(allocators_[frame]->Reset(), "Reset allocator");
     check(cmd_->Reset(allocators_[frame].Get(), nullptr), "Reset command list");
     recordTextureCopies();
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = targets_[frame].Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    cmd_->ResourceBarrier(1, &barrier);
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
-    rtv.ptr += SIZE_T(frame) * rtvStep_;
+    const bool msaa = msaa_ > 1 && msaaColor_;
+    auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r;
+        b.Transition.StateBefore = from;
+        b.Transition.StateAfter = to;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        return b;
+    };
+    {
+        // The scene goes into the multisampled target (resolved below) or
+        // straight into the back buffer when MSAA is off.
+        D3D12_RESOURCE_BARRIER begin[2] = {
+            transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_PRESENT,
+                       msaa ? D3D12_RESOURCE_STATE_RESOLVE_DEST : D3D12_RESOURCE_STATE_RENDER_TARGET),
+            transition(msaaColor_.Get(), D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+        cmd_->ResourceBarrier(msaa ? 2 : 1, begin);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE backRtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    backRtv.ptr += SIZE_T(frame) * rtvStep_;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = backRtv;
+    if (msaa) {
+        rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(kFrameCount) * rtvStep_;
+    }
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
     cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
     // A browser canvas starts every frame cleared (preserveDrawingBuffer=false).
@@ -1150,21 +1540,170 @@ void WebappWindow::renderFrame() {
     ID3D12DescriptorHeap* texHeaps[] = {texHeap_.Get()};
     cmd_->SetDescriptorHeaps(1, texHeaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = textureHandle(0);
-    UINT64 boundTexture = ~0ull;
+    UINT64 boundTexture = ~0ull, boundNormalMap = ~0ull, boundStageMap = ~0ull;
 
     UINT drawsThisFrame = 0;
+    const D3D12_GPU_DESCRIPTOR_HANDLE shadowHandle = textureHandleForSlot(kShadowSlot);
+    cmd_->SetGraphicsRootDescriptorTable(4, shadowHandle);
+    cmd_->SetGraphicsRootDescriptorTable(5, whiteTexture);   // colour stage texture until a draw sets one
+    cmd_->SetGraphicsRootConstantBufferView(6, ringGpu);      // bone palette; read only by skinned draws
+    boundStageMap = whiteTexture.ptr;
+    auto setShadowState = [&](D3D12_RESOURCE_STATES state) {
+        if (shadowState_ == state) return;
+        D3D12_RESOURCE_BARRIER b = transition(shadowMap_.Get(), shadowState_, state);
+        cmd_->ResourceBarrier(1, &b);
+        shadowState_ = state;
+    };
+    auto bindScene = [&]() {
+        cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        cmd_->RSSetViewports(1, &viewport);
+        cmd_->RSSetScissorRects(1, &scissor);
+    };
+    // Per-draw state shared by the shadow and the scene pass: geometry, the
+    // instance buffer for this frame, and the Draw constant buffer.
+    struct Prepared {
+        Geometry* g = nullptr;
+        D3D12_VERTEX_BUFFER_VIEW views[3]{};
+        const std::vector<float>* bones = nullptr;
+        bool skinned = false;
+        UINT instanceCount = 1, start = 0, count = 0;
+    };
+    auto prepare = [&](const float* d, Prepared& out) -> bool {
+        auto g = geometries_.find(std::uint32_t(d[0]));
+        if (g == geometries_.end() || !g->second.vertices) return false;
+        out.g = &g->second;
+        out.start = UINT(d[4]);
+        out.count = UINT(d[5]);
+        out.instanceCount = std::max<UINT>(1, UINT(d[2]));
+        out.views[0] = g->second.vbv;
+        out.views[1] = identityView_;
+        out.views[2] = noSkinView_;
+        out.skinned = false;
+        if (d[59] > 0 && g->second.skin && g->second.skinVertices >= g->second.vertexCount) {
+            auto b = bones_.find(std::uint32_t(d[59]));
+            if (b != bones_.end() && !b->second.empty()) {
+                out.views[2] = g->second.skinView;
+                out.bones = &b->second;
+                out.skinned = true;
+            }
+        }
+        if (d[1] > 0) {
+            auto it = instances_.find(std::uint32_t(d[1]));
+            if (it == instances_.end() || it->second.count == 0) return false;
+            InstanceSet& set = it->second;
+            out.instanceCount = std::min(out.instanceCount, set.count);
+            if (set.uploaded[frame] != set.version || !set.gpu[frame]) {
+                if (set.capacity[frame] < set.count || !set.gpu[frame]) {
+                    retire(set.gpu[frame]);
+                    set.capacity[frame] = set.count;
+                    set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.count) * kInstanceStride);
+                }
+                void* mapped = nullptr;
+                check(set.gpu[frame]->Map(0, &none, &mapped), "Map instances");
+                std::memcpy(mapped, set.cpu.data(), set.cpu.size() * sizeof(float));
+                set.gpu[frame]->Unmap(0, nullptr);
+                set.uploaded[frame] = set.version;
+            }
+            out.views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
+            out.views[1].SizeInBytes = set.count * kInstanceStride;
+            out.views[1].StrideInBytes = kInstanceStride;
+        }
+        return true;
+    };
+    auto writeDrawCB = [&](const float* d, UINT drawFlags, const Prepared& pr) {
+        if (pr.skinned) {
+            // cbuffer Bones: this draw's palette in the frame ring.
+            const UINT bytes = UINT(pr.bones->size() * sizeof(float));
+            std::memcpy(ring + ringOffset, pr.bones->data(), bytes);
+            cmd_->SetGraphicsRootConstantBufferView(6, ringGpu + ringOffset);
+            ringOffset += (bytes + 255) & ~255u;
+        }
+        // cbuffer Draw: model, colour+opacity, emissive+shininess, params.
+        float* dcb = reinterpret_cast<float*>(ring + ringOffset);
+        std::memcpy(dcb, d + 16, 16 * sizeof(float));
+        dcb[16] = d[8]; dcb[17] = d[9]; dcb[18] = d[10]; dcb[19] = d[11];
+        dcb[20] = d[12]; dcb[21] = d[13]; dcb[22] = d[14]; dcb[23] = d[15];
+        dcb[24] = d[6]; dcb[25] = d[7]; dcb[26] = float(drawFlags); dcb[27] = d[54]; // normalScale.x
+        // uv transform rows (a c e | b d f), alphaTest, normalScale.y
+        dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
+        dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = d[55];
+        std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
+        std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
+        dcb[48] = d[58]; dcb[49] = dcb[50] = 0;  // gStage: colour stage texture flipY
+        dcb[51] = pr.skinned ? 1.0f : 0.0f;      // gStage.w: GPU skinning with cbuffer Bones
+        cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
+        ringOffset += kDrawCBBytes;
+    };
+    auto issue = [&](const Prepared& pr) -> bool {
+        cmd_->IASetVertexBuffers(0, 3, pr.views);
+        if (pr.g->indexCount) {
+            const UINT n = std::min(pr.count, pr.g->indexCount > pr.start ? pr.g->indexCount - pr.start : 0u);
+            if (!n) return false;
+            cmd_->IASetIndexBuffer(&pr.g->ibv);
+            cmd_->DrawIndexedInstanced(n, pr.instanceCount, pr.start, 0, 0);
+        } else {
+            const UINT n = std::min(pr.count, pr.g->vertexCount > pr.start ? pr.g->vertexCount - pr.start : 0u);
+            if (!n) return false;
+            cmd_->DrawInstanced(n, pr.instanceCount, pr.start, 0);
+        }
+        return true;
+    };
+
     for (const auto& pass : passes_) {
         const float* p = pass.data();
         const UINT lightCount = UINT(p[35]);
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
+        const float* firstDraw = p + native_three::kWebappPassHeaderFloats + lightCount * native_three::kWebappLightFloats;
+        const bool shadows = shadowsOn_ && p[88] > 0 && shadowSize_ > 1;
+
+        // ---- shadow pass: depth from the light into the shadow map
+        float shadowVP[16] = {};
+        if (shadows) {
+            mul4(p + 72, p + 56, shadowVP);   // projection * view
+            setShadowState(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+            shadowDsv.ptr += dsvStep_;
+            cmd_->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+            cmd_->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+            D3D12_VIEWPORT sv{0, 0, float(shadowSize_), float(shadowSize_), 0, 1};
+            D3D12_RECT sr{0, 0, LONG(shadowSize_), LONG(shadowSize_)};
+            cmd_->RSSetViewports(1, &sv);
+            cmd_->RSSetScissorRects(1, &sr);
+            float* scb = reinterpret_cast<float*>(ring + ringOffset);
+            std::memset(scb, 0, kFrameCBBytes);
+            std::memcpy(scb, p + 56, 32 * sizeof(float));   // gView, gProj = the light's camera
+            cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
+            ringOffset += kFrameCBBytes;
+            cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ID3D12PipelineState* current = nullptr;
+            const float* d = firstDraw;
+            for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
+                const UINT drawFlags = UINT(d[3]);
+                if (!(UINT(d[56]) & S_CAST) || (drawFlags & (F_LINES | F_LINE_STRIP | F_FAR_DEPTH))) continue;
+                Prepared pr;
+                if (!prepare(d, pr)) continue;
+                const bool alphaTested = d[33] > 0 && (drawFlags & F_MAP);
+                ID3D12PipelineState* pso = shadowPipeline(drawFlags, alphaTested);
+                if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
+                writeDrawCB(d, drawFlags, pr);
+                if (alphaTested) {
+                    const D3D12_GPU_DESCRIPTOR_HANDLE tex = textureHandle(std::uint32_t(d[32]));
+                    if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
+                }
+                issue(pr);
+            }
+            bindScene();
+        }
+        setShadowState(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
         if (flags & P_CLEAR_COLOR) {
             const float clear[4] = {p[36], p[37], p[38], p[39]};
             cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
         }
         if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-        // cbuffer Frame: view, projection, camera+lightCount, ambient+exposure, lights.
+        // cbuffer Frame: view, projection, camera+lightCount, ambient+exposure, lights, shadow.
         float* fcb = reinterpret_cast<float*>(ring + ringOffset);
         std::memset(fcb, 0, kFrameCBBytes);
         std::memcpy(fcb, p, 32 * sizeof(float));
@@ -1175,92 +1714,68 @@ void WebappWindow::renderFrame() {
         fcb[296] = p[48]; fcb[297] = p[47] > 0 ? p[47] : 1.0f; // tone mapping curve, exposure
         std::memcpy(fcb + 300, p + 49, 3 * sizeof(float)); // fog RGB in framebuffer space
         std::memcpy(fcb + 304, p + 52, 3 * sizeof(float)); // mode, near or density, far
+        if (shadows) {
+            std::memcpy(fcb + 308, shadowVP, 16 * sizeof(float));
+            fcb[324] = 1; fcb[325] = p[89]; fcb[326] = p[90]; fcb[327] = 1.0f / float(shadowSize_);
+            fcb[328] = p[92]; fcb[329] = p[93]; fcb[330] = p[94];
+        }
         cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
         ringOffset += kFrameCBBytes;
 
-        const float* d = p + native_three::kWebappPassHeaderFloats + lightCount * native_three::kWebappLightFloats;
+        // ---- scene pass
+        const float* d = firstDraw;
         ID3D12PipelineState* current = nullptr;
         D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
-            auto g = geometries_.find(std::uint32_t(d[0]));
-            if (g == geometries_.end() || !g->second.vertices) continue;
-            const UINT drawFlags = UINT(d[3]);
-            const UINT start = UINT(d[4]);
-            const UINT count = UINT(d[5]);
-            UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
-            D3D12_VERTEX_BUFFER_VIEW views[2] = {g->second.vbv, identityView_};
-            if (d[1] > 0) {
-                auto it = instances_.find(std::uint32_t(d[1]));
-                if (it == instances_.end() || it->second.count == 0) continue;
-                InstanceSet& set = it->second;
-                instanceCount = std::min(instanceCount, set.count);
-                if (set.uploaded[frame] != set.version || !set.gpu[frame]) {
-                    if (set.capacity[frame] < set.count || !set.gpu[frame]) {
-                        retire(set.gpu[frame]);
-                        set.capacity[frame] = set.count;
-                        set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.count) * kInstanceStride);
-                    }
-                    void* mapped = nullptr;
-                    check(set.gpu[frame]->Map(0, &none, &mapped), "Map instances");
-                    std::memcpy(mapped, set.cpu.data(), set.cpu.size() * sizeof(float));
-                    set.gpu[frame]->Unmap(0, nullptr);
-                    set.uploaded[frame] = set.version;
-                }
-                views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
-                views[1].SizeInBytes = set.count * kInstanceStride;
-                views[1].StrideInBytes = kInstanceStride;
-            }
+            if (UINT(d[56]) & S_ONLY) continue;   // outside the camera view: shadow map only
+            UINT drawFlags = UINT(d[3]);
+            // alphaTest cut-outs (foliage, thatch, hair) get soft MSAA edges.
+            if (msaa && d[33] > 0 && !(drawFlags & (F_TRANSPARENT | F_LINES | F_LINE_STRIP))) drawFlags |= F_ALPHA_COVERAGE;
+            Prepared pr;
+            if (!prepare(d, pr)) continue;
             ID3D12PipelineState* pso = pipeline(drawFlags, UINT(d[48]));
             if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
             const D3D_PRIMITIVE_TOPOLOGY wanted = (drawFlags & F_LINE_STRIP) ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
                                                   : (drawFlags & F_LINES)    ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                                                              : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
             if (wanted != topology) { cmd_->IASetPrimitiveTopology(wanted); topology = wanted; }
-
-            // cbuffer Draw: model, colour+opacity, emissive+shininess, params.
-            float* dcb = reinterpret_cast<float*>(ring + ringOffset);
-            std::memcpy(dcb, d + 16, 16 * sizeof(float));
-            dcb[16] = d[8]; dcb[17] = d[9]; dcb[18] = d[10]; dcb[19] = d[11];
-            dcb[20] = d[12]; dcb[21] = d[13]; dcb[22] = d[14]; dcb[23] = d[15];
-            dcb[24] = d[6]; dcb[25] = d[7]; dcb[26] = float(drawFlags); dcb[27] = 0;
-            // uv transform rows (a c e | b d f) and alphaTest
-            dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
-            dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
-            std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
-            std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
-            cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
-            ringOffset += kDrawCBBytes;
+            writeDrawCB(d, drawFlags, pr);
             const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
-
-            cmd_->IASetVertexBuffers(0, 2, views);
-            if (g->second.indexCount) {
-                const UINT n = std::min(count, g->second.indexCount > start ? g->second.indexCount - start : 0u);
-                if (!n) continue;
-                cmd_->IASetIndexBuffer(&g->second.ibv);
-                cmd_->DrawIndexedInstanced(n, instanceCount, start, 0, 0);
-            } else {
-                const UINT n = std::min(count, g->second.vertexCount > start ? g->second.vertexCount - start : 0u);
-                if (!n) continue;
-                cmd_->DrawInstanced(n, instanceCount, start, 0);
-            }
-            drawsThisFrame++;
+            const D3D12_GPU_DESCRIPTOR_HANDLE nrm = (drawFlags & F_NORMAL_MAP) ? textureHandle(std::uint32_t(d[53])) : whiteTexture;
+            if (nrm.ptr != boundNormalMap) { cmd_->SetGraphicsRootDescriptorTable(3, nrm); boundNormalMap = nrm.ptr; }
+            const D3D12_GPU_DESCRIPTOR_HANDLE stage = d[57] > 0 ? textureHandle(std::uint32_t(d[57])) : whiteTexture;
+            if (stage.ptr != boundStageMap) { cmd_->SetGraphicsRootDescriptorTable(5, stage); boundStageMap = stage.ptr; }
+            if (issue(pr)) drawsThisFrame++;
         }
     }
     ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
+    if (msaa) {
+        D3D12_RESOURCE_BARRIER toResolve = transition(msaaColor_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                      D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        cmd_->ResourceBarrier(1, &toResolve);
+        cmd_->ResolveSubresource(targets_[frame].Get(), 0, msaaColor_.Get(), 0, kColorFormat);
+        D3D12_RESOURCE_BARRIER toTarget = transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                                                     D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmd_->ResourceBarrier(1, &toTarget);
+    }
     if (uiReady_) {
         if (uiUpload_) uploadUi(frame);
-        if (uiVisible_) drawUi(frame);
+        if (uiVisible_) {
+            cmd_->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
+            drawUi(frame);
+        }
     }
 
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    cmd_->ResourceBarrier(1, &barrier);
+    D3D12_RESOURCE_BARRIER toPresent = transition(targets_[frame].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                  D3D12_RESOURCE_STATE_PRESENT);
+    cmd_->ResourceBarrier(1, &toPresent);
     check(cmd_->Close(), "Close command list");
     ID3D12CommandList* lists[] = {cmd_.Get()};
     queue_->ExecuteCommandLists(1, lists);
     const auto presentStart = std::chrono::steady_clock::now();
-    const HRESULT present = swap_->Present(1, 0);
+    const HRESULT present = swap_->Present(vsync_ ? 1 : 0, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
     if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
     frameFence_[frame] = ++fenceValue_;
@@ -1322,7 +1837,23 @@ void WebappWindow::keyEvent(bool down, WPARAM vk, LPARAM lp) {
     host_.key(down, key, code, repeat, alt, ctrl, shift, false);
 }
 
+void WebappWindow::flushMove() {
+    if (!moveQueued_) return;
+    moveQueued_ = false;
+    const auto start = std::chrono::steady_clock::now();
+    host_.pointer("move", moveX_, moveY_, 0);
+    inputMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP:
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        flushMove();
+        break;
+    }
     switch (msg) {
     case WM_SIZE:
         minimized_ = wp == SIZE_MINIMIZED;
@@ -1352,7 +1883,9 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE:
-        host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
+        moveQueued_ = true;
+        moveX_ = GET_X_LPARAM(lp);
+        moveY_ = GET_Y_LPARAM(lp);
         return 0;
     case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1380,9 +1913,9 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f,%.2f\n",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
-                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n);
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n, p.inputMs / n);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1398,7 +1931,7 @@ int WebappWindow::run(HINSTANCE instance) {
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg,input_ms_avg\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
@@ -1490,6 +2023,7 @@ int WebappWindow::run(HINSTANCE instance) {
         if (!reload) reload = host_.takeReload();
         if (reload) continue;
         if (minimized_) { Sleep(16); continue; } // like a hidden browser tab: no rAF
+        flushMove();
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
@@ -1520,6 +2054,8 @@ int WebappWindow::run(HINSTANCE instance) {
             perf_.renderMs += msd(tEnd - tRaster).count();
             perf_.fenceMs += fenceWaitMs_;
             perf_.presentMs += presentMs_;
+            perf_.inputMs += inputMs_;
+            inputMs_ = 0;
             // Attribute visible stalls to JavaScript, UI rasterisation or DX12.
             // Throttle warnings so an already slow scene cannot flood the log.
             static auto lastSlowFrameLog = std::chrono::steady_clock::time_point{};

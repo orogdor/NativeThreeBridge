@@ -391,6 +391,40 @@ JSValue jsReleaseInstances(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseInstances(id);
     return JS_UNDEFINED;
 }
+JSValue jsUploadSkin(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 3) return JS_ThrowTypeError(ctx, "uploadSkin(geometryId, data, vertexCount)");
+    std::uint32_t id = 0, count = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &count, argv[2]) < 0) return JS_EXCEPTION;
+    const float* data = nullptr;
+    std::size_t n = 0;
+    if (!typedView(ctx, argv[1], data, n, false, "data")) return JS_EXCEPTION;
+    if (n < std::size_t(count) * 8) return JS_ThrowRangeError(ctx, "Skin data smaller than vertexCount * 8");
+    if (self->sink) self->sink->uploadSkin(id, data, count);
+    return JS_UNDEFINED;
+}
+JSValue jsUploadBones(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 3) return JS_ThrowTypeError(ctx, "uploadBones(id, matrices, count)");
+    std::uint32_t id = 0, count = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &count, argv[2]) < 0) return JS_EXCEPTION;
+    const float* data = nullptr;
+    std::size_t n = 0;
+    if (!typedView(ctx, argv[1], data, n, false, "matrices")) return JS_EXCEPTION;
+    if (n < std::size_t(count) * 16) return JS_ThrowRangeError(ctx, "Bone palette smaller than count * 16");
+    if (self->sink) self->sink->uploadBones(id, data, count);
+    return JS_UNDEFINED;
+}
+JSValue jsReleaseBones(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0;
+    if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseBones(id);
+    return JS_UNDEFINED;
+}
+JSValue jsSupportsSkinning(JSContext* ctx, JSValueConst, int, JSValueConst*) {
+    Impl* self = Impl::from(ctx);
+    return JS_NewBool(ctx, self->sink && self->sink->supportsSkinning());
+}
 JSValue jsSubmitPass(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     if (argc < 2) return JS_ThrowTypeError(ctx, "submitPass(packet, floats)");
@@ -561,6 +595,8 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"evalScript", jsEvalScript, 2}, {"evalModule", jsEvalModule, 2},
         {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
+        {"uploadSkin", jsUploadSkin, 3}, {"uploadBones", jsUploadBones, 3}, {"releaseBones", jsReleaseBones, 1},
+        {"supportsSkinning", jsSupportsSkinning, 0},
         {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
         {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},

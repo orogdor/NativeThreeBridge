@@ -51,6 +51,17 @@ public:
     virtual void uploadInstances(std::uint32_t id, const float* matrices, const float* colors,
                                  std::uint32_t count) = 0;
     virtual void releaseInstances(std::uint32_t id) = 0;
+    // GPU skinning: per-vertex bone indices and weights (8 floats per vertex:
+    // 4 indices, 4 weights) for geometry `geometryId`, and a bone palette
+    // (count 4x4 column-major matrices, bindMatrixInverse * bone * bindMatrix).
+    virtual bool supportsSkinning() const { return false; }
+    virtual void uploadSkin(std::uint32_t geometryId, const float* data, std::uint32_t vertexCount) {
+        (void)geometryId; (void)data; (void)vertexCount;
+    }
+    virtual void uploadBones(std::uint32_t id, const float* matrices, std::uint32_t count) {
+        (void)id; (void)matrices; (void)count;
+    }
+    virtual void releaseBones(std::uint32_t id) { (void)id; }
     virtual bool registerColorPatch(std::uint32_t id, const std::string& source) {
         (void)id; (void)source;
         return false;
@@ -106,9 +117,9 @@ inline std::size_t webappUiHeaderFloats(float version) {
 }
 
 // Same numbers as js/native-renderer.mjs.
-constexpr std::size_t kWebappPassHeaderFloats = 64;
+constexpr std::size_t kWebappPassHeaderFloats = 96;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 56;
+constexpr std::size_t kWebappDrawFloats = 60;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 

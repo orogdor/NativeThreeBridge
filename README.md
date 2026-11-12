@@ -1,3 +1,17 @@
+# NativeThreeBridge v0.33.0 — sharper, animated, shadowed webapps; fewer draws
+
+Image quality and speed of the webapp renderer (Game2):
+
+- **Antialiasing.** The scene is drawn with 4x MSAA and resolved before the HTML/CSS UI (`NT_MSAA=1/2/4/8`; falls back when the GPU lacks it). `alphaTest` cut-outs (grass, leaves, thatch, hair) use alpha-to-coverage, so their edges are soft instead of jagged. Textures use 16x anisotropic filtering.
+- **Normal maps.** `material.normalMap` and `normalScale`, with Three.js' derivative-based tangent frame (no tangent attribute needed).
+- **Skinned characters move.** `SkinnedMesh` was drawn in bind pose; it is now skinned every frame exactly as Three.js' skinning shader does (CPU, normals included). Unchanged poses are not re-sent, and re-sent geometry reuses upload buffers.
+- **Shadows.** With `renderer.shadowMap.enabled`, the first `castShadow` directional or spot light renders a shadow map from `light.shadow.camera` (`mapSize`, `bias`, `normalBias`, `radius`, `intensity`); `receiveShadow` surfaces sample it with 3x3 PCF. Casters outside the camera view still cast; cut-outs cast cut-out shadows. Not yet: point light shadows, more than one shadow-casting light.
+- **Speed.** `THREE.LOD` draws only the level for the camera distance (all levels were drawn). Opaque meshes sharing geometry and material are merged into one instanced draw when 8 or more are visible (`renderer.autoInstancing = false` turns it off). Geometry is copied into GPU memory once instead of being read from upload memory every frame. `NT_VSYNC=0` presents without vsync for measuring.
+
+- **Webapp compatibility (Kuningriigid).** `onBeforeCompile` patches that sample their own texture and write alpha (fog of war) are translated; CSS `border-image`, `clip-path` and correct stacking for positioned `z-index:auto` boxes; a real `MutationObserver`; `dataset` reflected to `data-*` attributes; `querySelector`/`matches`/`closest` with the full CSS matcher (`:scope`, `:is`, `:not`, `+`, `~`).
+
+Pass header is 96 floats (shadow light at [56..94]), draw records 60 floats (normal map at [53..55], shadow bits at [56]). Tests: `test/webapp-render-features.test.mjs`.
+
 # NativeThreeBridge v0.32.16 — mirrored GLTF meshes drawn the right way round
 
 GLTF models often mirror part of a mesh with a negative scale. Three.js flips the front face for a mesh whose world matrix has a negative determinant; the engine did not, so the side facing the camera was culled and double-sided surfaces were lit from the wrong side (thatch roofs and hair cards looked shredded). Such draws now carry `DrawFlags.MIRRORED`: the DX12 pipeline swaps back/front culling and the pixel shader inverts `SV_IsFrontFace`. Not yet: per-instance mirroring inside an `InstancedMesh`. Test: `test/webapp-mirrored-mesh.test.mjs`.
