@@ -158,6 +158,9 @@ std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base,
 class WebappWindow final : public native_three::WebappRenderSink {
 public:
     explicit WebappWindow(std::filesystem::path root) : root_(std::move(root)) {}
+    // initUi() starts a worker before V8 boots. Drain it also on early boot
+    // failure, not just on the normal WM_QUIT/reload paths.
+    ~WebappWindow() { stopRenderThread(); stopUiThread(); }
     int run(HINSTANCE instance);
 
     // ---- WebappRenderSink
