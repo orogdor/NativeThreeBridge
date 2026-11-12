@@ -382,7 +382,7 @@ private:
     // NativeThreeBridge-webapp-frames.csv: one summary row per second.
     struct Perf {
         int frames = 0;
-        double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
+        double frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0, inputMs = 0;
         double uiStyle = 0, uiLayout = 0, uiPaint = 0;
         int forced = 0, full = 0, partial = 0, rasters = 0;
     } perf_;
@@ -390,6 +390,12 @@ private:
     std::chrono::steady_clock::time_point perfAt_ = std::chrono::steady_clock::now();
     double fenceWaitMs_ = 0;
     double presentMs_ = 0;
+    // Mouse moves are coalesced like a browser does (one pointermove per
+    // frame, flushed before any other input so the order stays the same).
+    bool moveQueued_ = false;
+    int moveX_ = 0, moveY_ = 0;
+    double inputMs_ = 0;
+    void flushMove();
     void writePerfRow(double atSeconds, double seconds);
     std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -1831,7 +1837,23 @@ void WebappWindow::keyEvent(bool down, WPARAM vk, LPARAM lp) {
     host_.key(down, key, code, repeat, alt, ctrl, shift, false);
 }
 
+void WebappWindow::flushMove() {
+    if (!moveQueued_) return;
+    moveQueued_ = false;
+    const auto start = std::chrono::steady_clock::now();
+    host_.pointer("move", moveX_, moveY_, 0);
+    inputMs_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
 LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+    case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP:
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+        flushMove();
+        break;
+    }
     switch (msg) {
     case WM_SIZE:
         minimized_ = wp == SIZE_MINIMIZED;
@@ -1861,7 +1883,9 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE:
-        host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
+        moveQueued_ = true;
+        moveX_ = GET_X_LPARAM(lp);
+        moveY_ = GET_Y_LPARAM(lp);
         return 0;
     case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1889,9 +1913,9 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
-        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
+        std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f,%.2f\n",
                      atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.uiStyle / n, p.uiLayout / n, p.uiPaint / n,
-                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n);
+                     p.full, p.partial, p.forced, p.rasters, p.rasterMs / n, p.renderMs / n, p.fenceMs / n, lastDraws_, p.presentMs / n, p.inputMs / n);
         std::fflush(perfCsv_);
     }
     p = Perf{};
@@ -1907,7 +1931,7 @@ int WebappWindow::run(HINSTANCE instance) {
     perfCsv_ = _wfsopen(perfPath.c_str(), L"wb", _SH_DENYWR);
     if (perfCsv_) {
         std::fputs("time_s,fps,frame_ms_avg,frame_ms_max,js_ms_avg,ui_style_ms_avg,ui_layout_ms_avg,ui_paint_ms_avg,"
-                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg\n",
+                   "ui_full_layouts,ui_partial_layouts,ui_forced_layouts,ui_rasters,ui_raster_ms_avg,render_ms_avg,gpu_wait_ms_avg,draws,present_ms_avg,input_ms_avg\n",
                    perfCsv_);
         std::fflush(perfCsv_);
     }
@@ -1999,6 +2023,7 @@ int WebappWindow::run(HINSTANCE instance) {
         if (!reload) reload = host_.takeReload();
         if (reload) continue;
         if (minimized_) { Sleep(16); continue; } // like a hidden browser tab: no rAF
+        flushMove();
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
         pendingPasses_.clear();
@@ -2029,6 +2054,8 @@ int WebappWindow::run(HINSTANCE instance) {
             perf_.renderMs += msd(tEnd - tRaster).count();
             perf_.fenceMs += fenceWaitMs_;
             perf_.presentMs += presentMs_;
+            perf_.inputMs += inputMs_;
+            inputMs_ = 0;
             // Attribute visible stalls to JavaScript, UI rasterisation or DX12.
             // Throttle warnings so an already slow scene cannot flood the log.
             static auto lastSlowFrameLog = std::chrono::steady_clock::time_point{};
