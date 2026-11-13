@@ -12,6 +12,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -61,6 +62,9 @@ constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 3
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
                F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
+// Pipeline cache: 6 state bits per colour patch (0 = stock shader, 1..16 patches).
+constexpr UINT kMaxColorPatches = 16;
+constexpr UINT kPipelineSlots = (kMaxColorPatches + 1) << 6;
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -107,6 +111,10 @@ struct InstanceSet {
     ComPtr<ID3D12Resource> gpu[kFrameCount];
     UINT capacity[kFrameCount] = {};
     UINT64 uploaded[kFrameCount] = {};
+    // Instances [0, uploadedCount) of `uploaded` are in gpu[frame]; the rest
+    // is copied only when a draw really needs it (InstancedMesh.count is
+    // usually far below the allocated capacity).
+    UINT uploadedCount[kFrameCount] = {};
 };
 struct Retired {
     ComPtr<ID3D12Resource> resource;
@@ -116,11 +124,16 @@ struct Texture {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
     UINT width = 0, height = 0;
+    UINT mips = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
 // A texture whose pixels still have to be copied on the GPU timeline.
 struct PendingTextureCopy {
     ComPtr<ID3D12Resource> texture, staging;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+    // true: the texture was already drawn with (PIXEL_SHADER_RESOURCE) and
+    // only gets new pixels; false: freshly created in COPY_DEST.
+    bool fromShaderResource = false;
 };
 struct RetiredSlot {
     UINT slot;
@@ -146,6 +159,13 @@ std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base,
                 std::uint8_t* o = &dst[(std::size_t(y) * nw + x) * 4];
                 // colour weighted by alpha so transparent texels do not darken edges
                 const UINT aw = UINT(a[3]) + b[3] + c[3] + d[3];
+                if (aw == 1020) { // fully opaque block: same result without three divisions by aw
+                    o[0] = std::uint8_t((UINT(a[0]) + b[0] + c[0] + d[0] + 2) / 4);
+                    o[1] = std::uint8_t((UINT(a[1]) + b[1] + c[1] + d[1] + 2) / 4);
+                    o[2] = std::uint8_t((UINT(a[2]) + b[2] + c[2] + d[2] + 2) / 4);
+                    o[3] = 255;
+                    continue;
+                }
                 for (int k = 0; k < 3; k++) {
                     o[k] = aw ? std::uint8_t((UINT(a[k]) * a[3] + UINT(b[k]) * b[3] + UINT(c[k]) * c[3] + UINT(d[k]) * d[3] + aw / 2) / aw)
                               : std::uint8_t((UINT(a[k]) + b[k] + c[k] + d[k] + 2) / 4);
@@ -158,6 +178,19 @@ std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base,
         h = nh;
     }
     return levels;
+}
+
+// Writes position, normal, colour rgba and uv of every vertex straight into
+// `o` (a mapped upload buffer: written front to back, never read).
+void interleaveVertices(float* o, const float* p, const float* n, const float* c, const float* uv,
+                        std::uint32_t vertexCount, std::uint32_t cc) {
+    for (std::uint32_t v = 0; v < vertexCount; v++, o += kVertexFloats) {
+        o[0] = p[v * 3]; o[1] = p[v * 3 + 1]; o[2] = p[v * 3 + 2];
+        o[3] = n ? n[v * 3] : 0; o[4] = n ? n[v * 3 + 1] : 1; o[5] = n ? n[v * 3 + 2] : 0;
+        o[6] = c ? c[v * cc] : 1; o[7] = c ? c[v * cc + 1] : 1; o[8] = c ? c[v * cc + 2] : 1;
+        o[9] = c && cc == 4 ? c[v * 4 + 3] : 1;
+        o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
+    }
 }
 
 class WebappWindow final : public native_three::WebappRenderSink {
@@ -181,7 +214,10 @@ public:
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
-        pendingPasses_.emplace_back(data, data + floats);
+        // Packet storage is recycled between frames: assign() into an
+        // existing vector keeps its capacity, so a steady scene allocates nothing.
+        if (pendingPassCount_ == pendingPasses_.size()) pendingPasses_.emplace_back();
+        pendingPasses_[pendingPassCount_++].assign(data, data + floats);
     }
     void setTitle(const std::string& title) override { pageTitle_ = widen(title); }
     void log(const std::string& level, const std::string& text) override;
@@ -268,6 +304,8 @@ private:
     void resize(UINT width, UINT height);
     void waitForGpu();
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
+    ComPtr<ID3D12Resource> interleavedUpload(const float* p, const float* n, const float* c, const float* uv,
+                                             std::uint32_t vertexCount, std::uint32_t colorChannels);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
@@ -289,7 +327,8 @@ private:
     void resetTextures();
     void resetPage();
     bool decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h);
-    bool createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags);
+    bool createTexture(std::uint32_t id, std::vector<std::vector<std::uint8_t>> levels, UINT w, UINT h, std::uint32_t flags);
+    void flushPointerMove();
     void recordTextureCopies();
     D3D12_GPU_DESCRIPTOR_HANDLE textureHandle(std::uint32_t id) const;
     void uploadUi(UINT frame);
@@ -356,9 +395,13 @@ private:
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3DBlob> vs_, ps_;
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
+    // Same pipelines addressed directly by their key: the per-draw lookup is one array read.
+    std::array<ID3D12PipelineState*, kPipelineSlots> pipelineTable_{};
     std::map<UINT, ComPtr<ID3DBlob>> colorPatches_;
     ComPtr<ID3D12Resource> ring_[kFrameCount];
     UINT64 ringBytes_[kFrameCount] = {};
+    std::uint8_t* ringMapped_[kFrameCount] = {}; // upload heaps stay mapped for their lifetime
+    UINT presentInterval_ = 1;                   // NTB_VSYNC=0: do not wait for the display
     ComPtr<ID3D12Resource> identityInstance_;
     D3D12_VERTEX_BUFFER_VIEW identityView_{};
 
@@ -375,8 +418,15 @@ private:
     std::size_t textureBytes_ = 0;
     int textureFailures_ = 0;
     std::vector<Retired> retired_;
+    // Only the first *Count_ entries are live; the rest is recycled storage.
     std::vector<std::vector<float>> pendingPasses_, passes_;
+    std::size_t pendingPassCount_ = 0, passCount_ = 0;
     UINT lastDraws_ = 0;
+    // Mouse moves are delivered to JavaScript once per frame (as browsers
+    // do), not once per Windows message: a 1000 Hz mouse would otherwise run
+    // the game's pointermove handler (often a raycast) ~16 times per frame.
+    bool pointerMovePending_ = false;
+    int pointerMoveX_ = 0, pointerMoveY_ = 0;
 
     std::chrono::steady_clock::time_point uiStatsAt_ = std::chrono::steady_clock::now();
     // NativeThreeBridge-webapp-frames.csv: one summary row per second.
@@ -425,7 +475,10 @@ float4 PSMain(V i) : SV_Target { return gUi.Sample(gPoint, i.uv); }
 
 WebappWindow* gActive = nullptr;
 std::FILE* gCrashLog = nullptr;
-std::string gCrashPhase = "startup";
+// What the engine was doing, for the crash report. A constant text plus a
+// frame number: nothing is formatted or allocated per frame.
+const char* gCrashPhase = "startup";
+int gCrashFrame = -1;
 
 // Native crashes (access violation, stack overflow) must not just close the
 // window silently: write what happened to the log and tell the user.
@@ -436,8 +489,11 @@ LONG WINAPI webappCrashFilter(EXCEPTION_POINTERS* info) {
     const char* name = code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
                      : code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
                      : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer divide by zero" : "native exception";
+    char phase[160];
+    if (gCrashFrame >= 0) std::snprintf(phase, sizeof phase, "%s %d", gCrashPhase, gCrashFrame);
+    else std::snprintf(phase, sizeof phase, "%s", gCrashPhase);
     std::snprintf(text, sizeof text, "NativeThreeBridge crashed: %s (0x%08lX at %p) during %s.",
-                  name, (unsigned long)code, address, gCrashPhase.c_str());
+                  name, (unsigned long)code, address, phase);
     if (gCrashLog) { std::fprintf(gCrashLog, "[crash] %s\n", text); std::fflush(gCrashLog); }
     if (GetEnvironmentVariableA("CI", nullptr, 0) == 0)
         MessageBoxA(nullptr, text, "NativeThreeBridge webapp", MB_OK | MB_ICONERROR);
@@ -609,7 +665,7 @@ void WebappWindow::resetTextures() {
     freeSlots_.clear();
     for (UINT slot = kMaxTextures - 1; slot >= 1; slot--) freeSlots_.push_back(slot);
     // slot 0: 1x1 white, bound for untextured draws
-    createTexture(0, std::vector<std::uint8_t>(4, 255), 1, 1, 0);
+    createTexture(0, buildMips(std::vector<std::uint8_t>(4, 255), 1, 1, false), 1, 1, 0);
 }
 
 void WebappWindow::resetPage() {
@@ -618,11 +674,14 @@ void WebappWindow::resetPage() {
     waitForGpu();
     pendingPasses_.clear();
     passes_.clear();
+    pendingPassCount_ = passCount_ = 0;
+    pointerMovePending_ = false;
     pendingGeometryCopies_.clear();
     geometries_.clear();
     instances_.clear();
     resetTextures();
     pipelines_.clear();
+    pipelineTable_.fill(nullptr);
     colorPatches_.clear();
     stopUiThread();
     {
@@ -665,9 +724,21 @@ bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std:
     return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
 }
 
-bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgba, UINT w, UINT h, std::uint32_t flags) {
-    UINT slot = 0;
+bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::vector<std::uint8_t>> levels, UINT w, UINT h, std::uint32_t flags) {
+    const bool srgb = (flags & native_three::kWebappTextureSrgb) != 0;
+    const DXGI_FORMAT format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    // A texture that is sent again with the same size and format (CanvasTexture,
+    // DataTexture with needsUpdate, e.g. a minimap redrawn every frame) keeps
+    // its GPU texture and descriptor slot: only the pixels are replaced.
+    Texture* existing = nullptr;
     if (id != 0) {
+        auto found = textures_.find(id);
+        if (found != textures_.end() && found->second.resource && found->second.width == w && found->second.height == h &&
+            found->second.mips == UINT(levels.size()) && found->second.format == format)
+            existing = &found->second;
+    }
+    UINT slot = 0;
+    if (id != 0 && !existing) {
         if (freeSlots_.empty()) {
             collectRetired();
             if (freeSlots_.empty()) {
@@ -678,20 +749,22 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
         slot = freeSlots_.back();
         freeSlots_.pop_back();
     }
-    const bool srgb = (flags & native_three::kWebappTextureSrgb) != 0;
-    std::vector<std::vector<std::uint8_t>> levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = w;
     td.Height = h;
     td.DepthOrArraySize = 1;
     td.MipLevels = UINT16(levels.size());
-    td.Format = srgb ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = format;
     td.SampleDesc.Count = 1;
     PendingTextureCopy copy;
-    auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
-    check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                           IID_PPV_ARGS(&copy.texture)), "Texture");
+    if (existing) {
+        copy.texture = existing->resource;
+    } else {
+        auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
+        check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&copy.texture)), "Texture");
+    }
     copy.layouts.resize(levels.size());
     std::vector<UINT> rows(levels.size());
     std::vector<UINT64> rowBytes(levels.size());
@@ -709,6 +782,21 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     }
     copy.staging->Unmap(0, nullptr);
 
+    if (existing) {
+        // Updated again before any frame copied the previous pixels: that
+        // staging buffer never reached the GPU, so it is simply replaced and
+        // the texture keeps the state its queued copy already expects.
+        for (auto& queued : pendingCopies_) {
+            if (queued.texture.Get() != copy.texture.Get()) continue;
+            queued.staging = std::move(copy.staging);
+            queued.layouts = std::move(copy.layouts);
+            return true;
+        }
+        copy.fromShaderResource = true;
+        pendingCopies_.push_back(std::move(copy));
+        return true;
+    }
+
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = td.Format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -724,6 +812,8 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::uint8_t> rgb
     t.slot = slot;
     t.width = w;
     t.height = h;
+    t.mips = UINT(levels.size());
+    t.format = format;
     textureBytes_ += std::size_t(total);
     pendingCopies_.push_back(std::move(copy));
     return true;
@@ -740,33 +830,62 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
 
 bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                                  std::uint32_t height, std::uint32_t flags) {
-    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0) return false;
+    // Decoding and the mip chain are pure CPU work on the caller's own data:
+    // done before the lock so they never wait for (or stall) the DX12 worker.
     std::vector<std::uint8_t> rgba;
     UINT w = width, h = height;
+    bool decoded = true;
     if (width) {
         if (width > 16384 || height > 16384 || bytes < std::size_t(width) * height * 4) return false;
         rgba.assign(data, data + std::size_t(width) * height * 4);
-    } else if (!decodeImage(data, bytes, rgba, w, h)) {
+    } else decoded = decodeImage(data, bytes, rgba, w, h);
+    std::vector<std::vector<std::uint8_t>> levels;
+    if (decoded) levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    if (!decoded) {
         if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes) + " bytes; WebP needs the Windows WebP Image Extension)");
         return false;
     }
-    return createTexture(id, std::move(rgba), w, h, flags);
+    return createTexture(id, std::move(levels), w, h, flags);
 }
 
 bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
-    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id == 0 || !uiReady_) return false;
     std::vector<std::uint8_t> rgba;
     UINT w = 0, h = 0;
-    if (!ui_.canvasPixelsRgba(canvasId, rgba, w, h)) return false;
-    return createTexture(id, std::move(rgba), w, h, flags);
+    {
+        // Canvas bitmaps belong to the native UI layer, which the raster
+        // worker may be using right now.
+        std::lock_guard<std::mutex> uiLock(uiMutex_);
+        if (!ui_.canvasPixelsRgba(canvasId, rgba, w, h)) return false;
+    }
+    std::vector<std::vector<std::uint8_t>> levels =
+        buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    return createTexture(id, std::move(levels), w, h, flags);
 }
 
 // Copies queued texture pixels; runs at the start of a frame's command list.
 void WebappWindow::recordTextureCopies() {
     if (pendingCopies_.empty()) return;
     std::vector<D3D12_RESOURCE_BARRIER> barriers;
+    barriers.reserve(pendingCopies_.size());
+    // Textures that only get new pixels leave the shader-resource state first.
+    for (auto& c : pendingCopies_) {
+        if (!c.fromShaderResource) continue;
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = c.texture.Get();
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers.push_back(b);
+    }
+    if (!barriers.empty()) {
+        cmd_->ResourceBarrier(UINT(barriers.size()), barriers.data());
+        barriers.clear();
+    }
     for (auto& c : pendingCopies_) {
         for (UINT m = 0; m < UINT(c.layouts.size()); m++) {
             D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
@@ -1065,54 +1184,67 @@ void WebappWindow::collectRetired() {
     retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
                                   [done](const Retired& r) { return r.fence <= done; }),
                    retired_.end());
-    for (auto it = retiredSlots_.begin(); it != retiredSlots_.end();) {
-        if (it->fence <= done) { freeSlots_.push_back(it->slot); it = retiredSlots_.erase(it); }
-        else ++it;
+    std::size_t kept = 0;
+    for (const RetiredSlot& r : retiredSlots_) {
+        if (r.fence <= done) freeSlots_.push_back(r.slot);
+        else retiredSlots_[kept++] = r;
     }
+    retiredSlots_.resize(kept);
+}
+
+// Upload buffer holding the interleaved vertices: written straight into
+// mapped GPU-visible memory, without a temporary CPU copy.
+ComPtr<ID3D12Resource> WebappWindow::interleavedUpload(const float* p, const float* n, const float* c, const float* uv,
+                                                       std::uint32_t vertexCount, std::uint32_t colorChannels) {
+    ComPtr<ID3D12Resource> buffer = uploadBuffer(nullptr, UINT64(vertexCount) * kVertexStride);
+    if (vertexCount) {
+        void* mapped = nullptr;
+        D3D12_RANGE none{0, 0};
+        check(buffer->Map(0, &none, &mapped), "Map vertex upload buffer");
+        interleaveVertices(static_cast<float*>(mapped), p, n, c, uv, vertexCount, colorChannels);
+        buffer->Unmap(0, nullptr);
+    }
+    return buffer;
 }
 
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
                                   std::uint32_t colorChannels, bool gpuLocal) {
+    // Filled before the lock: the DX12 worker is never held up by the copy.
+    const UINT64 vertexBytes = UINT64(vertexCount) * kVertexStride;
+    ComPtr<ID3D12Resource> vertexUpload = interleavedUpload(p, n, c, uv, vertexCount, colorChannels == 4 ? 4 : 3);
+    const bool indexed = idx && indexCount;
+    const UINT64 indexBytes = indexed ? UINT64(indexCount) * sizeof(std::uint32_t) : 0;
+    ComPtr<ID3D12Resource> indexUpload = indexed ? uploadBuffer(idx, indexBytes) : nullptr;
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
-    const std::uint32_t cc = colorChannels == 4 ? 4 : 3;
-    std::vector<float> interleaved(size_t(vertexCount) * kVertexFloats);
-    for (std::uint32_t v = 0; v < vertexCount; v++) {
-        float* o = &interleaved[size_t(v) * kVertexFloats];
-        o[0] = p[v * 3]; o[1] = p[v * 3 + 1]; o[2] = p[v * 3 + 2];
-        o[3] = n ? n[v * 3] : 0; o[4] = n ? n[v * 3 + 1] : 1; o[5] = n ? n[v * 3 + 2] : 0;
-        o[6] = c ? c[v * cc] : 1; o[7] = c ? c[v * cc + 1] : 1; o[8] = c ? c[v * cc + 2] : 1;
-        o[9] = c && cc == 4 ? c[v * 4 + 3] : 1;
-        o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
-    }
     Geometry& g = geometries_[id];
     // Replacements and disposals can happen before the next rendered frame.
     // Cancel those copies while they still belong to the CPU.
     pendingGeometryCopies_.erase(id);
     retire(g.vertices);
     retire(g.indices);
-    auto makeBuffer = [&](const void* data, UINT64 bytes, D3D12_RESOURCE_STATES drawState) {
-        if (!gpuLocal || !bytes) return uploadBuffer(data, bytes);
+    // `filled` already holds the data. Static geometry moves to GPU-local
+    // memory on the next frame; streaming geometry is drawn from `filled`.
+    auto place = [&](ComPtr<ID3D12Resource> filled, UINT64 bytes, D3D12_RESOURCE_STATES drawState) {
+        if (!gpuLocal || !bytes) return filled;
         ComPtr<ID3D12Resource> destination;
         const auto heap = heapProps(D3D12_HEAP_TYPE_DEFAULT);
         const auto desc = bufferDesc(bytes);
         // Streaming buffers remain valid if a device runs short of local memory.
         if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&destination))))
-            return uploadBuffer(data, bytes);
-        pendingGeometryCopies_[id].push_back({destination, uploadBuffer(data, bytes), bytes, drawState});
+            return filled;
+        pendingGeometryCopies_[id].push_back({destination, std::move(filled), bytes, drawState});
         return destination;
     };
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
-    g.vertices = makeBuffer(interleaved.data(), interleaved.size() * sizeof(float),
-                            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+    g.vertices = place(std::move(vertexUpload), vertexBytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
     g.vbv.BufferLocation = g.vertices->GetGPUVirtualAddress();
-    g.vbv.SizeInBytes = UINT(interleaved.size() * sizeof(float));
+    g.vbv.SizeInBytes = UINT(vertexBytes);
     g.vbv.StrideInBytes = kVertexStride;
-    if (idx && indexCount) {
-        g.indices = makeBuffer(idx, UINT64(indexCount) * sizeof(std::uint32_t),
-                               D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    if (indexed) {
+        g.indices = place(std::move(indexUpload), indexBytes, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         g.ibv.BufferLocation = g.indices->GetGPUVirtualAddress();
         g.ibv.SizeInBytes = indexCount * sizeof(std::uint32_t);
         g.ibv.Format = DXGI_FORMAT_R32_UINT;
@@ -1186,15 +1318,20 @@ bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& sourc
 }
 
 ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
-    const auto patch = colorPatches_.find(patchId);
-    if (patch == colorPatches_.end()) patchId = 0;
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
     UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
     // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
     // side that faces the camera is the other one (Three.js flips frontFace).
     if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
-    const UINT key = (patchId << 6) | (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                     ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+    const UINT state = (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
+                       ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+    // Hot path (once per draw): pipelines that exist are found with one array read.
+    if (patchId <= kMaxColorPatches) {
+        if (ID3D12PipelineState* ready = pipelineTable_[(patchId << 6) | state]) return ready;
+    }
+    const auto patch = colorPatches_.find(patchId);
+    if (patch == colorPatches_.end()) patchId = 0;
+    const UINT key = (patchId << 6) | state;
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1257,6 +1394,7 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     check(hr, "Create webapp pipeline");
     ID3D12PipelineState* raw = pso.Get();
     pipelines_[key] = pso;
+    if (key < kPipelineSlots) pipelineTable_[key] = raw;
     return raw;
 }
 
@@ -1277,6 +1415,9 @@ void WebappWindow::startUiThread() {
     }
     uiThread_ = std::thread([this] {
         const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        // Pixel storage of a snapshot the renderer no longer needs; reused so
+        // a UI raster does not allocate (and page in) a screen-sized buffer.
+        std::vector<std::uint8_t> spare;
         for (;;) {
             std::vector<float> display;
             std::string strings;
@@ -1308,16 +1449,27 @@ void WebappWindow::startUiThread() {
                     bitmap->stride = ui_.stride();
                     bitmap->visible = !ui_.empty();
                     const std::uint8_t* pixels = ui_.pixels();
-                    if (pixels && bitmap->height && bitmap->stride)
+                    if (pixels && bitmap->height && bitmap->stride) {
+                        bitmap->bgra = std::move(spare);
+                        spare.clear();
                         bitmap->bgra.assign(pixels, pixels + std::size_t(bitmap->height) * bitmap->stride);
+                    }
                 }
             }
             if (bitmap) {
+                std::shared_ptr<const UiFrame> previous;
                 {
                     std::lock_guard<std::mutex> publishLock(uiPublishedMutex_);
                     bitmap->sequence = uiPublished_ ? uiPublished_->sequence + 1 : 1;
+                    previous = std::move(uiPublished_);
                     uiPublished_ = std::move(bitmap);
                 }
+                // Readers take their reference from uiPublished_ under the
+                // lock above, so a count of one means nobody else can still
+                // see (or later obtain) the previous snapshot.
+                if (previous && previous.use_count() == 1)
+                    spare = std::move(const_cast<UiFrame&>(*previous).bgra);
+                previous.reset();
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start).count();
                 uiRasterUs_.fetch_add(std::uint64_t(std::max<std::int64_t>(0, us)), std::memory_order_relaxed);
@@ -1440,16 +1592,19 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
 
     // Size the per-frame constant ring for this frame's passes and draws.
     UINT64 needed = 0;
-    for (const auto& pass : passes_)
-        needed += kFrameCBBytes + UINT64(pass[43]) * kDrawCBBytes;
+    for (std::size_t i = 0; i < passCount_; i++)
+        needed += kFrameCBBytes + UINT64(passes_[i][43]) * kDrawCBBytes;
+    D3D12_RANGE none{0, 0};
     if (ringBytes_[frame] < needed || !ring_[frame]) {
         retire(ring_[frame]);
         ringBytes_[frame] = std::max<UINT64>(needed * 3 / 2, 1u << 20);
         ring_[frame] = uploadBuffer(nullptr, ringBytes_[frame]);
+        ringMapped_[frame] = nullptr;
     }
-    std::uint8_t* ring = nullptr;
-    D3D12_RANGE none{0, 0};
-    check(ring_[frame]->Map(0, &none, reinterpret_cast<void**>(&ring)), "Map constant ring");
+    // Mapped once per buffer, not once per frame (the map ends with the buffer).
+    if (!ringMapped_[frame])
+        check(ring_[frame]->Map(0, &none, reinterpret_cast<void**>(&ringMapped_[frame])), "Map constant ring");
+    std::uint8_t* const ring = ringMapped_[frame];
     const D3D12_GPU_VIRTUAL_ADDRESS ringGpu = ring_[frame]->GetGPUVirtualAddress();
     UINT64 ringOffset = 0;
 
@@ -1481,10 +1636,26 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     cmd_->SetDescriptorHeaps(1, texHeaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE whiteTexture = textureHandle(0);
     UINT64 boundTexture = ~0ull;
+    // State that survives from draw to draw inside this command list. Draws
+    // arrive sorted by depth, so neighbours often share geometry, texture or
+    // instance buffer: remember the last lookups and skip binds that would
+    // not change anything.
+    std::uint32_t cachedGeometryId = 0, cachedTextureId = 0;
+    const Geometry* cachedGeometry = nullptr;
+    D3D12_GPU_DESCRIPTOR_HANDLE cachedTexture = whiteTexture;
+    bool cachedTextureValid = false;
+    UINT cachedPipelineFlags = 0, cachedPipelinePatch = 0;
+    ID3D12PipelineState* cachedPipeline = nullptr;
+    const UINT kPipelineFlagBits = F_TRANSPARENT | F_DOUBLE | F_BACK | F_NO_DEPTH_WRITE | F_NO_DEPTH_TEST |
+                                   F_LINES | F_LINE_STRIP | F_MIRRORED;
+    D3D12_GPU_VIRTUAL_ADDRESS boundVertices = 0, boundInstances = 0, boundIndices = 0;
+    UINT boundInstanceBytes = 0;
+    ID3D12PipelineState* current = nullptr;
+    D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
     UINT drawsThisFrame = 0;
-    for (const auto& pass : passes_) {
-        const float* p = pass.data();
+    for (std::size_t passIndex = 0; passIndex < passCount_; passIndex++) {
+        const float* p = passes_[passIndex].data();
         const UINT lightCount = UINT(p[35]);
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
@@ -1509,38 +1680,63 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         ringOffset += kFrameCBBytes;
 
         const float* d = p + native_three::kWebappPassHeaderFloats + lightCount * native_three::kWebappLightFloats;
-        ID3D12PipelineState* current = nullptr;
-        D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
-            auto g = geometries_.find(std::uint32_t(d[0]));
-            if (g == geometries_.end() || !g->second.vertices) continue;
+            const std::uint32_t geometryId = std::uint32_t(d[0]);
+            if (!cachedGeometry || geometryId != cachedGeometryId) {
+                auto g = geometries_.find(geometryId);
+                if (g == geometries_.end() || !g->second.vertices) continue;
+                cachedGeometry = &g->second;
+                cachedGeometryId = geometryId;
+            }
+            const Geometry& geometry = *cachedGeometry;
             const UINT drawFlags = UINT(d[3]);
             const UINT start = UINT(d[4]);
             const UINT count = UINT(d[5]);
+            // Nothing to draw: decided before any constants are written or state is bound.
+            const UINT available = geometry.indexCount ? geometry.indexCount : geometry.vertexCount;
+            const UINT n = std::min(count, available > start ? available - start : 0u);
+            if (!n) continue;
             UINT instanceCount = std::max<UINT>(1, UINT(d[2]));
-            D3D12_VERTEX_BUFFER_VIEW views[2] = {g->second.vbv, identityView_};
+            D3D12_GPU_VIRTUAL_ADDRESS instanceAddress = identityView_.BufferLocation;
+            UINT instanceBytes = identityView_.SizeInBytes;
             if (d[1] > 0) {
                 auto it = instances_.find(std::uint32_t(d[1]));
                 if (it == instances_.end() || it->second.count == 0) continue;
                 InstanceSet& set = it->second;
                 instanceCount = std::min(instanceCount, set.count);
-                if (set.uploaded[frame] != set.version || !set.gpu[frame]) {
-                    if (set.capacity[frame] < set.count || !set.gpu[frame]) {
-                        retire(set.gpu[frame]);
-                        set.capacity[frame] = set.count;
-                        set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.count) * kInstanceStride);
-                    }
-                    void* mapped = nullptr;
-                    check(set.gpu[frame]->Map(0, &none, &mapped), "Map instances");
-                    std::memcpy(mapped, set.cpu.data(), set.cpu.size() * sizeof(float));
-                    set.gpu[frame]->Unmap(0, nullptr);
-                    set.uploaded[frame] = set.version;
+                if (set.capacity[frame] < set.count || !set.gpu[frame]) {
+                    retire(set.gpu[frame]);
+                    // Grow in steps: a set that gains instances over time (units,
+                    // trees, projectiles) does not get a new GPU buffer per change.
+                    set.capacity[frame] = std::max(set.count, set.capacity[frame] + set.capacity[frame] / 2);
+                    set.gpu[frame] = uploadBuffer(nullptr, UINT64(set.capacity[frame]) * kInstanceStride);
+                    set.uploadedCount[frame] = 0;
                 }
-                views[1].BufferLocation = set.gpu[frame]->GetGPUVirtualAddress();
-                views[1].SizeInBytes = set.count * kInstanceStride;
-                views[1].StrideInBytes = kInstanceStride;
+                if (set.uploaded[frame] != set.version) {
+                    set.uploaded[frame] = set.version;
+                    set.uploadedCount[frame] = 0;
+                }
+                if (set.uploadedCount[frame] < instanceCount) {
+                    // Copy only the instances that are drawn and not yet in this buffer.
+                    const UINT from = set.uploadedCount[frame];
+                    std::uint8_t* mapped = nullptr;
+                    check(set.gpu[frame]->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map instances");
+                    std::memcpy(mapped + std::size_t(from) * kInstanceStride, set.cpu.data() + std::size_t(from) * 19,
+                                std::size_t(instanceCount - from) * kInstanceStride);
+                    set.gpu[frame]->Unmap(0, nullptr);
+                    set.uploadedCount[frame] = instanceCount;
+                }
+                instanceAddress = set.gpu[frame]->GetGPUVirtualAddress();
+                instanceBytes = set.count * kInstanceStride;
             }
-            ID3D12PipelineState* pso = pipeline(drawFlags, UINT(d[48]));
+            const UINT patchId = UINT(d[48]);
+            const UINT pipelineFlags = drawFlags & kPipelineFlagBits;
+            if (!cachedPipeline || pipelineFlags != cachedPipelineFlags || patchId != cachedPipelinePatch) {
+                cachedPipeline = pipeline(drawFlags, patchId);
+                cachedPipelineFlags = pipelineFlags;
+                cachedPipelinePatch = patchId;
+            }
+            ID3D12PipelineState* pso = cachedPipeline;
             if (pso != current) { cmd_->SetPipelineState(pso); current = pso; }
             const D3D_PRIMITIVE_TOPOLOGY wanted = (drawFlags & F_LINE_STRIP) ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP
                                                   : (drawFlags & F_LINES)    ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
@@ -1556,28 +1752,45 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             // uv transform rows (a c e | b d f) and alphaTest
             dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
             dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
-            std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
             std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
+            std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
             cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
             ringOffset += kDrawCBBytes;
-            const D3D12_GPU_DESCRIPTOR_HANDLE tex = (drawFlags & F_MAP) ? textureHandle(std::uint32_t(d[32])) : whiteTexture;
+            D3D12_GPU_DESCRIPTOR_HANDLE tex = whiteTexture;
+            if (drawFlags & F_MAP) {
+                const std::uint32_t textureId = std::uint32_t(d[32]);
+                if (!cachedTextureValid || textureId != cachedTextureId) {
+                    cachedTexture = textureHandle(textureId);
+                    cachedTextureId = textureId;
+                    cachedTextureValid = true;
+                }
+                tex = cachedTexture;
+            }
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
 
-            cmd_->IASetVertexBuffers(0, 2, views);
-            if (g->second.indexCount) {
-                const UINT n = std::min(count, g->second.indexCount > start ? g->second.indexCount - start : 0u);
-                if (!n) continue;
-                cmd_->IASetIndexBuffer(&g->second.ibv);
+            if (geometry.vbv.BufferLocation != boundVertices || instanceAddress != boundInstances ||
+                instanceBytes != boundInstanceBytes) {
+                D3D12_VERTEX_BUFFER_VIEW views[2] = {geometry.vbv, identityView_};
+                views[1].BufferLocation = instanceAddress;
+                views[1].SizeInBytes = instanceBytes;
+                views[1].StrideInBytes = kInstanceStride;
+                cmd_->IASetVertexBuffers(0, 2, views);
+                boundVertices = geometry.vbv.BufferLocation;
+                boundInstances = instanceAddress;
+                boundInstanceBytes = instanceBytes;
+            }
+            if (geometry.indexCount) {
+                if (geometry.ibv.BufferLocation != boundIndices) {
+                    cmd_->IASetIndexBuffer(&geometry.ibv);
+                    boundIndices = geometry.ibv.BufferLocation;
+                }
                 cmd_->DrawIndexedInstanced(n, instanceCount, start, 0, 0);
             } else {
-                const UINT n = std::min(count, g->second.vertexCount > start ? g->second.vertexCount - start : 0u);
-                if (!n) continue;
                 cmd_->DrawInstanced(n, instanceCount, start, 0);
             }
             drawsThisFrame++;
         }
     }
-    ring_[frame]->Unmap(0, nullptr);
     lastDraws_ = drawsThisFrame;
     if (uiReady_) {
         if (uiThreadOn_) {
@@ -1609,7 +1822,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     // the next frame's resources while Present waits for the display.
     if (resourceLock) resourceLock->unlock();
     const auto presentStart = std::chrono::steady_clock::now();
-    const HRESULT present = swap_->Present(1, 0);
+    const HRESULT present = swap_->Present(presentInterval_, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
     if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
 }
@@ -1622,8 +1835,17 @@ void WebappWindow::updateTitle(double fps) {
     SetWindowTextW(window_, text);
 }
 
+// Delivers the newest pending mouse position. Called before any other input
+// event, so JavaScript still sees every event in its real order.
+void WebappWindow::flushPointerMove() {
+    if (!pointerMovePending_) return;
+    pointerMovePending_ = false;
+    host_.pointer("move", pointerMoveX_, pointerMoveY_, 0);
+}
+
 // Win32 virtual key -> DOM KeyboardEvent.key / .code
 void WebappWindow::keyEvent(bool down, WPARAM vk, LPARAM lp) {
+    flushPointerMove();
     const bool shift = GetKeyState(VK_SHIFT) < 0, ctrl = GetKeyState(VK_CONTROL) < 0,
                alt = GetKeyState(VK_MENU) < 0;
     const bool repeat = down && (lp & (1 << 30));
@@ -1684,6 +1906,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
         SetCapture(hwnd);
+        flushPointerMove();
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("down", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONDOWN ? 0 : msg == WM_MBUTTONDOWN ? 1 : 2);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1691,6 +1914,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+        flushPointerMove();
         const auto start = std::chrono::steady_clock::now();
         host_.pointer("up", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg == WM_LBUTTONUP ? 0 : msg == WM_MBUTTONUP ? 1 : 2);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1699,9 +1923,12 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE:
-        host_.pointer("move", GET_X_LPARAM(lp), GET_Y_LPARAM(lp), 0);
+        pointerMoveX_ = GET_X_LPARAM(lp);
+        pointerMoveY_ = GET_Y_LPARAM(lp);
+        pointerMovePending_ = true;
         return 0;
     case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {
+        flushPointerMove();
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd, &pt);
         const double delta = -double(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 100.0;
@@ -1714,8 +1941,8 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ ? nullptr : cursor_); return TRUE; }
         break;
-    case WM_SETFOCUS: host_.focus(true); return 0;
-    case WM_KILLFOCUS: host_.focus(false); return 0;
+    case WM_SETFOCUS: flushPointerMove(); host_.focus(true); return 0;
+    case WM_KILLFOCUS: flushPointerMove(); host_.focus(false); return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -1798,6 +2025,14 @@ int WebappWindow::run(HINSTANCE instance) {
     log("info", "index.html parsed, scripts started");
     char asyncMode[8] = {};
     GetEnvironmentVariableA("NTB_ASYNC_RENDER", asyncMode, sizeof(asyncMode));
+    char vsyncMode[8] = {};
+    GetEnvironmentVariableA("NTB_VSYNC", vsyncMode, sizeof(vsyncMode));
+    if (std::strcmp(vsyncMode, "0") == 0) {
+        // Benchmark aid: frames are presented without waiting for the display,
+        // so the FPS counter shows what the engine can do, not the monitor.
+        presentInterval_ = 0;
+        log("info", "[present] NTB_VSYNC=0: not waiting for the display refresh");
+    }
     asyncDisabled_ = std::strcmp(asyncMode, "0") == 0;
     asyncForced_ = std::strcmp(asyncMode, "1") == 0;
     if (asyncForced_) startRenderThread(true);
@@ -1813,6 +2048,7 @@ int WebappWindow::run(HINSTANCE instance) {
     for (;;) {
         if (reload) {
             gCrashPhase = "reloading index.html and the game's JavaScript";
+            gCrashFrame = -1;
             log("info", "Reloading the webapp");
             resetPage();
             if (!host_.start(root_, shim, builtins, this, int(width_), int(height_), error, *reload)) {
@@ -1847,8 +2083,12 @@ int WebappWindow::run(HINSTANCE instance) {
         if (minimized_) { Sleep(16); continue; } // like a hidden browser tab: no rAF
         const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - pageStart).count();
-        pendingPasses_.clear();
-        gCrashPhase = "JavaScript frame " + std::to_string(frameNumber);
+        gCrashPhase = "JavaScript frame";
+        gCrashFrame = frameNumber;
+        flushPointerMove(); // the newest mouse position, once per frame
+        reload = host_.takeReload();
+        if (reload) continue;
+        pendingPassCount_ = 0;
         host_.frame(ms);
         reload = host_.takeReload();
         if (reload) continue;
@@ -1866,15 +2106,18 @@ int WebappWindow::run(HINSTANCE instance) {
             previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
             previousPresentMs = presentMs_; presentMs_ = 0;
         }
-        gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
-        if (!pendingPasses_.empty()) passes_.swap(pendingPasses_); // otherwise keep the last image
+        gCrashPhase = "DX12 rendering of frame";
+        if (pendingPassCount_) { // otherwise keep the last image
+            passes_.swap(pendingPasses_);
+            passCount_ = pendingPassCount_;
+        }
         if (uiReady_) {
-            gCrashPhase = "HTML/CSS UI raster of frame " + std::to_string(frameNumber);
+            gCrashPhase = "HTML/CSS UI raster of frame";
             if (!uiThreadOn_) {
                 if (ui_.render(width_, height_)) { uiUpload_ = true; perf_.rasters++; }
                 uiVisible_ = !ui_.empty();
             } // Otherwise UI publishes at its own pace in the worker.
-            gCrashPhase = "DX12 rendering of frame " + std::to_string(frameNumber);
+            gCrashPhase = "DX12 rendering of frame";
         }
         const auto tRaster = std::chrono::steady_clock::now();
         // Auto-select only nontrivial scenes on machines with spare cores.
