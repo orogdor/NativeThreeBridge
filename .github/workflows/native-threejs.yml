@@ -379,8 +379,8 @@ jobs:
         shell: pwsh
         run: |
           $log = Get-Content shots/textures-fixture-log.txt -Raw -ErrorAction Stop
-          if ($log -notmatch '\[material-color\] compiled GLSL color stage' -or $log -match '\[material-color\] (shader patch skipped|pipeline could not)') {
-            throw "The GLSL color stage did not run on DX12"
+          if ($log -notmatch '\[material-color\] compiled GLSL material stage' -or $log -match '\[material-color\] (shader patch skipped|pipeline could not)') {
+            throw "The GLSL material stage did not run on DX12"
           }
       - name: Upload UI screenshots
         if: always()
@@ -412,10 +412,26 @@ jobs:
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
             if ($channel -eq 'stable') {
-              # Promote the already-built release without replacing signed/downloadable artifacts.
+              $existing = gh release view $tag --repo $env:GITHUB_REPOSITORY --json isPrerelease | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw "Could not inspect release $tag" }
+              # v0.32.24 was staged before the shader work. Replace that test build
+              # with this tested build before exposing it to the stable updater.
+              if ($tag -eq 'v0.32.24' -and $existing.isPrerelease) {
+                $ref = "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$tag"
+                $previous = gh api $ref --jq '.object.sha'
+                if ($LASTEXITCODE -ne 0 -or $previous -notin @('9121b71763bfaad374e2b37ba6f20fa960d3c33b', $env:GITHUB_SHA)) {
+                  throw "Unexpected source revision for $tag"
+                }
+                gh release upload $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/UpdateEngine.exe release/UpdateKuningriigid.exe release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --clobber
+                if ($LASTEXITCODE -ne 0) { throw "Could not upload the tested packages for $tag" }
+                gh api --method PATCH $ref -f "sha=$env:GITHUB_SHA" -F force=true --silent
+                if ($LASTEXITCODE -ne 0) { throw "Could not point $tag at the tested commit" }
+                gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --notes "Stable Windows release with expanded DirectX 12 shader support for water, fire and terrain. UpdateEngine.exe installs the verified engine files."
+                if ($LASTEXITCODE -ne 0) { throw "Could not update the release notes for $tag" }
+              }
               gh release edit $tag --repo $env:GITHUB_REPOSITORY --prerelease=false --latest
               if ($LASTEXITCODE -ne 0) { throw "Could not promote $tag to stable" }
-              Write-Host "Existing release $tag promoted to stable/latest; assets preserved"
+              Write-Host "Release $tag is stable/latest"
             } else {
               Write-Host "Test release $tag already exists; it is NOT overwritten"
             }
