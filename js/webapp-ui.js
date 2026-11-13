@@ -116,12 +116,15 @@
     return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
   }
   const colorCache = new Map();
+  const colorByText = new Map(); // exact source text -> result (skips the trim/lower-case copy)
   // -> [r,g,b,a] in 0..1, or null. `current` is the element's `color`.
   function parseColor(text, current) {
     if (text == null) return null;
+    const hit = colorByText.get(text);
+    if (hit !== undefined) return hit;
     let s = String(text).trim().toLowerCase();
     if (s === 'currentcolor') return current || [0, 0, 0, 1];
-    if (colorCache.has(s)) return colorCache.get(s);
+    if (colorCache.has(s)) { const c = colorCache.get(s); colorByText.set(text, c); return c; }
     let out = null;
     if (s[0] === '#') out = hexColor(s.slice(1));
     else if (hasOwn(NAMED, s)) out = typeof NAMED[s] === 'string' ? hexColor(NAMED[s]) : NAMED[s];
@@ -153,8 +156,9 @@
         }
       }
     }
-    if (colorCache.size > 4000) colorCache.clear();
+    if (colorCache.size > 4000 || colorByText.size > 8000) { colorCache.clear(); colorByText.clear(); }
     colorCache.set(s, out);
+    colorByText.set(text, out);
     return out;
   }
 
@@ -196,9 +200,23 @@
       const bang = /!\s*important\s*$/i.exec(value);
       if (bang) { important = true; value = value.slice(0, bang.index).trim(); }
       if (!prop || value === '') continue;
-      out.push({ p: prop.startsWith('--') ? prop : prop.toLowerCase(), v: value, i: important });
+      out.push(makeDecl(prop.startsWith('--') ? prop : prop.toLowerCase(), value, important));
     }
     return out;
+  }
+  // Declaration: p/v/i as written, plus what the cascade needs on every
+  // element, worked out once: c = custom property, n = longhand-lookup name
+  // (vendor prefix dropped; null = ignored prefix), hv = contains var(),
+  // x = cached shorthand expansion (see expandFlat).
+  const KEEP_WEBKIT = /^-webkit-(line-clamp|text-fill-color|box-orient)$/;
+  function makeDecl(p, v, i) {
+    const c = p.charCodeAt(0) === 45 && p.charCodeAt(1) === 45;
+    let n = p;
+    if (!c) {
+      if (p.startsWith('-webkit-') && !KEEP_WEBKIT.test(p)) n = p.slice(8);
+      else if (p.startsWith('-moz-') || p.startsWith('-ms-')) n = null;
+    }
+    return { p, v, i, c, n, hv: v.indexOf('var(') >= 0, x: null };
   }
   let ruleOrder = 0;
   // Parsed sheet: { rules: [{ sel: [...complex], decls, order, media }], imports: [{ path, media }] }
@@ -391,8 +409,21 @@
       i = res.end;
     }
     if (!parts.length) return null;
-    if (pseudoEl && pseudoEl !== 'before' && pseudoEl !== 'after') return { parts, spec, pseudoEl, never: true };
-    return { parts, spec, pseudoEl };
+    // Keys (tag, #id, .class) that some proper ancestor of a matching element
+    // must carry: compounds reached through a descendant/child combinator.
+    // Lets the cascade reject most multi-part selectors with a few Set
+    // lookups instead of walking up the tree (see ancestorKeys).
+    let anc = null;
+    for (let j = 0; j < parts.length - 1; j++) {
+      const comb = parts[j + 1].comb;
+      if (comb !== ' ' && comb !== '>') continue;
+      const c = parts[j].c;
+      if (c.id !== null) (anc || (anc = [])).push('#' + c.id);
+      for (const k of c.cls) (anc || (anc = [])).push('.' + k);
+      if (c.tag) (anc || (anc = [])).push(c.tag);
+    }
+    if (pseudoEl && pseudoEl !== 'before' && pseudoEl !== 'after') return { parts, spec, pseudoEl, never: true, anc };
+    return { parts, spec, pseudoEl, anc };
   }
   // Specificity packed as a*10000 + b*100 + c.
   function parseCompound(text, start) {
@@ -443,6 +474,8 @@
         } else if (name.startsWith('nth-')) {
           const m = /^\s*(.*?)(?:\s+of\s+(.*))?\s*$/.exec(arg || '');
           pc.nth = parseNth(m[1]);
+          pc.ofType = name.endsWith('of-type');
+          pc.fromEnd = name.includes('last');
           if (m[2]) pc.of = parseSelectorList(m[2]);
           spec += 100;
         } else spec += 100;
@@ -478,17 +511,27 @@
   // Interaction state used by :hover/:active/:focus.
   const interact = { hover: null, active: null };
   const isInChain = (el, target) => { for (let n = target; n; n = n.parentNode) if (n === el) return true; return false; };
-  const elementChildren = (p) => (p ? p.childNodes.filter((c) => c.nodeType === 1) : []);
 
+  // Attribute value or null. Selector attribute names are already
+  // lower-case, which is how the shim's elements store them.
+  function attrOf(el, name) {
+    const m = el._attrs;
+    if (m === undefined) return el.getAttribute(name);
+    const v = m.get(name);
+    return v === undefined ? null : v;
+  }
   function matchCompound(el, c) {
     if (c.tag && el.localName !== c.tag) return false;
-    if (c.id !== null && el.getAttribute('id') !== c.id) return false;
-    if (c.cls.length) {
+    if (c.id !== null && attrOf(el, 'id') !== c.id) return false;
+    const want = c.cls;
+    if (want.length) {
       const cls = el._ntClassSet || classSet(el);
-      for (const k of c.cls) if (!cls.has(k)) return false;
+      for (let k = 0; k < want.length; k++) if (!cls.has(want[k])) return false;
     }
-    for (const a of c.attrs) {
-      let v = el.getAttribute(a.name);
+    const attrs = c.attrs;
+    for (let ai = 0; ai < attrs.length; ai++) {
+      const a = attrs[ai];
+      let v = attrOf(el, a.name);
       if (v === null) return false;
       if (!a.op) continue;
       let want = a.value;
@@ -502,38 +545,75 @@
         case '|=': if (v !== want && !v.startsWith(want + '-')) return false; break;
       }
     }
-    for (const p of c.pcs) if (!matchPseudo(el, p)) return false;
+    const pcs = c.pcs;
+    for (let pi = 0; pi < pcs.length; pi++) if (!matchPseudo(el, pcs[pi])) return false;
     return true;
   }
+  const EMPTY_SET = new Set();
   function classSet(el) {
-    const s = new Set((el.getAttribute('class') || '').split(/\s+/).filter(Boolean));
+    const text = attrOf(el, 'class');
+    const s = text ? new Set(text.split(/\s+/).filter(Boolean)) : EMPTY_SET;
     el._ntClassSet = s;
     return s;
   }
+  const FORM_TAGS = new Set(['button', 'input', 'select', 'textarea', 'option', 'fieldset']);
+  // Element siblings without building arrays (child-position pseudo-classes
+  // run for every candidate rule of every element).
+  function firstElement(p, tag) {
+    if (!p) return null;
+    const k = p.childNodes;
+    for (let i = 0; i < k.length; i++) if (k[i].nodeType === 1 && (tag === null || k[i].localName === tag)) return k[i];
+    return null;
+  }
+  function lastElement(p, tag) {
+    if (!p) return null;
+    const k = p.childNodes;
+    for (let i = k.length - 1; i >= 0; i--) if (k[i].nodeType === 1 && (tag === null || k[i].localName === tag)) return k[i];
+    return null;
+  }
+  function countElements(p, tag) {
+    if (!p) return 0;
+    const k = p.childNodes;
+    let n = 0;
+    for (let i = 0; i < k.length; i++) if (k[i].nodeType === 1 && (tag === null || k[i].localName === tag)) n++;
+    return n;
+  }
+  function matchAny(el, list) {
+    for (let i = 0; i < list.length; i++) if (matchSelector(el, list[i])) return true;
+    return false;
+  }
   function isDisabled(el) {
-    if (!/^(button|input|select|textarea|option|fieldset)$/.test(el.localName)) return false;
+    if (!FORM_TAGS.has(el.localName)) return false;
     if (el.hasAttribute('disabled') || el._disabled) return true;
     return false;
   }
   function matchPseudo(el, p) {
     switch (p.name) {
-      case 'not': return !p.list.some((s) => matchSelector(el, s));
-      case 'is': case 'matches': case 'where': case '-webkit-any': return p.list.some((s) => matchSelector(el, s));
-      case 'has': return p.list.some((s) => matchHas(el, s));
-      case 'first-child': return elementChildren(el.parentNode)[0] === el;
-      case 'last-child': { const k = elementChildren(el.parentNode); return k[k.length - 1] === el; }
-      case 'only-child': return elementChildren(el.parentNode).length === 1;
-      case 'first-of-type': return elementChildren(el.parentNode).find((e) => e.localName === el.localName) === el;
-      case 'last-of-type': { const k = elementChildren(el.parentNode).filter((e) => e.localName === el.localName); return k[k.length - 1] === el; }
-      case 'only-of-type': return elementChildren(el.parentNode).filter((e) => e.localName === el.localName).length === 1;
+      case 'not': return !matchAny(el, p.list);
+      case 'is': case 'matches': case 'where': case '-webkit-any': return matchAny(el, p.list);
+      case 'has': { const l = p.list; for (let i = 0; i < l.length; i++) if (matchHas(el, l[i])) return true; return false; }
+      case 'first-child': return firstElement(el.parentNode, null) === el;
+      case 'last-child': return lastElement(el.parentNode, null) === el;
+      case 'only-child': return countElements(el.parentNode, null) === 1;
+      case 'first-of-type': return firstElement(el.parentNode, el.localName) === el;
+      case 'last-of-type': return lastElement(el.parentNode, el.localName) === el;
+      case 'only-of-type': return countElements(el.parentNode, el.localName) === 1;
       case 'nth-child': case 'nth-last-child': case 'nth-of-type': case 'nth-last-of-type': {
-        let sibs = elementChildren(el.parentNode);
-        if (p.name.endsWith('of-type')) sibs = sibs.filter((e) => e.localName === el.localName);
-        if (p.of) sibs = sibs.filter((e) => p.of.some((s) => matchSelector(e, s)));
-        let idx = sibs.indexOf(el);
-        if (idx < 0) return false;
-        if (p.name.includes('last')) idx = sibs.length - 1 - idx;
-        return nthMatch(p.nth, idx + 1);
+        const parent = el.parentNode;
+        if (!parent) return false;
+        const k = parent.childNodes, tag = p.ofType ? el.localName : null, of = p.of || null;
+        if (of && !matchAny(el, of)) return false;
+        // 1-based position among the counted siblings, from the start or the end
+        let pos = 0, found = false;
+        const step = p.fromEnd ? -1 : 1;
+        for (let i = p.fromEnd ? k.length - 1 : 0; i >= 0 && i < k.length; i += step) {
+          const e = k[i];
+          if (e.nodeType !== 1 || (tag !== null && e.localName !== tag)) continue;
+          if (e === el) { pos++; found = true; break; }
+          if (of && !matchAny(e, of)) continue;
+          pos++;
+        }
+        return found && nthMatch(p.nth, pos);
       }
       case 'empty': return !el.childNodes.some((n) => n.nodeType === 1 || (n.nodeType === 3 && n.data.length));
       case 'root': return el === document.documentElement;
@@ -544,7 +624,7 @@
       case 'focus-visible': return false;
       case 'focus-within': return !!document.activeElement && document.activeElement !== document.body && isInChain(el, document.activeElement);
       case 'disabled': return isDisabled(el);
-      case 'enabled': return /^(button|input|select|textarea|option|fieldset)$/.test(el.localName) && !isDisabled(el);
+      case 'enabled': return FORM_TAGS.has(el.localName) && !isDisabled(el);
       case 'checked': return el.localName === 'option' ? el.hasAttribute('selected') : !!el.checked;
       case 'indeterminate': return false;
       case 'link': case 'any-link': return el.localName === 'a' && el.hasAttribute('href');
@@ -573,15 +653,17 @@
   }
   const warnedPseudo = new Set();
   function matchHas(el, rel) {
-    const test = (cand) => matchSelector(cand, rel);
-    if (rel.lead === '>') return elementChildren(el).some(test);
-    if (rel.lead === '+') { const n = el.nextElementSibling; return !!n && test(n); }
-    if (rel.lead === '~') { for (let n = el.nextElementSibling; n; n = n.nextElementSibling) if (test(n)) return true; return false; }
-    const stack = elementChildren(el).slice();
+    const kids = el.childNodes;
+    if (rel.lead === '>') { for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === 1 && matchSelector(kids[i], rel)) return true; return false; }
+    if (rel.lead === '+') { const n = el.nextElementSibling; return !!n && matchSelector(n, rel); }
+    if (rel.lead === '~') { for (let n = el.nextElementSibling; n; n = n.nextElementSibling) if (matchSelector(n, rel)) return true; return false; }
+    const stack = [];
+    for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === 1) stack.push(kids[i]);
     while (stack.length) {
       const n = stack.pop();
-      if (test(n)) return true;
-      for (const c of n.childNodes) if (c.nodeType === 1) stack.push(c);
+      if (matchSelector(n, rel)) return true;
+      const c = n.childNodes;
+      for (let i = 0; i < c.length; i++) if (c[i].nodeType === 1) stack.push(c[i]);
     }
     return false;
   }
@@ -614,21 +696,43 @@
   const ctx = { vw: 1280, vh: 720, rootFs: 16 };
   // Resolves a CSS length/calc() to px. `base` resolves %, `fs` resolves em.
   // Returns NaN for auto/none/invalid.
+  // The text of a length is parsed once per distinct string (layout asks for
+  // the same few hundred values again and again); only the unit conversion,
+  // which depends on base/font size/viewport, runs per call.
+  const LEN_NAN = 0, LEN_SIMPLE = 1, LEN_CALC = 2, LEN_ENV = 3;
+  const lengthCache = new Map();
+  function parseLength(text) {
+    const s = text.trim();
+    let e = null;
+    if (s) {
+      const c = s.charCodeAt(0);
+      if ((c >= 48 && c <= 57) || c === 46 || c === 45 || c === 43) {
+        const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)$/i.exec(s);
+        if (m) e = { kind: LEN_SIMPLE, n: parseFloat(m[1]), unit: m[2].toLowerCase(), s };
+      }
+      if (!e && /^(calc|min|max|clamp|-webkit-calc)\(/i.test(s)) e = { kind: LEN_CALC, n: 0, unit: '', s };
+      if (!e && /^env\(/i.test(s)) {
+        const parts = splitTop(s.slice(4, -1), ',');
+        e = { kind: LEN_ENV, n: 0, unit: '', s: parts.length > 1 ? parts.slice(1).join(',') : null };
+      }
+    }
+    if (!e) e = { kind: LEN_NAN, n: 0, unit: '', s };
+    if (lengthCache.size > 8000) lengthCache.clear();
+    lengthCache.set(text, e);
+    return e;
+  }
   function px(value, base, fs) {
     if (value == null) return NaN;
     if (typeof value === 'number') return value;
-    const s = String(value).trim();
-    if (!s) return NaN;
-    const c = s.charCodeAt(0);
-    if ((c >= 48 && c <= 57) || c === 46 || c === 45 || c === 43) {
-      const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)$/i.exec(s);
-      if (m) return unitToPx(parseFloat(m[1]), m[2].toLowerCase(), base, fs);
+    const text = typeof value === 'string' ? value : String(value);
+    const e = lengthCache.get(text) || parseLength(text);
+    switch (e.kind) {
+      case LEN_SIMPLE: return e.unit === 'px' || e.unit === '' ? e.n : unitToPx(e.n, e.unit, base, fs);
+      case LEN_CALC:
+        try { const v = new CalcParser(e.s, base, fs).parse(); return typeof v === 'number' ? v : NaN; } catch { return NaN; }
+      case LEN_ENV: return e.s === null ? 0 : px(e.s, base, fs);
+      default: return NaN;
     }
-    if (/^(calc|min|max|clamp|-webkit-calc)\(/i.test(s)) {
-      try { const v = new CalcParser(s, base, fs).parse(); return typeof v === 'number' ? v : NaN; } catch { return NaN; }
-    }
-    if (/^env\(/i.test(s)) { const parts = splitTop(s.slice(4, -1), ','); return parts.length > 1 ? px(parts.slice(1).join(','), base, fs) : 0; }
-    return NaN;
   }
   function unitToPx(n, unit, base, fs) {
     switch (unit) {
@@ -722,6 +826,7 @@
     'letter-spacing', 'word-spacing', 'text-align', 'text-transform', 'white-space', 'visibility', 'cursor', 'pointer-events',
     'word-break', 'overflow-wrap', 'word-wrap', 'text-shadow', 'direction', 'list-style-type', 'text-indent', 'text-wrap',
     '-webkit-text-fill-color', 'font-stretch', 'tab-size', 'hyphens', 'caret-color', 'accent-color']);
+  const INHERITED_LIST = [...INHERITED];
   const DEFAULTS = {
     display: 'inline', position: 'static', 'box-sizing': 'content-box', color: '#000', opacity: '1', visibility: 'visible',
     'font-size': '16px', 'font-weight': '400', 'font-style': 'normal', 'font-family': 'Segoe UI', 'line-height': 'normal',
@@ -959,6 +1064,7 @@ center{text-align:center}
   let sheetSignature = '';
   let ruleIndex = null;
   let pseudoIndex = null;
+  let pseudoRules = 0;      // ::before/::after entries in pseudoIndex
   function readCss(path) {
     try { return nt.readText(path); } catch (e) { host.warnOnce(`ui-css-${path}`, `Stylesheet not found in game folder: ${path}`); return null; }
   }
@@ -1021,32 +1127,83 @@ center{text-align:center}
     return (h >>> 0).toString(36);
   }
   function buildIndex() {
-    ruleIndex = { id: new Map(), cls: new Map(), tag: new Map(), any: [] };
-    pseudoIndex = { id: new Map(), cls: new Map(), tag: new Map(), any: [] };
+    ruleIndex = { id: new Map(), cls: new Map(), tag: new Map(), attr: new Map(), any: [] };
+    pseudoIndex = { id: new Map(), cls: new Map(), tag: new Map(), attr: new Map(), any: [] };
+    pseudoRules = 0;
     let seq = 0;
     for (const { sheet, media } of sheets) {
       for (const rule of sheet.rules) {
         for (const sel of rule.sel) {
           if (sel.never) continue;
-          const entry = { sel, rule, spec: sel.spec, order: seq++, media: joinMedia(media, rule.media) };
+          const entry = { sel, rule, spec: sel.spec, order: seq++, media: joinMedia(media, rule.media), mw: -1, mh: -1, mr: -1, mv: true };
           const last = sel.parts[sel.parts.length - 1].c;
           const idx = sel.pseudoEl ? pseudoIndex : ruleIndex;
+          if (sel.pseudoEl) pseudoRules++;
           if (last.id !== null) push(idx.id, last.id, entry);
           else if (last.cls.length) push(idx.cls, last.cls[0], entry);
           else if (last.tag) push(idx.tag, last.tag, entry);
+          else if (last.attrs.length) push(idx.attr, last.attrs[0].name, entry); // only elements carrying that attribute
           else idx.any.push(entry);
         }
       }
     }
   }
   const push = (map, key, v) => { const l = map.get(key); if (l) l.push(v); else map.set(key, [v]); };
-  function candidates(idx, el) {
-    const out = idx.any.slice();
-    const t = idx.tag.get(el.localName); if (t) for (const e of t) out.push(e);
-    const id = el.getAttribute('id');
-    if (id) { const l = idx.id.get(id); if (l) for (const e of l) out.push(e); }
+  // Media verdict of an index entry, re-evaluated only when the window changes.
+  function entryMediaOk(e) {
+    if (e.mw !== state.width || e.mh !== state.height || e.mr !== state.pixelRatio) {
+      e.mw = state.width; e.mh = state.height; e.mr = state.pixelRatio;
+      e.mv = mediaMatches(e.media);
+    }
+    return e.mv;
+  }
+  // tag / #id / .class keys of an element and all its ancestors, built once
+  // per element per restyle pass (the DOM cannot change inside a pass).
+  function chainKeys(el) {
+    if (el._ntKeysGen === styleGeneration) return el._ntKeys;
+    const p = el.parentNode;
+    const set = p && p.nodeType === 1 ? new Set(chainKeys(p)) : new Set();
+    set.add(el.localName);
+    const id = attrOf(el, 'id');
+    if (id) set.add('#' + id);
     const cls = el._ntClassSet || classSet(el);
-    for (const c of cls) { const l = idx.cls.get(c); if (l) for (const e of l) out.push(e); }
+    if (cls.size) for (const c of cls) set.add('.' + c);
+    el._ntKeys = set; el._ntKeysGen = styleGeneration;
+    return set;
+  }
+  let matchKeys = null; // ancestor keys of the element being matched (lazy)
+  function collectMatches(list, el, out) {
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i], sel = e.sel;
+      if (e.media !== null && !entryMediaOk(e)) continue;
+      const anc = sel.anc;
+      if (anc !== null) {
+        if (matchKeys === null) { const p = el.parentNode; matchKeys = p && p.nodeType === 1 ? chainKeys(p) : EMPTY_SET; }
+        let ok = true;
+        for (let k = 0; k < anc.length; k++) if (!matchKeys.has(anc[k])) { ok = false; break; }
+        if (!ok) continue;
+      }
+      if (matchFrom(el, sel.parts, sel.parts.length - 1)) out.push(e);
+    }
+  }
+  // Index entries whose selector matches `el` (same set as filtering every
+  // candidate bucket, without the intermediate arrays).
+  function matchedEntries(idx, el) {
+    const out = [];
+    matchKeys = null;
+    if (idx.any.length) collectMatches(idx.any, el, out);
+    if (idx.attr.size) {
+      const attrs = el._attrs;
+      if (attrs === undefined) { for (const l of idx.attr.values()) collectMatches(l, el, out); }
+      else if (attrs.size) for (const name of attrs.keys()) { const l = idx.attr.get(name); if (l) collectMatches(l, el, out); }
+    }
+    const t = idx.tag.get(el.localName); if (t) collectMatches(t, el, out);
+    const id = attrOf(el, 'id');
+    if (id) { const l = idx.id.get(id); if (l) collectMatches(l, el, out); }
+    if (idx.cls.size) {
+      const cls = el._ntClassSet || classSet(el);
+      if (cls.size) for (const c of cls) { const l = idx.cls.get(c); if (l) collectMatches(l, el, out); }
+    }
     return out;
   }
 
@@ -1084,41 +1241,115 @@ center{text-align:center}
     return d;
   }
 
+  // Longhands of one declaration as a flat [prop, value, prop, value ...]
+  // list. Expansion depends only on the property and its (var()-substituted)
+  // value, so it is done once per distinct declaration instead of once per
+  // element that the declaration applies to.
+  const expandCache = new Map();
+  function expandFlat(p, v) {
+    const key = p + '\u0000' + v;
+    let flat = expandCache.get(key);
+    if (flat === undefined) {
+      flat = [];
+      const set = (prop, val) => { flat.push(prop, val); };
+      if (!expandShorthand(p, v, set)) flat.push(p, v);
+      if (expandCache.size > 20000) expandCache.clear();
+      expandCache.set(key, flat);
+    }
+    return flat;
+  }
+  function sameOwn(a, b) {
+    const ka = Object.keys(a), kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (let i = 0; i < ka.length; i++) { const k = ka[i]; if (!hasOwn(b, k) || a[k] !== b[k]) return false; }
+    return true;
+  }
+  const entryOrder = (a, b) => a.spec - b.spec || a.order - b.order;
+  const ruleHasImportant = (rule) => {
+    let v = rule.imp;
+    if (v === undefined) { v = false; for (const d of rule.decls) if (d.i) { v = true; break; } rule.imp = v; }
+    return v;
+  };
+  // Scratch lists for cascade(): declarations in application order + their url() base.
+  const cascDecls = [], cascBases = [];
   // Computed style: plain object of longhand strings + __fs (font px) + __custom.
-  function cascade(el, entries, inline, parent) {
-    const list = [];
-    for (const e of entries) {
-      const ua = e.rule.ua;
-      const decls = e.rule.decls;
-      for (let k = 0; k < decls.length; k++) {
-        const d = decls[k];
-        const w = ua ? (d.i ? -2e9 : -3e9) + e.spec : d.i ? 2e9 + e.spec : e.spec;
-        list.push({ d, w, o: e.order * 256 + k, base: e.rule.baseDir });
+  // `prev` = the style this replaces (only used to keep the identity of an
+  // unchanged custom-property table, which makes "did anything inherited
+  // change?" a pointer comparison for the whole subtree).
+  function cascade(el, entries, inline, parent, prev) {
+    // Cascade order, lowest first: UA normal, UA !important, author normal,
+    // inline normal, author !important, inline !important; inside a layer
+    // by specificity, then source order.
+    if (entries.length > 1) entries.sort(entryOrder);
+    let n = 0, uaImportant = false, authorImportant = false;
+    for (let pass = 0; pass < 2; pass++) { // 0: UA rules, 1: author rules
+      for (let i = 0; i < entries.length; i++) {
+        const rule = entries[i].rule;
+        if ((rule.ua ? 0 : 1) !== pass) continue;
+        const decls = rule.decls;
+        if (ruleHasImportant(rule)) {
+          if (pass === 0) uaImportant = true; else authorImportant = true;
+          for (let k = 0; k < decls.length; k++) if (!decls[k].i) { cascDecls[n] = decls[k]; cascBases[n++] = rule.baseDir; }
+        } else for (let k = 0; k < decls.length; k++) { cascDecls[n] = decls[k]; cascBases[n++] = rule.baseDir; }
+      }
+      if (pass === 0 && uaImportant) {
+        for (let i = 0; i < entries.length; i++) {
+          const rule = entries[i].rule;
+          if (!rule.ua || !rule.imp) continue;
+          const decls = rule.decls;
+          for (let k = 0; k < decls.length; k++) if (decls[k].i) { cascDecls[n] = decls[k]; cascBases[n++] = rule.baseDir; }
+        }
       }
     }
-    if (inline) inline.forEach((d, k) => list.push({ d, w: d.i ? 3e9 : 1e9, o: 1e12 + k, base: '' }));
-    list.sort((a, b) => a.w - b.w || a.o - b.o);
+    let inlineImportant = false;
+    if (inline) for (let k = 0; k < inline.length; k++) { if (inline[k].i) inlineImportant = true; else { cascDecls[n] = inline[k]; cascBases[n++] = ''; } }
+    if (authorImportant) {
+      for (let i = 0; i < entries.length; i++) {
+        const rule = entries[i].rule;
+        if (rule.ua || !rule.imp) continue;
+        const decls = rule.decls;
+        for (let k = 0; k < decls.length; k++) if (decls[k].i) { cascDecls[n] = decls[k]; cascBases[n++] = rule.baseDir; }
+      }
+    }
+    if (inlineImportant) for (let k = 0; k < inline.length; k++) if (inline[k].i) { cascDecls[n] = inline[k]; cascBases[n++] = ''; }
+
     const pcs = parent ? parent.__custom : null;
-    const custom = Object.create(pcs || null);
-    for (const { d } of list) if (d.p.charCodeAt(0) === 45 && d.p.charCodeAt(1) === 45) custom[d.p] = d.v === 'initial' ? null : d.v;
+    let custom = null;
+    for (let i = 0; i < n; i++) {
+      const d = cascDecls[i];
+      if (!d.c) continue;
+      if (custom === null) custom = Object.create(pcs || null);
+      custom[d.p] = d.v === 'initial' ? null : d.v;
+    }
+    if (custom === null) custom = pcs || Object.create(null); // nothing declared here: the parent's table as is
+    else if (prev) {
+      const old = prev.__custom;
+      if (old && Object.getPrototypeOf(old) === (pcs || null) && sameOwn(old, custom)) custom = old;
+    }
     const spec = Object.create(null);
     const bases = Object.create(null);
-    for (const { d, base } of list) {
-      if (d.p.charCodeAt(0) === 45 && d.p.charCodeAt(1) === 45) continue;
-      let v = d.v.indexOf('var(') >= 0 ? substituteVars(d.v, custom) : d.v;
-      if (v === '') v = 'unset';
-      const setter = (p, val) => { spec[p] = val; if (base) bases[p] = base; };
-      let p = d.p;
-      if (p.startsWith('-webkit-') && !/^-webkit-(line-clamp|text-fill-color|box-orient)$/.test(p)) p = p.slice(8);
-      else if (p.startsWith('-moz-') || p.startsWith('-ms-')) continue;
-      if (!expandShorthand(p, v, setter)) setter(p, v);
+    for (let i = 0; i < n; i++) {
+      const d = cascDecls[i];
+      if (d.c || d.n === null) continue;
+      let flat;
+      if (d.hv) {
+        let v = substituteVars(d.v, custom);
+        if (v === '') v = 'unset';
+        flat = expandFlat(d.n, v);
+      } else flat = d.x || (d.x = expandFlat(d.n, d.v));
+      const base = cascBases[i];
+      if (base) for (let j = 0; j < flat.length; j += 2) { spec[flat[j]] = flat[j + 1]; bases[flat[j]] = base; }
+      else for (let j = 0; j < flat.length; j += 2) spec[flat[j]] = flat[j + 1];
     }
+    for (let i = 0; i < n; i++) { cascDecls[i] = null; }
     const cs = Object.create(null);
     cs.__custom = custom;
     cs.__bases = bases;
     for (const p in spec) {
-      let v = spec[p];
-      const lv = v.length < 12 ? v.toLowerCase() : '';
+      const v = spec[p];
+      // CSS-wide keywords all start with i/u/r: skip the lowercase copy otherwise
+      const c0 = v.charCodeAt(0) | 32;
+      const lv = (c0 === 105 || c0 === 117 || c0 === 114) && v.length < 12 ? v.toLowerCase() : '';
       if (lv === 'inherit' || (lv === 'unset' && INHERITED.has(p)) || (lv === 'revert' && INHERITED.has(p))) {
         if (parent && parent[p] !== undefined) cs[p] = parent[p];
         continue;
@@ -1126,7 +1357,7 @@ center{text-align:center}
       if (lv === 'initial' || lv === 'unset' || lv === 'revert' || lv === 'revert-layer') continue;
       cs[p] = v;
     }
-    if (parent) for (const p of INHERITED) if (cs[p] === undefined && parent[p] !== undefined) cs[p] = parent[p];
+    if (parent) for (let i = 0; i < INHERITED_LIST.length; i++) { const p = INHERITED_LIST[i]; if (cs[p] === undefined && parent[p] !== undefined) cs[p] = parent[p]; }
     // font-size resolves here so children can use em.
     // Inherited values are computed values: font-size and length/percent
     // line-heights become px here so children do not re-apply em/%.
@@ -1244,7 +1475,15 @@ center{text-align:center}
     fantasy: 'Impact', 'ui-rounded': 'Segoe UI', emoji: 'Segoe UI Emoji', math: 'Cambria Math', fangsong: 'SimSun',
   };
   const fontCache = new Map();
+  // Computed styles never change once built, so the font and line height of
+  // a style object are worked out once (layout and paint ask repeatedly).
+  const fontByStyle = new WeakMap(), lineHeightByStyle = new WeakMap();
   function fontOf(cs) {
+    let f = fontByStyle.get(cs);
+    if (f === undefined) { f = resolveFont(cs); fontByStyle.set(cs, f); }
+    return f;
+  }
+  function resolveFont(cs) {
     const familyText = cs['font-family'] || 'Segoe UI';
     const weightText = String(cs['font-weight'] || '400').toLowerCase();
     const italic = /italic|oblique/.test(cs['font-style'] || '') ? 1 : 0;
@@ -1305,6 +1544,11 @@ center{text-align:center}
   }
   const letterSpacing = (cs) => { const v = cs['letter-spacing']; if (!v || v === 'normal') return 0; const n = px(v, 0, cs.__fs); return Number.isNaN(n) ? 0 : n; };
   function lineHeightOf(cs) {
+    let h = lineHeightByStyle.get(cs);
+    if (h === undefined) { h = resolveLineHeight(cs); lineHeightByStyle.set(cs, h); }
+    return h;
+  }
+  function resolveLineHeight(cs) {
     const v = String(cs['line-height'] || 'normal').trim().toLowerCase();
     if (v === 'normal') return Math.round(cs.__fs * 1.25 * 100) / 100;
     if (/^[\d.]+$/.test(v)) return parseFloat(v) * cs.__fs;
@@ -3089,12 +3333,14 @@ center{text-align:center}
       if (p.clip !== curClip) {
         const c = p.clip;
         const cmd = [OP.CLIP, c ? c.x : 0, c ? c.y : 0, c ? c.w : -1, c ? c.h : -1, c ? c.r || 0 : 0];
-        for (const v of cmd) out.push(v);
-        keys.push({ k: cmd.join(','), b: c ? [c.x, c.y, c.w, c.h] : null, clip: true });
+        for (let j = 0; j < 6; j++) out.push(cmd[j]);
+        keys.push({ d: cmd, s1: null, s2: null, b: c ? [c.x, c.y, c.w, c.h] : null, clip: true });
         curClip = c; count++;
       }
-      for (const v of p.d) out.push(v);
-      keys.push({ k: commandKey(p.d, table), b: commandBounds(p.d, curClip) });
+      const d = p.d, op = d[0];
+      for (let j = 0; j < d.length; j++) out.push(d[j]);
+      // text and image commands reference strings: remembered by content
+      keys.push({ d, s1: op === OP.TEXT || op === OP.IMAGE ? table[d[5]] : null, s2: op === OP.TEXT ? table[d[6]] : null, b: commandBounds(d, curClip), clip: false });
       count++;
     }
     out[3] = count;
@@ -3106,12 +3352,26 @@ center{text-align:center}
     return { floats, joined };
   }
   let lastKeys = null, pendingKeys = null;
-  // Text and image commands reference strings; compare by content.
-  function commandKey(d, table) {
-    const parts = Array.from(d, (v) => Math.round(v * 64) / 64);
-    if (d[0] === OP.TEXT) { parts[5] = table[d[5]]; parts[6] = table[d[6]]; }
-    else if (d[0] === OP.IMAGE) parts[5] = table[d[5]];
-    return parts.join(',');
+  // Same command as last time? Clips compare exactly, everything else at
+  // 1/64 px; string operands (text, font, image) compare by content.
+  function sameCommand(a, b) {
+    if (a.clip !== b.clip) return false;
+    const x = a.d, y = b.d, n = x.length;
+    if (n !== y.length) return false;
+    if (a.clip) {
+      for (let i = 0; i < n; i++) if (x[i] !== y[i] && (x[i] === x[i] || y[i] === y[i])) return false;
+      return true;
+    }
+    if (a.s1 !== b.s1 || a.s2 !== b.s2) return false;
+    const skip1 = a.s1 !== null ? 5 : -1, skip2 = a.s2 !== null ? 6 : -1;
+    for (let i = 0; i < n; i++) {
+      if (i === skip1 || i === skip2) continue;
+      const u = x[i], v = y[i];
+      if (u === v) continue;
+      const ru = Math.round(u * 64), rv = Math.round(v * 64);
+      if (ru !== rv && (ru === ru || rv === rv)) return false;
+    }
+    return true;
   }
   // Pixels a command can touch (generous for text and shadows), within its clip.
   function commandBounds(d, clip) {
@@ -3131,7 +3391,7 @@ center{text-align:center}
       x0 = Math.min(x0, b[0]); y0 = Math.min(y0, b[1]); x1 = Math.max(x1, b[0] + b[2]); y1 = Math.max(y1, b[1] + b[3]);
     };
     for (let i = 0; i < next.length; i++) {
-      if (prev[i].k === next[i].k) continue;
+      if (sameCommand(prev[i], next[i])) continue;
       n++;
       add(prev[i].b); add(next[i].b);
     }
@@ -3171,7 +3431,7 @@ center{text-align:center}
   // Changes restyle only what selectors can reach: the element itself,
   // its subtree (descendant selectors), following siblings (+ ~), the
   // subjects of :has() rules, and :hover/:active/:focus chains.
-  const deps = { sibling: false, structural: false, hasKeys: null, hasSubjects: [], interactAncestor: [], interactSibling: false, interact: false };
+  const deps = { sibling: false, structural: false, hasKeys: null, hasSubjects: [], hasTargets: { id: new Set(), cls: new Set(), tag: new Set(), all: false }, interactAncestor: [], interactSibling: false, interact: false };
   const INTERACT = new Set(['hover', 'active', 'focus', 'focus-within', 'focus-visible']);
   function analyzeSelectors() {
     deps.sibling = false; deps.structural = false; deps.interact = false; deps.interactSibling = false;
@@ -3210,17 +3470,19 @@ center{text-align:center}
       });
     };
     for (const { sheet } of sheets) for (const rule of sheet.rules) visitList(rule.sel, false);
+    const targets = { id: new Set(), cls: new Set(), tag: new Set(), all: false };
+    for (const c of deps.hasSubjects) subjectKey(c, targets);
+    deps.hasTargets = targets;
   }
-  // Elements that a compound can match, found through the cheapest key.
-  function compoundTargets(c, out) {
-    const root = document.documentElement;
-    if (!root) return;
-    if (c.id !== null) { const e = document.getElementById(c.id); if (e) out.add(e); return; }
-    if (c.cls.length) { for (const e of document.getElementsByClassName(c.cls[0])) out.add(e); return; }
-    if (c.tag) { for (const e of document.getElementsByTagName(c.tag)) out.add(e); return; }
+  // The cheapest key through which the elements a :has() subject can match
+  // are found. All subjects share one table so a single walk finds them all.
+  function subjectKey(c, t) {
+    if (c.id !== null) { t.id.add(c.id); return; }
+    if (c.cls.length) { t.cls.add(c.cls[0]); return; }
+    if (c.tag) { t.tag.add(c.tag); return; }
     const lists = c.pcs.filter((p) => (p.name === 'is' || p.name === 'where' || p.name === 'matches') && p.list);
-    if (lists.length) { for (const sel of lists[0].list) compoundTargets(sel.parts[sel.parts.length - 1].c, out); return; }
-    out.add(null); // matches anything: caller restyles everything
+    if (lists.length) { for (const sel of lists[0].list) subjectKey(sel.parts[sel.parts.length - 1].c, t); return; }
+    t.all = true; // matches anything: everything is restyled
   }
   function subtreeRelevant(el) {
     if (hasRelevant(el)) return true;
@@ -3232,7 +3494,7 @@ center{text-align:center}
     if (!k || !deps.hasSubjects.length) return false;
     if (k.any) return true;
     if (attrName && k.attr.has(attrName)) return true;
-    const id = el.getAttribute && el.getAttribute('id');
+    const id = k.id.size ? attrOf(el, 'id') : null;
     if (id && k.id.has(id)) return true;
     if (k.tag.has(el.localName)) return true;
     for (const c of (el._ntClassSet || classSet(el))) if (k.cls.has(c)) return true;
@@ -3248,11 +3510,30 @@ center{text-align:center}
     if (!el || el.nodeType !== 1) return;
     if (restyleQueue.get(el) !== 'subtree') restyleQueue.set(el, mode);
   };
+  // :has() subjects are looked up once per style flush (one walk of the
+  // document), however many changes asked for it since the last one.
+  let hasRestylePending = false;
   function requestHasRestyle() {
-    const targets = new Set();
-    for (const c of deps.hasSubjects) compoundTargets(c, targets);
-    if (targets.has(null)) { needStyle = true; return; }
-    for (const e of targets) requestRestyle(e, 'self');
+    if (deps.hasTargets.all) { needStyle = true; return; }
+    hasRestylePending = true;
+  }
+  function flushHasRestyle() {
+    hasRestylePending = false;
+    const t = deps.hasTargets, root = document.documentElement;
+    if (!root || (!t.id.size && !t.cls.size && !t.tag.size)) return;
+    const stack = [root];
+    while (stack.length) {
+      const e = stack.pop();
+      let hit = t.tag.has(e.localName);
+      if (!hit && t.id.size) { const id = attrOf(e, 'id'); hit = id !== null && t.id.has(id); }
+      if (!hit && t.cls.size) {
+        const cls = e._ntClassSet || classSet(e);
+        if (cls.size) for (const c of cls) if (t.cls.has(c)) { hit = true; break; }
+      }
+      if (hit) requestRestyle(e, 'self');
+      const kids = e.childNodes;
+      for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === 1) stack.push(kids[i]);
+    }
   }
   function requestSiblings(el, mode) {
     for (let n = el.nextElementSibling; n; n = n.nextElementSibling) requestRestyle(n, mode);
@@ -3269,16 +3550,19 @@ center{text-align:center}
   function styleDiff(a, b, pa, pb) {
     if (!a) return 'layout';
     if (a.__fs !== b.__fs) return 'layout';
-    if ((pa ? JSON.stringify(Object.keys(pa)) : '') !== (pb ? JSON.stringify(Object.keys(pb)) : '')) return 'layout';
+    // same set of pseudo-elements (a non-null record always has at least one)
+    if ((pa ? (pa.before ? 1 : 0) | (pa.after ? 2 : 0) : 0) !== (pb ? (pb.before ? 1 : 0) | (pb.after ? 2 : 0) : 0)) return 'layout';
     let kind = 'none';
-    const check = (k) => {
-      if (k === '__custom' || k === '__bases' || k === '__fs') return;
-      if (a[k] === b[k]) return;
-      if (PAINT_ONLY.has(k)) { if (kind === 'none') kind = 'paint'; return; }
-      kind = 'layout';
-    };
-    for (const k in b) { check(k); if (kind === 'layout') return kind; }
-    for (const k in a) if (!(k in b)) { check(k); if (kind === 'layout') return kind; }
+    for (const k in b) {
+      if (a[k] === b[k] || k === '__custom' || k === '__bases' || k === '__fs') continue;
+      if (!PAINT_ONLY.has(k)) return 'layout';
+      kind = 'paint';
+    }
+    for (const k in a) {
+      if (k in b || k === '__custom' || k === '__bases' || k === '__fs' || a[k] === undefined) continue;
+      if (!PAINT_ONLY.has(k)) return 'layout';
+      kind = 'paint';
+    }
     if (pa || pb) {
       for (const w of ['before', 'after']) {
         const x = pa && pa[w], y = pb && pb[w];
@@ -3293,29 +3577,28 @@ center{text-align:center}
   function styleOne(el, parentCs) {
     const root = document.documentElement;
     const oldCs = el._ntStyle, oldPseudo = el._ntPseudo;
-    const entries = candidates(ruleIndex, el).filter((e) => (!e.media || mediaMatches(e.media)) && matchSelector(el, e.sel));
-    const cs = cascade(el, entries, inlineDecls(el), parentCs);
-    if (lower(cs['font-weight']) === 'bolder' || lower(cs['font-weight']) === 'lighter') {
-      const pw = parentCs ? parseInt(parentCs['font-weight'], 10) || (lower(parentCs['font-weight']) === 'bold' ? 700 : 400) : 400;
-      cs['font-weight'] = String(lower(cs['font-weight']) === 'bolder' ? (pw < 600 ? 700 : 900) : (pw > 500 ? 400 : 100));
+    const cs = cascade(el, matchedEntries(ruleIndex, el), inlineDecls(el), parentCs, oldCs);
+    const fw = cs['font-weight'];
+    if (fw !== undefined && fw.length >= 6) { // only 'bolder'/'lighter' (maybe padded) are that long
+      const lfw = lower(fw);
+      if (lfw === 'bolder' || lfw === 'lighter') {
+        const pw = parentCs ? parseInt(parentCs['font-weight'], 10) || (lower(parentCs['font-weight']) === 'bold' ? 700 : 400) : 400;
+        cs['font-weight'] = String(lfw === 'bolder' ? (pw < 600 ? 700 : 900) : (pw > 500 ? 400 : 100));
+      }
     }
     if (el === root) ctx.rootFs = cs.__fs;
     el._ntStyle = cs;
     el._ntStyledParent = el.parentNode;
     el._ntPseudo = null;
     timing.restyled++;
-    const pc = candidates(pseudoIndex, el);
-    if (pc.length) {
+    const pc = pseudoRules ? matchedEntries(pseudoIndex, el) : null;
+    if (pc && pc.length) {
       const before = [], after = [];
-      for (const e of pc) {
-        if (e.media && !mediaMatches(e.media)) continue;
-        if (!matchSelector(el, e.sel)) continue;
-        (e.sel.pseudoEl === 'before' ? before : after).push(e);
-      }
-      if (before.length || after.length) {
+      for (let i = 0; i < pc.length; i++) (pc[i].sel.pseudoEl === 'before' ? before : after).push(pc[i]);
+      {
         el._ntPseudo = {};
-        if (before.length) el._ntPseudo.before = cascade(el, before, null, cs);
-        if (after.length) el._ntPseudo.after = cascade(el, after, null, cs);
+        if (before.length) el._ntPseudo.before = cascade(el, before, null, cs, oldPseudo ? oldPseudo.before : null);
+        if (after.length) el._ntPseudo.after = cascade(el, after, null, cs, oldPseudo ? oldPseudo.after : null);
       }
     }
     if (diffing) {
@@ -3326,27 +3609,42 @@ center{text-align:center}
     return cs;
   }
   // What children inherit: inherited properties, custom properties, font size.
-  function inheritSignature(cs) {
-    if (!cs) return '';
-    let sig = String(cs.__fs);
-    for (const p of INHERITED) sig += '|' + (cs[p] ?? '');
-    for (const k in cs.__custom) sig += '|' + k + '=' + cs.__custom[k];
-    return sig;
+  // Compared field by field (no signature strings; custom properties walk
+  // the prototype chain only when the two styles hang off different parents).
+  function inheritSame(a, b) {
+    if (!a || a.__fs !== b.__fs) return false;
+    for (let i = 0; i < INHERITED_LIST.length; i++) {
+      const p = INHERITED_LIST[i], x = a[p], y = b[p];
+      if (x !== y && (x ?? '') !== (y ?? '')) return false;
+    }
+    const ca = a.__custom, cb = b.__custom;
+    if (ca === cb) return true;
+    if (Object.getPrototypeOf(ca) === Object.getPrototypeOf(cb)) {
+      const ka = Object.keys(ca), kb = Object.keys(cb);
+      if (ka.length !== kb.length) return false;
+      for (let i = 0; i < ka.length; i++) { const k = ka[i]; if (!hasOwn(cb, k) || ca[k] !== cb[k]) return false; }
+      return true;
+    }
+    for (const k in ca) if (ca[k] !== cb[k] || !(k in cb)) return false;
+    for (const k in cb) if (!(k in ca)) return false;
+    return true;
   }
   function styleSubtree(el, parentCs) {
     const cs = styleOne(el, parentCs);
-    for (const c of el.childNodes) if (c.nodeType === 1) styleSubtree(c, cs);
+    const kids = el.childNodes;
+    for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === 1) styleSubtree(kids[i], cs);
   }
   // Restyles one element; its children follow only if what they inherit changed.
   function styleSelf(el, parentCs) {
-    const before = inheritSignature(el._ntStyle);
+    const before = el._ntStyle;
     const cs = styleOne(el, parentCs);
-    if (inheritSignature(cs) === before) {
+    const kids = el.childNodes;
+    if (inheritSame(before, cs)) {
       // children whose parent changed (moved nodes) or never styled
-      for (const c of el.childNodes) if (c.nodeType === 1 && (!c._ntStyle || c._ntStyledParent !== el)) styleSubtree(c, cs);
+      for (let i = 0; i < kids.length; i++) { const c = kids[i]; if (c.nodeType === 1 && (!c._ntStyle || c._ntStyledParent !== el)) styleSubtree(c, cs); }
       return;
     }
-    for (const c of el.childNodes) if (c.nodeType === 1) styleSelf(c, cs);
+    for (let i = 0; i < kids.length; i++) if (kids[i].nodeType === 1) styleSelf(kids[i], cs);
   }
   function fullRestyle() {
     styleGeneration++;
@@ -3366,11 +3664,14 @@ center{text-align:center}
     try { processItems(items); } finally { diffing = false; }
   }
   function processItems(items) {
-    items.sort((a, b) => depthOf(a[0]) - depthOf(b[0]));
+    if (items.length > 1) {
+      for (const it of items) it.push(depthOf(it[0]));
+      items.sort((a, b) => a[2] - b[2]);
+    }
     const doneSubtree = new Set();
     for (const [el, mode] of items) {
       let covered = false;
-      for (let p = el.parentNode; p; p = p.parentNode) if (doneSubtree.has(p)) { covered = true; break; }
+      if (doneSubtree.size) for (let p = el.parentNode; p; p = p.parentNode) if (doneSubtree.has(p)) { covered = true; break; }
       if (covered) continue;
       const parent = el.parentNode;
       const pcs = parent && parent.nodeType === 1 ? parent._ntStyle || null : null;
@@ -3384,8 +3685,11 @@ center{text-align:center}
     if (size !== lastSize) { lastSize = size; needStyle = true; }
     if (sheetsDirty) { sheetsDirty = false; if (collectSheets()) { needStyle = true; analyzeSelectors(); } }
     const t0 = now();
-    if (needStyle) { restyleQueue.clear(); fullRestyle(); needStyle = false; needLayout = true; layoutDirty.clear(); fullLayoutNeeded = true; }
-    else if (restyleQueue.size) processRestyles();
+    if (needStyle) { restyleQueue.clear(); hasRestylePending = false; fullRestyle(); needStyle = false; needLayout = true; layoutDirty.clear(); fullLayoutNeeded = true; }
+    else {
+      if (hasRestylePending) flushHasRestyle();
+      if (restyleQueue.size) processRestyles();
+    }
     if (needStyle) { fullRestyle(); needStyle = false; fullLayoutNeeded = true; }
     timing.style += now() - t0;
   }
@@ -3640,7 +3944,7 @@ center{text-align:center}
     timing.paint += now() - t0;
     return true;
   }
-  const layoutPending = () => needPaint || needStyle || sheetsDirty || restyleQueue.size > 0 || needLayout || layoutDirty.size > 0 || fullLayoutNeeded || lastSize !== `${state.width}x${state.height}`;
+  const layoutPending = () => needPaint || needStyle || sheetsDirty || restyleQueue.size > 0 || hasRestylePending || needLayout || layoutDirty.size > 0 || fullLayoutNeeded || lastSize !== `${state.width}x${state.height}`;
 
   // ---- hit testing
   function hitTest(x, y) {
