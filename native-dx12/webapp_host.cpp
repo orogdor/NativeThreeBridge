@@ -266,26 +266,29 @@ JSValue jsUploadGeometry(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
     if (argc < 5) return JS_ThrowTypeError(ctx, "uploadGeometry(id, positions, normals, colors, indices, uvs)");
     std::uint32_t id = 0;
     if (JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
-    const float *positions = nullptr, *normals = nullptr, *colors = nullptr, *uvs = nullptr;
+    const float *positions = nullptr, *normals = nullptr, *colors = nullptr, *uvs = nullptr, *shaderAttributes = nullptr;
     const std::uint32_t* indices = nullptr;
-    std::size_t nPositions = 0, nNormals = 0, nColors = 0, nIndices = 0, nUvs = 0;
+    std::size_t nPositions = 0, nNormals = 0, nColors = 0, nIndices = 0, nUvs = 0, nAttributes = 0;
     if (!typedView(ctx, argv[1], positions, nPositions, false, "positions") ||
         !typedView(ctx, argv[2], normals, nNormals, true, "normals") ||
         !typedView(ctx, argv[3], colors, nColors, true, "colors") ||
         !typedView(ctx, argv[4], indices, nIndices, true, "indices") ||
-        (argc >= 6 && !typedView(ctx, argv[5], uvs, nUvs, true, "uvs")))
+        (argc >= 6 && !typedView(ctx, argv[5], uvs, nUvs, true, "uvs")) ||
+        (argc >= 8 && !typedView(ctx, argv[7], shaderAttributes, nAttributes, true, "shader attributes")))
         return JS_EXCEPTION;
     if (nPositions % 3 || (normals && nNormals != nPositions) || (colors && nColors != nPositions && nColors != nPositions / 3 * 4))
         return JS_ThrowRangeError(ctx, "Geometry attributes must be 3 floats per vertex (colours 3 or 4) and equal length");
     const std::uint32_t vertexCount = static_cast<std::uint32_t>(nPositions / 3);
     const std::uint32_t colorChannels = colors && nColors != nPositions ? 4 : 3;
     if (uvs && nUvs != std::size_t(vertexCount) * 2) return JS_ThrowRangeError(ctx, "Geometry uvs must be 2 floats per vertex");
+    if (shaderAttributes && nAttributes != std::size_t(vertexCount) * 4)
+        return JS_ThrowRangeError(ctx, "Shader attributes must be 4 floats per vertex");
     for (std::size_t i = 0; i < nIndices; i++)
         if (indices[i] >= vertexCount) return JS_ThrowRangeError(ctx, "Geometry index out of range");
     if (self->sink)
         self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices,
                                    static_cast<std::uint32_t>(nIndices), uvs, colorChannels,
-                                   argc >= 7 && JS_IsBool(argv[6]) && JS_ToBool(ctx, argv[6]) == 1);
+                                   argc >= 7 && JS_IsBool(argv[6]) && JS_ToBool(ctx, argv[6]) == 1, shaderAttributes);
     return JS_UNDEFINED;
 }
 JSValue jsUploadTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
@@ -391,6 +394,13 @@ JSValue jsReleaseInstances(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     std::uint32_t id = 0;
     if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseInstances(id);
     return JS_UNDEFINED;
+}
+JSValue jsRegisterColorPatch(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 2 || !self->sink || !JS_IsString(argv[1])) return JS_FALSE;
+    std::uint32_t id = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    return JS_NewBool(ctx, self->sink->registerColorPatch(id, argString(ctx, argv[1])));
 }
 JSValue jsSubmitPass(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
@@ -566,7 +576,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
         {"registerImage", jsRegisterImage, 2},
-        {"submitPass", jsSubmitPass, 2},
+        {"registerColorPatch", jsRegisterColorPatch, 2}, {"submitPass", jsSubmitPass, 2},
         {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1}, {"reportUi", jsReportUi, 6},
     };
     for (const Fn& f : functions)

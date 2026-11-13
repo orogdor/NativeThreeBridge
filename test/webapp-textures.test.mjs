@@ -89,11 +89,11 @@ test('sprites, shader-patched water, sky ShaderMaterial and tone mapping', { ski
   assert.ok(sprite, 'Sprite with CanvasTexture is drawn unlit without depth test');
   assert.ok(near(sprite.matrix[12], 2) && near(sprite.matrix[13], 1), 'at the sprite position');
   assert.ok(near(Math.hypot(sprite.matrix[0], sprite.matrix[1], sprite.matrix[2]), 2), 'scaled');
-  const sea = pass.draws.find((d) => near(d.opacity, 0.94));
-  assert.ok(sea, 'diffuseColor.a from the patch');
-  assert.ok(!(sea.flags & DrawFlags.VERTEX_COLORS));
+  const sea = pass.draws.find((d) => d.colorStage && rec.colorPatches.get(d.colorStage).includes('seaC'));
+  assert.ok(sea, 'sea runs its original color and alpha math');
+  assert.match(rec.colorPatches.get(sea.colorStage), /diffuseColor\.a = \.94/);
   const deep = [lin(0x1f), lin(0x4b), lin(0x55)], shallow = [lin(0x5e), lin(0x84), lin(0x66)];
-  for (let i = 0; i < 3; i++) assert.ok(near(sea.color[i], deep[i] * 0.7 + shallow[i] * 0.3, 0.005), `sea channel ${i}`);
+  for (const [i, value] of [...deep, ...shallow].entries()) assert.ok(near(sea.colorUniforms[i], value, 0.005));
   assert.ok(!pass.draws.some((d) => near(d.color[0], lin(0xd7), 0.002) && near(d.color[1], lin(0xc1), 0.002)), 'fog plane with a texture alpha mask is left out');
   const coast = pass.draws.find((d) => near(d.opacity, 0.72));
   assert.ok(coast, 'attribute-driven coast fade remains visible');
@@ -142,11 +142,11 @@ test('light RGB and hemisphere or spotlight parameters occupy separate packet fi
 
 test('terrain color stage translates local position, normals, GLSL math and live uniforms', { skip }, async () => {
   const { pass, context, host, rec } = await run();
-  const patch = pass.draws.find((d) => d.colorStage > 0);
+  const patch = pass.draws.find((d) => d.colorStage && rec.colorPatches.get(d.colorStage).includes('patchPosition'));
   assert.ok(patch);
   const source = rec.colorPatches.get(patch.colorStage);
   assert.match(source, /float3 patchPosition = ntPosition/);
-  assert.match(source, /float3 patchNormal = ntNormal/);
+  assert.match(source, /float3 patchNormal = normalize\(ntNormal\)/);
   assert.match(source, /return frac\(sin\(dot\(p, float2/);
   assert.match(source, /diffuseColor\.rgb = lerp\(diffuseColor\.rgb, rock/);
   assert.ok(near(patch.colorUniforms[0], .85));
@@ -155,7 +155,7 @@ test('terrain color stage translates local position, normals, GLSL math and live
   await settle();
   const changed = decodePass(rec.framePasses.at(-1) || rec.passes.at(-1)).draws.find((d) => d.colorStage === patch.colorStage);
   assert.ok(near(changed.colorUniforms[0], .25), 'updating the uniform reuses the native shader');
-  assert.equal(rec.colorPatches.size, 1);
+  assert.equal([...rec.colorPatches.values()].filter(source => source.includes('patchPosition')).length, 1);
 });
 
 test('showing and hiding a fixed panel lays out only that panel', { skip }, async () => {

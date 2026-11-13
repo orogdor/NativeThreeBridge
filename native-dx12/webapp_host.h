@@ -32,7 +32,7 @@ public:
     virtual void uploadGeometry(std::uint32_t id, const float* positions, const float* normals,
                                 const float* colors, std::uint32_t vertexCount,
                                 const std::uint32_t* indices, std::uint32_t indexCount, const float* uvs,
-                                std::uint32_t colorChannels, bool gpuLocal) = 0;
+                                std::uint32_t colorChannels, bool gpuLocal, const float* shaderAttributes) = 0;
     virtual void releaseGeometry(std::uint32_t id) = 0;
     // Texture `id` from encoded image bytes (width == 0: PNG/JPEG/WebP/...)
     // or tightly packed RGBA8 pixels. flags: kWebappTexture*. Returns false
@@ -108,7 +108,7 @@ inline std::size_t webappUiHeaderFloats(float version) {
 // Same numbers as js/native-renderer.mjs.
 constexpr std::size_t kWebappPassHeaderFloats = 64;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 56;
+constexpr std::size_t kWebappDrawFloats = 72;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 

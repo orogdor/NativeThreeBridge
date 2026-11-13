@@ -35,7 +35,7 @@ struct RecordingSink final : native_three::WebappRenderSink {
     int uploads = 0, passes = 0, badDraws = 0, errors = 0;
     std::string title;
     void uploadGeometry(std::uint32_t id, const float* p, const float*, const float*, std::uint32_t vertexCount,
-                        const std::uint32_t*, std::uint32_t, const float*, std::uint32_t, bool) override {
+                        const std::uint32_t*, std::uint32_t, const float*, std::uint32_t, bool, const float*) override {
         if (!p || !vertexCount) badDraws++;
         geometryVertices[id] = vertexCount;
         uploads++;
@@ -43,6 +43,19 @@ struct RecordingSink final : native_three::WebappRenderSink {
     void releaseGeometry(std::uint32_t id) override { geometryVertices.erase(id); }
     void uploadInstances(std::uint32_t id, const float*, const float*, std::uint32_t count) override { instanceCounts[id] = count; }
     void releaseInstances(std::uint32_t id) override { instanceCounts.erase(id); }
+    bool registerColorPatch(std::uint32_t id, const std::string& source) override {
+        std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
+        const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
+        shader.replace(shader.find(marker), marker.size(), source);
+        Microsoft::WRL::ComPtr<ID3DBlob> code, error;
+        const HRESULT hr = D3DCompile(shader.data(), shader.size(), "webapp_material", nullptr, nullptr,
+                                     "PSMain", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &code, &error);
+        if (FAILED(hr)) {
+            errors++;
+            std::printf("[error] material %u: %s\n", id, error ? static_cast<const char*>(error->GetBufferPointer()) : "HLSL compilation failed");
+        }
+        return SUCCEEDED(hr);
+    }
     void submitPass(const float* data, std::size_t floats) override {
         passes++;
         framePasses.emplace_back(data, data + floats);

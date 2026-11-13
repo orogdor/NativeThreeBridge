@@ -447,22 +447,25 @@ void ntUploadGeometry(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() < 5) return self->throwError("type", "uploadGeometry(id, positions, normals, colors, indices, uvs)");
     v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
     const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0);
-    const float *positions, *normals, *colors, *uvs = nullptr;
+    const float *positions, *normals, *colors, *uvs = nullptr, *shaderAttributes = nullptr;
     const std::uint32_t* indices;
-    std::size_t nP, nN, nC, nI, nU = 0;
+    std::size_t nP, nN, nC, nI, nU = 0, nA = 0;
     if (!typedView(self, info[1], positions, nP, false, "positions") || !typedView(self, info[2], normals, nN, true, "normals") ||
         !typedView(self, info[3], colors, nC, true, "colors") || !typedView(self, info[4], indices, nI, true, "indices") ||
-        (info.Length() >= 6 && !typedView(self, info[5], uvs, nU, true, "uvs")))
+        (info.Length() >= 6 && !typedView(self, info[5], uvs, nU, true, "uvs")) ||
+        (info.Length() >= 8 && !typedView(self, info[7], shaderAttributes, nA, true, "shader attributes")))
         return;
     if (nP % 3 || (normals && nN != nP) || (colors && nC != nP && nC != nP / 3 * 4))
         return self->throwError("range", "Geometry attributes must be 3 floats per vertex (colours 3 or 4) and equal length");
     const std::uint32_t vertexCount = std::uint32_t(nP / 3);
     const std::uint32_t colorChannels = colors && nC != nP ? 4 : 3;
     if (uvs && nU != std::size_t(vertexCount) * 2) return self->throwError("range", "Geometry uvs must be 2 floats per vertex");
+    if (shaderAttributes && nA != std::size_t(vertexCount) * 4)
+        return self->throwError("range", "Shader attributes must be 4 floats per vertex");
     for (std::size_t i = 0; i < nI; i++)
         if (indices[i] >= vertexCount) return self->throwError("range", "Geometry index out of range");
     if (self->sink) self->sink->uploadGeometry(id, positions, normals, colors, vertexCount, indices, std::uint32_t(nI),
-                                              uvs, colorChannels, info.Length() >= 7 && info[6]->IsTrue());
+                                              uvs, colorChannels, info.Length() >= 7 && info[6]->IsTrue(), shaderAttributes);
 }
 void ntUploadTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);

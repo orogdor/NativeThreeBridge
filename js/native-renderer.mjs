@@ -8,12 +8,12 @@
 //   * InstancedMesh matrices/colours only when they change,
 //   * textures once per image (encoded bytes are decoded natively),
 //   * one compact Float32Array "pass" per render() call: camera, lights and
-//     a 56-float record per visible draw.
+//     a fixed-size record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
 export const PASS_HEADER_FLOATS = 64;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 56;
+export const DRAW_FLOATS = 72;
 export const MAX_LIGHTS = 16;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
@@ -25,6 +25,7 @@ export const DrawFlags = {
   // matrixWorld has a negative determinant (mirrored, e.g. scale -1 in a GLTF):
   // the triangle winding is reversed, as Three.js' WebGLRenderer flips frontFace.
   MIRRORED: 524288,
+  ADDITIVE: 1048576, PREMULTIPLIED_ADDITIVE: 2097152,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
@@ -59,6 +60,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   let nextInstanceId = 1;
   let nextTextureId = 1;
   const colorPatches = new Map();
+  const shaderMaterials = new WeakMap();
+  const attributeGetters = ['getX', 'getY', 'getZ', 'getW'];
+  function registerMaterialStage(stage) {
+    if (!stage) return null;
+    let id = colorPatches.get(stage.source);
+    if (id === undefined && colorPatches.size < 32) {
+      id = colorPatches.size + 1;
+      if (!nt.registerColorPatch(id, stage.source)) id = 0;
+      colorPatches.set(stage.source, id);
+    }
+    return id ? { ...stage, id } : null;
+  }
   const SHADER_IDS = { MeshStandardMaterial: 'standard', MeshPhysicalMaterial: 'physical', MeshLambertMaterial: 'lambert', MeshPhongMaterial: 'phong', MeshBasicMaterial: 'basic', MeshToonMaterial: 'toon', MeshMatcapMaterial: 'matcap' };
 
   class NativeRenderer {
@@ -120,6 +133,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._animationLoop = null;
       this._animationHandle = 0;
       this._geometries = new WeakMap();
+      this._shaderGeometries = new WeakMap();
       this._instances = new WeakMap();
       this._textures = new WeakMap();   // THREE.Source -> { id, version, ok }
       this._patches = new WeakMap();    // material -> what its shader patch does to colours
@@ -229,10 +243,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     }
 
     // ------------------------------------------------------------ uploads
-    _geometryRecord(geometry) {
-      let record = this._geometries.get(geometry);
+    _geometryRecord(geometry, shaderInputs = null) {
       const position = geometry.attributes.position;
       if (!position) return null;
+      const custom = shaderInputs?.map(input => geometry.attributes[input.name]);
+      if (custom?.some((attr, i) => !attr || attr.itemSize !== shaderInputs[i].width || attr.count !== position.count)) return null;
+      const versions = custom?.map(attributeVersion);
+      const key = shaderInputs?.map(input => input.name).join(' ');
+      let variants = key && this._shaderGeometries.get(geometry);
+      let record = key ? variants?.get(key) : this._geometries.get(geometry);
       const normal = geometry.attributes.normal;
       const color = geometry.attributes.color;
       const uv = geometry.attributes.uv;
@@ -242,14 +261,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (record && record.position === position && record.normal === normal &&
           record.index === index && record.color === color && record.uv === uv &&
           record.pv === pv && record.nv === nv && record.cv === cv && record.uvv === uvv && record.iv === iv &&
-          record.vertexCount === position.count && record.indexCount === (index?.count ?? 0)) return record;
+          record.vertexCount === position.count && record.indexCount === (index?.count ?? 0) &&
+          (!custom || custom.every((attr, i) => attr === record.custom[i] && versions[i] === record.versions[i]))) return record;
       if (!record) {
         record = { id: nextGeometryId++, revision: 0 };
-        this._geometries.set(geometry, record);
+        if (key) {
+          if (!variants) this._shaderGeometries.set(geometry, variants = new Map());
+          variants.set(key, record);
+        } else this._geometries.set(geometry, record);
         this.info.memory.geometries++;
         const onDispose = () => {
           geometry.removeEventListener('dispose', onDispose);
-          this._geometries.delete(geometry);
+          if (key) variants.delete(key); else this._geometries.delete(geometry);
           this.info.memory.geometries--;
           nt.releaseGeometry(record.id);
         };
@@ -262,10 +285,21 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvs = uv ? toFloat2(uv) : null;
       let indices = null;
       if (index) indices = index.array instanceof Uint32Array ? index.array : Uint32Array.from(index.array);
-      const gpuLocal = [position, normal, color, uv, index].every(attribute =>
+      const gpuLocal = [position, normal, color, uv, index, ...(custom ?? [])].every(attribute =>
         !attribute || (attribute.isInterleavedBufferAttribute ? attribute.data.usage : attribute.usage) === THREE.StaticDrawUsage);
-      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs, gpuLocal);
-      Object.assign(record, { position, normal, color, uv, index, pv, nv, cv, uvv, iv,
+      let packed = null;
+      if (custom?.length) {
+        packed = new Float32Array(position.count * 4);
+        let channel = 0;
+        for (const attr of custom) {
+          for (let i = 0; i < position.count; i++) {
+            for (let j = 0; j < attr.itemSize; j++) packed[4 * i + channel + j] = attr[attributeGetters[j]](i);
+          }
+          channel += attr.itemSize;
+        }
+      }
+      nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs, gpuLocal, packed);
+      Object.assign(record, { position, normal, color, uv, index, pv, nv, cv, uvv, iv, custom, versions,
         hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index?.count ?? 0 });
       record.revision++;
       return record;
@@ -432,18 +466,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const before = new Set(Object.keys(shader.uniforms));
         m.onBeforeCompile(shader, this);
         const added = Object.entries(shader.uniforms).filter(([k, u]) => !before.has(k) && u && u.value && u.value.isColor);
-        if (nt.registerColorPatch && !m.transparent) {
-          const stage = translateColorStage(shader);
-          if (stage) {
-            let id = colorPatches.get(stage.source);
-            if (id === undefined && colorPatches.size < 16) {
-              id = colorPatches.size + 1;
-              if (!nt.registerColorPatch(id, stage.source)) id = 0;
-              colorPatches.set(stage.source, id);
-            }
-            if (id) info.colorStage = { id, uniforms: stage.uniforms };
-          }
-        }
+        if (nt.registerColorPatch) info.colorStage = registerMaterialStage(translateMaterialStage(shader));
         const palette = new Map(added);
         info.colors = diffusePalette(shader.fragmentShader, palette);
         info.reflection = outgoingReflection(shader.fragmentShader, palette);
@@ -696,25 +719,36 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       else if (m.isMeshLambertMaterial || m.isMeshToonMaterial) { roughness = 1; }
       else if (m.isShadowMaterial) return;
       else if (m.isShaderMaterial || m.isRawShaderMaterial) {
-        // Single directly sampled sampler2D with unmodified vUv can use the
-        // native colour-map path. Complex UVs and multi-texture GLSL still need
-        // full shader support; do not silently select an arbitrary uniform.
-        const fragment = m.fragmentShader || '';
-        const samplers = [...fragment.matchAll(/\b(?:texture2D|texture)\s*\(\s*([A-Za-z_]\w*)\s*,\s*vUv\s*\)/g)];
-        if (samplers.length === 1 && m.uniforms && m.uniforms[samplers[0][1]]?.value?.isTexture &&
-            /\bvarying\s+vec2\s+vUv\b/.test(fragment) &&
-            /\bvUv\s*=\s*uv\s*;/.test(m.vertexShader || '')) {
-          shaderMap = m.uniforms[samplers[0][1]].value;
-          if (!m.lights) flags |= DrawFlags.UNLIT;
+        if (nt.registerColorPatch) {
+          let cached = shaderMaterials.get(m);
+          if (!cached || cached.version !== m.version) {
+            cached = { version: m.version, stage: registerMaterialStage(translateMaterialStage(m, true)) };
+            shaderMaterials.set(m, cached);
+          }
+          colorStage = cached.stage;
         }
-        // Custom GLSL cannot run here: use its colour uniforms, unlit unless it uses lights.
-        const shaderColors = m.uniforms ? Object.entries(m.uniforms).filter(([, u]) => u && u.value && u.value.isColor) : [];
-        if (shaderColors.length) {
-          color = mixColors(_color, colorWeights(shaderColors, m.fragmentShader || ''));
-          if (!m.lights) flags |= DrawFlags.UNLIT;
-          unsupported('ShaderMaterial / custom GLSL', 'drawn in the colour of its colour uniforms');
-        } else unsupported('ShaderMaterial / custom GLSL', `drawn as a plain lit surface (${m.type})`);
-        if (/gl_Position\.z\s*=\s*gl_Position\.w/.test(m.vertexShader || '')) flags |= DrawFlags.FAR_DEPTH;
+        if (colorStage) {
+          flags |= DrawFlags.UNLIT;
+        } else {
+          // Keep the existing color-map and palette fallbacks for other GLSL.
+          const fragment = m.fragmentShader || '';
+          const samplers = [...fragment.matchAll(/\b(?:texture2D|texture)\s*\(\s*([A-Za-z_]\w*)\s*,\s*vUv\s*\)/g)];
+          if (samplers.length === 1 && m.uniforms && m.uniforms[samplers[0][1]]?.value?.isTexture &&
+              /\bvarying\s+vec2\s+vUv\b/.test(fragment) &&
+              /\bvUv\s*=\s*uv\s*;/.test(m.vertexShader || '')) {
+            shaderMap = m.uniforms[samplers[0][1]].value;
+            if (!m.lights) flags |= DrawFlags.UNLIT;
+          }
+          const shaderColors = Object.entries(m.uniforms ?? {}).filter(([, u]) => u?.value?.isColor);
+          if (shaderColors.length) {
+            color = mixColors(_color, colorWeights(shaderColors, fragment));
+            if (!m.lights) flags |= DrawFlags.UNLIT;
+            unsupported('ShaderMaterial / custom GLSL', 'drawn in the colour of its colour uniforms');
+          } else if (!shaderMap) {
+            unsupported('ShaderMaterial / custom GLSL', `drawn as a plain lit surface (${m.type})`);
+          }
+          if (/gl_Position\.z\s*=\s*gl_Position\.w/.test(m.vertexShader || '')) flags |= DrawFlags.FAR_DEPTH;
+        }
         if (!/tonemapping_fragment/.test(m.fragmentShader || '')) flags |= DrawFlags.NO_TONE_MAP;
       }
       else if (m.isMeshMatcapMaterial) unsupported('MeshMatcapMaterial', 'drawn as lit colour');
@@ -730,6 +764,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const patch = this._patchInfo(m);
         if (patch.hide) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
         colorStage = patch.colorStage;
+        if (colorStage?.attributes.length) {
+          const geometry = this._geometryRecord(mesh.geometry, colorStage.attributes);
+          if (geometry) base = { ...base, record: geometry };
+          else colorStage = null;
+        }
         if (!colorStage && patch.colors) {
           color = mixColors(_color, patch.colors);
           flags &= ~(DrawFlags.VERTEX_COLORS | DrawFlags.INSTANCE_COLORS);
@@ -739,8 +778,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           flags |= DrawFlags.FRESNEL;
           reflection = patch.reflection;
         }
-        if (patch.alpha !== null && m.transparent) opacity = patch.alpha * (m.opacity ?? 1);
-        if (patch.alphaRamp && mesh.geometry) {
+        if (!colorStage && patch.alpha !== null && m.transparent) opacity = patch.alpha * (m.opacity ?? 1);
+        if (!colorStage && patch.alphaRamp && mesh.geometry) {
           const masked = this._maskedGeometryRecord(mesh.geometry, base.record, m, patch.alphaRamp, !!(m.vertexColors && !patch.colors && !patch.colorRamp), patch.colorRamp);
           if (masked) {
             base = { ...base, record: masked };
@@ -751,7 +790,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         }
       }
       if (m.clippingPlanes && m.clippingPlanes.length) unsupported('Clipping planes');
-      if (m.blending === THREE.AdditiveBlending) unsupported('AdditiveBlending', 'drawn with normal alpha blending');
+      if (m.blending !== undefined && m.blending === THREE.AdditiveBlending) {
+        flags |= DrawFlags.ADDITIVE | DrawFlags.TRANSPARENT;
+        if (m.premultipliedAlpha) flags |= DrawFlags.PREMULTIPLIED_ADDITIVE;
+      }
       // colour map
       let textureId = 0;
       const uvt = _uvIdentity;
@@ -782,6 +824,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
+        materialTextures: colorStage?.textures.map(({ uniform }) => {
+          const texture = uniform.value;
+          return { id: this._textureRecord(texture)?.id ?? 0, texture };
+        }),
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
       };
@@ -830,11 +876,26 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o + 46] = reflection?.power ?? 0;
     p[o + 47] = (reflection?.alphaGain ?? 0) * (d.reflectionMask ? -1 : 1);
     p[o + 48] = d.colorStage?.id ?? 0;
-    for (let i = 0; i < 4; i++) {
-      const value = d.colorStage?.uniforms[i]?.value;
+    for (let i = 0; i < 12; i++) {
+      const binding = d.colorStage?.uniforms[i];
+      const uniform = binding?.uniform.value;
+      const component = binding?.component;
+      const value = component && uniform?.isColor ? uniform['rgb'['xyz'.indexOf(component)]]
+        : component ? uniform?.[component] : uniform;
       p[o + 49 + i] = Number.isFinite(value) ? value : 0;
     }
-    p[o + 53] = p[o + 54] = p[o + 55] = 0;
+    let flip = 0, repeat = 0, mirror = 0;
+    for (let i = 0; i < 9; i++) {
+      const binding = d.materialTextures?.[i];
+      p[o + 61 + i] = binding?.id ?? 0;
+      const texture = binding?.texture;
+      if (!texture) continue;
+      if (texture.flipY) flip |= 1 << i;
+      if (texture.wrapS === THREE.RepeatWrapping || texture.wrapT === THREE.RepeatWrapping) repeat |= 1 << i;
+      else if (texture.wrapS === THREE.MirroredRepeatWrapping || texture.wrapT === THREE.MirroredRepeatWrapping) mirror |= 1 << i;
+    }
+    p[o + 70] = flip;
+    p[o + 71] = repeat | (mirror << 9);
   }
   // Weights for colour uniforms: mix(A, B, t) in the shader leans to A.
   function colorWeights(entries, glsl) {
@@ -881,45 +942,184 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     }
     return null;
   }
-  // Translate a pure colour stage with local position/normal, scalar uniforms
-  // and small math helpers. Everything outside this stage stays in native HLSL.
-  function translateColorStage(shader) {
-    const clean = (source) => source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
+  // Translate a bounded, procedural subset of Three.js materials. The native
+  // vertex shader still supplies transforms, while HLSL evaluates GLSL math
+  // with interpolated inputs and the current draw's uniforms and samplers.
+  function translateMaterialStage(shader, standalone = false) {
+    const clean = source => source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
     const fragment = clean(shader.fragmentShader);
     const vertex = clean(shader.vertexShader);
-    let helpers = fragment.match(/#include <common>([^#]*)#include/)?.[1].trim();
-    const body = fragment.match(/#include <color_fragment>([^#]*)#include/)?.[1].trim();
-    if (helpers === undefined || !body || !/\bdiffuseColor\.rgb\s*=(?!=)/.test(body) || body.length + helpers.length > 12000) return null;
-    const declarations = [], uniforms = [];
-    let supported = true;
-    helpers = helpers.replace(/\bvarying\s+vec3\s+(\w+)\s*;/g, (_, name) => {
-      const init = new RegExp(`\\b${name}\\s*=\\s*(position|normalize\\(\\s*objectNormal\\s*\\))\\s*;`).exec(vertex);
-      if (init) declarations.push(`float3 ${name} = ${init[1] === 'position' ? 'ntPosition' : 'ntNormal'};`);
-      else supported = false;
-      return '';
-    }).replace(/\buniform\s+float\s+(\w+)\s*;/g, (_, name) => {
-      if (uniforms.length >= 4 || !Number.isFinite(shader.uniforms[name]?.value)) supported = false;
-      else {
-        declarations.push(`float ${name} = gColorStage.${"xyzw"[uniforms.length]};`);
-        uniforms.push(shader.uniforms[name]);
+    if (standalone && Object.keys(shader.defines ?? {}).length) return null;
+    const uniforms = [], textures = [], attributes = new Map(), inputs = [];
+    let valid = true;
+    const channels = 'xyzw';
+    function components(expression, offset, size) {
+      return expression + '.' + channels.slice(offset, offset + size);
+    }
+    function declarations(source, stage) {
+      return source.replace(/\b(uniform|varying|attribute)\s+(float|vec[234]|sampler2D)\s+([A-Za-z_]\w*)\s*;/g, (_, storage, type, name) => {
+        const width = type === 'float' ? 1 : Number(type.at(-1));
+        if (storage === 'uniform' && !inputs.some(input => input.name === name)) {
+          // Reflected sky color is already packed by the native Fresnel stage.
+          if (stage === 'fragment' && !new RegExp('\\b' + name + '\\b').test([source.replace(_ , ''), body, normal, roughness, alpha].join('\n'))) return '';
+          const uniform = shader.uniforms[name];
+          if (!uniform) valid = false;
+          else if (type === 'sampler2D') {
+            if (textures.length >= 9 || !uniform.value?.isTexture) valid = false;
+            else textures.push({ name, uniform });
+          } else if (uniforms.length + width <= 12) {
+            const expressions = [];
+            for (let i = 0; i < width; i++) {
+              const index = uniforms.length;
+              expressions.push(components('gColorStage[' + Math.floor(index / 4) + ']', index % 4, 1));
+              uniforms.push({ uniform, component: width === 1 ? null : channels[i] });
+            }
+            inputs.push({ name, type, expression: width === 1 ? expressions[0] : type + '(' + expressions.join(', ') + ')' });
+          } else valid = false;
+        }
+        if (storage === 'attribute' && stage === 'vertex') attributes.set(name, { name, width });
+        return '';
+      });
+    }
+    let helpers, body, normal = '', roughness = '', alpha = '';
+    if (standalone) {
+      if (shader.isRawShaderMaterial || shader.lights || shader.glslVersion) return null;
+      const program = fragment.replace(/#include\s+<colorspace_fragment>/g, '');
+      const main = program.match(/^([\s\S]*?)\bvoid\s+main\s*\(\s*\)\s*\{([\s\S]*)\}\s*$/);
+      if (!main || !/\bgl_FragColor\s*=/.test(main[2])) return null;
+      // Keep the direct single-map case on the stock texture path.
+      if (/^\s*gl_FragColor\s*=\s*texture2D\(\s*\w+\s*,\s*vUv\s*\)\s*;\s*$/.test(main[2])) return null;
+      helpers = main[1];
+      body = main[2].replace(/\bgl_FragColor\b/g, 'diffuseColor');
+    } else {
+      helpers = fragment.match(/#include <common>([^#]*)#include/)?.[1];
+      body = fragment.match(/#include <color_fragment>([^#]*)#include/)?.[1];
+      if (!helpers || !body || !/\bdiffuseColor\.rgb\s*=/.test(body)) return null;
+      // Three.js also permits declarations before the first chunk.
+      helpers = (fragment.match(/^[^#]*/)?.[0].match(/\buniform\s+(?:float|vec[234]|sampler2D)\s+\w+\s*;/g) ?? []).join('\n') + '\n' + helpers;
+      normal = fragment.match(/#include <normal_fragment_maps>([^#]*)#include/)?.[1].trim() ?? '';
+      roughness = fragment.match(/#include <roughnessmap_fragment>([^#]*)#include/)?.[1].trim() ?? '';
+      // Alpha fades immediately before opaque_fragment belong after reflection.
+      alpha = fragment.match(/((?:float\s+\w+\s*=\s*smoothstep\([^;]+\);\s*)if\s*\([^;]+\)\s*discard\s*;\s*diffuseColor\.a\s*\*=\s*\w+\s*;)\s*#include <opaque_fragment>/)?.[1] ?? '';
+      alpha = alpha.replace(/diffuseColor\.a\s*\*=/g, 'alphaMask *=');
+    }
+
+    const vertexHead = standalone ? '' : (vertex.match(/#include <common>([^#]*)#include/)?.[1] ?? '');
+    declarations(vertexHead, 'vertex');
+    const varyingPattern = /\bvarying\s+(float|vec[234])\s+([A-Za-z_]\w*)\s*;/g;
+    const varyings = [...helpers.matchAll(varyingPattern)];
+    helpers = declarations(helpers, 'fragment');
+    const vertexBody = standalone ? vertex : (vertex.match(/#include <begin_vertex>([^#]*)#include/)?.[1] ?? '');
+    const assignments = [];
+    const uses = new Map();
+    for (const [, type, name] of varyings) {
+      const expression = new RegExp('\\b' + name + '\\s*=\\s*([^;]+);').exec(vertexBody)?.[1];
+      if (!expression) return null;
+      if (standalone) {
+        if (type === 'vec2' && expression.trim() === 'uv') assignments.push(type + ' ' + name + ' = i.rawUv;');
+        else if (type === 'float' && /^fract\s*\(\s*\w+\[3\]\.x\s*\*\s*[\d.]+\s*\+\s*\w+\[3\]\.z\s*\*\s*[\d.]+\s*\)$/.test(expression.trim())) {
+          const matrix = expression.match(/\b(\w+)\[3\]/)[1];
+          if (!new RegExp('\\bmat4\\s+' + matrix + '\\s*=\\s*modelMatrix\\s*;').test(vertex)) return null;
+          assignments.push(type + ' ' + name + ' = ' + expression.replace(new RegExp('\\b' + matrix + '\\[3\\]', 'g'), 'i.origin') + ';');
+        } else return null;
+      } else {
+        assignments.push(type + ' ' + name + ' = ' + expression + ';');
+        for (const [attr, spec] of attributes) {
+          if (new RegExp('\\b' + attr + '\\b').test(expression)) uses.set(attr, spec);
+        }
       }
-      return '';
-    }).trim();
-    if (!supported || !declarations.length) return null;
-    const type = '(?:float|vec[234])';
-    const functions = new RegExp(`\\b${type}\\s+([A-Za-z_]\\w*)\\s*\\([^()]*\\)\\s*\\{[^{}]*\\}`, 'g');
-    const names = [...helpers.matchAll(functions)].map((m) => m[1]);
-    if (helpers.replace(functions, '').trim()) return null;
-    const text = helpers + '\n' + body;
-    if (/[^\w\s.,;(){}+*/%<>!=?:&|\-]/.test(text) || /[{}]/.test(body) ||
-        /\b(?:for|while|do|if|switch|discard|register|static|uniform|varying|layout)\b/.test(text) ||
-        /\breturn\b/.test(body) || /\bdiffuseColor\s*\.(?!rgb\b)[A-Za-z_]/.test(body)) return null;
+    }
+    if (standalone) {
+      const vertexMain = vertex.replace(/\bvarying\s+(?:float|vec[234])\s+\w+\s*;/g, '')
+        .replace(/^\s*#ifdef\s+USE_INSTANCING\s*\n\s*(\w+)\s*=\s*modelMatrix\s*\*\s*instanceMatrix\s*;\s*\n\s*#endif\s*$/gm, '');
+      const clip = /\bgl_Position\s*=\s*projectionMatrix\s*\*\s*(?:viewMatrix\s*\*\s*(?:\w+|modelMatrix\s*\*\s*vec4\s*\(\s*position\s*,\s*1(?:\.0)?\s*\))|modelViewMatrix\s*\*\s*vec4\s*\(\s*position\s*,\s*1(?:\.0)?\s*\))\s*;/;
+      const world = /\bvec4\s+\w+\s*=\s*(?:modelMatrix|\w+)\s*\*\s*vec4\s*\(\s*position\s*,\s*1(?:\.0)?\s*\)\s*;/g;
+      let remainder = vertexMain.replace(clip, '').replace(world, '').replace(/\bmat4\s+\w+\s*=\s*modelMatrix\s*;/g, '');
+      for (const [, , name] of varyings) remainder = remainder.replace(new RegExp('\\b' + name + '\\s*=\\s*[^;]+;'), '');
+      if (!clip.test(vertexMain) || !/^\s*void\s+main\s*\(\s*\)\s*\{\s*\}\s*$/.test(remainder)) return null;
+    }
+
+    let cursor = 0;
+    for (const { name, width } of uses.values()) {
+      const type = width === 1 ? 'float' : 'vec' + width;
+      inputs.push({ name, type, expression: components('i.attributes', cursor, width) });
+      cursor += width;
+    }
+    if (!valid || cursor > 4) return null;
+
+    // Match top-level mutable scalar/vector temporaries and move them into
+    // this invocation. HLSL global variables are read-only at runtime.
+    const locals = [];
+    let depth = 0;
+    helpers = helpers.replace(/[{}]|(?:float|vec[234])\s+\w+\s*=\s*[^;{}]+;/g, code => {
+      if (code === '{') depth++;
+      else if (code === '}') depth--;
+      else if (depth === 0) {
+        locals.push(code);
+        return '';
+      }
+      return code;
+    });
+    if (normal && !/^\{[\s\S]*\}$|^normal\s*=/.test(normal)) return null;
+    if (roughness && !/^roughnessFactor\s*=/.test(roughness)) return null;
+    const reflectionScale = /outgoingLight\s*=\s*mix\s*\(\s*outgoingLight\s*,\s*\w+\s*\*\s*\(([^;()]+)\)\s*,/.exec(fragment)?.[1];
+    const functions = [...helpers.matchAll(/\b(?:float|vec[234])\s+([A-Za-z_]\w*)\s*\([^()]*\)\s*\{/g)].map(match => match[1]);
+    const code = [helpers, body, normal, roughness, alpha, ...locals, ...assignments, reflectionScale || ''].join('\n');
+    if (code.length > 18000 || /[^\w\s.,;(){}+*/%<>!=?:&|\-\[\]]/.test(code) ||
+        /\b(?:for|while|do|switch|register|static|uniform|varying|layout|texture|samplerCube|cbuffer)\b/.test(code)) return null;
     const calls = new Set(['vec2', 'vec3', 'vec4', 'float', 'abs', 'min', 'max', 'clamp', 'mix', 'smoothstep',
-      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp', ...names]);
-    for (const [, name] of text.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name) && name !== 'return') return null;
-    const hlsl = (source) => source.replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\(/g, 'lerp(').replace(/\bfract\(/g, 'frac(');
-    return { source: `${hlsl(helpers)}\nfloat3 nativeColorStage(float3 ntPosition, float3 ntNormal, float4 diffuseColor) {\n${declarations.join('\n')}\n${hlsl(body)}\nreturn diffuseColor.rgb;\n}`, uniforms };
+      'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp',
+      'fwidth', 'cross', 'sign', 'texture2D', 'if', 'return', ...functions]);
+    for (const [, name] of code.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name)) return null;
+
+    // GLSL carries a combined texture/sampler through helper parameters.
+    // Pass its uniform slot through the HLSL helper and select the sampler
+    // from that draw's wrapping and orientation flags.
+    const sample = textures.length ? materialTextureSource(textures.length) : '';
+    const translate = source => {
+      let result = source.replace(/\bsampler2D\b/g, 'int').replace(/\btexture2D\s*\(/g, 'ntMaterialSample(')
+        .replace(/\bvec2\s*\(\s*0\.0\s*\)/g, 'float2(0.0, 0.0)')
+        .replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\s*\(/g, 'lerp(').replace(/\bfract\s*\(/g, 'frac(')
+        .replace(/\bposition\b/g, 'ntPosition').replace(/\bobjectNormal\b/g, 'ntNormal')
+        .replace(/\(\s*viewMatrix\s*\*\s*float4\(([^;]+?),\s*0\.0\)\s*\)\.xyz/g, 'mul((float3x3)gView, float3($1))');
+      textures.forEach(({ name }, slot) => { result = result.replace(new RegExp('\\b' + name + '\\b', 'g'), String(slot)); });
+      return result;
+    };
+    const globals = [
+      ...inputs.filter(input => new RegExp('\\b' + input.name + '\\b').test(helpers)),
+      ...varyings.filter(([, , name]) => new RegExp('\\b' + name + '\\b').test(helpers)).map(([, type, name]) => ({ type, name })),
+    ];
+    const globalNames = new Set(globals.map(input => input.name));
+    const init = (type, name, expression) => (globalNames.has(name) ? '' : type + ' ') + name + ' = ' + expression + ';';
+    const varyingInit = assignments.map(line => line.replace(/^(\w+) (\w+) = (.*);$/, (_, type, name, expression) => init(type, name, expression)));
+    const source = sample + translate(globals.map(({ type, name }) => 'static ' + type + ' ' + name + ';').join('\n') + '\n' + helpers) + '\n' +
+      'void nativeColorStage(VSOut i, inout float4 diffuseColor, inout float3 ntWorldNormal, inout float roughnessFactor, inout float skyScale, inout float alphaMask) {\n' +
+      'float3 ntPosition = i.localPosition, ntNormal = i.localNormal;\n' +
+      'float3 vViewPosition = -mul(gView, float4(i.world, 1.0)).xyz;\n' +
+      inputs.map(({ type, name, expression }) => translate(init(type, name, expression))).join('\n') + '\n' +
+      translate(varyingInit.join('\n') + '\n' + locals.join('\n') + '\n' + body + '\n' + roughness + '\n' + alpha) + '\n' +
+      (reflectionScale ? 'skyScale = ' + translate(reflectionScale) + ';\n' : '') +
+      (normal ? 'float3 normal = normalize(mul((float3x3)gView, ntWorldNormal));\n' +
+        translate(normal) + '\nntWorldNormal = normalize(mul(transpose((float3x3)gView), normal));\n' : '') +
+      '}';
+    return { source, uniforms, textures, attributes: [...uses.values()] };
   }
+
+  function materialTextureSource(count) {
+    const samples = [];
+    for (let slot = 0; slot < count; slot++) {
+      const texture = 'gMaterialMap' + slot;
+      samples.push('if (slot == ' + slot + ') { ' +
+        'if (((uint)gMaterialOptions.y & bit) != 0) return ' + texture + '.SampleGrad(gRepeat, uv, dx, dy); ' +
+        'if (((uint)gMaterialOptions.z & bit) != 0) return ' + texture + '.SampleGrad(gMirror, uv, dx, dy); ' +
+        'return ' + texture + '.SampleGrad(gClamp, uv, dx, dy); }');
+    }
+    return 'float4 ntMaterialSample(int slot, float2 uv) {\n' +
+      'uint bit = 1u << slot;\nif (((uint)gMaterialOptions.x & bit) != 0) uv.y = 1.0 - uv.y;\n' +
+      'float2 dx = ddx(uv), dy = ddy(uv);\n' + samples.join('\n') +
+      '\nreturn float4(1.0, 1.0, 1.0, 1.0);\n}\n';
+  }
+
 
   // Only replace albedo when the fragment actually assigns a palette to it.
   // A uniform used elsewhere (e.g. in sky reflection) must not tint the base.

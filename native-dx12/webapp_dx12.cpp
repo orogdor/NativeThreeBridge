@@ -51,20 +51,21 @@ using native_three::WebappHost;
 namespace {
 
 constexpr UINT kFrameCount = 2;
-constexpr UINT kVertexFloats = 12;                    // position, normal, colour rgba, uv
+constexpr UINT kVertexFloats = 16;                    // position, normal, colour rgba, uv, shader attributes
 constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
 constexpr UINT kFrameCBBytes = 1280;                 // see cbuffer Frame
 constexpr UINT kDrawCBBytes = 256;
+constexpr UINT kMaterialMapCount = 9;
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
-               F_MIRRORED = 524288;  // negative-determinant world matrix: reversed winding
+               F_MIRRORED = 524288, F_ADDITIVE = 1048576, F_PREMULTIPLIED_ADDITIVE = 2097152;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
-// Pipeline cache: 6 state bits per colour patch (0 = stock shader, 1..16 patches).
-constexpr UINT kMaxColorPatches = 16;
-constexpr UINT kPipelineSlots = (kMaxColorPatches + 1) << 6;
+// Pipeline cache: 8 state bits per material shader (0 = stock shader).
+constexpr UINT kMaxColorPatches = 32;
+constexpr UINT kPipelineSlots = (kMaxColorPatches + 1) << 8;
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -183,13 +184,14 @@ std::vector<std::vector<std::uint8_t>> buildMips(std::vector<std::uint8_t> base,
 // Writes position, normal, colour rgba and uv of every vertex straight into
 // `o` (a mapped upload buffer: written front to back, never read).
 void interleaveVertices(float* o, const float* p, const float* n, const float* c, const float* uv,
-                        std::uint32_t vertexCount, std::uint32_t cc) {
+                        std::uint32_t vertexCount, std::uint32_t cc, const float* shaderAttributes) {
     for (std::uint32_t v = 0; v < vertexCount; v++, o += kVertexFloats) {
         o[0] = p[v * 3]; o[1] = p[v * 3 + 1]; o[2] = p[v * 3 + 2];
         o[3] = n ? n[v * 3] : 0; o[4] = n ? n[v * 3 + 1] : 1; o[5] = n ? n[v * 3 + 2] : 0;
         o[6] = c ? c[v * cc] : 1; o[7] = c ? c[v * cc + 1] : 1; o[8] = c ? c[v * cc + 2] : 1;
         o[9] = c && cc == 4 ? c[v * 4 + 3] : 1;
         o[10] = uv ? uv[v * 2] : 0; o[11] = uv ? uv[v * 2 + 1] : 0;
+        for (unsigned i = 0; i < 4; i++) o[12 + i] = shaderAttributes ? shaderAttributes[v * 4 + i] : 0;
     }
 }
 
@@ -204,7 +206,7 @@ public:
     // ---- WebappRenderSink
     void uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                         std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
-                        std::uint32_t colorChannels, bool gpuLocal) override;
+                        std::uint32_t colorChannels, bool gpuLocal, const float* shaderAttributes) override;
     void releaseGeometry(std::uint32_t id) override;
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
@@ -305,7 +307,7 @@ private:
     void waitForGpu();
     ComPtr<ID3D12Resource> uploadBuffer(const void* data, UINT64 bytes);
     ComPtr<ID3D12Resource> interleavedUpload(const float* p, const float* n, const float* c, const float* uv,
-                                             std::uint32_t vertexCount, std::uint32_t colorChannels);
+                                          std::uint32_t vertexCount, std::uint32_t colorChannels, const float* shaderAttributes);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
@@ -584,21 +586,24 @@ void WebappWindow::initDevice() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
-    // t0 = colour map; s0 repeat, s1 clamp, s2 mirrored repeat.
-    D3D12_ROOT_PARAMETER params[3]{};
+    // t0 = colour map, t1..t9 = material maps.
+    D3D12_ROOT_PARAMETER params[3 + kMaterialMapCount]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
         params[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     }
-    D3D12_DESCRIPTOR_RANGE texRange{};
-    texRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    texRange.NumDescriptors = 1;
-    texRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &texRange;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_DESCRIPTOR_RANGE texRanges[1 + kMaterialMapCount]{};
+    for (UINT i = 0; i <= kMaterialMapCount; i++) {
+        auto& range = texRanges[i];
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 1;
+        range.BaseShaderRegister = i;
+        auto& param = params[2 + i];
+        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        param.DescriptorTable = {1, &range};
+        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
     D3D12_STATIC_SAMPLER_DESC samplers[3]{};
     const D3D12_TEXTURE_ADDRESS_MODE modes[3] = {D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                   D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
@@ -611,7 +616,7 @@ void WebappWindow::initDevice() {
         samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     }
     D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
+    rs.NumParameters = UINT(std::size(params));
     rs.pParameters = params;
     rs.NumStaticSamplers = 3;
     rs.pStaticSamplers = samplers;
@@ -1195,13 +1200,13 @@ void WebappWindow::collectRetired() {
 // Upload buffer holding the interleaved vertices: written straight into
 // mapped GPU-visible memory, without a temporary CPU copy.
 ComPtr<ID3D12Resource> WebappWindow::interleavedUpload(const float* p, const float* n, const float* c, const float* uv,
-                                                       std::uint32_t vertexCount, std::uint32_t colorChannels) {
+                                                       std::uint32_t vertexCount, std::uint32_t colorChannels, const float* shaderAttributes) {
     ComPtr<ID3D12Resource> buffer = uploadBuffer(nullptr, UINT64(vertexCount) * kVertexStride);
     if (vertexCount) {
         void* mapped = nullptr;
         D3D12_RANGE none{0, 0};
         check(buffer->Map(0, &none, &mapped), "Map vertex upload buffer");
-        interleaveVertices(static_cast<float*>(mapped), p, n, c, uv, vertexCount, colorChannels);
+        interleaveVertices(static_cast<float*>(mapped), p, n, c, uv, vertexCount, colorChannels, shaderAttributes);
         buffer->Unmap(0, nullptr);
     }
     return buffer;
@@ -1209,10 +1214,10 @@ ComPtr<ID3D12Resource> WebappWindow::interleavedUpload(const float* p, const flo
 
 void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float* n, const float* c,
                                   std::uint32_t vertexCount, const std::uint32_t* idx, std::uint32_t indexCount, const float* uv,
-                                  std::uint32_t colorChannels, bool gpuLocal) {
+                                  std::uint32_t colorChannels, bool gpuLocal, const float* shaderAttributes) {
     // Filled before the lock: the DX12 worker is never held up by the copy.
     const UINT64 vertexBytes = UINT64(vertexCount) * kVertexStride;
-    ComPtr<ID3D12Resource> vertexUpload = interleavedUpload(p, n, c, uv, vertexCount, colorChannels == 4 ? 4 : 3);
+    ComPtr<ID3D12Resource> vertexUpload = interleavedUpload(p, n, c, uv, vertexCount, colorChannels == 4 ? 4 : 3, shaderAttributes);
     const bool indexed = idx && indexCount;
     const UINT64 indexBytes = indexed ? UINT64(indexCount) * sizeof(std::uint32_t) : 0;
     ComPtr<ID3D12Resource> indexUpload = indexed ? uploadBuffer(idx, indexBytes) : nullptr;
@@ -1297,9 +1302,9 @@ void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float
 
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
-    if (!id || id > 16 || source.size() > 16000 || colorPatches_.count(id)) return false;
-    if (source.find_first_of("#[]\\\"'") != std::string::npos) return false;
-    static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|discard|clip)\b)");
+    if (!id || id > kMaxColorPatches || source.size() > 24000 || colorPatches_.count(id)) return false;
+    if (source.find_first_of("#\\\"'") != std::string::npos) return false;
+    static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|clip)\b)");
     if (std::regex_search(source, control)) return false;
     std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
     const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
@@ -1313,7 +1318,7 @@ bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& sourc
         return false;
     }
     colorPatches_.emplace(id, std::move(code));
-    log("info", "[material-color] compiled GLSL color stage " + std::to_string(id));
+    log("info", "[material-color] compiled GLSL material stage " + std::to_string(id));
     return true;
 }
 
@@ -1324,14 +1329,15 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     // side that faces the camera is the other one (Three.js flips frontFace).
     if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
     const UINT state = (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
-                       ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u);
+                       ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
+                       ((flags & F_ADDITIVE) ? 64u : 0u) | ((flags & F_PREMULTIPLIED_ADDITIVE) ? 128u : 0u);
     // Hot path (once per draw): pipelines that exist are found with one array read.
     if (patchId <= kMaxColorPatches) {
-        if (ID3D12PipelineState* ready = pipelineTable_[(patchId << 6) | state]) return ready;
+        if (ID3D12PipelineState* ready = pipelineTable_[(patchId << 8) | state]) return ready;
     }
     const auto patch = colorPatches_.find(patchId);
     if (patch == colorPatches_.end()) patchId = 0;
-    const UINT key = (patchId << 6) | state;
+    const UINT key = (patchId << 8) | state;
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) return found->second.Get();
 
@@ -1340,6 +1346,7 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"IROW", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
         {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
@@ -1359,7 +1366,15 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.RasterizerState.DepthClipEnable = TRUE;
     auto& rt = d.BlendState.RenderTarget[0];
     rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    if (flags & F_TRANSPARENT) {
+    if (flags & F_ADDITIVE) {
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = (flags & F_PREMULTIPLIED_ADDITIVE) ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+        rt.DestBlend = D3D12_BLEND_ONE;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_ONE;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    } else if (flags & F_TRANSPARENT) {
         rt.BlendEnable = TRUE;
         rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
         rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -1644,10 +1659,11 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     const Geometry* cachedGeometry = nullptr;
     D3D12_GPU_DESCRIPTOR_HANDLE cachedTexture = whiteTexture;
     bool cachedTextureValid = false;
+    std::array<D3D12_GPU_DESCRIPTOR_HANDLE, kMaterialMapCount> boundMaterialMaps{};
     UINT cachedPipelineFlags = 0, cachedPipelinePatch = 0;
     ID3D12PipelineState* cachedPipeline = nullptr;
     const UINT kPipelineFlagBits = F_TRANSPARENT | F_DOUBLE | F_BACK | F_NO_DEPTH_WRITE | F_NO_DEPTH_TEST |
-                                   F_LINES | F_LINE_STRIP | F_MIRRORED;
+                                   F_LINES | F_LINE_STRIP | F_MIRRORED | F_ADDITIVE | F_PREMULTIPLIED_ADDITIVE;
     D3D12_GPU_VIRTUAL_ADDRESS boundVertices = 0, boundInstances = 0, boundIndices = 0;
     UINT boundInstanceBytes = 0;
     ID3D12PipelineState* current = nullptr;
@@ -1753,7 +1769,10 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             dcb[28] = d[34]; dcb[29] = d[36]; dcb[30] = d[38]; dcb[31] = d[33];
             dcb[32] = d[35]; dcb[33] = d[37]; dcb[34] = d[39]; dcb[35] = 0;
             std::memcpy(dcb + 36, d + 40, 8 * sizeof(float)); // sky reflection and view-angle parameters
-            std::memcpy(dcb + 44, d + 49, 4 * sizeof(float)); // translated color stage uniforms
+            std::memcpy(dcb + 44, d + 49, 12 * sizeof(float)); // translated material uniforms
+            dcb[56] = d[70];
+            dcb[57] = float(std::uint32_t(d[71]) & 511u);
+            dcb[58] = float(std::uint32_t(d[71]) >> 9);
             cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
             ringOffset += kDrawCBBytes;
             D3D12_GPU_DESCRIPTOR_HANDLE tex = whiteTexture;
@@ -1767,6 +1786,14 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
                 tex = cachedTexture;
             }
             if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
+            if (patchId) {
+                for (UINT slot = 0; slot < kMaterialMapCount; slot++) {
+                    const auto map = textureHandle(std::uint32_t(d[61 + slot]));
+                    if (map.ptr == boundMaterialMaps[slot].ptr) continue;
+                    cmd_->SetGraphicsRootDescriptorTable(3 + slot, map);
+                    boundMaterialMaps[slot] = map;
+                }
+            }
 
             if (geometry.vbv.BufferLocation != boundVertices || instanceAddress != boundInstances ||
                 instanceBytes != boundInstanceBytes) {
