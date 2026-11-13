@@ -382,18 +382,22 @@
       if (i < 0) this.childNodes.push(child); else this.childNodes.splice(i, 0, child);
       child.parentNode = this;
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
+      if (child.nodeType === 1 && this.isConnected) idEpoch++;
       uiNotify('tree', this, child);
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
-      if (i >= 0) { this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this, child); }
+      if (i >= 0) {
+        if (child.nodeType === 1 && this.isConnected) idEpoch++;
+        this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this, child);
+      }
       return child;
     }
     replaceChild(newChild, oldChild) { this.insertBefore(newChild, oldChild); return this.removeChild(oldChild); }
     contains(node) { for (let n = node; n; n = n.parentNode) if (n === this) return true; return false; }
     get textContent() { return this.childNodes.map((c) => c.textContent).join(''); }
-    set textContent(v) { const hadElements = this.childNodes.some((c) => c.nodeType === 1); for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; uiNotify('tree', this, hadElements ? null : undefined); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
+    set textContent(v) { const hadElements = this.childNodes.some((c) => c.nodeType === 1); if (hadElements && this.isConnected) idEpoch++; for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; uiNotify('tree', this, hadElements ? null : undefined); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
     cloneNode(deep) {
       const copy = this._shallowClone();
       if (deep) for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
@@ -559,24 +563,35 @@
   class DocumentFragment extends Node {
     constructor() { super(11, '#document-fragment'); }
     _shallowClone() { return new DocumentFragment(); }
-    querySelector(s) { return querySelectorAll(this, s)[0] || null; }
+    querySelector(s) { return queryFirst(this, s); }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     get children() { return this.childNodes.filter((c) => c.nodeType === 1); }
     append(...n) { for (const c of n) this.appendChild(typeof c === 'string' ? new Text(c) : c); }
   }
 
+  const NO_TOKENS = Object.freeze([]);
   class DOMTokenList {
-    constructor(el) { this._el = el; }
-    _get() { return (this._el.getAttribute('class') || '').split(/\s+/).filter(Boolean); }
-    _set(list) { this._el.setAttribute('class', list.join(' ')); }
-    get length() { return this._get().length; }
-    item(i) { return this._get()[i] ?? null; }
-    contains(c) { return this._get().includes(c); }
+    constructor(el) { this._el = el; this._src = ''; this._list = NO_TOKENS; }
+    // Tokens of the current class attribute; split once per attribute value.
+    // The returned array is shared: callers that change it take _get().
+    _read() {
+      const s = this._el._attrs.get('class');
+      if (!s) return NO_TOKENS;
+      if (s !== this._src) { this._src = s; this._list = s.split(/\s+/).filter(Boolean); }
+      return this._list;
+    }
+    _get() { return this._read().slice(); }
+    // Writing the value the attribute already has would only make the UI
+    // layer restyle the subtree for nothing (games call add/remove every frame).
+    _set(list) { const v = list.join(' '); if (this._el._attrs.get('class') !== v) this._el.setAttribute('class', v); }
+    get length() { return this._read().length; }
+    item(i) { return this._read()[i] ?? null; }
+    contains(c) { return this._read().includes(c); }
     add(...c) { const l = this._get(); for (const x of c) if (!l.includes(x)) l.push(x); this._set(l); }
-    remove(...c) { this._set(this._get().filter((x) => !c.includes(x))); }
+    remove(...c) { this._set(this._read().filter((x) => !c.includes(x))); }
     toggle(c, force) { const has = this.contains(c); const want = force === undefined ? !has : !!force; if (want && !has) this.add(c); if (!want && has) this.remove(c); return want; }
-    replace(a, b) { if (!this.contains(a)) return false; this._set(this._get().map((x) => (x === a ? b : x))); return true; }
-    toString() { return this._get().join(' '); }
+    replace(a, b) { if (!this.contains(a)) return false; this._set(this._read().map((x) => (x === a ? b : x))); return true; }
+    toString() { return this._read().join(' '); }
     forEach(fn, self) { this._get().forEach(fn, self); }
     [Symbol.iterator]() { return this._get()[Symbol.iterator](); }
   }
@@ -638,6 +653,18 @@
     return out;
   }
 
+  // Lower-cased attribute names (a handful of distinct strings, asked for constantly).
+  const lowerNames = new Map();
+  function attrName(n) {
+    if (typeof n !== 'string') n = String(n);
+    let l = lowerNames.get(n);
+    if (l === undefined) {
+      l = n.toLowerCase();
+      if (lowerNames.size > 4000) lowerNames.clear();
+      lowerNames.set(n, l);
+    }
+    return l;
+  }
   class Element extends Node {
     constructor(tagName, namespaceURI = 'http://www.w3.org/1999/xhtml') {
       const lower = String(tagName).toLowerCase();
@@ -653,20 +680,32 @@
     get className() { return this.getAttribute('class') || ''; }
     set className(v) { this.setAttribute('class', v); }
     get attributes() { return [...this._attrs].map(([name, value]) => ({ name, value })); }
-    getAttribute(n) { n = String(n).toLowerCase(); return this._attrs.has(n) ? this._attrs.get(n) : null; }
+    // Names are stored lower-case and values are always strings, so a direct
+    // hit needs no normalising; only a miss looks at the lower-cased name.
+    getAttribute(n) {
+      if (typeof n !== 'string') n = String(n);
+      let v = this._attrs.get(n);
+      if (v !== undefined) return v;
+      const l = attrName(n);
+      if (l === n) return null;
+      v = this._attrs.get(l);
+      return v === undefined ? null : v;
+    }
     setAttribute(n, v) {
-      n = String(n).toLowerCase(); v = String(v); this._attrs.set(n, v);
+      n = attrName(n); v = String(v); this._attrs.set(n, v);
+      if (n === 'id') idEpoch++;
       if (n.startsWith('data-')) this.dataset[n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
       if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
       uiNotify('attr', this, n);
     }
     _attributeChanged() {}
-    hasAttribute(n) { return this._attrs.has(String(n).toLowerCase()); }
+    hasAttribute(n) { return this._attrs.has(n) || this._attrs.has(attrName(n)); }
     removeAttribute(n) {
-      n = String(n).toLowerCase();
+      n = attrName(n);
       if (!this._attrs.has(n)) return;
       this._attrs.delete(n);
+      if (n === 'id') idEpoch++;
       if (n === 'style') this.style._setSilently('');
       uiNotify('attr', this, n);
     }
@@ -703,11 +742,11 @@
       }
       return el;
     }
-    querySelector(s) { return querySelectorAll(this, s)[0] || null; }
+    querySelector(s) { return queryFirst(this, s); }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
     getElementsByClassName(c) { return querySelectorAll(this, c.split(/\s+/).filter(Boolean).map((x) => '.' + x).join('')); }
-    matches(s) { return parseSelectorGroups(s).some((g) => matchComplex(this, g)); }
+    matches(s) { return matchesAny(this, selectorGroups(s)); }
     closest(s) { for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (n.matches(s)) return n; return null; }
     _fullView() { return this.localName === 'canvas' || this.localName === 'body' || this.localName === 'html'; }
     // Real layout boxes from the UI layer; full-window fallback without it.
@@ -1437,8 +1476,22 @@
     createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
     createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     createEvent() { return new Event(''); }
-    getElementById(id) { return findFirst(this, (e) => e.getAttribute('id') === id); }
-    querySelector(s) { return querySelectorAll(this, s)[0] || null; }
+    // The page's document answers from an id table. The table is rebuilt
+    // only on the second lookup after elements or ids changed (the first one
+    // searches like before), so code that alternates DOM changes and single
+    // lookups never pays for a rebuild it does not use.
+    getElementById(id) {
+      if (this !== document || typeof id !== 'string') return findFirst(this, (e) => e.getAttribute('id') === id);
+      if (idMapEpoch !== idEpoch) {
+        if (idSeenEpoch !== idEpoch) { idSeenEpoch = idEpoch; return findById(this, id); }
+        idMap = new Map();
+        indexIds(this, idMap);
+        idMapEpoch = idEpoch;
+      }
+      const e = idMap.get(id);
+      return e === undefined ? null : e;
+    }
+    querySelector(s) { return queryFirst(this, s); }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
     getElementsByClassName(c) { return querySelectorAll(this, c.split(/\s+/).filter(Boolean).map((x) => '.' + x).join('')); }
@@ -1450,6 +1503,30 @@
     elementsFromPoint(x, y) { const e = this.elementFromPoint(x, y); const out = []; for (let n = e; n && n.nodeType === 1; n = n.parentNode) out.push(n); return out; }
     execCommand() { return false; }
     _shallowClone() { return new Document(); }
+  }
+  // Bumped whenever the connected tree gains/loses elements or an id changes.
+  let idEpoch = 0, idMapEpoch = -1, idSeenEpoch = -1, idMap = null;
+  function findById(root, id) {
+    const kids = root.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.nodeType !== 1) continue;
+      if (c._attrs.get('id') === id) return c;
+      const hit = findById(c, id);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  // Document order; the first element with an id wins, like a search would find it.
+  function indexIds(root, map) {
+    const kids = root.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.nodeType !== 1) continue;
+      const id = c._attrs.get('id');
+      if (id !== undefined && !map.has(id)) map.set(id, c);
+      indexIds(c, map);
+    }
   }
   function findFirst(root, pred) {
     for (const c of root.childNodes) {
@@ -1491,8 +1568,11 @@
   function matchCompound(el, c) {
     if (el.nodeType !== 1) return false;
     if (c.tag && el.localName !== c.tag) return false;
-    if (c.id && el.getAttribute('id') !== c.id) return false;
-    for (const cls of c.classes) if (!el.classList.contains(cls)) return false;
+    if (c.id && el._attrs.get('id') !== c.id) return false;
+    if (c.classes.length) {
+      const have = el.classList._read();
+      for (let i = 0; i < c.classes.length; i++) if (!have.includes(c.classes[i])) return false;
+    }
     for (const a of c.attrs) {
       const v = el.getAttribute(a.name);
       if (v === null) return false;
@@ -1521,17 +1601,57 @@
     for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) if (matchComplex(p, parts, index - 1)) return true;
     return false;
   }
+  // Parsed selectors are kept: games query with the same few strings every frame.
+  const selectorGroupCache = new Map();
+  function selectorGroups(selector) {
+    const key = typeof selector === 'string' ? selector : String(selector);
+    let g = selectorGroupCache.get(key);
+    if (g === undefined) {
+      g = parseSelectorGroups(key);
+      if (selectorGroupCache.size > 2000) selectorGroupCache.clear();
+      selectorGroupCache.set(key, g);
+    }
+    return g;
+  }
+  function matchesAny(el, groups) {
+    for (let i = 0; i < groups.length; i++) if (matchComplex(el, groups[i])) return true;
+    return false;
+  }
+  function collectMatching(node, groups, out) {
+    const kids = node.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.nodeType !== 1) continue;
+      if (matchesAny(c, groups)) out.push(c);
+      collectMatching(c, groups, out);
+    }
+  }
   function querySelectorAll(root, selector) {
-    const groups = parseSelectorGroups(selector), out = [];
-    (function walk(node) {
-      for (const c of node.childNodes) {
-        if (c.nodeType !== 1) continue;
-        if (groups.some((g) => matchComplex(c, g))) out.push(c);
-        walk(c);
-      }
-    })(root);
+    const out = [];
+    collectMatching(root, selectorGroups(selector), out);
     out.item = (i) => out[i] || null;
     return out;
+  }
+  function firstMatching(node, groups) {
+    const kids = node.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.nodeType !== 1) continue;
+      if (matchesAny(c, groups)) return c;
+      const hit = firstMatching(c, groups);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  // querySelector: stops at the first match; a bare '#id' on the document
+  // is an id lookup.
+  function queryFirst(root, selector) {
+    const groups = selectorGroups(selector);
+    if (root === document && groups.length === 1 && groups[0].length === 1) {
+      const c = groups[0][0].compound;
+      if (c.id && !c.tag && !c.classes.length && !c.attrs.length && !c.pseudo.length) return document.getElementById(c.id);
+    }
+    return firstMatching(root, groups);
   }
 
   // ---- HTML parsing (tolerant, enough for game shells)
