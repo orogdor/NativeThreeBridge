@@ -32,6 +32,10 @@ export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
 export const ToneMapping = { NONE: 0, LINEAR: 1, REINHARD: 2, CINEON: 3, ACES: 4, AGX: 6, NEUTRAL: 7 };
 export const PassFlags = { CLEAR_COLOR: 1, CLEAR_DEPTH: 2 };
 
+function attributeVersion(attribute) {
+  return attribute?.isInterleavedBufferAttribute ? attribute.data.version : attribute?.version;
+}
+
 // `shaders`: { ShaderLib, UniformsUtils } from three.module.js (not in three.core.js).
 export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHost, shaders = {}) {
   const warnOnce = (key, text) => (host && host.warnOnce ? host.warnOnce(key, text) : undefined);
@@ -47,6 +51,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _spriteScale = new THREE.Vector3();
   const _spriteQuat = new THREE.Quaternion();
   const _spriteTmp = new THREE.Matrix4();
+  const defaultCompile = THREE.Material?.prototype.onBeforeCompile;
+  const defaultCompileSource = defaultCompile?.toString();
+  const hasCompilePatch = fn => !!fn && fn !== defaultCompile && fn.toString() !== defaultCompileSource;
 
   let nextGeometryId = 1;
   let nextInstanceId = 1;
@@ -119,6 +126,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       this._maskedGeometries = new WeakMap(); // geometry -> cached RGBA attribute-mask variants
       this._packet = new Float32Array(PASS_HEADER_FLOATS + MAX_LIGHTS * LIGHT_FLOATS + 256 * DRAW_FLOATS);
       this._opaque = [];
+      this.collectTimings = false;
       this._transparent = [];
       this._lights = [];
       this._lastFrame = -1;
@@ -229,10 +237,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const color = geometry.attributes.color;
       const uv = geometry.attributes.uv;
       const index = geometry.index;
-      const key = `${position.version}:${normal ? normal.version : -1}:${color ? color.version : -1}:${uv ? uv.version : -1}:${index ? index.version : -1}:${position.count}:${index ? index.count : 0}`;
-      if (record && record.key === key && record.position === position && record.normal === normal && record.index === index && record.color === color && record.uv === uv) return record;
+      const pv = attributeVersion(position), nv = attributeVersion(normal), cv = attributeVersion(color);
+      const uvv = attributeVersion(uv), iv = attributeVersion(index);
+      if (record && record.position === position && record.normal === normal &&
+          record.index === index && record.color === color && record.uv === uv &&
+          record.pv === pv && record.nv === nv && record.cv === cv && record.uvv === uvv && record.iv === iv &&
+          record.vertexCount === position.count && record.indexCount === (index?.count ?? 0)) return record;
       if (!record) {
-        record = { id: nextGeometryId++, key: '', position: null, normal: null, color: null, uv: null, index: null, hasColors: false, hasUvs: false, vertexCount: 0, indexCount: 0 };
+        record = { id: nextGeometryId++, revision: 0 };
         this._geometries.set(geometry, record);
         this.info.memory.geometries++;
         const onDispose = () => {
@@ -253,7 +265,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const gpuLocal = [position, normal, color, uv, index].every(attribute =>
         !attribute || (attribute.isInterleavedBufferAttribute ? attribute.data.usage : attribute.usage) === THREE.StaticDrawUsage);
       nt.uploadGeometry(record.id, positions, normals, colors, indices, uvs, gpuLocal);
-      Object.assign(record, { key, position, normal, color, uv, index, hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index ? index.count : 0 });
+      Object.assign(record, { position, normal, color, uv, index, pv, nv, cv, uvv, iv,
+        hasColors: !!colors, hasUvs: !!uvs, vertexCount: position.count, indexCount: index?.count ?? 0 });
+      record.revision++;
       return record;
     }
 
@@ -289,7 +303,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const original = geometry.attributes.color;
       const c0 = colorRamp?.from.value, c1 = colorRamp?.to.value;
       const colorKey = colorRamp ? [colorRamp.lo, colorRamp.hi, colorRamp.power, colorRamp.scale, c0.r, c0.g, c0.b, c1.r, c1.g, c1.b].join(':') : '';
-      const key = `${base.key}:${mask.version}:${ramp.lo}:${ramp.hi}:${preserveRgb}:${original ? original.version : -1}:${colorKey}`;
+      const key = `${base.revision}:${attributeVersion(mask)}:${ramp.lo}:${ramp.hi}:${preserveRgb}:${attributeVersion(original)}:${colorKey}`;
       if (key === record.key && record.mask === mask && record.colorAttribute === original) return record;
       const colors = new Float32Array(vertexCount * 4);
       for (let i = 0; i < vertexCount; i++) {
@@ -455,8 +469,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!camera || !camera.isCamera) { warnOnce('render-no-camera', 'render() called without a camera'); return; }
       if (this._renderTarget) return; // render-to-texture is not supported yet: skip, do not draw to screen
 
+      const timings = this.collectTimings ? {} : null;
+      let start = timings ? performance.now() : 0;
       if (scene.matrixWorldAutoUpdate !== false) scene.updateMatrixWorld();
       if (camera.parent === null && camera.matrixWorldAutoUpdate !== false) camera.updateMatrixWorld();
+      if (timings) { const now = performance.now(); timings.matrices = now - start; start = now; }
       if (this.info.autoReset) this.info.reset();
       this.info.render.frame++;
 
@@ -469,11 +486,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      if (timings) { const now = performance.now(); timings.collect = now - start; start = now; }
 
       if (this.sortObjects) {
         opaque.sort((a, b) => a.renderOrder - b.renderOrder || a.z - b.z);
         transparent.sort((a, b) => a.renderOrder - b.renderOrder || b.z - a.z);
       }
+      if (timings) { const now = performance.now(); timings.sort = now - start; start = now; }
 
       // ---- pass header
       const drawCount = opaque.length + transparent.length;
@@ -526,7 +545,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       for (const d of transparent) { writeDraw(p, o, d); o += DRAW_FLOATS; }
 
       this.info.render.calls += drawCount;
+      if (timings) { const now = performance.now(); timings.pack = now - start; start = now; }
       nt.submitPass(p, floats);
+      if (timings) { timings.submit = performance.now() - start; this.lastRenderTimings = timings; }
       if (scene.onAfterRender) scene.onAfterRender(this, scene, camera, this._renderTarget);
     }
 
@@ -705,7 +726,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
-      if (m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString()) {
+      if (hasCompilePatch(m.onBeforeCompile)) {
         const patch = this._patchInfo(m);
         if (patch.hide) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
         colorStage = patch.colorStage;
@@ -769,7 +790,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         globalThis.__ntDebugDraws.push({
           mesh: mesh.name || mesh.type, material: m.type, matName: m.name || '', color: color && color.isColor ? color.getHexString() : null,
           vertexColors: !!m.vertexColors, colorAttr: c ? `${c.itemSize}/${c.array.constructor.name}/${c.normalized}` : null,
-          map: !!colorMap, onBeforeCompile: m.onBeforeCompile && m.onBeforeCompile.toString() !== THREE.Material.prototype.onBeforeCompile.toString(),
+          map: !!colorMap, onBeforeCompile: hasCompilePatch(m.onBeforeCompile),
           uniforms: m.uniforms ? Object.keys(m.uniforms).slice(0, 12) : null, emissive: emissive ? emissive.getHexString() : null,
           transparent: !!m.transparent, opacity: m.opacity, count, instances: draw.instanceCount, defines: m.defines ? Object.keys(m.defines) : null,
         });
@@ -794,6 +815,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p.set(d.matrix, o + 16);
     p[o + 32] = d.textureId; p[o + 33] = d.alphaTest;
     p[o + 34] = d.ua; p[o + 35] = d.ub; p[o + 36] = d.uc; p[o + 37] = d.ud; p[o + 38] = d.ue; p[o + 39] = d.uf;
+    if (!d.reflection && !d.colorStage) {
+      p.fill(0, o + 40, o + DRAW_FLOATS);
+      return;
+    }
     const reflection = d.reflection;
     const sky = reflection?.uniform.value;
     p[o + 40] = sky ? sky.r * reflection.intensity : 0;
