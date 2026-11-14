@@ -673,7 +673,27 @@
       this._attrs = new Map();
       this.style = makeStyle(this);
       this.classList = new DOMTokenList(this);
-      this.dataset = {};
+      this._dataset = null;
+    }
+    // DOMStringMap: element.dataset.fooBar <-> data-foo-bar, both directions,
+    // so CSS [data-*] selectors see values that scripts set through dataset.
+    get dataset() {
+      if (this._dataset) return this._dataset;
+      const el = this;
+      const toAttr = (k) => 'data-' + String(k).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+      const toKey = (n) => n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      this._dataset = new Proxy({}, {
+        get(_, k) { return typeof k === 'string' ? (el.getAttribute(toAttr(k)) ?? undefined) : undefined; },
+        set(_, k, v) { if (typeof k === 'string') el.setAttribute(toAttr(k), v); return true; },
+        deleteProperty(_, k) { if (typeof k === 'string') el.removeAttribute(toAttr(k)); return true; },
+        has(_, k) { return typeof k === 'string' && el.hasAttribute(toAttr(k)); },
+        ownKeys() { return [...el._attrs.keys()].filter((n) => n.startsWith('data-')).map(toKey); },
+        getOwnPropertyDescriptor(_, k) {
+          if (typeof k !== 'string' || !el.hasAttribute(toAttr(k))) return undefined;
+          return { value: el.getAttribute(toAttr(k)), writable: true, enumerable: true, configurable: true };
+        },
+      });
+      return this._dataset;
     }
     get id() { return this.getAttribute('id') || ''; }
     set id(v) { this.setAttribute('id', v); }
@@ -694,7 +714,6 @@
     setAttribute(n, v) {
       n = attrName(n); v = String(v); this._attrs.set(n, v);
       if (n === 'id') idEpoch++;
-      if (n.startsWith('data-')) this.dataset[n.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v;
       if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
       uiNotify('attr', this, n);

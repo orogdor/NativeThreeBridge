@@ -923,7 +923,7 @@
             else if (/^(repeat|repeat-x|repeat-y|no-repeat|space|round)$/.test(tl)) repeat = repeat !== 'repeat' && repeat !== tl ? `${repeat} ${tl}` : tl;
             else if (/^(scroll|fixed|local|border-box|padding-box|content-box|text)$/.test(tl)) { /* ignored */ }
             else if (t === '/') { size = toks[k + 1] || 'auto'; k++; if (toks[k + 1] && !/^(repeat|no-repeat|repeat-x|repeat-y|scroll|fixed|border-box|padding-box|content-box)$/i.test(toks[k + 1]) && parseColor(toks[k + 1]) === null) { size += ' ' + toks[k + 1]; k++; } }
-            else if (t.includes('/')) { const [a, b] = t.split('/'); if (a) pos.push(a); size = b || 'auto'; if (toks[k + 1] && !Number.isNaN(px(toks[k + 1], 100, 16)) || toks[k + 1] === 'auto') { size += ' ' + toks[k + 1]; k++; } }
+            else if (t.includes('/') && splitTop(t, '/').length > 1) { const [a, b] = splitTop(t, '/'); if (a) pos.push(a); size = b || 'auto'; if (toks[k + 1] && !Number.isNaN(px(toks[k + 1], 100, 16)) || toks[k + 1] === 'auto') { size += ' ' + toks[k + 1]; k++; } }
             else if (/^(left|right|top|bottom|center)$/.test(tl) || !Number.isNaN(px(t, 100, 16))) pos.push(t);
             else if (li === layers.length - 1 && parseColor(t)) color = t;
           }
@@ -947,7 +947,8 @@
           else break;
         }
         const sizePart = toks[k] || '16px';
-        const [size, lh] = sizePart.split('/');
+        // Top-level '/' only: `calc(28 * (100vw / 1672))/1` must keep the calc whole.
+        const [size, lh] = splitTop(sizePart, '/');
         let lineHeight = lh;
         let rest = toks.slice(k + 1);
         if (!lineHeight && rest[0] === '/') { lineHeight = rest[1]; rest = rest.slice(2); } else if (!lineHeight && rest[0] && rest[0].startsWith('/')) { lineHeight = rest[0].slice(1); rest = rest.slice(1); }
@@ -1007,9 +1008,42 @@
         set('text-decoration-line', t.filter((x) => /^(none|underline|overline|line-through)$/.test(x)).join(' ') || 'none');
         return true;
       }
+      case 'border-image': {
+        const BI = ['border-image-source', 'border-image-slice', 'border-image-width', 'border-image-outset', 'border-image-repeat'];
+        if (global) return all(BI);
+        let source = 'none';
+        const rep = [], rest = [];
+        for (const t of splitTop(v, ' ')) {
+          const tl = t.toLowerCase();
+          if (/^(url|(-webkit-)?(repeating-)?(linear|radial|conic)-gradient|(-webkit-)?image-set)\(/i.test(t) || tl === 'none') source = t;
+          else if (/^(stretch|repeat|round|space)$/.test(tl)) rep.push(tl);
+          else rest.push(t);
+        }
+        const parts = splitTop(rest.join(' '), '/').map((x) => x.trim());
+        set('border-image-source', source);
+        set('border-image-slice', parts[0] || '100%');
+        set('border-image-width', parts[1] || '1');
+        set('border-image-outset', parts[2] || '0');
+        set('border-image-repeat', rep.join(' ') || 'stretch');
+        return true;
+      }
       case 'word-wrap': set('overflow-wrap', v); return true;
-      case 'columns': case 'column-count': case 'list-style': case 'outline': case 'transition': case 'animation':
-      case 'mask': case '-webkit-mask': case 'border-image': case 'scroll-margin': case 'scroll-padding':
+      case 'list-style': {
+        const LS = ['list-style-type', 'list-style-position', 'list-style-image'];
+        if (global) return all(LS);
+        let type = null, position = 'outside', image = 'none', nones = 0;
+        for (const t of splitTop(v, ' ')) {
+          const tl = t.toLowerCase();
+          if (tl === 'none') nones++;
+          else if (tl === 'inside' || tl === 'outside') position = tl;
+          else if (/^url\(/i.test(t)) image = t;
+          else type = t;
+        }
+        set('list-style-type', type ?? (nones ? 'none' : 'disc')); set('list-style-position', position); set('list-style-image', image);
+        return true;
+      }
+      case 'columns': case 'column-count': case 'outline': case 'transition': case 'animation':
+      case 'mask': case '-webkit-mask': case 'scroll-margin': case 'scroll-padding':
         return true; // not drawn
     }
     return false;
@@ -1046,7 +1080,7 @@ button,select,meter,progress,input[type=button],input[type=submit],input[type=re
 textarea{width:178px;height:32px;white-space:pre-wrap}
 progress,meter{display:inline-block;width:160px;height:16px;vertical-align:-.2em}
 img,canvas,video,svg,iframe,embed,object{display:inline}
-summary{display:block;cursor:pointer}
+summary{display:list-item;cursor:pointer;list-style:disclosure-closed inside}details[open]>summary{list-style-type:disclosure-open}
 details:not([open])>:not(summary){display:none}
 dialog[open]{position:absolute;left:0;right:0;width:fit-content;height:fit-content;margin:auto;border:solid;padding:1em;background-color:canvas;color:canvastext}
 fieldset{margin:0 2px;padding:.35em .75em .625em;border:2px groove #c0c0c0}
@@ -1648,8 +1682,22 @@ center{text-align:center}
     if (!box.replaced) {
       const kids = [];
       const pseudo = el._ntPseudo;
+      // <summary> disclosure triangle (display:list-item, list-style inside).
+      if (el.localName === 'summary' && lower(cs.display || '') === 'list-item') {
+        const type = lower(cs['list-style-type'] || '');
+        if (type === 'disclosure-closed' || type === 'disclosure-open') kids.push({ text: (type === 'disclosure-open' ? '\u25bc' : '\u25b6') + '\u00a0', cs, el, parent: box, isText: true });
+      }
       if (pseudo && pseudo.before) addPseudo(box, pseudo.before, kids, 'before');
+      // Closed <details>: only its first <summary> child gets a box. Chromium
+      // hides the rest through the details shadow slot, so author rules such
+      // as `.fields{display:grid}` must not bring them back.
+      const closedDetails = el.localName === 'details' && !el.hasAttribute('open');
+      let summarySeen = false;
       for (const n of el.childNodes) {
+        if (closedDetails) {
+          if (n.nodeType !== 1 || n.localName !== 'summary' || summarySeen) continue;
+          summarySeen = true;
+        }
         if (n.nodeType === 3) {
           if (n.data) kids.push({ text: n.data, cs, el, parent: box, isText: true });
         } else if (n.nodeType === 1) {
@@ -1662,7 +1710,6 @@ center{text-align:center}
       }
       if (pseudo && pseudo.after) addPseudo(box, pseudo.after, kids, 'after');
       box.children = kids;
-      // <details> shows only <summary> when closed (UA sheet handles children).
     }
     return box;
   }
@@ -2801,18 +2848,63 @@ center{text-align:center}
     if (same(b)) out.r = b.r; else if (same(a)) out.r = a.r;
     return out;
   }
+  // clip-path as a (rounded) clip rectangle: inset() exactly, circle() and
+  // ellipse() as their bounding box with round corners, polygon() as its
+  // bounding box. Reference box = border box.
+  function clipPathRect(b) {
+    const v = b.cs && b.cs['clip-path'];
+    if (!v) return null;
+    const m = /^\s*(inset|circle|ellipse|polygon)\((.*)\)\s*$/is.exec(v);
+    if (!m) return null;
+    const fn = m[1].toLowerCase(), args = m[2].trim(), fs = b.cs.__fs;
+    const len = (t, base) => { const n = px(t, base, fs); return Number.isNaN(n) ? 0 : n; };
+    if (fn === 'inset') {
+      const [main, round] = args.split(/\s+round\s+/i);
+      const iv = boxValues(main) || ['0', '0', '0', '0'];
+      const t = len(iv[0], b.h), rgt = len(iv[1], b.w), btm = len(iv[2], b.h), l = len(iv[3], b.w);
+      return { x: b.x + l, y: b.y + t, w: Math.max(0, b.w - l - rgt), h: Math.max(0, b.h - t - btm), r: round ? len(splitTop(round, ' ')[0], b.w) : 0 };
+    }
+    if (fn === 'polygon') {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const pt of splitTop(args.replace(/^(nonzero|evenodd)\s*,/i, ''), ',')) {
+        const [px_, py_] = splitTop(pt, ' ');
+        const xx = len(px_, b.w), yy = len(py_ ?? '0', b.h);
+        x0 = Math.min(x0, xx); y0 = Math.min(y0, yy); x1 = Math.max(x1, xx); y1 = Math.max(y1, yy);
+      }
+      if (!Number.isFinite(x0)) return null;
+      return { x: b.x + x0, y: b.y + y0, w: x1 - x0, h: y1 - y0, r: 0 };
+    }
+    const [shape, at] = args.split(/\s*\bat\b\s*/i);
+    const pos = splitTop(at || '50% 50%', ' ');
+    const cx = b.x + len(pos[0] || '50%', b.w), cy = b.y + len(pos[1] || '50%', b.h);
+    const st = splitTop(shape || '', ' ');
+    let rx, ry;
+    if (fn === 'circle') {
+      const ref = Math.hypot(b.w, b.h) / Math.SQRT2;
+      rx = ry = st[0] && !/^(closest|farthest)-side$/i.test(st[0]) ? len(st[0], ref) : Math.min(cx - b.x, b.x + b.w - cx, cy - b.y, b.y + b.h - cy);
+    } else {
+      rx = st[0] && !/side$/i.test(st[0]) ? len(st[0], b.w) : Math.min(cx - b.x, b.x + b.w - cx);
+      ry = st[1] && !/side$/i.test(st[1]) ? len(st[1], b.h) : Math.min(cy - b.y, b.y + b.h - cy);
+    }
+    return { x: cx - rx, y: cy - ry, w: 2 * rx, h: 2 * ry, r: Math.min(rx, ry) };
+  }
   function innerClip(b, outer) {
     if (!b.clips || b.isText) return outer;
     const r = innerRadii(radiiOf(b), b);
     return clipIntersect(outer, { x: b.x + b.bl, y: b.y + b.bt, w: Math.max(0, b.w - b.bl - b.br), h: Math.max(0, b.h - b.bt - b.bb), r: Math.max(...r) });
   }
   function zIndexOf(b) { const z = parseInt(b.cs['z-index'], 10); return Number.isNaN(z) ? 0 : z; }
+  // A real stacking context. Positioned boxes with z-index:auto are not one:
+  // they paint in the z=0 layer, but their positioned descendants take part in
+  // the enclosing context (see paintContext).
   function formsContext(b) {
     if (b.anonText) return false;
     const cs = b.cs;
-    if (b.pos !== 'static') return true;
     const zi = lower(cs['z-index']);
-    if (zi && zi !== 'auto' && b.parent && (b.parent.inner === 'flex' || b.parent.inner === 'grid')) return true;
+    const zSet = zi && zi !== 'auto';
+    if (b.pos === 'fixed' || b.pos === 'sticky') return true;
+    if (b.pos !== 'static' && zSet) return true;
+    if (zSet && b.parent && (b.parent.inner === 'flex' || b.parent.inner === 'grid')) return true;
     if (b.alpha < 1 && (!b.parent || b.parent.alpha > b.alpha)) return true;
     if (hasTransform(cs)) return true;
     if (lower(cs.isolation) === 'isolate') return true;
@@ -2938,26 +3030,44 @@ center{text-align:center}
       if (c.pos === 'absolute' || c.pos === 'fixed') return c.cbBox && c.cbBox !== viewportBox ? (c.cbBox._clipInner ?? null) : null;
       return clip;
     };
-    const collect = (p, clip) => {
+    const collect = (p, clip, flowList) => {
       for (const c of paintChildren(p)) {
-        const cc = clipFor(c, clip);
+        let cc = clipFor(c, clip);
+        const cp = clipPathRect(c);
+        if (cp) cc = clipIntersect(cc, cp);
         if (formsContext(c)) {
           const z = zIndexOf(c);
           (z < 0 ? neg : z === 0 ? zero : pos).push({ box: c, clip: cc, z, seq: seq++ });
           continue;
         }
-        flow.push({ box: c, clip: cc });
+        if (c.pos !== 'static' && !c.anonText) {
+          // positioned, z-index:auto: painted in tree order with the z=0
+          // layer; its in-flow content paints with it, positioned or
+          // z-indexed descendants join this context's layers.
+          const entry = { box: c, clip: cc, z: 0, seq: seq++, flow: [] };
+          zero.push(entry);
+          c._clipInner = innerClip(c, cc);
+          collect(c, c._clipInner, entry.flow);
+          continue;
+        }
+        flowList.push({ box: c, clip: cc });
         c._clipInner = innerClip(c, cc);
-        collect(c, c._clipInner);
+        collect(c, c._clipInner, flowList);
       }
     };
-    collect(b, b._clipInner);
+    collect(b, b._clipInner, flow);
     neg.sort((a, c) => a.z - c.z || a.seq - c.seq);
     pos.sort((a, c) => a.z - c.z || a.seq - c.seq);
-    for (const e of neg) paintContext(e.box, e.clip);
+    zero.sort((a, c) => a.seq - c.seq);
+    const paintEntry = (e) => {
+      if (!e.flow) { paintContext(e.box, e.clip); return; }
+      paintOwn(e.box, e.clip);
+      for (const f of e.flow) paintOwn(f.box, f.clip);
+    };
+    for (const e of neg) paintEntry(e);
     for (const e of flow) paintOwn(e.box, e.clip);
-    for (const e of zero) paintContext(e.box, e.clip);
-    for (const e of pos) paintContext(e.box, e.clip);
+    for (const e of zero) paintEntry(e);
+    for (const e of pos) paintEntry(e);
   }
   const prim = (clip, d) => prims.push({ clip, d });
   const colorWithAlpha = (c, a) => [c[0], c[1], c[2], c[3] * a];
@@ -2985,9 +3095,10 @@ center{text-align:center}
       }
       const bgCs = b === viewportRoot && b._propagatedBg ? b._propagatedBg : b._bgOnRoot ? null : cs;
       if (bgCs) paintBackground(b, bgCs, r, clip, alpha, current);
-      // border
+      // border (a drawable border-image replaces the border styles)
       const w = [b.bt, b.br, b.bb, b.bl];
-      if (w.some((v) => v > 0)) {
+      if (paintBorderImage(b, cs, clip, alpha)) { /* drawn */ }
+      else if (w.some((v) => v > 0)) {
         const cols = SIDES.map((s) => parseColor(cs[`border-${s}-color`] ?? 'currentcolor', current) || current);
         if (cols.some((c, i) => w[i] > 0 && c[3] > 0)) prim(clip, [OP.BORDER, b.x, b.y, b.w, b.h, ...r, ...w, ...cols.flatMap((c) => colorWithAlpha(c, alpha))]);
       }
@@ -3070,6 +3181,62 @@ center{text-align:center}
     if (Number.isNaN(w)) w = natural && nh ? (h * nw) / nh : area[0];
     if (Number.isNaN(h)) h = natural && nw ? (w * nh) / nw : area[1];
     return [w, h];
+  }
+  // border-image: nine-slice of a url() image (slice / width / outset). All
+  // repeat modes are drawn as `stretch`. Returns false when nothing was drawn
+  // so the ordinary border is used instead (as browsers do for a broken image).
+  function paintBorderImage(b, cs, clip, alpha) {
+    const source = cs['border-image-source'];
+    if (!source || !/^url\(/i.test(source.trim())) return false;
+    const src = cssUrl(source, cs, 'border-image-source');
+    const info = src && imageSize(src);
+    if (!info || !info.w || !info.h) return false;
+    const iw = info.w, ih = info.h;
+    // slice: numbers are image pixels, % of the image size; `fill` keeps the middle.
+    const sliceToks = splitTop(cs['border-image-slice'] || '100%', ' ');
+    const fill = sliceToks.some((t) => lower(t) === 'fill');
+    const sv = boxValues(sliceToks.filter((t) => lower(t) !== 'fill').join(' ') || '100%');
+    if (!sv) return false;
+    const slice = sv.map((t, i) => {
+      const dim = i % 2 ? iw : ih;
+      const n = t.trim().endsWith('%') ? (parseFloat(t) * dim) / 100 : parseFloat(t);
+      return Number.isNaN(n) ? 0 : clamp(n, 0, dim);
+    });
+    const bw = [b.bt, b.br, b.bb, b.bl];
+    // outset grows the image area beyond the border box (numbers = border widths).
+    const ov = boxValues(cs['border-image-outset'] || '0') || ['0', '0', '0', '0'];
+    const out = ov.map((t, i) => (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(t.trim()) ? parseFloat(t) * bw[i] : Math.max(0, px(t, 0, cs.__fs) || 0)));
+    const ax = b.x - out[3], ay = b.y - out[0], aw = b.w + out[1] + out[3], ah = b.h + out[0] + out[2];
+    if (aw <= 0 || ah <= 0) return false;
+    // width: numbers multiply the border width, % uses the image area, auto = slice.
+    const wv = boxValues(cs['border-image-width'] || '1') || ['1', '1', '1', '1'];
+    let wid = wv.map((t, i) => {
+      const tt = t.trim(), tl = lower(tt);
+      if (tl === 'auto') return slice[i];
+      if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(tt)) return parseFloat(tt) * bw[i];
+      const n = px(tt, i % 2 ? aw : ah, cs.__fs);
+      return Number.isNaN(n) ? bw[i] : Math.max(0, n);
+    });
+    const f = Math.min(1, aw / Math.max(1e-6, wid[1] + wid[3]), ah / Math.max(1e-6, wid[0] + wid[2]));
+    if (f < 1) wid = wid.map((v) => v * f);
+    const [wt, wr, wb, wl] = wid, [st, sr, sb, sl] = slice;
+    const si = str(src);
+    const part = (dx, dy, dw, dh, sx, sy, sw, sh) => {
+      if (dw <= 0.01 || dh <= 0.01 || sw <= 0.01 || sh <= 0.01) return;
+      prim(clip, [OP.IMAGE, dx, dy, dw, dh, si, sx, sy, sw, sh, alpha, 0, 1]);
+    };
+    const mx = ax + wl, my = ay + wt, mw = aw - wl - wr, mh = ah - wt - wb;
+    const smw = iw - sl - sr, smh = ih - st - sb;
+    part(ax, ay, wl, wt, 0, 0, sl, st);
+    part(mx, ay, mw, wt, sl, 0, smw, st);
+    part(ax + aw - wr, ay, wr, wt, iw - sr, 0, sr, st);
+    part(ax, my, wl, mh, 0, st, sl, smh);
+    if (fill) part(mx, my, mw, mh, sl, st, smw, smh);
+    part(ax + aw - wr, my, wr, mh, iw - sr, st, sr, smh);
+    part(ax, ay + ah - wb, wl, wb, 0, ih - sb, sl, sb);
+    part(mx, ay + ah - wb, mw, wb, sl, ih - sb, smw, sb);
+    part(ax + aw - wr, ay + ah - wb, wr, wb, iw - sr, ih - sb, sr, sb);
+    return true;
   }
   function paintBackground(b, cs, r, clip, alpha, current) {
     const box = b === viewportRoot ? { x: 0, y: 0, w: Math.max(ctx.vw, b.w), h: Math.max(ctx.vh, b.h) } : b;
