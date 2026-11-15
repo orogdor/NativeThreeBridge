@@ -18,7 +18,7 @@ function ops(rec) {
   const out = [];
   let clip = null;
   decodeUi(rec.ui.floats, (op, a) => {
-    if (op === OP.CLIP) { clip = a[2] < 0 ? null : Array.from(a.slice(0, 4)); return; }
+    if (op === OP.CLIP) { clip = a[2] < 0 ? null : Array.from(a.slice(0, 5)); return; }
     out.push({ op, a: Array.from(a), clip, s: op === OP.IMAGE || op === OP.TEXT ? rec.ui.strings[a[4]] : null });
   });
   return out;
@@ -68,5 +68,42 @@ test('painted HUD features match Chromium', { skip }, async () => {
   const picAt = imgs.findIndex((o) => o.a[2] === 80);
   assert.ok(frameAt >= 0 && picAt > frameAt, `picture after frame (${frameAt}, ${picAt})`);
   // clip-path: inset(0 0 25% 0)
-  assert.deepEqual(imgs[picAt].clip.map(Math.round), [612, 22, 80, 60], 'inside the button border');
+  assert.deepEqual(imgs[picAt].clip.slice(0, 4).map(Math.round), [612, 22, 80, 60], 'inside the button border');
+  assert.equal(Math.round(imgs[picAt].clip[4]), 30, 'round portrait keeps its rounding after the cut');
+});
+
+// Kuningriigid's bottom menu (ui-v309/v310) decorates the build cards from a
+// MutationObserver and closes itself when the embedded panel gets [hidden].
+test('MutationObserver delivers childList, attribute and text records', { skip }, async () => {
+  const { context } = await runWebapp(fixture, { frames: 2 });
+  const doc = context.document;
+  const panel = doc.getElementById('panel');
+  const log = [];
+  const mo = new context.MutationObserver((records, observer) => { assert.equal(observer, mo); for (const r of records) log.push(r); });
+  mo.observe(doc.body, { childList: true, subtree: true });
+  const attrs = new context.MutationObserver((records) => { for (const r of records) log.push(r); });
+  attrs.observe(panel, { attributeFilter: ['hidden'], attributeOldValue: true });
+  const text = doc.createTextNode('a');
+  const card = doc.createElement('button');
+  card.append(text);
+  panel.append(card);                 // childList on #panel (subtree of body)
+  panel.setAttribute('data-x', '1');  // filtered out
+  panel.hidden = true;                // attributes, oldValue null
+  panel.hidden = false;               // attributes, oldValue ''
+  text.data = 'b';                    // not observed (no characterData)
+  assert.equal(log.length, 0, 'records arrive in a microtask');
+  await Promise.resolve();
+  const kinds = log.map((r) => r.type + ':' + (r.attributeName || '') + ':' + r.oldValue);
+  assert.deepEqual(kinds, ['childList::null', 'attributes:hidden:null', 'attributes:hidden:']);
+  assert.equal(log[0].target, panel);
+  assert.equal(log[0].addedNodes[0], card);
+  log.length = 0;
+  card.remove();
+  await Promise.resolve();
+  assert.equal(log.length, 1);
+  assert.equal(log[0].removedNodes[0], card);
+  mo.disconnect(); attrs.disconnect();
+  panel.append(card);
+  await Promise.resolve();
+  assert.equal(log.length, 1, 'no records after disconnect');
 });

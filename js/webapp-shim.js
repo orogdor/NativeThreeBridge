@@ -22,6 +22,27 @@
   // HTML/CSS UI layer (js/webapp-ui.js) installs itself as __ntHost.ui.
   let uiLayer = null;
   const uiNotify = (kind, node, name) => { if (uiLayer) uiLayer.invalidate(kind, node, name); };
+  // MutationObserver records (childList / attributes / characterData), delivered
+  // in a microtask like browsers do. Nothing is recorded while no observer exists.
+  const mutationObservers = new Set();
+  const queueMutation = (rec) => {
+    for (const mo of mutationObservers) {
+      for (const [node, o] of mo._targets) {
+        if (rec.target !== node && !(o.subtree && node.contains(rec.target))) continue;
+        if (rec.type === 'attributes' && (!o.attributes || (o.attributeFilter && !o.attributeFilter.includes(rec.attributeName)))) continue;
+        if (rec.type === 'childList' && !o.childList) continue;
+        if (rec.type === 'characterData' && !o.characterData) continue;
+        const keepOld = rec.type === 'attributes' ? o.attributeOldValue : rec.type === 'characterData' ? o.characterDataOldValue : false;
+        mo._records.push({
+          type: rec.type, target: rec.target, addedNodes: rec.addedNodes || [], removedNodes: rec.removedNodes || [],
+          previousSibling: rec.previousSibling || null, nextSibling: rec.nextSibling || null,
+          attributeName: rec.attributeName ?? null, attributeNamespace: null, oldValue: keepOld ? (rec.oldValue ?? null) : null,
+        });
+        mo._schedule();
+        break;
+      }
+    }
+  };
   const state = {
     width: 1280, height: 720, pixelRatio: 1,
     now: 0, frame: 0,
@@ -384,20 +405,23 @@
       child.ownerDocument = this.ownerDocument || (this.nodeType === 9 ? this : null);
       if (child.nodeType === 1 && this.isConnected) idEpoch++;
       uiNotify('tree', this, child);
+      if (mutationObservers.size) queueMutation({ type: 'childList', target: this, addedNodes: [child], previousSibling: child.previousSibling, nextSibling: child.nextSibling });
       return child;
     }
     removeChild(child) {
       const i = this.childNodes.indexOf(child);
       if (i >= 0) {
         if (child.nodeType === 1 && this.isConnected) idEpoch++;
+        const previousSibling = this.childNodes[i - 1] || null, nextSibling = this.childNodes[i + 1] || null;
         this.childNodes.splice(i, 1); child.parentNode = null; uiNotify('tree', this, child);
+        if (mutationObservers.size) queueMutation({ type: 'childList', target: this, removedNodes: [child], previousSibling, nextSibling });
       }
       return child;
     }
     replaceChild(newChild, oldChild) { this.insertBefore(newChild, oldChild); return this.removeChild(oldChild); }
     contains(node) { for (let n = node; n; n = n.parentNode) if (n === this) return true; return false; }
     get textContent() { return this.childNodes.map((c) => c.textContent).join(''); }
-    set textContent(v) { const hadElements = this.childNodes.some((c) => c.nodeType === 1); if (hadElements && this.isConnected) idEpoch++; for (const c of this.childNodes) c.parentNode = null; this.childNodes = []; uiNotify('tree', this, hadElements ? null : undefined); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
+    set textContent(v) { const hadElements = this.childNodes.some((c) => c.nodeType === 1); if (hadElements && this.isConnected) idEpoch++; const removed = this.childNodes; for (const c of removed) c.parentNode = null; this.childNodes = []; uiNotify('tree', this, hadElements ? null : undefined); if (removed.length && mutationObservers.size) queueMutation({ type: 'childList', target: this, removedNodes: removed.slice() }); if (v !== '' && v != null) this.appendChild(new Text(String(v))); }
     cloneNode(deep) {
       const copy = this._shallowClone();
       if (deep) for (const c of this.childNodes) copy.appendChild(c.cloneNode(true));
@@ -543,7 +567,7 @@
   class Text extends Node {
     constructor(data = '') { super(3, '#text'); this._data = String(data); }
     get data() { return this._data; }
-    set data(v) { v = String(v); if (v === this._data) return; this._data = v; uiNotify('text', this); }
+    set data(v) { v = String(v); if (v === this._data) return; const oldValue = this._data; this._data = v; uiNotify('text', this); if (mutationObservers.size) queueMutation({ type: 'characterData', target: this, oldValue }); }
     get textContent() { return this.data; }
     set textContent(v) { this.data = String(v); }
     get nodeValue() { return this.data; }
@@ -712,7 +736,10 @@
       return v === undefined ? null : v;
     }
     setAttribute(n, v) {
-      n = attrName(n); v = String(v); this._attrs.set(n, v);
+      n = attrName(n); v = String(v);
+      const oldValue = mutationObservers.size ? (this._attrs.get(n) ?? null) : null;
+      this._attrs.set(n, v);
+      if (mutationObservers.size) queueMutation({ type: 'attributes', target: this, attributeName: n, oldValue });
       if (n === 'id') idEpoch++;
       if (n === 'style') this.style._setSilently(v);
       this._attributeChanged(n, v);
@@ -723,7 +750,9 @@
     removeAttribute(n) {
       n = attrName(n);
       if (!this._attrs.has(n)) return;
+      const oldValue = this._attrs.get(n);
       this._attrs.delete(n);
+      if (mutationObservers.size) queueMutation({ type: 'attributes', target: this, attributeName: n, oldValue });
       if (n === 'id') idEpoch++;
       if (n === 'style') this.style._setSilently('');
       uiNotify('attr', this, n);
@@ -764,9 +793,12 @@
     querySelector(s) { return queryFirst(this, s); }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
-    getElementsByClassName(c) { return querySelectorAll(this, c.split(/\s+/).filter(Boolean).map((x) => '.' + x).join('')); }
-    matches(s) { return matchesAny(this, selectorGroups(s)); }
-    closest(s) { for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (n.matches(s)) return n; return null; }
+    getElementsByClassName(c) { const sel = String(c).split(/\s+/).filter(Boolean).map((x) => '.' + x.replace(/[^\w-]/g, (ch) => '\\' + ch)).join(''); return sel ? querySelectorAll(this, sel) : Object.assign([], { item: () => null }); }
+    matches(s) { return domEngine() ? uiLayer.domMatches(this, uiLayer.domSelector(s), this) : matchesAny(this, selectorGroups(s)); }
+    closest(s) {
+      if (domEngine()) { const list = uiLayer.domSelector(s); for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (uiLayer.domMatches(n, list, this)) return n; return null; }
+      for (let n = this; n && n.nodeType === 1; n = n.parentNode) if (n.matches(s)) return n; return null;
+    }
     _fullView() { return this.localName === 'canvas' || this.localName === 'body' || this.localName === 'html'; }
     // Real layout boxes from the UI layer; full-window fallback without it.
     _layoutRect() {
@@ -1513,7 +1545,7 @@
     querySelector(s) { return queryFirst(this, s); }
     querySelectorAll(s) { return querySelectorAll(this, s); }
     getElementsByTagName(t) { return querySelectorAll(this, t); }
-    getElementsByClassName(c) { return querySelectorAll(this, c.split(/\s+/).filter(Boolean).map((x) => '.' + x).join('')); }
+    getElementsByClassName(c) { const sel = String(c).split(/\s+/).filter(Boolean).map((x) => '.' + x.replace(/[^\w-]/g, (ch) => '\\' + ch)).join(''); return sel ? querySelectorAll(this, sel) : Object.assign([], { item: () => null }); }
     getElementsByName(n) { return querySelectorAll(this, `[name="${n}"]`); }
     hasFocus() { return true; }
     exitPointerLock() {}
@@ -1645,9 +1677,25 @@
       collectMatching(c, groups, out);
     }
   }
+  // With the UI layer loaded the full CSS selector engine answers DOM queries
+  // (:scope, :is/:not/:has, nth-*, + and ~ ...); the small matcher below is
+  // the fallback for scripts that run without it.
+  const domEngine = () => !!(uiLayer && uiLayer.domSelector);
+  function domCollect(node, list, scope, out, first) {
+    const kids = node.childNodes;
+    for (let i = 0; i < kids.length; i++) {
+      const c = kids[i];
+      if (c.nodeType !== 1) continue;
+      if (uiLayer.domMatches(c, list, scope)) { out.push(c); if (first) return true; }
+      if (domCollect(c, list, scope, out, first)) return true;
+    }
+    return false;
+  }
+  const scopeOf = (root) => (root.nodeType === 1 ? root : document.documentElement);
   function querySelectorAll(root, selector) {
     const out = [];
-    collectMatching(root, selectorGroups(selector), out);
+    if (domEngine()) domCollect(root, uiLayer.domSelector(selector), scopeOf(root), out, false);
+    else collectMatching(root, selectorGroups(selector), out);
     out.item = (i) => out[i] || null;
     return out;
   }
@@ -1665,6 +1713,14 @@
   // querySelector: stops at the first match; a bare '#id' on the document
   // is an id lookup.
   function queryFirst(root, selector) {
+    if (domEngine()) {
+      const text = String(selector);
+      const id = /^#([\w-]+)$/.exec(text.trim());
+      if (root === document && id) return document.getElementById(id[1]);
+      const out = [];
+      domCollect(root, uiLayer.domSelector(text), scopeOf(root), out, true);
+      return out[0] || null;
+    }
     const groups = selectorGroups(selector);
     if (root === document && groups.length === 1 && groups[0].length === 1) {
       const c = groups[0][0].compound;
@@ -2238,7 +2294,31 @@
       try { this._cb(entries, this); } catch (e) { reportError('ResizeObserver', e); }
     }
   }
-  class MutationObserver { observe() {} disconnect() {} takeRecords() { return []; } }
+  class MutationObserver {
+    constructor(cb) { this._cb = cb; this._targets = new Map(); this._records = []; this._queued = false; }
+    observe(target, options = {}) {
+      if (!target || typeof target.contains !== 'function') throw new TypeError("MutationObserver.observe: target is not a Node");
+      const o = { ...options };
+      if (o.attributeFilter || o.attributeOldValue) o.attributes = o.attributes ?? true;
+      if (o.characterDataOldValue) o.characterData = o.characterData ?? true;
+      if (!o.childList && !o.attributes && !o.characterData) throw new TypeError("MutationObserver.observe: childList, attributes or characterData must be true");
+      if (o.attributeFilter) o.attributeFilter = [...o.attributeFilter].map((n) => attrName(String(n)));
+      this._targets.set(target, o);
+      mutationObservers.add(this);
+    }
+    disconnect() { this._targets.clear(); this._records = []; mutationObservers.delete(this); }
+    takeRecords() { const r = this._records; this._records = []; return r; }
+    _schedule() {
+      if (this._queued) return;
+      this._queued = true;
+      queueMicrotask(() => {
+        this._queued = false;
+        const records = this.takeRecords();
+        if (!records.length) return;
+        try { this._cb(records, this); } catch (e) { reportError('MutationObserver', e); }
+      });
+    }
+  }
   class IntersectionObserver {
     constructor(cb) { this._cb = cb; }
     observe(el) { setTimeout(() => this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1 }], this), 0); }

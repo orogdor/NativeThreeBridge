@@ -617,7 +617,7 @@
       }
       case 'empty': return !el.childNodes.some((n) => n.nodeType === 1 || (n.nodeType === 3 && n.data.length));
       case 'root': return el === document.documentElement;
-      case 'scope': return el === document.documentElement;
+      case 'scope': return domScope ? el === domScope : el === document.documentElement;
       case 'hover': return !!interact.hover && isInChain(el, interact.hover);
       case 'active': return !!interact.active && isInChain(el, interact.active);
       case 'focus': return document.activeElement === el && el !== document.body;
@@ -666,6 +666,27 @@
       for (let i = 0; i < c.length; i++) if (c[i].nodeType === 1) stack.push(c[i]);
     }
     return false;
+  }
+  // DOM queries (querySelector, matches, closest) use the same selector engine
+  // as the style sheets; :scope is the element the query runs on.
+  let domScope = null;
+  const domSelectorCache = new Map();
+  function domSelector(text) {
+    text = String(text);
+    let list = domSelectorCache.get(text);
+    if (list) return list;
+    list = parseSelectorList(text.trim());
+    if (!list.length || list.length !== splitTop(text, ',').length) throw new SyntaxError(`'${text}' is not a valid selector`);
+    list = list.filter((sel) => !sel.pseudoEl);
+    if (domSelectorCache.size > 4000) domSelectorCache.clear();
+    domSelectorCache.set(text, list);
+    return list;
+  }
+  function domMatches(el, list, scope) {
+    if (!el || el.nodeType !== 1) return false;
+    const prev = domScope;
+    domScope = scope || null;
+    try { return matchAny(el, list); } finally { domScope = prev; }
   }
   function matchSelector(el, sel) {
     if (sel.never) return false;
@@ -2846,6 +2867,15 @@ center{text-align:center}
     const out = { x, y, w: Math.max(0, r - x), h: Math.max(0, btm - y), r: 0 };
     const same = (c) => Math.abs(c.x - out.x) < 0.01 && Math.abs(c.y - out.y) < 0.01 && Math.abs(c.w - out.w) < 0.01 && Math.abs(c.h - out.h) < 0.01;
     if (same(b)) out.r = b.r; else if (same(a)) out.r = a.r;
+    if (!out.r) {
+      // A strongly rounded clip (round portrait, border-radius:50%) cut by a
+      // rectangle (clip-path:inset(0 0 25% 0)): keep the rounding when the
+      // result still owns one of the rounded clip's corners. One radius serves all four
+      // corners, so the cut side is rounded too instead of straight.
+      const corner = (c) => c.r > 0 && c.r >= 0.25 * Math.min(c.w, c.h) && ((Math.abs(c.x - out.x) < 0.5 || Math.abs(c.x + c.w - out.x - out.w) < 0.5) && (Math.abs(c.y - out.y) < 0.5 || Math.abs(c.y + c.h - out.y - out.h) < 0.5));
+      const keep = Math.max(corner(a) ? a.r : 0, corner(b) ? b.r : 0);
+      if (keep > 0) out.r = Math.min(keep, out.w / 2, out.h / 2);
+    }
     return out;
   }
   // clip-path as a (rounded) clip rectangle: inset() exactly, circle() and
@@ -4338,6 +4368,8 @@ center{text-align:center}
     },
     matchMedia: mediaMatches,
     imageSize(src) { return imageSize(src); },
+    domSelector,
+    domMatches,
     parseColor(text) { const c = parseColor(text); return c ? c.slice() : null; },
     sniffImage(bytes) { try { return bytes ? sniffImage(bytes) : null; } catch { return null; } },
     resolve(base, ref) { return resolveRef(base, ref); },
