@@ -13,7 +13,9 @@
 
 export const PASS_HEADER_FLOATS = 64;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 72;
+export const DRAW_FLOATS = 88;
+// Translated material stages: up to 28 uniform floats (draw floats 49..60 and 72..87).
+const STAGE_UNIFORM_FLOATS = 28;
 export const MAX_LIGHTS = 16;
 
 export const LightType = { DIRECTIONAL: 3, POINT: 4, SPOT: 5, HEMISPHERE: 2 };
@@ -762,7 +764,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (hasCompilePatch(m.onBeforeCompile)) {
         const patch = this._patchInfo(m);
-        if (patch.hide) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
+        // A translated stage evaluates the texture mask itself; only untranslated masks are left out.
+        if (patch.hide && !patch.colorStage) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
         colorStage = patch.colorStage;
         if (colorStage?.attributes.length) {
           const geometry = this._geometryRecord(mesh.geometry, colorStage.attributes);
@@ -876,13 +879,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o + 46] = reflection?.power ?? 0;
     p[o + 47] = (reflection?.alphaGain ?? 0) * (d.reflectionMask ? -1 : 1);
     p[o + 48] = d.colorStage?.id ?? 0;
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < STAGE_UNIFORM_FLOATS; i++) {
       const binding = d.colorStage?.uniforms[i];
       const uniform = binding?.uniform.value;
       const component = binding?.component;
       const value = component && uniform?.isColor ? uniform['rgb'['xyz'.indexOf(component)]]
         : component ? uniform?.[component] : uniform;
-      p[o + 49 + i] = Number.isFinite(value) ? value : 0;
+      p[o + (i < 12 ? 49 + i : 60 + i)] = Number.isFinite(value) ? value : 0;
     }
     let flip = 0, repeat = 0, mirror = 0;
     for (let i = 0; i < 9; i++) {
@@ -967,11 +970,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           else if (type === 'sampler2D') {
             if (textures.length >= 9 || !uniform.value?.isTexture) valid = false;
             else textures.push({ name, uniform });
-          } else if (uniforms.length + width <= 12) {
+          } else if (uniforms.length + width <= STAGE_UNIFORM_FLOATS) {
             const expressions = [];
             for (let i = 0; i < width; i++) {
               const index = uniforms.length;
-              expressions.push(components('gColorStage[' + Math.floor(index / 4) + ']', index % 4, 1));
+              const register = index < 12 ? 'gColorStage[' + Math.floor(index / 4) + ']' : 'gColorStageMore[' + Math.floor((index - 12) / 4) + ']';
+              expressions.push(components(register, index % 4, 1));
               uniforms.push({ uniform, component: width === 1 ? null : channels[i] });
             }
             inputs.push({ name, type, expression: width === 1 ? expressions[0] : type + '(' + expressions.join(', ') + ')' });
@@ -1049,12 +1053,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
     // Match top-level mutable scalar/vector temporaries and move them into
     // this invocation. HLSL global variables are read-only at runtime.
-    const locals = [];
+    const locals = [], privates = [];
     let depth = 0;
-    helpers = helpers.replace(/[{}]|(?:float|vec[234])\s+\w+\s*=\s*[^;{}]+;/g, code => {
+    helpers = helpers.replace(/[{}]|(?:float|vec[234])\s+\w+\s*=\s*[^;{}]+;|(?:float|vec[234])\s+\w+(?:\s*,\s*\w+)*\s*;/g, code => {
       if (code === '{') depth++;
       else if (code === '}') depth--;
       else if (depth === 0) {
+        // Declared without a value: written later by the colour code, so a
+        // private (static) global; plain HLSL globals are read-only constants.
+        if (!code.includes('=')) { privates.push(code); return ''; }
         locals.push(code);
         return '';
       }
@@ -1079,11 +1086,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const translate = source => {
       let result = source.replace(/\bsampler2D\b/g, 'int').replace(/\btexture2D\s*\(/g, 'ntMaterialSample(')
         .replace(/\bvec2\s*\(\s*0\.0\s*\)/g, 'float2(0.0, 0.0)')
+        .replace(HLSL_RESERVED, 'nt_$1')
         .replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\s*\(/g, 'lerp(').replace(/\bfract\s*\(/g, 'frac(')
         .replace(/\bposition\b/g, 'ntPosition').replace(/\bobjectNormal\b/g, 'ntNormal')
         .replace(/\(\s*viewMatrix\s*\*\s*float4\(([^;]+?),\s*0\.0\)\s*\)\.xyz/g, 'mul((float3x3)gView, float3($1))');
       textures.forEach(({ name }, slot) => { result = result.replace(new RegExp('\\b' + name + '\\b', 'g'), String(slot)); });
-      return result;
+      return splatConstructors(result);
     };
     const globals = [
       ...inputs.filter(input => new RegExp('\\b' + input.name + '\\b').test(helpers)),
@@ -1092,7 +1100,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const globalNames = new Set(globals.map(input => input.name));
     const init = (type, name, expression) => (globalNames.has(name) ? '' : type + ' ') + name + ' = ' + expression + ';';
     const varyingInit = assignments.map(line => line.replace(/^(\w+) (\w+) = (.*);$/, (_, type, name, expression) => init(type, name, expression)));
-    const source = sample + translate(globals.map(({ type, name }) => 'static ' + type + ' ' + name + ';').join('\n') + '\n' + helpers) + '\n' +
+    const source = sample + translate(globals.map(({ type, name }) => 'static ' + type + ' ' + name + ';').join('\n') + '\n' +
+      privates.map(code => 'static ' + code).join('\n') + '\n' + helpers) + '\n' +
       'void nativeColorStage(VSOut i, inout float4 diffuseColor, inout float3 ntWorldNormal, inout float roughnessFactor, inout float skyScale, inout float alphaMask) {\n' +
       'float3 ntPosition = i.localPosition, ntNormal = i.localNormal;\n' +
       'float3 vViewPosition = -mul(gView, float4(i.world, 1.0)).xyz;\n' +
@@ -1103,6 +1112,31 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         translate(normal) + '\nntWorldNormal = normalize(mul(transpose((float3x3)gView), normal));\n' : '') +
       '}';
     return { source, uniforms, textures, attributes: [...uses.values()] };
+  }
+
+  // GLSL words that HLSL reserves (interpolation modifiers, types ...).
+  const HLSL_RESERVED = /\b(line|point|triangle|sample|linear|centroid|precise|shared|vector|matrix|half|string|pass|compile|snorm|unorm|lineadj|triangleadj|nointerpolation|noperspective|groupshared|technique|dword|row_major|column_major|export|inline)\b/g;
+  // GLSL vec3(x) fills every component from one value; HLSL's float3(...)
+  // needs all components, but a cast does the same: ((float3)(x)).
+  function splatConstructors(code) {
+    let out = '', i = 0;
+    const head = /\bfloat([234])\s*\(/g;
+    for (let match; (match = head.exec(code));) {
+      let depth = 1, j = head.lastIndex, comma = false;
+      for (; j < code.length && depth; j++) {
+        const c = code[j];
+        if (c === '(') depth++;
+        else if (c === ')') depth--;
+        else if (c === ',' && depth === 1) comma = true;
+      }
+      if (depth || comma) continue;
+      const inner = code.slice(head.lastIndex, j - 1);
+      if (!inner.trim()) continue;
+      out += code.slice(i, match.index) + '((float' + match[1] + ')(' + splatConstructors(inner) + '))';
+      i = j;
+      head.lastIndex = j;
+    }
+    return out + code.slice(i);
   }
 
   function materialTextureSource(count) {

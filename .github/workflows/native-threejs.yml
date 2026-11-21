@@ -118,6 +118,11 @@ jobs:
           $code = $LASTEXITCODE
           $out | Write-Host
           if ($code -ne 0 -or !($out -match 'title: Workers OK')) { throw "Web Worker fixture failed on V8" }
+          # GLSL stages past the old limits: 17 uniform floats + depth texture
+          # (Kuningriigid sea), nine-photo ground with vec3(x) constructors.
+          # The smoke compiles every translated stage with D3DCompile.
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-shader-limits 2
+          if ($LASTEXITCODE -ne 0) { throw "shader-limits fixture failed on V8 (HLSL of a translated stage?)" }
       - name: Verify native web storage survives a Windows restart
         shell: pwsh
         run: |
