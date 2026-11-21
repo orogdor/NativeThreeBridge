@@ -465,9 +465,22 @@ jobs:
           Save-Screen (Join-Path (Get-Location) 'shots/launcher-ready.png')
           Print-Shot (Join-Path (Get-Location) 'shots/launcher-ready.png') 'launcher-ready'
           Get-Content launcher-check/NativeThree-Updater.log -ErrorAction SilentlyContinue
+          Get-Content launcher-check/Launcher.log -ErrorAction SilentlyContinue
           if ($p.HasExited) { throw "Launcher.exe closed by itself (exit $($p.ExitCode))" }
           Stop-Process -Id $p.Id -Force
           Start-Sleep -Seconds 2
+          if ((Get-Content launcher-check/Launcher.log -Raw) -match 'Pilti ei saanud avada') {
+            # This Windows has no WebP codec: show that a PNG picture from native-launcher.json works.
+            Write-Host "No WebP codec on this runner; checking the picture path with a PNG"
+            '{ "image": "majaehitaja/textures/atlas-stone/high-relief.png" }' | Set-Content launcher-check/game2/native-launcher.json -Encoding utf8
+            $p = Start-Process -FilePath $launcher -PassThru
+            Start-Sleep -Seconds 20
+            Save-Screen (Join-Path (Get-Location) 'shots/launcher-ready-png.png')
+            Print-Shot (Join-Path (Get-Location) 'shots/launcher-ready-png.png') 'launcher-ready-png'
+            Stop-Process -Id $p.Id -Force
+            Remove-Item launcher-check/game2/native-launcher.json
+            Start-Sleep -Seconds 2
+          }
           # --autostart: starts when everything is current; closes once the game window is on screen.
           $p = Start-Process -FilePath $launcher -ArgumentList '--autostart' -PassThru
           if (!$p.WaitForExit(180000)) {
@@ -481,6 +494,7 @@ jobs:
           Save-Screen (Join-Path (Get-Location) 'shots/launcher-game.png')
           Print-Shot (Join-Path (Get-Location) 'shots/launcher-game.png') 'launcher-game'
           if (!$game) { throw "The launcher closed but no game window is open" }
+          Get-Content launcher-check/Launcher.log -ErrorAction SilentlyContinue
           Write-Host "Launcher handed over to the game window: $($game.MainWindowTitle)"
           $game | Stop-Process -Force
       - name: Upload UI screenshots

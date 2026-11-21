@@ -80,6 +80,21 @@ DWORD gGamePid = 0;
 ULONGLONG gGameStart = 0;
 bool gHover = false;
 HANDLE gSingle = nullptr;   // one launcher at a time
+HANDLE gShown = nullptr;    // set by the engine on its first frame that shows the game
+float gScale = 1;           // < 1 when the screen is smaller than the window
+
+// Launcher.log next to the EXE: what the launcher saw (for problem reports).
+void logLine(const std::wstring& text) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (gRoot + L"\\Launcher.log").c_str(), L"ab") != 0 || !f) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0, nullptr, nullptr);
+    std::string utf8(std::size_t(std::max(0, n)), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), utf8.data(), n, nullptr, nullptr);
+    std::fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d %s\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, utf8.c_str());
+    std::fclose(f);
+}
 
 // ------------------------------------------------------------ text helpers
 std::wstring widen(const std::string& s) {
@@ -186,6 +201,7 @@ void applyInfo(const std::vector<std::wstring>& f) {
 }
 
 void setStatus(Phase phase, const std::wstring& text, int progress) {
+    logLine(text);
     {
         std::lock_guard<std::mutex> lock(gMutex);
         gState.phase = phase;
@@ -320,10 +336,14 @@ void startGame() {
     STARTUPINFOW si{};
     si.cb = sizeof si;
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(engine.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, gRoot.c_str(), &si, &pi)) {
+    // Suspended until the "shown" event (named after its process id) exists.
+    if (!CreateProcessW(engine.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, gRoot.c_str(), &si, &pi)) {
         setStatus(Phase::Failed, L"NativeThree-Engine.exe ei käivitunud. Paki mängu ZIP uuesti lahti.", 0);
         return;
     }
+    if (gShown) CloseHandle(gShown);
+    gShown = CreateEventW(nullptr, TRUE, FALSE, (L"Local\\NativeThreeBridge-Shown-" + std::to_wstring(pi.dwProcessId)).c_str());
+    ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
     gGameProcess = pi.hProcess;
     gGamePid = pi.dwProcessId;
@@ -335,7 +355,10 @@ void startGame() {
 void checkGameWindow() {
     bool found = false;
     EnumWindows(findGameWindow, reinterpret_cast<LPARAM>(&found));
-    if (found) {
+    const ULONGLONG waited = GetTickCount64() - gGameStart;
+    // The window is open and has drawn the game (or an older engine: 3 minutes).
+    if (found && ((gShown && WaitForSingleObject(gShown, 0) == WAIT_OBJECT_0) || waited > 180000)) {
+        logLine(L"Mänguaken on ekraanil (" + std::to_wstring(waited / 1000) + L" s), käivitaja sulgub.");
         KillTimer(gWindow, kGameWindowTimer);
         CloseHandle(gGameProcess);
         gGameProcess = nullptr;
@@ -349,7 +372,7 @@ void checkGameWindow() {
         setStatus(Phase::Failed, L"Mäng sulgus enne akna avanemist. Vaata faili NativeThreeBridge-webapp-log.txt.", 0);
         return;
     }
-    const ULONGLONG seconds = (GetTickCount64() - gGameStart) / 1000;
+    const ULONGLONG seconds = waited / 1000;
     std::lock_guard<std::mutex> lock(gMutex);
     gState.status = L"Laen mängu… " + std::to_wstring(seconds) + L" s";
 }
@@ -409,13 +432,17 @@ void loadPicture(const std::wstring& file) {
     g.pictureSource.Reset();
     g.pictureFile = file;
     if (file.empty() || !g.wic) return;
+    logLine(L"Pilt: " + file);
     ComPtr<IWICBitmapDecoder> decoder;
     ComPtr<IWICBitmapFrameDecode> frame;
     // WebP needs the Windows WebP codec (installed with Windows 10/11).
     if (FAILED(g.wic->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) ||
         FAILED(decoder->GetFrame(0, &frame)) || FAILED(g.wic->CreateFormatConverter(&g.pictureSource)) ||
         FAILED(g.pictureSource->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeMedianCut)))
+    {
         g.pictureSource.Reset();
+        logLine(L"Pilti ei saanud avada (WebP vajab Windowsi WebP laiendust).");
+    }
 }
 
 void createTarget() {
@@ -497,7 +524,7 @@ void paint() {
     }
     if (!g.picture && g.pictureSource) g.rt->CreateBitmapFromWicBitmap(g.pictureSource.Get(), nullptr, &g.picture);
     g.rt->BeginDraw();
-    g.rt->SetTransform(D2D1::IdentityMatrix());
+    g.rt->SetTransform(D2D1::Matrix3x2F::Scale(gScale, gScale));
     g.rt->Clear(D2D1::ColorF(0x10141a));
 
     // picture (cover) or a plain gradient
@@ -560,7 +587,7 @@ void paint() {
 }
 
 bool overButton(LPARAM lp) {
-    const float k = 96.0f / g.dpi;
+    const float k = 96.0f / g.dpi / gScale;
     const float x = float(GET_X_LPARAM(lp)) * k, y = float(GET_Y_LPARAM(lp)) * k;
     return x >= kButton.left && x <= kButton.right && y >= kButton.top && y <= kButton.bottom;
 }
@@ -711,6 +738,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     if (!length || length >= MAX_PATH) return 40;
     gRoot = path;
     gRoot.erase(gRoot.find_last_of(L'\\'));
+    {   // keep Launcher.log small
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        const std::wstring log = gRoot + L"\\Launcher.log";
+        if (GetFileAttributesExW(log.c_str(), GetFileExInfoStandard, &info) && info.nFileSizeLow > 256 * 1024) DeleteFileW(log.c_str());
+    }
     // launcher.json may name another game folder ({"gameFolder": "game2", ...}).
     FILE* f = nullptr;
     if (_wfopen_s(&f, (gRoot + L"\\launcher.json").c_str(), L"rb") == 0 && f) {
@@ -753,15 +785,25 @@ owned:
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     const UINT dpi = GetDpiForSystem();
     g.dpi = float(dpi);
-    RECT r{0, 0, LONG(std::lround(kWidth * dpi / 96.0f)), LONG(std::lround(kHeight * dpi / 96.0f))};
+    // Smaller screens: the whole layout is scaled down to fit the work area.
+    RECT work{0, 0, 1920, 1080};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    RECT frame{0, 0, 0, 0};
+    AdjustWindowRectExForDpi(&frame, style, FALSE, 0, dpi);
+    const float fitW = float(work.right - work.left - (frame.right - frame.left)) / (kWidth * dpi / 96.0f);
+    const float fitH = float(work.bottom - work.top - (frame.bottom - frame.top)) / (kHeight * dpi / 96.0f);
+    gScale = std::clamp(std::min(fitW, fitH), 0.5f, 1.0f);
+    RECT r{0, 0, LONG(std::lround(kWidth * gScale * dpi / 96.0f)), LONG(std::lround(kHeight * gScale * dpi / 96.0f))};
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
-    gWindow = CreateWindowExW(0, wc.lpszClassName, L"Käivitaja", style, CW_USEDEFAULT, CW_USEDEFAULT,
-                              r.right - r.left, r.bottom - r.top, nullptr, nullptr, instance, nullptr);
+    const int width = r.right - r.left, height = r.bottom - r.top;
+    gWindow = CreateWindowExW(0, wc.lpszClassName, L"Käivitaja", style,
+                              work.left + std::max(0, int(work.right - work.left - width) / 2), work.top + std::max(0, int(work.bottom - work.top - height) / 2),
+                              width, height, nullptr, nullptr, instance, nullptr);
     if (!gWindow) return 41;
     const UINT windowDpi = GetDpiForWindow(gWindow);
     if (windowDpi != dpi) { // another monitor: size for its DPI
         g.dpi = float(windowDpi);
-        RECT w{0, 0, LONG(std::lround(kWidth * windowDpi / 96.0f)), LONG(std::lround(kHeight * windowDpi / 96.0f))};
+        RECT w{0, 0, LONG(std::lround(kWidth * gScale * windowDpi / 96.0f)), LONG(std::lround(kHeight * gScale * windowDpi / 96.0f))};
         AdjustWindowRectExForDpi(&w, style, FALSE, 0, windowDpi);
         SetWindowPos(gWindow, nullptr, 0, 0, w.right - w.left, w.bottom - w.top, SWP_NOMOVE | SWP_NOZORDER);
     }

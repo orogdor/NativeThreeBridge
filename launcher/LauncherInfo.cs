@@ -32,9 +32,9 @@ internal static class LauncherInfo
         catch (JsonException) { return (null, null, null); }
     }
 
-    // The main menu's background picture: the last CSS rule (stylesheets in
-    // index.html order) whose selector names a menu/start/title element and
-    // sets a background url().
+    // The main menu's background picture: CSS rules (stylesheets in index.html
+    // order) whose selector ends in a menu/start/title element and set a
+    // background url(); of those pictures the largest file (icons are small).
     internal static string? MenuBackground(string game, string html)
     {
         List<(string css, string dir)> sheets = new();
@@ -56,6 +56,7 @@ internal static class LauncherInfo
         foreach (Match style in Regex.Matches(html, @"<style[^>]*>([\s\S]*?)</style>", RegexOptions.IgnoreCase))
             sheets.Add((style.Groups[1].Value, game));
         string? found = null;
+        long foundSize = -1;
         Regex menu = new(@"[#.][\w-]*(menu|start|title|splash|intro|lobby)[\w-]*", RegexOptions.IgnoreCase);
         foreach ((string css, string dir) in sheets)
         {
@@ -63,14 +64,17 @@ internal static class LauncherInfo
             foreach (Match rule in Regex.Matches(clean, @"([^{}]+)\{([^{}]*)\}"))
             {
                 string selector = rule.Groups[1].Value;
-                if (!menu.IsMatch(selector) || selector.Contains("::") || selector.Contains(":hover")) continue;
+                if (selector.Contains("::") || selector.Contains(":hover")) continue;
+                // the element the rule styles: last compound of each selector in the list
+                if (!selector.Split(',').Any(part => menu.IsMatch(Regex.Split(part.Trim(), @"[\s>+~]+").Last()))) continue;
                 foreach (Match url in Regex.Matches(rule.Groups[2].Value, @"background(?:-image)?\s*:[^;]*?url\(\s*[""']?([^""')]+)[""']?\s*\)", RegexOptions.IgnoreCase))
                 {
                     string target = url.Groups[1].Value;
                     if (target.StartsWith("data:") || target.EndsWith(".svg", StringComparison.OrdinalIgnoreCase)) continue;
                     string full = Path.GetFullPath(Path.Combine(dir, target.Split('?', '#')[0].Replace('/', Path.DirectorySeparatorChar)));
-                    if (full.StartsWith(Path.GetFullPath(game) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
-                        found = full;
+                    if (!full.StartsWith(Path.GetFullPath(game) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) continue;
+                    long size = new FileInfo(full).Length;
+                    if (size >= foundSize) { found = full; foundSize = size; }
                 }
             }
         }
@@ -171,7 +175,8 @@ internal static class LauncherInfo
         try
         {
             File.WriteAllText(Path.Combine(dir, "art", "menu.webp"), "x");
-            File.WriteAllText(Path.Combine(dir, "a.css"), "#hud{background:url('art/hud.webp')} #startmenu{color:red;background:linear-gradient(#000,#111),url('art/menu.webp') center/cover}");
+            File.WriteAllText(Path.Combine(dir, "art", "icon.webp"), "");
+            File.WriteAllText(Path.Combine(dir, "a.css"), "#hud{background:url('art/hud.webp')} #startmenu{color:red;background:linear-gradient(#000,#111),url('art/menu.webp') center/cover} #startmenu .card{background:url('art/icon.webp')} #menubtn::before{background:url('art/icon.webp')}");
             string? found = MenuBackground(dir, "<link rel=\"stylesheet\" href=\"a.css?v=1\">");
             if (found is null || !found.EndsWith("menu.webp")) throw new Exception("Menu background not found: " + found);
         }
