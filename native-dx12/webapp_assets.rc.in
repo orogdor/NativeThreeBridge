@@ -8,3 +8,4 @@
 405 RCDATA "@WEBAPP_ADDONS_DIR@/controls/OrbitControls.js"
 406 RCDATA "@WEBAPP_ADDONS_DIR@/controls/PointerLockControls.js"
 407 RCDATA "@WEBAPP_SOURCE_DIR@/js/webapp-ui.js"
+408 RCDATA "@WEBAPP_SOURCE_DIR@/js/webapp-worker-shim.js"

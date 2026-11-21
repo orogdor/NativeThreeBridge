@@ -1,5 +1,5 @@
-NativeThreeBridge v0.32.20 - KAKS MÄNGU, ÜKS ENGINE
-==================================================
+NativeThreeBridge v0.33.0 - KAKS MÄNGU, ÜKS ENGINE
+=================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
 UpdateKuningriigid.exe  laeb Kuningriigid GitHubist kausta game2 või uuendab
@@ -12,6 +12,26 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.33.0 - MITU TUUMA: mängu JavaScript ei pea enam kõike ühe lõime peal
+ootama. Kehtib kõigile veebirakendustele, mänguspetsiifilist koodi pole.
+- Web Workerid: new Worker(...) käivitab skripti eraldi V8 isolate'is oma
+  Windowsi lõimes (päriselt paralleelselt). postMessage, ülekantavad
+  ArrayBufferid (ilma kopeerimata), SharedArrayBuffer + Atomics, moodul-
+  workerid (type: 'module'), Blob-URL workerid (nt DRACOLoader),
+  importScripts, taimerid, fetch mängukaustas, WebAssembly.
+- fetch: üle 256 KB failid (GLB, pildid, heli) loetakse taustalõimes,
+  väiksemad kohe nagu varem.
+- Tekstuuride pildid (PNG/JPEG/WebP) dekodeeritakse ja mipmap'itakse
+  taustalõimedes; kuni pilt on valmis, on pind valge (nagu brauseris enne
+  pildi laadimist). NTB_ASYNC_TEXTURES=0 = vana viis.
+- structuredClone on päris (Map, Set, Date, tüübitud massiivid).
+  navigator.hardwareConcurrency näitab arvuti tegelikku lõimede arvu.
+  performance.now() on alla millisekundi täpsusega.
+- V8 prügikoristus: suurem noorte objektide ala (vähem GC pause kaadri
+  sees). Logisse kirjutatakse iga 30 s järel "[gc] ..." kokkuvõte.
+  NTB_V8_FLAGS lisab V8 lippe (testimiseks).
+Täpsemalt: docs/MULTITHREADING.md
 
 v0.32.20 TEST: Three.js veebirakenduste staatiline geomeetria joonistatakse
 DX12 GPU-lokaalsest mälust. Dünaamilise geomeetria üleslaadimine jätkub

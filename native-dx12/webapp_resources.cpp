@@ -26,6 +26,7 @@ bool NativeWebapp_LoadBuiltins(std::string& shimSource,
         {404, "nt:native-renderer.mjs"},
         {405, "nt:addons/controls/OrbitControls.js"},
         {406, "nt:addons/controls/PointerLockControls.js"},
+        {408, "nt:webapp-worker-shim.js"}, // global scope of Web Workers (V8 builds)
     };
     builtins.clear();
     for (const Entry& e : modules) {

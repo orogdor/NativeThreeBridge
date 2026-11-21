@@ -191,6 +191,18 @@ bool webappReadGameFile(const std::filesystem::path& root, const std::string& re
     return true;
 }
 
+bool webappGameFileSize(const std::filesystem::path& root, const std::string& rel,
+                        std::uint64_t& size, std::string& error) {
+    const std::string clean = webappNormalizeGamePath(rel);
+    if (clean.empty()) { error = "Invalid game path: " + rel; return false; }
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(root / std::filesystem::u8path(clean), ec);
+    if (ec) { error = "File not found in game folder: " + clean; return false; }
+    if (bytes > kMaxGameFileBytes) { error = "File too large or unreadable: " + clean; return false; }
+    size = bytes;
+    return true;
+}
+
 std::string webappPathUtf8(const std::filesystem::path& path) { return path.u8string(); }
 
 } // namespace native_three

@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "task_queue.h"
 #include "webapp_host.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
@@ -195,12 +196,46 @@ void interleaveVertices(float* o, const float* p, const float* n, const float* c
     }
 }
 
+// PNG/JPEG/WebP/... -> RGBA8 with a given WIC factory (any thread).
+bool decodeImageWic(IWICImagingFactory* wic, const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba,
+                    UINT& w, UINT& h) {
+    if (!wic || !data || !bytes || bytes > 0x7fffffff) return false;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    if (FAILED(wic->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(data), DWORD(bytes))) ||
+        FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(wic->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
+                                     WICBitmapPaletteTypeCustom)))
+        return false;
+    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 16384 || h > 16384) return false;
+    rgba.resize(std::size_t(w) * h * 4);
+    return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
+}
+
+// WIC factory of the calling background thread (multithreaded COM apartment).
+IWICImagingFactory* threadWic() {
+    thread_local ComPtr<IWICImagingFactory> factory;
+    thread_local bool tried = false;
+    if (!tried) {
+        tried = true;
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        (void)co; // S_FALSE: already initialised on this thread
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
+            factory.Reset();
+    }
+    return factory.Get();
+}
+
 class WebappWindow final : public native_three::WebappRenderSink {
 public:
     explicit WebappWindow(std::filesystem::path root) : root_(std::move(root)) {}
     // initUi() starts a worker before V8 boots. Drain it also on early boot
     // failure, not just on the normal WM_QUIT/reload paths.
-    ~WebappWindow() { stopRenderThread(); stopUiThread(); }
+    ~WebappWindow() { decodeQueue_.stop(); stopRenderThread(); stopUiThread(); }
     int run(HINSTANCE instance);
 
     // ---- WebappRenderSink
@@ -329,6 +364,8 @@ private:
     void resetTextures();
     void resetPage();
     bool decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h);
+    void decodeTextureJob(std::uint32_t id, std::uint32_t flags, std::uint64_t version, std::uint64_t epoch,
+                          const std::vector<std::uint8_t>& bytes);
     bool createTexture(std::uint32_t id, std::vector<std::vector<std::uint8_t>> levels, UINT w, UINT h, std::uint32_t flags);
     void flushPointerMove();
     void recordTextureCopies();
@@ -341,7 +378,16 @@ private:
     UINT width_ = 1280, height_ = 720;
     bool minimized_ = false;
     WebappHost host_;
-    std::recursive_mutex gfxMutex_; // protects DX12 resource changes by V8 and renderer
+    std::recursive_mutex gfxMutex_; // protects DX12 resource changes by V8, renderer and image decoding
+    // Encoded images (PNG/JPEG/WebP) are decoded and mipmapped on background
+    // threads; until a texture is ready its draws use the white texture, as
+    // a browser shows a mesh before its image has loaded. NTB_ASYNC_TEXTURES=0
+    // decodes on the JavaScript thread as before.
+    native_three::TaskQueue decodeQueue_{native_three::TaskQueue::cpuThreads(4)};
+    bool asyncDecode_ = true;
+    std::uint64_t textureVersionCounter_ = 0;                     // gfxMutex_
+    std::unordered_map<std::uint32_t, std::uint64_t> textureVersions_; // id -> newest upload (gfxMutex_)
+    std::uint64_t textureEpoch_ = 0;                              // bumped by resetTextures (gfxMutex_)
     std::mutex logMutex_;
     std::thread renderThread_;
     std::mutex renderStateMutex_;
@@ -658,9 +704,17 @@ void WebappWindow::initTextures() {
     (void)co; // S_FALSE / RPC_E_CHANGED_MODE: COM is already usable on this thread
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_))))
         log("warn", "WIC is not available: image textures cannot be decoded");
+    char decodeMode[8] = {};
+    GetEnvironmentVariableA("NTB_ASYNC_TEXTURES", decodeMode, sizeof(decodeMode));
+    asyncDecode_ = std::strcmp(decodeMode, "0") != 0;
+    log("info", asyncDecode_ ? "[async-textures] images decode on " + std::to_string(native_three::TaskQueue::cpuThreads(4)) + " background threads"
+                             : std::string("[async-textures] off (NTB_ASYNC_TEXTURES=0)"));
 }
 
 void WebappWindow::resetTextures() {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    textureEpoch_++;
+    textureVersions_.clear();
     pendingCopies_.clear();
     retired_.clear();
     retiredSlots_.clear();
@@ -675,6 +729,7 @@ void WebappWindow::resetTextures() {
 
 void WebappWindow::resetPage() {
     stopRenderThread();
+    decodeQueue_.stop(); // pending image decodes belong to the old page
     host_.shutdown();
     waitForGpu();
     pendingPasses_.clear();
@@ -712,21 +767,25 @@ void WebappWindow::resetPage() {
 }
 
 bool WebappWindow::decodeImage(const std::uint8_t* data, std::size_t bytes, std::vector<std::uint8_t>& rgba, UINT& w, UINT& h) {
-    if (!wic_ || !data || !bytes || bytes > 0x7fffffff) return false;
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> converter;
-    if (FAILED(wic_->CreateStream(&stream)) ||
-        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(data), DWORD(bytes))) ||
-        FAILED(wic_->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
-        FAILED(decoder->GetFrame(0, &frame)) || FAILED(wic_->CreateFormatConverter(&converter)) ||
-        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0,
-                                     WICBitmapPaletteTypeCustom)))
-        return false;
-    if (FAILED(converter->GetSize(&w, &h)) || !w || !h || w > 16384 || h > 16384) return false;
-    rgba.resize(std::size_t(w) * h * 4);
-    return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(rgba.size()), rgba.data()));
+    return decodeImageWic(wic_.Get(), data, bytes, rgba, w, h);
+}
+
+void WebappWindow::decodeTextureJob(std::uint32_t id, std::uint32_t flags, std::uint64_t version, std::uint64_t epoch,
+                                    const std::vector<std::uint8_t>& bytes) {
+    std::vector<std::uint8_t> rgba;
+    UINT w = 0, h = 0;
+    const bool decoded = decodeImageWic(threadWic(), bytes.data(), bytes.size(), rgba, w, h);
+    std::vector<std::vector<std::uint8_t>> levels;
+    if (decoded) levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    // A page reload, a release or a newer upload of the same texture wins.
+    auto current = textureVersions_.find(id);
+    if (epoch != textureEpoch_ || current == textureVersions_.end() || current->second != version) return;
+    if (!decoded) {
+        if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes.size()) + " bytes; WebP needs the Windows WebP Image Extension)");
+        return;
+    }
+    createTexture(id, std::move(levels), w, h, flags);
 }
 
 bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::vector<std::uint8_t>> levels, UINT w, UINT h, std::uint32_t flags) {
@@ -826,6 +885,7 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::vector<std::
 
 void WebappWindow::releaseTexture(std::uint32_t id) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    if (id != 0) textureVersions_.erase(id);
     auto it = textures_.find(id);
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
@@ -836,6 +896,18 @@ void WebappWindow::releaseTexture(std::uint32_t id) {
 bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                                  std::uint32_t height, std::uint32_t flags) {
     if (id == 0) return false;
+    if (!width && asyncDecode_ && data && bytes && bytes <= 0x7fffffff) {
+        // Encoded image: decode + mipmaps on a background thread.
+        std::uint64_t version, epoch;
+        {
+            std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+            version = textureVersions_[id] = ++textureVersionCounter_;
+            epoch = textureEpoch_;
+        }
+        auto copy = std::make_shared<const std::vector<std::uint8_t>>(data, data + bytes);
+        decodeQueue_.post([this, id, flags, version, epoch, copy] { decodeTextureJob(id, flags, version, epoch, *copy); });
+        return true;
+    }
     // Decoding and the mip chain are pure CPU work on the caller's own data:
     // done before the lock so they never wait for (or stall) the DX12 worker.
     std::vector<std::uint8_t> rgba;
@@ -848,6 +920,7 @@ bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std
     std::vector<std::vector<std::uint8_t>> levels;
     if (decoded) levels = buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    textureVersions_[id] = ++textureVersionCounter_; // supersedes a pending background decode
     if (!decoded) {
         if (textureFailures_++ < 5) log("warn", "Texture image could not be decoded (" + std::to_string(bytes) + " bytes; WebP needs the Windows WebP Image Extension)");
         return false;
@@ -868,6 +941,7 @@ bool WebappWindow::uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId,
     std::vector<std::vector<std::uint8_t>> levels =
         buildMips(std::move(rgba), w, h, (flags & native_three::kWebappTextureMipmaps) != 0);
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    textureVersions_[id] = ++textureVersionCounter_;
     return createTexture(id, std::move(levels), w, h, flags);
 }
 
@@ -2155,7 +2229,9 @@ int WebappWindow::run(HINSTANCE instance) {
         const bool threaded = renderThread_.joinable();
         if (threaded) submitRenderThread();
         else {
-            renderFrame();
+            // Background image decoding may add textures at any time.
+            std::unique_lock<std::recursive_mutex> gpuLock(gfxMutex_);
+            renderFrame(&gpuLock);
             previousFenceMs = fenceWaitMs_; fenceWaitMs_ = 0;
             previousPresentMs = presentMs_; presentMs_ = 0;
         }

@@ -2096,12 +2096,19 @@
       let path;
       try { path = toGamePath(url); } catch (e) { reject(e); return; }
       if (path === null) { reject(new TypeError(`fetch: network access is disabled in NativeThreeBridge (${url})`)); return; }
-      try {
-        const data = nt.readBinary(path);
+      const notFound = (e) => resolve(new Response(String(e && e.message || e), { status: 404, statusText: 'Not Found', url }));
+      const respond = (data) => {
         const ext = path.split('.').pop().toLowerCase();
         resolve(new Response(method === 'HEAD' ? null : data, { url: `${GAME_ORIGIN}/${path}`, headers: { 'content-type': MIME[ext] || 'application/octet-stream', 'content-length': String(data.byteLength) } }));
+      };
+      try {
+        // Big files (GLB, textures, audio) are read on a background thread
+        // and arrive on a later frame; small ones are read at once as before.
+        const data = method !== 'HEAD' && typeof nt.readBinaryAsync === 'function' ? nt.readBinaryAsync(path) : nt.readBinary(path);
+        if (typeof data === 'number') pendingReads.set(data, (buffer, error) => (buffer ? respond(buffer) : notFound(error)));
+        else respond(data);
       } catch (e) {
-        resolve(new Response(String(e && e.message || e), { status: 404, statusText: 'Not Found', url }));
+        notFound(e);
       }
     });
   }
@@ -2126,6 +2133,71 @@
         this.dispatchEvent(new Event('loadend'));
       }, () => { this.readyState = 4; this.dispatchEvent(new Event('error')); this.dispatchEvent(new Event('loadend')); });
     }
+  }
+
+  // ------------------------------------------------------------ workers
+  // `new Worker(url)` runs the script in its own V8 isolate on its own OS
+  // thread (webapp_host_v8.cpp). Messages are structured clones; transferred
+  // ArrayBuffers move without copying, SharedArrayBuffer + Atomics share
+  // memory. Builds without native workers (QuickJS) keep `Worker` undefined.
+  class MessageEvent extends Event {
+    constructor(t, i = {}) { super(t, i); this.data = i.data; this.origin = i.origin || ''; this.lastEventId = i.lastEventId || ''; this.source = i.source ?? null; this.ports = i.ports || []; }
+  }
+  const nativeWorkers = typeof nt.workerCreate === 'function';
+  const liveWorkers = new Map();
+  class Worker extends EventTarget {
+    constructor(url, options = {}) {
+      super();
+      if (arguments.length < 1) throw new TypeError("Failed to construct 'Worker': 1 argument required");
+      const raw = url instanceof URL ? url.href : String(url);
+      const href = /^(blob|data):/i.test(raw) ? raw : new URL(raw, documentURL).href;
+      let path = null, source = null;
+      if (/^blob:/i.test(href)) {
+        const blob = blobStore.get(href);
+        if (!blob) throw Object.assign(new Error(`Worker script ${href} was revoked or never created`), { name: 'SecurityError' });
+        source = new TextDecoder().decode(blob._bytes);
+      } else if (/^data:/i.test(href)) {
+        source = new TextDecoder().decode(dataUrlBytes(href));
+      } else {
+        path = toGamePath(href);
+        if (path === null) throw Object.assign(new Error(`Worker scripts must be inside the game folder (network access is disabled): ${href}`), { name: 'SecurityError' });
+      }
+      this.onmessage = null; this.onmessageerror = null; this.onerror = null;
+      Object.defineProperty(this, '_ntId', {
+        value: nt.workerCreate(path, source, options.type === 'module', String(options.name ?? ''), path !== null ? `${GAME_ORIGIN}/${path}` : documentURL),
+        writable: true,
+      });
+      liveWorkers.set(this._ntId, this);
+    }
+    postMessage(message, transfer) {
+      const list = Array.isArray(transfer) ? transfer : transfer && Array.isArray(transfer.transfer) ? transfer.transfer : [];
+      nt.workerPost(this._ntId, message, list);
+    }
+    terminate() {
+      if (!this._ntId) return;
+      nt.workerTerminate(this._ntId);
+      liveWorkers.delete(this._ntId);
+      this._ntId = 0;
+    }
+  }
+  // Engine -> page: kind 0 message, 1 uncaught error, 3 messageerror.
+  function workerEvent(id, kind, data, message, filename, lineno) {
+    const worker = liveWorkers.get(id);
+    if (!worker) return;
+    if (kind === 0) worker.dispatchEvent(new MessageEvent('message', { data }));
+    else if (kind === 3) worker.dispatchEvent(new MessageEvent('messageerror', { data: null }));
+    else if (kind === 1) {
+      const event = new ErrorEvent('error', { message, filename, lineno, cancelable: true });
+      worker.dispatchEvent(event);
+      if (!event.defaultPrevented) reportError(`Worker ${filename || '#' + id}`, message);
+    }
+  }
+  // Large file reads finish on a background thread (__nt.readBinaryAsync).
+  const pendingReads = new Map();
+  function ioComplete(id, buffer, error) {
+    const done = pendingReads.get(id);
+    pendingReads.delete(id);
+    if (done) done(buffer, error);
   }
 
   // ------------------------------------------------------------ storage
@@ -2387,7 +2459,7 @@
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NativeThreeBridge',
     appName: 'NativeThreeBridge', platform: 'Win32', vendor: 'NativeThreeBridge',
     language: 'et-EE', languages: ['et-EE', 'et', 'en'], onLine: false, cookieEnabled: false,
-    hardwareConcurrency: 4, maxTouchPoints: 0, deviceMemory: 8,
+    hardwareConcurrency: typeof nt.hardwareConcurrency === 'function' ? nt.hardwareConcurrency() : 4, maxTouchPoints: 0, deviceMemory: 8,
     getGamepads: () => [], vibrate: () => false,
     clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
     mediaDevices: undefined, xr: undefined, gpu: undefined,
@@ -2419,7 +2491,8 @@
     alert(msg) { nt.log('info', `[alert] ${msg}`); },
     confirm(msg) { nt.log('info', `[confirm] ${msg} -> true`); return true; },
     prompt(msg, def = '') { nt.log('info', `[prompt] ${msg} -> ${def}`); return def; },
-    isSecureContext: true, crossOriginIsolated: false, origin: GAME_ORIGIN, name: '', closed: false,
+    // SharedArrayBuffer is usable by workers, as on a cross-origin-isolated page.
+    isSecureContext: true, crossOriginIsolated: nativeWorkers, origin: GAME_ORIGIN, name: '', closed: false,
     scrollX: 0, scrollY: 0, pageXOffset: 0, pageYOffset: 0, screenX: 0, screenY: 0, screenLeft: 0, screenTop: 0,
     Node, Text, Comment, Element, HTMLElement, HTMLCanvasElement, HTMLImageElement, HTMLInputElement, HTMLButtonElement, HTMLScriptElement,
     HTMLVideoElement: HTMLMediaElement, HTMLAudioElement: HTMLMediaElement, HTMLMediaElement, SVGElement: Element, Document, HTMLDocument: Document, DocumentFragment,
@@ -2430,7 +2503,8 @@
     fetch, Headers, Request, Response, Blob, File, XMLHttpRequest, DOMParser,
     ReadableStream, DecompressionStream, CompressionStream,
     createImageBitmap, ImageBitmap, CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D,
-    ResizeObserver, MutationObserver, IntersectionObserver,
+    ResizeObserver, MutationObserver, IntersectionObserver, MessageEvent,
+    ...(nativeWorkers ? { Worker } : {}),
   };
   for (const [k, v] of Object.entries(assign)) {
     if (k === 'globalThis') continue;
@@ -2451,12 +2525,19 @@
     Object.defineProperty(windowEvents, name, { get: () => global[name] });
   }
   document.defaultView = window;
-  if (typeof global.structuredClone !== 'function') {
+  if (typeof nt.structuredClone === 'function') {
+    // Real structured clone (Map, Set, Date, typed arrays, transfer, DataCloneError).
+    global.structuredClone = (value, options) => nt.structuredClone(value, options && Array.isArray(options.transfer) ? options.transfer : []);
+  } else if (typeof global.structuredClone !== 'function') {
     global.structuredClone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
   }
   if (typeof global.performance === 'undefined') {
     const start = Date.now();
-    global.performance = { now: () => Date.now() - start, timeOrigin: start };
+    // Sub-millisecond clock when the engine has one (smoother frame deltas).
+    if (typeof nt.now === 'function') {
+      const origin = nt.now();
+      global.performance = { now: () => nt.now() - origin, timeOrigin: start };
+    } else global.performance = { now: () => Date.now() - start, timeOrigin: start };
   }
   for (const m of ['mark', 'measure', 'clearMarks', 'clearMeasures']) if (typeof performance[m] !== 'function') performance[m] = () => {};
   if (typeof performance.getEntriesByName !== 'function') performance.getEntriesByName = () => [];
@@ -2805,6 +2886,8 @@
     },
     unsupported,
     warnOnce,
+    workerEvent,
+    ioComplete,
     get ui() { return uiLayer; },
     set ui(layer) { uiLayer = layer || null; },
   };
