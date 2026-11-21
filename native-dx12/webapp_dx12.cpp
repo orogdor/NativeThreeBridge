@@ -58,7 +58,7 @@ constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots
 constexpr UINT kShadowSlot = kMaxTextures - 1;       // SRV of the shadow map (t10)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
 constexpr UINT kFrameCBBytes = 1536;                 // see cbuffer Frame (332 floats)
-constexpr UINT kDrawCBBytes = 512; // cbuffer Draw (76 floats), CBVs are 256-byte aligned
+constexpr UINT kDrawCBBytes = 512; // cbuffer Draw (80 floats), CBVs are 256-byte aligned
 constexpr UINT kMaterialMapCount = 9;
 constexpr UINT kShadowParam = 3 + kMaterialMapCount; // root parameter of t10
 // Draw record float 88 (js/native-renderer.mjs ShadowFlags)
@@ -316,7 +316,64 @@ public:
         else if (css == "ns-resize" || css == "row-resize" || css == "n-resize" || css == "s-resize") id = IDC_SIZENS;
         cursorHidden_ = css == "none";
         cursor_ = LoadCursorW(nullptr, id);
+        SetCursor(cursorHidden_ || pointerLocked_ ? nullptr : cursor_);
+    }
+    bool setPointerLock(bool lock) override {
+        if (lock == pointerLocked_) return true;
+        if (lock) {
+            if (GetForegroundWindow() != window_) return false; // like a browser: needs the focused window
+            RAWINPUTDEVICE mouse{0x01, 0x02, 0, window_};   // generic desktop / mouse: relative motion
+            if (!RegisterRawInputDevices(&mouse, 1, sizeof mouse)) return false;
+            pointerLocked_ = true;
+            lockDx_ = lockDy_ = 0;
+            clipPointerToCenter();
+            SetCursor(nullptr);
+        } else {
+            releasePointerLock(false);
+        }
+        return true;
+    }
+    bool setFullscreen(bool on) override {
+        if (on == fullscreen_) return true;
+        if (on) {
+            windowedStyle_ = GetWindowLongPtrW(window_, GWL_STYLE);
+            windowedPlacement_.length = sizeof windowedPlacement_;
+            GetWindowPlacement(window_, &windowedPlacement_);
+            MONITORINFO mi{sizeof mi};
+            if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+            SetWindowLongPtrW(window_, GWL_STYLE, windowedStyle_ & ~LONG_PTR(WS_OVERLAPPEDWINDOW));
+            SetWindowPos(window_, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            fullscreen_ = true;
+        } else {
+            SetWindowLongPtrW(window_, GWL_STYLE, windowedStyle_);
+            SetWindowPlacement(window_, &windowedPlacement_);
+            SetWindowPos(window_, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            fullscreen_ = false;
+        }
+        if (pointerLocked_) clipPointerToCenter();
+        return true;
+    }
+    // The cursor stays in a 1 px box in the window centre while locked.
+    void clipPointerToCenter() {
+        RECT rc;
+        GetClientRect(window_, &rc);
+        POINT c{(rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2};
+        ClientToScreen(window_, &c);
+        SetCursorPos(c.x, c.y);
+        RECT clip{c.x, c.y, c.x + 1, c.y + 1};
+        ClipCursor(&clip);
+    }
+    // notify: the engine ended it (Escape, focus loss), so the page hears about it.
+    void releasePointerLock(bool notify) {
+        if (!pointerLocked_) return;
+        RAWINPUTDEVICE mouse{0x01, 0x02, RIDEV_REMOVE, nullptr};
+        RegisterRawInputDevices(&mouse, 1, sizeof mouse);
+        pointerLocked_ = false;
+        lockDx_ = lockDy_ = 0;
+        ClipCursor(nullptr);
         SetCursor(cursorHidden_ ? nullptr : cursor_);
+        if (notify) host_.lockChanged(false, fullscreen_);
     }
     void canvasCommands(std::uint32_t id, std::uint32_t w, std::uint32_t h, const float* ops, std::size_t floats,
                         const std::string& strings) override {
@@ -479,6 +536,12 @@ private:
     ComPtr<ID3D12Resource> shadowMap_;
     ComPtr<ID3D12DescriptorHeap> shadowDsvHeap_;
     UINT shadowSize_ = 0;
+    UINT shadowSlot_ = kShadowSlot;   // SRV slot of the current shadow map
+    D3D12_GPU_DESCRIPTOR_HANDLE shadowSrv() const {
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = texHeap_->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(shadowSlot_) * texStep_;
+        return gpu;
+    }
     UINT lastShadowDraws_ = 0;
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
     // Same pipelines addressed directly by their key: the per-draw lookup is one array read.
@@ -530,6 +593,10 @@ private:
     std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
     bool cursorHidden_ = false;
+    bool pointerLocked_ = false, fullscreen_ = false;
+    double lockDx_ = 0, lockDy_ = 0;               // raw mouse motion since the last flush
+    LONG_PTR windowedStyle_ = 0;
+    WINDOWPLACEMENT windowedPlacement_{};
     // HTML/CSS UI overlay: Direct2D raster -> texture -> premultiplied blend.
     native_three::WebappUiRenderer ui_;
     bool uiReady_ = false, uiUpload_ = false, uiVisible_ = false;
@@ -754,12 +821,17 @@ void WebappWindow::initDevice() {
     initUi();
 }
 
-// Depth texture for light.shadow (size = shadow.mapSize, clamped).
+// Depth texture for light.shadow (size = shadow.mapSize, clamped). Called
+// while a frame is being recorded: the old map and its SRV slot are retired
+// by fence like textures (never wait for the GPU here: that would also free
+// this frame's pending upload buffers).
 void WebappWindow::ensureShadowMap(UINT size) {
     if (shadowMap_ && shadowSize_ == size) return;
+    UINT slot = shadowSlot_;
     if (shadowMap_) {
-        waitForGpu(); // the SRV slot is rewritten below
-        retire(shadowMap_);
+        if (freeSlots_.empty()) return; // keep the current size
+        slot = freeSlots_.back();
+        freeSlots_.pop_back();
     }
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -788,10 +860,15 @@ void WebappWindow::ensureShadowMap(UINT size) {
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
-    cpu.ptr += SIZE_T(kShadowSlot) * texStep_;
+    cpu.ptr += SIZE_T(slot) * texStep_;
     device_->CreateShaderResourceView(map.Get(), &srv, cpu);
+    if (shadowMap_) {
+        retire(shadowMap_);
+        retiredSlots_.push_back({shadowSlot_, fenceValue_ + kFrameCount});
+    }
     shadowMap_ = map;
     shadowSize_ = size;
+    shadowSlot_ = slot;
 }
 
 ID3D12PipelineState* WebappWindow::shadowPipeline() {
@@ -851,6 +928,17 @@ void WebappWindow::resetTextures() {
     textureFailures_ = 0;
     freeSlots_.clear();
     for (UINT slot = kShadowSlot - 1; slot >= 1; slot--) freeSlots_.push_back(slot); // kShadowSlot is reserved
+    if (shadowMap_) { // a page reload keeps the shadow map; its view goes back to the reserved slot
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
+        cpu.ptr += SIZE_T(kShadowSlot) * texStep_;
+        device_->CreateShaderResourceView(shadowMap_.Get(), &srv, cpu);
+        shadowSlot_ = kShadowSlot;
+    }
     // slot 0: 1x1 white, bound for untextured draws
     createTexture(0, buildMips(std::vector<std::uint8_t>(4, 255), 1, 1, false), 1, 1, 0);
 }
@@ -1963,7 +2051,9 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         dcb[56] = d[70];
         dcb[57] = float(std::uint32_t(d[71]) & 511u);
         dcb[58] = float(std::uint32_t(d[71]) >> 9);
+        dcb[59] = d[89];                                     // standard material map bits
         std::memcpy(dcb + 60, d + 72, 16 * sizeof(float)); // translated material uniforms 12..27
+        dcb[76] = d[90]; dcb[77] = d[91]; dcb[78] = d[92]; dcb[79] = 0; // normalScale, aoMapIntensity
         cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
         ringOffset += kDrawCBBytes;
     };
@@ -2003,11 +2093,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             cmd_->DrawInstanced(in.n, in.instanceCount, in.start, 0);
         }
     };
-    {
-        D3D12_GPU_DESCRIPTOR_HANDLE shadowSrv = texHeap_->GetGPUDescriptorHandleForHeapStart();
-        shadowSrv.ptr += UINT64(kShadowSlot) * texStep_;
-        cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv);
-    }
+    cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv());
 
     UINT drawsThisFrame = 0, shadowDrawsThisFrame = 0;
     for (std::size_t passIndex = 0; passIndex < passCount_; passIndex++) {
@@ -2035,7 +2121,10 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         const bool shadows = p[56] > 0;
         if (shadows) {
             const UINT size = UINT(std::clamp(p[60], 256.0f, 4096.0f));
-            ensureShadowMap(size);
+            if (size != shadowSize_) {
+                ensureShadowMap(size);
+                cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv());
+            }
             std::memcpy(fcb + 308, p + 64, 16 * sizeof(float)); // shadow camera view-projection
             fcb[324] = 1; fcb[325] = p[57]; fcb[326] = p[58]; fcb[327] = p[59];
             fcb[328] = 1.0f / float(size); fcb[329] = p[61]; fcb[330] = p[62];
@@ -2108,7 +2197,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             if (wanted != topology) { cmd_->IASetPrimitiveTopology(wanted); topology = wanted; }
             writeDrawConstants(d, drawFlags);
             bindColorMap(d, drawFlags);
-            if (patchId) {
+            if (patchId || d[89] > 0) { // material stage textures or standard maps (normalMap ...)
                 for (UINT slot = 0; slot < kMaterialMapCount; slot++) {
                     const auto map = textureHandle(std::uint32_t(d[61 + slot]));
                     if (map.ptr == boundMaterialMaps[slot].ptr) continue;
@@ -2168,6 +2257,11 @@ void WebappWindow::updateTitle(double fps) {
 // Delivers the newest pending mouse position. Called before any other input
 // event, so JavaScript still sees every event in its real order.
 void WebappWindow::flushPointerMove() {
+    if (pointerLocked_ && (lockDx_ != 0 || lockDy_ != 0)) {
+        const double dx = lockDx_, dy = lockDy_;
+        lockDx_ = lockDy_ = 0;
+        host_.pointerMovement(dx, dy);
+    }
     if (!pointerMovePending_) return;
     pointerMovePending_ = false;
     host_.pointer("move", pointerMoveX_, pointerMoveY_, 0);
@@ -2226,9 +2320,19 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         minimized_ = wp == SIZE_MINIMIZED;
         if (!minimized_) resize(LOWORD(lp), HIWORD(lp));
+        if (pointerLocked_ && !minimized_) clipPointerToCenter();
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (wp == VK_F4 && GetKeyState(VK_MENU) < 0) break; // Alt+F4 closes
+        if (wp == VK_ESCAPE && (pointerLocked_ || fullscreen_)) {
+            // Browsers keep Escape for leaving pointer lock / fullscreen.
+            flushPointerMove();
+            const bool wasFullscreen = fullscreen_;
+            releasePointerLock(false);
+            if (wasFullscreen) setFullscreen(false);
+            host_.lockChanged(false, false);
+            return 0;
+        }
         keyEvent(true, wp, lp);
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
@@ -2252,7 +2356,19 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!(wp & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON))) ReleaseCapture();
         return 0;
     }
+    case WM_INPUT:
+        if (pointerLocked_) {
+            RAWINPUT raw{};
+            UINT size = sizeof raw;
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
+                raw.header.dwType == RIM_TYPEMOUSE && !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                lockDx_ += raw.data.mouse.lLastX;
+                lockDy_ += raw.data.mouse.lLastY;
+            }
+        }
+        break;
     case WM_MOUSEMOVE:
+        if (pointerLocked_) return 0; // position is pinned; movement comes from WM_INPUT
         pointerMoveX_ = GET_X_LPARAM(lp);
         pointerMoveY_ = GET_Y_LPARAM(lp);
         pointerMovePending_ = true;
@@ -2269,10 +2385,10 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CONTEXTMENU:
         return 0;
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ ? nullptr : cursor_); return TRUE; }
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(cursorHidden_ || pointerLocked_ ? nullptr : cursor_); return TRUE; }
         break;
     case WM_SETFOCUS: flushPointerMove(); host_.focus(true); return 0;
-    case WM_KILLFOCUS: flushPointerMove(); host_.focus(false); return 0;
+    case WM_KILLFOCUS: flushPointerMove(); releasePointerLock(true); host_.focus(false); return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;

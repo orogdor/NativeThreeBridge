@@ -15,9 +15,13 @@
 // radius, intensity, perspective); 64..79: shadow camera view-projection.
 export const PASS_HEADER_FLOATS = 96;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 92;
+export const DRAW_FLOATS = 96;
 // Draw float 88: shadow bits (castShadow, receiveShadow, only in the shadow pass).
+// 89: standard map bits (StandardMaps), 90..91 normalScale, 92 aoMapIntensity.
 export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4 };
+// Material maps besides `map`, bound to t1..t6 (bit i = slot i).
+export const StandardMaps = { NORMAL: 1, ROUGHNESS: 2, METALNESS: 4, EMISSIVE: 8, AO: 16, ALPHA: 32 };
+const STANDARD_MAP_KEYS = ['normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'aoMap', 'alphaMap'];
 // Translated material stages: up to 28 uniform floats (draw floats 49..60 and 72..87).
 const STAGE_UNIFORM_FLOATS = 28;
 export const MAX_LIGHTS = 16;
@@ -50,6 +54,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
   const _projScreen = new THREE.Matrix4();
   const _shadowViewProj = new THREE.Matrix4();
+  const _identityMatrix = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -615,7 +620,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (object.isLOD && object.autoUpdate !== false) object.update(camera);
         if (object.isLight) this._addLight(object, lights, ambient);
         else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
-        else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
+        else if (object.isPoints) this._addPoints(object, camera, opaque, transparent);
         else if (object.isSprite) this._addSprite(object, camera, opaque, transparent);
       }
       const children = object.children;
@@ -664,15 +669,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const m = sprite.material;
       if (!m || !m.visible) return;
       if (sprite.frustumCulled && !_frustum.intersectsSprite(sprite)) return;
-      if (!this._spriteGeometry) {
-        const g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
-        g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
-        g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
-        g.setIndex([0, 1, 2, 0, 2, 3]);
-        this._spriteGeometry = g;
-      }
-      const record = this._geometryRecord(this._spriteGeometry);
+      const record = this._geometryRecord(this._spriteQuad());
       if (!record) return;
       _vec.setFromMatrixPosition(sprite.matrixWorld);
       _spriteScale.setFromMatrixScale(sprite.matrixWorld);
@@ -692,6 +689,96 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const proxy = { isSprite: true, matrixWorld: matrix, renderOrder: sprite.renderOrder || 0, name: sprite.name, type: 'Sprite', geometry: this._spriteGeometry };
       this._queue({ mesh: proxy, record, instances: null, z: _vec.z }, m, 0, 6, opaque, transparent);
     }
+    _spriteQuad() {
+      if (!this._spriteGeometry) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
+        g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
+        g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+        g.setIndex([0, 1, 2, 0, 2, 3]);
+        this._spriteGeometry = g;
+      }
+      return this._spriteGeometry;
+    }
+
+    // THREE.Points: every point is a camera-facing quad of PointsMaterial.size
+    // (pixels, shrinking with distance when sizeAttenuation), all points of
+    // one object in a single instanced draw.
+    _addPoints(points, camera, opaque, transparent) {
+      const geometry = points.geometry, m = points.material;
+      if (!geometry || !geometry.attributes || !geometry.attributes.position || !m) return;
+      if (Array.isArray(m)) { unsupported('THREE.Points with several materials'); return; }
+      if (!m.visible) return;
+      if (points.frustumCulled && geometry.boundingSphere !== undefined && !_frustum.intersectsObject(points)) return;
+      if (!m.isPointsMaterial) unsupported('THREE.Points with ' + m.type, 'drawn as PointsMaterial squares');
+      const position = geometry.attributes.position, colorAttr = geometry.attributes.color;
+      const range = geometry.drawRange;
+      const first = Math.max(0, range.start);
+      const last = Math.min(position.count, range.start + range.count);
+      let count = last - first;
+      if (count <= 0) return;
+      if (count > 262144) { warnOnce('points-cap', 'Only the first 262144 points of a THREE.Points are drawn'); count = 262144; }
+      const quad = this._geometryRecord(this._spriteQuad());
+      if (!quad) return;
+      if (!this._pointRecords) this._pointRecords = new Map();
+      let rec = this._pointRecords.get(points);
+      if (!rec) {
+        rec = { id: nextInstanceId++, matrices: new Float32Array(0), colors: null };
+        this._pointRecords.set(points, rec);
+        const onDispose = () => {
+          points.removeEventListener('dispose', onDispose);
+          this._pointRecords.delete(points);
+          nt.releaseInstances(rec.id);
+        };
+        points.addEventListener('dispose', onDispose);
+      }
+      if (rec.matrices.length < count * 16) rec.matrices = new Float32Array(Math.ceil(count * 1.25) * 16);
+      const useColors = !!(m.vertexColors && colorAttr);
+      if (useColors && (!rec.colors || rec.colors.length < count * 3)) rec.colors = new Float32Array(Math.ceil(count * 1.25) * 3);
+      const ce = camera.matrixWorld.elements;
+      _vec2.set(ce[0], ce[1], ce[2]).normalize();
+      const rx = _vec2.x, ry = _vec2.y, rz = _vec2.z;
+      _vec2.set(ce[4], ce[5], ce[6]).normalize();
+      const ux = _vec2.x, uy = _vec2.y, uz = _vec2.z;
+      _vec2.set(ce[8], ce[9], ce[10]).normalize();
+      const fx = _vec2.x, fy = _vec2.y, fz = _vec2.z;
+      const cx = ce[12], cy = ce[13], cz = ce[14];
+      const height = Math.max(1, this._height || 1);
+      const size = m.size ?? 1;
+      let perPixelAtDepth = 0, fixedWorld = 0;
+      if (camera.isPerspectiveCamera) {
+        const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / (camera.zoom || 1);
+        if (m.sizeAttenuation !== false) fixedWorld = size * tanHalf;      // gl_PointSize = size * (h/2) / -z
+        else perPixelAtDepth = 2 * tanHalf / height;                       // constant size in pixels
+      } else {
+        fixedWorld = size * (camera.top - camera.bottom) / (camera.zoom || 1) / height;
+      }
+      const out = rec.matrices, colors = rec.colors, mw = points.matrixWorld;
+      let zSum = 0;
+      for (let i = 0; i < count; i++) {
+        _vec.fromBufferAttribute(position, first + i).applyMatrix4(mw);
+        const depth = (cx - _vec.x) * fx + (cy - _vec.y) * fy + (cz - _vec.z) * fz; // distance in front of the camera
+        zSum += depth;
+        const w = fixedWorld || size * perPixelAtDepth * Math.max(depth, 0);
+        const o = i * 16;
+        out[o] = rx * w; out[o + 1] = ry * w; out[o + 2] = rz * w; out[o + 3] = 0;
+        out[o + 4] = ux * w; out[o + 5] = uy * w; out[o + 6] = uz * w; out[o + 7] = 0;
+        out[o + 8] = fx; out[o + 9] = fy; out[o + 10] = fz; out[o + 11] = 0;
+        out[o + 12] = _vec.x; out[o + 13] = _vec.y; out[o + 14] = _vec.z; out[o + 15] = 1;
+        if (useColors) {
+          colors[i * 3] = colorAttr.getX(first + i); colors[i * 3 + 1] = colorAttr.getY(first + i); colors[i * 3 + 2] = colorAttr.getZ(first + i);
+        }
+      }
+      nt.uploadInstances(rec.id, out.subarray(0, count * 16), useColors ? colors.subarray(0, count * 3) : null, count);
+      _vec.set(cx - fx * zSum / count, cy - fy * zSum / count, cz - fz * zSum / count).applyMatrix4(_projScreen);
+      const proxy = {
+        isPoints: true, matrixWorld: _identityMatrix, renderOrder: points.renderOrder || 0, name: points.name, type: 'Points',
+        geometry: this._spriteGeometry, count, instanceColor: useColors ? colorAttr : null, castShadow: false, receiveShadow: false,
+      };
+      this._queue({ mesh: proxy, record: quad, instances: rec, z: _vec.z }, m, 0, 6, opaque, transparent);
+      this.info.render.points += count;
+    }
+
     _spriteMatrix(i) {
       if (!this._spriteMatrices) this._spriteMatrices = [];
       return this._spriteMatrices[i] || (this._spriteMatrices[i] = new THREE.Matrix4());
@@ -754,7 +841,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       let color = m.color || null, opacity = m.opacity ?? 1;
       let shaderMap = null, reflection = null, reflectionMask = false, colorStage = null;
       if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.isLineDashedMaterial) flags |= DrawFlags.UNLIT;
-      else if (m.isSpriteMaterial) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
+      else if (m.isSpriteMaterial || m.isPointsMaterial || mesh.isPoints) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
       else if (m.isMeshNormalMaterial) flags |= DrawFlags.NORMAL_COLOR;
       else if (m.isMeshStandardMaterial) { roughness = m.roughness; metalness = m.metalness; }
       else if (m.isMeshPhongMaterial) { shininess = m.shininess; roughness = Math.sqrt(2 / (m.shininess + 2)); }
@@ -798,8 +885,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
       if (m.fog !== false && (!(m.isShaderMaterial || m.isRawShaderMaterial) ||
           (m.fog && /#include\s+<fog_fragment>/.test(m.fragmentShader)))) flags |= DrawFlags.FOG;
-      if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
-        unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
+      if (m.envMap || m.lightMap || m.bumpMap || m.displacementMap) {
+        unsupported('envMap / lightMap / bumpMap / displacementMap', 'drawn without them');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (hasCompilePatch(m.onBeforeCompile)) {
@@ -842,6 +929,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvt = _uvIdentity;
       uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
       const colorMap = m.map || shaderMap;
+      // u' = a u + c v + e ; v' = b u + d v + f  (D3D rows run top-down: flipY mirrors v)
+      const setUv = (map) => {
+        if (map.matrixAutoUpdate) map.updateMatrix();
+        const e = map.matrix.elements;
+        let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
+        if (map.flipY) { b = -b; d = -d; ty = 1 - ty; }
+        uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
+      };
+      let uvSource = null;
       if (colorMap && base.record.hasUvs) {
         const tex = this._textureRecord(colorMap);
         if (tex) {
@@ -850,14 +946,26 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           flags |= DrawFlags.MAP;
           if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
           else if (map.wrapS === THREE.MirroredRepeatWrapping || map.wrapT === THREE.MirroredRepeatWrapping) flags |= DrawFlags.MAP_MIRROR;
-          if (map.matrixAutoUpdate) map.updateMatrix();
-          const e = map.matrix.elements;
-          // u' = a u + c v + e ; v' = b u + d v + f  (D3D rows run top-down: flipY mirrors v)
-          let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
-          if (map.flipY) { b = -b; d = -d; ty = 1 - ty; }
-          uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
+          setUv(map);
+          uvSource = map;
         }
       }
+      // normalMap, roughnessMap, metalnessMap, emissiveMap, aoMap, alphaMap:
+      // sampled with the colour map's uv transform (or the first of them).
+      let stdMaps = 0, stdTextures = null;
+      if (!colorStage && base.record.hasUvs) {
+        for (let slot = 0; slot < STANDARD_MAP_KEYS.length; slot++) {
+          const texture = m[STANDARD_MAP_KEYS[slot]];
+          if (!texture || !texture.isTexture) continue;
+          const tex = this._textureRecord(texture);
+          if (!tex) continue;
+          if (!uvSource) { setUv(texture); uvSource = texture; }
+          (stdTextures ||= [])[slot] = { id: tex.id, texture, std: true };
+          stdMaps |= 1 << slot;
+        }
+      }
+      const normalScale = m.normalScale;
+      const uvFlip = uvSource?.flipY ? -1 : 1;
       const emissive = m.emissive || null;
       const ei = m.emissiveIntensity ?? 1;
       const draw = {
@@ -867,10 +975,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
-        materialTextures: colorStage?.textures.map(({ uniform }) => {
+        materialTextures: colorStage ? colorStage.textures.map(({ uniform }) => {
           const texture = uniform.value;
           return { id: this._textureRecord(texture)?.id ?? 0, texture };
-        }),
+        }) : stdTextures,
+        stdMaps, normalScaleX: normalScale ? normalScale.x : 1, normalScaleY: (normalScale ? normalScale.y : 1) * uvFlip,
+        aoIntensity: m.aoMapIntensity ?? 1,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
         shadow: (mesh.castShadow && !(flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? ShadowFlags.CAST : 0) |
@@ -906,13 +1016,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p.set(d.matrix, o + 16);
     p[o + 32] = d.textureId; p[o + 33] = d.alphaTest;
     p[o + 34] = d.ua; p[o + 35] = d.ub; p[o + 36] = d.uc; p[o + 37] = d.ud; p[o + 38] = d.ue; p[o + 39] = d.uf;
-    if (!d.reflection && !d.colorStage) {
+    if (!d.reflection && !d.colorStage && !d.stdMaps) {
       p.fill(0, o + 40, o + DRAW_FLOATS);
       p[o + 88] = d.shadow || 0;
       return;
     }
     p[o + 88] = d.shadow || 0;
-    p[o + 89] = 0; p[o + 90] = 0; p[o + 91] = 0;
+    p[o + 89] = d.stdMaps || 0; p[o + 90] = d.normalScaleX ?? 1; p[o + 91] = d.normalScaleY ?? 1; p[o + 92] = d.aoIntensity ?? 1;
+    p[o + 93] = 0; p[o + 94] = 0; p[o + 95] = 0;
     const reflection = d.reflection;
     const sky = reflection?.uniform.value;
     p[o + 40] = sky ? sky.r * reflection.intensity : 0;
@@ -938,7 +1049,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 61 + i] = binding?.id ?? 0;
       const texture = binding?.texture;
       if (!texture) continue;
-      if (texture.flipY) flip |= 1 << i;
+      if (texture.flipY && !binding.std) flip |= 1 << i; // standard maps use the draw's uv (flip included)
       if (texture.wrapS === THREE.RepeatWrapping || texture.wrapT === THREE.RepeatWrapping) repeat |= 1 << i;
       else if (texture.wrapS === THREE.MirroredRepeatWrapping || texture.wrapT === THREE.MirroredRepeatWrapping) mirror |= 1 << i;
     }

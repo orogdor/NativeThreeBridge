@@ -452,6 +452,14 @@ JSValue jsReportUi(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     self->sink->reportUi(v[0], v[1], v[2], int(v[3]), int(v[4]), int(v[5]));
     return JS_UNDEFINED;
 }
+JSValue jsSetPointerLock(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    return JS_NewBool(ctx, argc >= 1 && self->sink && self->sink->setPointerLock(JS_ToBool(ctx, argv[0]) > 0));
+}
+JSValue jsSetFullscreen(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    return JS_NewBool(ctx, argc >= 1 && self->sink && self->sink->setFullscreen(JS_ToBool(ctx, argv[0]) > 0));
+}
 JSValue jsSetCursor(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     if (argc >= 1 && self->sink) self->sink->setCursor(argString(ctx, argv[0]));
@@ -578,6 +586,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"registerImage", jsRegisterImage, 2},
         {"registerColorPatch", jsRegisterColorPatch, 2}, {"submitPass", jsSubmitPass, 2},
         {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1}, {"reportUi", jsReportUi, 6},
+        {"setPointerLock", jsSetPointerLock, 1}, {"setFullscreen", jsSetFullscreen, 1},
     };
     for (const Fn& f : functions)
         JS_SetPropertyStr(s.ctx, api, f.name, JS_NewCFunction(s.ctx, f.fn, f.name, f.length));
@@ -660,6 +669,16 @@ void WebappHost::wheel(double x, double y, double deltaX, double deltaY) {
     JSContext* c = impl_->ctx;
     JSValue args[4] = {JS_NewFloat64(c, x), JS_NewFloat64(c, y), JS_NewFloat64(c, deltaX), JS_NewFloat64(c, deltaY)};
     impl_->callHost("wheel", 4, args);
+}
+void WebappHost::pointerMovement(double dx, double dy) {
+    if (!running()) return;
+    JSValue args[2] = {JS_NewFloat64(impl_->ctx, dx), JS_NewFloat64(impl_->ctx, dy)};
+    impl_->callHost("pointerMovement", 2, args);
+}
+void WebappHost::lockChanged(bool pointerLocked, bool fullscreen) {
+    if (!running()) return;
+    JSValue args[2] = {JS_NewBool(impl_->ctx, pointerLocked), JS_NewBool(impl_->ctx, fullscreen)};
+    impl_->callHost("lockChanged", 2, args);
 }
 void WebappHost::focus(bool focused) {
     if (!running()) return;

@@ -389,6 +389,14 @@ jobs:
               Get-Content dist/NativeThreeBridge-webapp-log.txt | Select-String -Pattern 'UI layer|frame \d+:|\[error\]|crash|Texture|Canvas|shader' | Select-Object -First 40
             }
           }
+      - name: Verify the engine ran the screenshot fixtures without crashing
+        shell: pwsh
+        run: |
+          foreach ($name in @('ui-fixture', 'textures-fixture', 'shadows-fixture')) {
+            $log = Get-Content "shots/$name-log.txt" -Raw -ErrorAction Stop
+            if ($log -match '\[crash\]') { throw "$name crashed in the engine: $([regex]::Match($log, '\[crash\][^\r\n]*').Value)" }
+            if ($log -notmatch 'frame 60: [1-9]') { throw "$name drew nothing by frame 60" }
+          }
       - name: Verify translated material on DX12
         shell: pwsh
         run: |

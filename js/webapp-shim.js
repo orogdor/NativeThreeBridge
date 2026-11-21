@@ -844,8 +844,8 @@
     scrollTo(x, y) { if (typeof x === 'object' && x) { if (x.top !== undefined) this.scrollTop = x.top; if (x.left !== undefined) this.scrollLeft = x.left; } else { if (x !== undefined) this.scrollLeft = x; if (y !== undefined) this.scrollTop = y; } }
     scrollBy(x, y) { if (typeof x === 'object' && x) { this.scrollTop += x.top || 0; this.scrollLeft += x.left || 0; } else { this.scrollLeft += x || 0; this.scrollTop += y || 0; } }
     animate() { unsupported('Element.animate'); return { finished: Promise.resolve(), cancel() {}, play() {}, pause() {} }; }
-    requestPointerLock() { unsupported('Pointer Lock', 'cursor stays free'); return Promise.resolve(); }
-    requestFullscreen() { unsupported('Fullscreen API'); return Promise.resolve(); }
+    requestPointerLock() { return setPointerLock(this); }
+    requestFullscreen() { return setFullscreen(this); }
     setPointerCapture() {}
     releasePointerCapture() {}
     hasPointerCapture() { return false; }
@@ -1548,8 +1548,10 @@
     getElementsByClassName(c) { const sel = String(c).split(/\s+/).filter(Boolean).map((x) => '.' + x.replace(/[^\w-]/g, (ch) => '\\' + ch)).join(''); return sel ? querySelectorAll(this, sel) : Object.assign([], { item: () => null }); }
     getElementsByName(n) { return querySelectorAll(this, `[name="${n}"]`); }
     hasFocus() { return true; }
-    exitPointerLock() {}
-    exitFullscreen() { return Promise.resolve(); }
+    exitPointerLock() { setPointerLock(null); }
+    exitFullscreen() { return setFullscreen(null); }
+    get pointerLockEnabled() { return typeof nt.setPointerLock === 'function'; }
+    get fullscreenEnabled() { return typeof nt.setFullscreen === 'function'; }
     elementFromPoint(x, y) { return (uiLayer && uiLayer.hitTest(x, y)) || this.querySelector('canvas') || this.body; }
     elementsFromPoint(x, y) { const e = this.elementFromPoint(x, y); const out = []; for (let n = e; n && n.nodeType === 1; n = n.parentNode) out.push(n); return out; }
     execCommand() { return false; }
@@ -2659,6 +2661,67 @@
       if (old.isConnected) old.dispatchEvent(new FocusEvent('blur'));
     }
   }
+  // ---------------------------------------------- pointer lock, fullscreen
+  // The engine hides and pins the cursor and sends raw movement
+  // (host.pointerMovement); Escape or losing focus ends it (host.lockChanged).
+  // pointerlock* events go to the document; fullscreen* events start at the
+  // element and bubble up to the document (as in browsers).
+  const lockEvent = (type, element) => {
+    Promise.resolve().then(() => {
+      const start = type.startsWith('fullscreen') && element && element.isConnected ? element : document;
+      start.dispatchEvent(new Event(type, { bubbles: true }));
+    });
+  };
+  function setPointerLock(element) {
+    if (!element) {
+      if (!document.pointerLockElement) return;
+      if (typeof nt.setPointerLock === 'function') nt.setPointerLock(false);
+      const old = document.pointerLockElement;
+      document.pointerLockElement = null;
+      lockEvent('pointerlockchange', old);
+      return;
+    }
+    if (document.pointerLockElement === element) return Promise.resolve();
+    if (typeof nt.setPointerLock !== 'function' || !nt.setPointerLock(true)) {
+      lockEvent('pointerlockerror', element);
+      return Promise.reject(Object.assign(new Error('Pointer lock was refused (the window is not focused)'), { name: 'NotAllowedError' }));
+    }
+    document.pointerLockElement = element;
+    lockEvent('pointerlockchange', element);
+    return Promise.resolve();
+  }
+  function setFullscreen(element) {
+    const on = !!element;
+    if ((document.fullscreenElement !== null) === on && document.fullscreenElement === (element || null)) return Promise.resolve();
+    if (typeof nt.setFullscreen !== 'function' || !nt.setFullscreen(on)) {
+      if (on) lockEvent('fullscreenerror', element);
+      return Promise.reject(Object.assign(new Error('Fullscreen is not available'), { name: 'NotAllowedError' }));
+    }
+    const old = document.fullscreenElement;
+    document.fullscreenElement = element || null;
+    lockEvent('fullscreenchange', element || old);
+    return Promise.resolve();
+  }
+  function pointerMovement(dx, dy) {
+    const target = document.pointerLockElement;
+    if (!target || !target.isConnected) return;
+    const { x, y } = lastPointer;
+    const init = { ...PTR, ...modifiers, clientX: x, clientY: y, offsetX: x, offsetY: y, pageX: x, pageY: y, screenX: x, screenY: y, movementX: dx, movementY: dy, button: -1, buttons: pointerButtons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    if (fire(target, new PointerEvent('pointermove', init))) fire(target, new MouseEvent('mousemove', init));
+  }
+  function lockChanged(pointerLocked, fullscreen) {
+    if (!pointerLocked && document.pointerLockElement) {
+      const old = document.pointerLockElement;
+      document.pointerLockElement = null;
+      lockEvent('pointerlockchange', old);
+    }
+    if (!fullscreen && document.fullscreenElement) {
+      const old = document.fullscreenElement;
+      document.fullscreenElement = null;
+      lockEvent('fullscreenchange', old);
+    }
+  }
+
   function pointer(kind, x, y, button, mods) {
     const movementX = x - lastPointer.x, movementY = y - lastPointer.y;
     lastPointer = { x, y };
@@ -2676,9 +2739,10 @@
     if (kind === 'down') pointerButtons |= bit;
     if (kind === 'up') pointerButtons &= ~bit;
     const init = { ...PTR, ...mods, clientX: x, clientY: y, offsetX: x, offsetY: y, pageX: x, pageY: y, screenX: x, screenY: y, movementX, movementY, button: kind === 'move' ? -1 : button, buttons: pointerButtons, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-    const under = hitTarget(x, y);
+    const locked = document.pointerLockElement && document.pointerLockElement.isConnected ? document.pointerLockElement : null;
+    const under = locked || hitTarget(x, y);
     // Implicit capture: a drag that starts on the canvas stays with it.
-    const target = captureTarget && captureTarget.isConnected ? captureTarget : under;
+    const target = locked || (captureTarget && captureTarget.isConnected ? captureTarget : under);
     if (kind === 'move' && !captureTarget) updateHover(under, init);
     if (kind === 'down') {
       if (!captureTarget) { captureTarget = under; downTarget = under; }
@@ -2849,6 +2913,8 @@
       } else if (edit && key === 'Enter') edit.dispatchEvent(new Event('change', { bubbles: true }));
     },
     pointer(kind, x, y, button) { pointer(kind, x, y, button | 0, modifiers); },
+    pointerMovement(dx, dy) { pointerMovement(dx, dy); },
+    lockChanged(pointerLocked, fullscreen) { lockChanged(!!pointerLocked, !!fullscreen); },
     wheel(x, y, deltaX, deltaY) {
       if (uiLayer?.selectWheel?.(x, y, deltaY)) return;
       const target = hitTarget(x, y);
