@@ -1,3 +1,13 @@
+# NativeThreeBridge v0.35.0 — several shadow lights incl. PointLight, GPU skinning, post-processing, Canvas 2D shadows and patterns
+
+- **Shadows from several lights per render()**: up to 8 shadow-casting lights in a 16-slice shadow map array. `PointLight.castShadow` renders six cube faces and stores distance (like MeshDistanceMaterial, `shadow.camera.near/far`). Directional and spot lights take one slice each. The map size is the largest `shadow.mapSize`, kept under ~160 MB.
+- **GPU skinning**: SkinnedMesh geometry is uploaded once. `skinIndex`/`skinWeight` go into a separate vertex stream, and the bone matrices (bindMatrixInverse · bone · bindMatrix) are sent with each pass and applied in the vertex shader, shadow pass included. Morph targets are still deformed on the CPU. Engines without the native call fall back to CPU skinning.
+- **InstancedMesh with mirrored instances** (negative determinant, e.g. `scale.x = -1`): drawn without pipeline culling, and the pixel shader drops the hidden side per instance.
+- **Post-processing**: EffectComposer with RenderPass, UnrealBloomPass and OutputPass from three.js addons runs unchanged. Translated ShaderMaterial GLSL now supports `material.defines`, `#define`, `#if/#ifdef/#elif/#else`, `<common>`, uniform arrays (`float w[N]`, `vec3 c[N]`) and `for` loops with constant bounds (≤ 64). OutputPass keeps the renderer's tone mapping.
+- **Canvas 2D**: `shadowBlur`, `shadowOffsetX/Y` and `shadowColor` on fills, strokes, rectangles, text and images (Direct2D Shadow effect), and `createPattern` from canvases and images (repeat, repeat-x/y, `setTransform`). `Image.decode()` now waits for the image to load.
+
+Packets: header 56..59 = shadow lights, shadow views, bones, map size. The sections after the lights are shadow light records (8 floats), view-projections, then bone matrices. Draw float 93 = first bone + 1. New fixtures: `webapp-shadow-lights`, `webapp-postprocessing`, `webapp-canvas2d`.
+
 # NativeThreeBridge v0.34.0 — shadows, standard material maps, render targets, points, skinning, pointer lock
 
 Features most Three.js games expect, all generic:

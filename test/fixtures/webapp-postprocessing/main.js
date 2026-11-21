@@ -17,12 +17,12 @@ scene.background = new THREE.Color('#05070c');
 const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
 camera.position.set(0, 2.5, 9);
 camera.lookAt(0, 0.5, 0);
-scene.add(new THREE.HemisphereLight('#8090a0', '#202020', 1));
+scene.add(new THREE.HemisphereLight('#b0c0d0', '#303030', 2));
 
 const colors = ['#ff4040', '#40ff80', '#4080ff'];
 colors.forEach((c, i) => {
   const ring = new THREE.Mesh(new THREE.TorusGeometry(0.8, 0.12, 16, 64),
-    new THREE.MeshStandardMaterial({ color: '#000000', emissive: c, emissiveIntensity: 6 }));
+    new THREE.MeshStandardMaterial({ color: '#000000', emissive: c, emissiveIntensity: 2.5 }));
   ring.position.set((i - 1) * 2.6, 1.2, 0);
   ring.name = 'ring' + i;
   scene.add(ring);
@@ -33,7 +33,7 @@ colors.forEach((c, i) => {
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.2, 0.4, 0.6);
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.8, 0.3, 0.85);
 composer.addPass(bloom);
 composer.addPass(new OutputPass());
 window.composer = composer;

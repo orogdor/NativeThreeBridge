@@ -1,4 +1,4 @@
-NativeThreeBridge v0.34.0 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.35.0 - KAKS MÄNGU, ÜKS ENGINE
 =================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -12,6 +12,16 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.35.0 UUS (kõigile mängudele):
+- Varjud mitmest tulest korraga (kuni 8), ka PointLight (lamp, tõrvik)
+  heidab varju igas suunas.
+- Luustikuga mudelid arvutatakse graafikakaardil: palju animeeritud
+  tegelasi ei koorma enam protsessorit.
+- InstancedMesh peegeldatud koopiad (scale -1) näevad õiged välja.
+- Järeltöötlus: EffectComposer, UnrealBloomPass (helendus), OutputPass.
+- Canvas 2D: varjud (shadowBlur, shadowColor ...) ja mustrid
+  (createPattern).
 
 v0.34.0 UUS: Three.js võimalused, mis enne puudu olid (kõigile mängudele).
 - Varjud: renderer.shadowMap.enabled + castShadow suunatuli või prožektor,
