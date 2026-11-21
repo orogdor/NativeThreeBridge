@@ -94,13 +94,14 @@ struct RecordingSink final : native_three::WebappRenderSink {
 };
 
 bool compileShaders() {
-    for (int stage = 0; stage < 2; stage++) {
+    const char* entries[4][2] = {{"VSMain", "vs_5_0"}, {"PSMain", "ps_5_0"}, {"VSShadow", "vs_5_0"}, {"PSShadow", "ps_5_0"}};
+    for (const auto& entry : entries) {
         Microsoft::WRL::ComPtr<ID3DBlob> code, error;
         const HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
-                                      stage ? "PSMain" : "VSMain", stage ? "ps_5_0" : "vs_5_0",
+                                      entry[0], entry[1],
                                       D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (FAILED(hr)) {
-            std::printf("HLSL %s failed:\n%s\n", stage ? "PSMain" : "VSMain",
+            std::printf("HLSL %s failed:\n%s\n", entry[0],
                         error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown error");
             return false;
         }
@@ -131,7 +132,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool expectBootError = argc > 3 && std::wcscmp(argv[3], L"expect-boot-error") == 0;
     const bool expectResize = argc > 3 && std::wcscmp(argv[3], L"expect-resize") == 0;
     const bool expectUi = argc > 3 && std::wcscmp(argv[3], L"expect-ui") == 0;
-    expect(compileShaders(), "webapp HLSL (VSMain/PSMain) compiles");
+    expect(compileShaders(), "webapp HLSL (VSMain/PSMain/VSShadow/PSShadow) compiles");
 
     std::string shim, error;
     std::vector<native_three::WebappBuiltin> builtins;

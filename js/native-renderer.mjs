@@ -11,9 +11,13 @@
 //     a fixed-size record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
-export const PASS_HEADER_FLOATS = 64;
+// Header 56..63: shadow (enabled, light index, bias, normalBias, mapSize,
+// radius, intensity, perspective); 64..79: shadow camera view-projection.
+export const PASS_HEADER_FLOATS = 96;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 88;
+export const DRAW_FLOATS = 92;
+// Draw float 88: shadow bits (castShadow, receiveShadow, only in the shadow pass).
+export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4 };
 // Translated material stages: up to 28 uniform floats (draw floats 49..60 and 72..87).
 const STAGE_UNIFORM_FLOATS = 28;
 export const MAX_LIGHTS = 16;
@@ -45,6 +49,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const unsupported = (feature, detail) => (host && host.unsupported ? host.unsupported(feature, detail) : undefined);
 
   const _projScreen = new THREE.Matrix4();
+  const _shadowViewProj = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -510,7 +515,24 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
+      this._shadowLight = null;
+      this._offscreenCasters = this._offscreenCasters || [];
+      this._offscreenCasters.length = 0;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      const shadow = this.shadowMap.enabled ? this._shadowLight : null;
+      if (shadow) {
+        const light = shadow, ls = light.shadow;
+        if (!light.target.parent) light.target.updateMatrixWorld();
+        ls.updateMatrices(light);
+        // Casters outside the camera view whose shadow falls inside the shadow camera.
+        const shadowFrustum = ls.getFrustum();
+        this._shadowPass = true;
+        for (const mesh of this._offscreenCasters) {
+          if (!shadowFrustum.intersectsObject(mesh)) continue;
+          this._addMesh(mesh, camera, opaque, transparent);
+        }
+        this._shadowPass = false;
+      }
       if (timings) { const now = performance.now(); timings.collect = now - start; start = now; }
 
       if (this.sortObjects) {
@@ -556,6 +578,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           : tm === THREE.AgXToneMapping ? ToneMapping.AGX : tm === THREE.NeutralToneMapping ? ToneMapping.NEUTRAL : ToneMapping.NONE;
       if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
       const fog = scene.fog;
+      if (shadow) {
+        const ls = shadow.shadow;
+        p[56] = 1; p[57] = this._shadowLightIndex; p[58] = ls.bias; p[59] = ls.normalBias;
+        p[60] = Math.min(4096, Math.max(256, ls.mapSize.x)); p[61] = ls.radius; p[62] = ls.intensity ?? 1;
+        p[63] = shadow.isSpotLight ? 1 : 0;
+        _shadowViewProj.multiplyMatrices(ls.camera.projectionMatrix, ls.camera.matrixWorldInverse);
+        p.set(_shadowViewProj.elements, 64);
+      }
       if (fog?.isFog || fog?.isFogExp2) {
         fog.color.getRGB(_srgb, THREE.SRGBColorSpace);
         p[49] = _srgb.r; p[50] = _srgb.g; p[51] = _srgb.b;
@@ -597,7 +627,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (light.isAmbientLight) { ambient[0] += c.r * k; ambient[1] += c.g * k; ambient[2] += c.b * k; return; }
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
-      if (light.castShadow) unsupported('Shadow maps in webapps', 'lights work, shadows are not rendered yet');
       const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
@@ -621,6 +650,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         rec.type = LightType.POINT; rec.distance = light.distance; rec.decay = light.decay;
       } else return;
       lights.push(rec);
+      if (light.castShadow && light.shadow) {
+        if (light.isPointLight) unsupported('PointLight shadows', 'only directional and spot lights cast shadows');
+        else if (!this._shadowLight && lights.length <= MAX_LIGHTS) {
+          this._shadowLight = light;
+          this._shadowLightIndex = lights.length - 1;
+        } else if (this._shadowLight !== light) warnOnce('one-shadow-light', 'Only one shadow-casting light is used per render()');
+      }
     }
 
     // THREE.Sprite: a camera-facing textured quad (SpriteMaterial is unlit).
@@ -665,7 +701,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const geometry = mesh.geometry;
       if (!geometry || !geometry.isBufferGeometry || !geometry.attributes.position) return;
       if (mesh.isInstancedMesh && mesh.count === 0) return;
-      if (mesh.frustumCulled && !_frustum.intersectsObject(mesh)) return;
+      if (mesh.frustumCulled && !this._shadowPass && !_frustum.intersectsObject(mesh)) {
+        // Off screen, but its shadow may still fall into the view.
+        if (mesh.castShadow && this.shadowMap.enabled) this._offscreenCasters.push(mesh);
+        return;
+      }
       if (mesh.isSkinnedMesh) unsupported('Skinned meshes (SkinnedMesh animation)', 'drawn in bind pose');
       if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
@@ -833,6 +873,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         }),
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
+        shadow: (mesh.castShadow && !(flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? ShadowFlags.CAST : 0) |
+          (mesh.receiveShadow && !(flags & DrawFlags.UNLIT) ? ShadowFlags.RECEIVE : 0) | (this._shadowPass ? ShadowFlags.ONLY : 0),
       };
       if (globalThis.__ntDebugDraws) {
         const g = mesh.geometry, c = g.attributes.color;
@@ -866,8 +908,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o + 34] = d.ua; p[o + 35] = d.ub; p[o + 36] = d.uc; p[o + 37] = d.ud; p[o + 38] = d.ue; p[o + 39] = d.uf;
     if (!d.reflection && !d.colorStage) {
       p.fill(0, o + 40, o + DRAW_FLOATS);
+      p[o + 88] = d.shadow || 0;
       return;
     }
+    p[o + 88] = d.shadow || 0;
+    p[o + 89] = 0; p[o + 90] = 0; p[o + 91] = 0;
     const reflection = d.reflection;
     const sky = reflection?.uniform.value;
     p[o + 40] = sky ? sky.r * reflection.intensity : 0;

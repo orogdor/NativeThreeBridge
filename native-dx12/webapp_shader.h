@@ -13,6 +13,9 @@ cbuffer Frame : register(b0) {
     float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
     float4 gFogColor;
     float4 gFog;      // mode, near or density, far
+    float4x4 gShadowMatrix; // world -> shadow light clip (light.shadow.camera)
+    float4 gShadow;   // enabled, light index, bias, normalBias
+    float4 gShadow2;  // 1 / map size, radius, intensity, unused
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
@@ -40,6 +43,8 @@ Texture2D gMaterialMap8 : register(t9);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
+Texture2D<float> gShadowMap : register(t10);
+SamplerComparisonState gShadowSampler : register(s3);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
                   F_MIRRORED = 524288;
@@ -91,6 +96,37 @@ VSOut VSMain(VSIn i) {
     if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;
     return o;
+}
+
+// Depth pass for light.shadow (one directional or spot light per render()).
+VSOut VSShadow(VSIn i) {
+    VSOut o = VSMain(i);
+    float4 clip = mul(gShadowMatrix, float4(o.world, 1));
+    clip.z = 0.5 * (clip.z + clip.w);
+    o.pos = clip;
+    return o;
+}
+void PSShadow(VSOut i) {
+    uint flags = (uint)gParams.z;
+    if ((flags & F_MAP) && gUvU.w > 0) {
+        float a = gColor.a * i.col.a * ((flags & F_MAP_REPEAT) ? gMap.Sample(gRepeat, i.uv).a : gMap.Sample(gClamp, i.uv).a);
+        if (a < gUvU.w) discard;   // alphaTest cut-outs (leaves) cast cut-out shadows
+    }
+}
+// Three.js PCF: 1 = lit, 0 = in shadow. normalBias moves along the normal, bias shifts depth.
+float shadowFactor(float3 world, float3 n) {
+    float4 s = mul(gShadowMatrix, float4(world + n * gShadow.w, 1));
+    if (s.w <= 0) return 1;
+    s.xyz /= s.w;
+    float2 uv = float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
+    float depth = s.z * 0.5 + 0.5 + gShadow.z;
+    if (uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || depth > 1) return 1;
+    float spread = gShadow2.x * max(gShadow2.y, 1);
+    float sum = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            sum += gShadowMap.SampleCmpLevelZero(gShadowSampler, uv + float2(x, y) * spread, depth);
+    return sum / 9;
 }
 
 float3 toSRGB(float3 c) {
@@ -193,6 +229,12 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
     float3 indirect = gAmbient.rgb;
     float3 direct = 0;
+    float shadow = 1;
+    if (gShadow.x > 0 && ((uint)gParams.w & 2u)) {   // mesh.receiveShadow
+        float3 geometric = normalize(i.nrm);
+        if (!front) geometric = -geometric;
+        shadow = lerp(1, shadowFactor(i.world, geometric), saturate(gShadow2.z));
+    }
     uint count = (uint)gCamera.w;
     for (uint li = 0; li < count; li++) {
         float4 a = gLights[li * 4 + 0], b = gLights[li * 4 + 1], c = gLights[li * 4 + 2], d = gLights[li * 4 + 3];
@@ -215,6 +257,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
             if (cutoff > 0) { float r = saturate(1 - pow(dist / cutoff, 4)); attenuation *= r * r; }
             if (type == 5) attenuation *= smoothstep(d.x, d.y, dot(-L, c.xyz));
         }
+        if (li == (uint)gShadow.y) attenuation *= shadow;
         float nl = saturate(dot(N, L));
         if (nl <= 0 || attenuation <= 0) continue;
         float3 irradiance = color * (nl * attenuation);

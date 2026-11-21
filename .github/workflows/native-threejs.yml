@@ -123,6 +123,9 @@ jobs:
           # The smoke compiles every translated stage with D3DCompile.
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-shader-limits 2
           if ($LASTEXITCODE -ne 0) { throw "shader-limits fixture failed on V8 (HLSL of a translated stage?)" }
+          # Shadow maps: casters, receivers, instanced and alpha-tested casters, off-screen caster.
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-shadows 5
+          if ($LASTEXITCODE -ne 0) { throw "shadows fixture failed on V8" }
       - name: Verify native web storage survives a Windows restart
         shell: pwsh
         run: |
@@ -359,7 +362,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force shots | Out-Null
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
-          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 })
+          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 }, @{ name = 'shadows-fixture'; dir = 'test/fixtures/webapp-shadows'; wait = 10 })
           if (Test-Path kuningriigid-check/index.html) { $runs += @{ name = 'kuningriigid'; dir = 'kuningriigid-check'; wait = 40 } }
           foreach ($r in $runs) {
             $folder = (Resolve-Path $r.dir).Path
