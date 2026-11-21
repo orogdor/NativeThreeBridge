@@ -113,7 +113,7 @@ export function createRecorder() {
 }
 
 export async function runWebapp(root, options = {}) {
-  const { frames = 120, width = 1280, height = 720, frameMs = 1000 / 60, onFrame } = options;
+  const { frames = 120, width = 1280, height = 720, frameMs = 1000 / 60, onFrame, beforeFrame } = options;
   const builtins = options.builtins || loadBuiltins();
   const builtinNames = [...builtins.keys()];
   const rec = createRecorder();
@@ -265,6 +265,8 @@ export async function runWebapp(root, options = {}) {
       rec.framePasses.push(Float32Array.from(packet.subarray(0, floats)));
     },
   };
+  // Extra native functions (e.g. the Web Worker fake in worker-fake.mjs).
+  if (options.natives) options.natives({ nt, context, readGameFile, rec });
   context.__nt = nt;
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-shim.js'), 'utf8'), context, { filename: 'nt:webapp-shim.js' });
   vm.runInContext(readFileSync(path.join(repo, 'js/webapp-ui.js'), 'utf8'), context, { filename: 'nt:webapp-ui.js' });
@@ -277,6 +279,7 @@ export async function runWebapp(root, options = {}) {
   let t = 0;
   for (let f = 0; f < frames; f++) {
     rec.framePasses = [];
+    if (beforeFrame) await beforeFrame({ frame: f, host, rec, context });
     host.frame(t);
     await settle();
     if (rec.framePasses.length) rec.passes = rec.framePasses;

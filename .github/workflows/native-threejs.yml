@@ -112,6 +112,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed in the native webapp runtime" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-ui 1 expect-ui
           if ($LASTEXITCODE -ne 0) { throw "HTML/CSS UI fixture failed on V8" }
+          # Web Workers on their own threads: classic/module/blob workers,
+          # transfer, SharedArrayBuffer + Atomics, worker errors, background fetch.
+          $out = & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-workers 4
+          $code = $LASTEXITCODE
+          $out | Write-Host
+          if ($code -ne 0 -or !($out -match 'title: Workers OK')) { throw "Web Worker fixture failed on V8" }
       - name: Verify native web storage survives a Windows restart
         shell: pwsh
         run: |

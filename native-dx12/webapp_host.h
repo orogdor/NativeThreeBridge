@@ -130,6 +130,9 @@ const char* webappThreeModuleSource();
 // Reads root/<rel> after webappNormalizeGamePath (no escaping the folder).
 bool webappReadGameFile(const std::filesystem::path& root, const std::string& rel,
                         std::string& out, std::string& error);
+// Size of root/<rel> without reading it (same path checks as webappReadGameFile).
+bool webappGameFileSize(const std::filesystem::path& root, const std::string& rel,
+                        std::uint64_t& size, std::string& error);
 // UTF-8 form of a path (kept in a C++17 file: u8string changes type in C++20).
 std::string webappPathUtf8(const std::filesystem::path& path);
 // Name of the JavaScript engine this build uses ("QuickJS-NG" or "V8 <version>").

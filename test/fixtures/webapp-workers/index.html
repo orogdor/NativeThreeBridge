@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Workers pending</title>
+</head>
+<body>
+  <script type="module">
+    // Web Workers, SharedArrayBuffer/Atomics, transfer, blob and module
+    // workers, worker errors, background fetch and structuredClone.
+    // The title becomes "Workers OK" when every check has passed.
+    import * as THREE from 'three';
+    const renderer = new THREE.WebGLRenderer();
+    document.body.appendChild(renderer.domElement);
+    renderer.setSize(innerWidth, innerHeight);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+    camera.position.z = 8;
+    const box = new THREE.BoxGeometry();
+    const material = new THREE.MeshBasicMaterial({ color: 0x3388ff });
+    scene.add(new THREE.Mesh(box, material));
+
+    const expected = ['classic', 'timer', 'importScripts', 'module', 'blob', 'error', 'fetch', 'clone'];
+    const passed = new Set();
+    const workers = [];
+    const fail = (what) => console.error(`worker test failed: ${what}`);
+    function pass(name) {
+      passed.add(name);
+      if (passed.size !== expected.length) return;
+      for (let i = 1; i <= 3; i++) {
+        const mesh = new THREE.Mesh(box, material);
+        mesh.position.x = i * 1.5;
+        scene.add(mesh);
+      }
+      for (const w of workers) w.terminate();
+      document.title = 'Workers OK';
+    }
+
+    // 1. classic worker: transfer, SharedArrayBuffer + Atomics, timers, importScripts
+    const shared = new Int32Array(new SharedArrayBuffer(16));
+    const calc = new Worker('./worker.js', { name: 'calc' });
+    workers.push(calc);
+    calc.onmessage = ({ data }) => {
+      if (data.type === 'sum') {
+        if (data.sum !== 10) fail(`sum ${data.sum}`);
+        else if (Atomics.load(shared, 0) !== 42) fail('SharedArrayBuffer was not shared');
+        else if (data.name !== 'calc') fail(`worker name ${data.name}`);
+        else pass('classic');
+      } else if (data.type === 'timer') pass('timer');
+      else if (data.type === 'import') data.value === 'helper:7' ? pass('importScripts') : fail(`importScripts ${data.value}`);
+      else if (data.type === 'error') fail(`inside worker: ${data.message}`);
+    };
+    const numbers = new Float32Array([1, 2, 3, 4]);
+    calc.postMessage({ type: 'sum', buffer: numbers.buffer, shared }, [numbers.buffer]);
+    if (numbers.byteLength !== 0) fail('transferred ArrayBuffer was not detached');
+
+    // 2. module worker importing another module
+    const mod = new Worker(new URL('./lib/module-worker.mjs', import.meta.url), { type: 'module' });
+    workers.push(mod);
+    mod.onmessage = ({ data }) => (data === 'module:6' ? pass('module') : fail(`module worker ${data}`));
+    mod.postMessage(3);
+
+    // 3. worker from a Blob URL (how DRACOLoader and many libraries start theirs)
+    const blob = new Blob(['onmessage = (e) => postMessage(e.data * 2);'], { type: 'text/javascript' });
+    const fromBlob = new Worker(URL.createObjectURL(blob));
+    workers.push(fromBlob);
+    fromBlob.onmessage = ({ data }) => (data === 42 ? pass('blob') : fail(`blob worker ${data}`));
+    fromBlob.postMessage(21);
+
+    // 4. an uncaught error reaches Worker.onerror
+    const broken = new Worker('./lib/throws.js');
+    workers.push(broken);
+    broken.onerror = (event) => {
+      event.preventDefault();
+      /boom/.test(event.message) ? pass('error') : fail(`error event ${event.message}`);
+    };
+
+    // 5. a large file (background read in the engine)
+    fetch('./big.bin').then((r) => r.arrayBuffer()).then((buffer) => {
+      const words = new Uint32Array(buffer);
+      buffer.byteLength === 294912 && words[73727] === 73727 ? pass('fetch') : fail(`fetch ${buffer.byteLength}`);
+    }, (e) => fail(`fetch ${e}`));
+
+    // 6. structuredClone keeps types
+    const clone = structuredClone({ when: new Date(5), map: new Map([[1, 'a']]), list: new Float64Array([0.5]) });
+    const kind = (v) => Object.prototype.toString.call(v);
+    kind(clone.when) === '[object Date]' && clone.when.getTime() === 5 && kind(clone.map) === '[object Map]' && clone.map.get(1) === 'a' &&
+      clone.list[0] === 0.5 ? pass('clone') : fail('structuredClone');
+
+    // The engine's smoke test runs frames as fast as it can; give the
+    // worker threads real time to answer (main-thread Atomics.wait is
+    // allowed in the engine, not in browsers).
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    let frames = 0;
+    renderer.setAnimationLoop(() => {
+      if (passed.size < expected.length && !globalThis.__ntTestHarness && ++frames < 250) Atomics.wait(pause, 0, 0, 8);
+      renderer.render(scene, camera);
+    });
+  </script>
+</body>
+</html>
