@@ -1,4 +1,4 @@
-# NativeThreeBridge v0.33.0 — Web Workers on real threads, background loading (test)
+# NativeThreeBridge v0.33.0 — Web Workers on real threads, background loading
 
 Webapps can now use more than one CPU core. `new Worker(...)` runs the script in its own V8 isolate on its own Windows thread, with structured-clone `postMessage`, zero-copy transfer of `ArrayBuffer`s, `SharedArrayBuffer` + `Atomics`, module and Blob-URL workers, `importScripts`, timers and `fetch` inside the game folder. Game files of 256 KB or more are read on background threads, and PNG/JPEG/WebP textures are decoded and mipmapped on background threads (`NTB_ASYNC_TEXTURES=0` restores the old path). `structuredClone` is the real algorithm, `navigator.hardwareConcurrency` reports the machine, `performance.now()` has sub-millisecond resolution, and V8 runs with a larger young generation (fewer GC pauses inside a frame; `[gc]` summaries in the webapp log, `NTB_V8_FLAGS` for experiments). Nothing is game-specific. The `webapp-workers` fixture runs on V8 in CI. Details: `docs/MULTITHREADING.md`.
 

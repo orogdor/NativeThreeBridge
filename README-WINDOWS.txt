@@ -13,7 +13,7 @@ Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
 
-v0.33.0 TEST - MITU TUUMA: mängu JavaScript ei pea enam kõike ühe lõime peal
+v0.33.0 - MITU TUUMA: mängu JavaScript ei pea enam kõike ühe lõime peal
 ootama. Kehtib kõigile veebirakendustele, mänguspetsiifilist koodi pole.
 - Web Workerid: new Worker(...) käivitab skripti eraldi V8 isolate'is oma
   Windowsi lõimes (päriselt paralleelselt). postMessage, ülekantavad
