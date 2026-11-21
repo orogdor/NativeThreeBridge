@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { DRAW_FLOATS, LIGHT_FLOATS, PASS_HEADER_FLOATS } from '../../js/native-renderer.mjs';
+import { DRAW_FLOATS, LIGHT_FLOATS, PASS_HEADER_FLOATS, SHADOW_LIGHT_FLOATS, passLayout } from '../../js/native-renderer.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -258,14 +258,20 @@ export async function runWebapp(root, options = {}) {
       rec.instances.set(id, { count, hasColors: !!colors, first: Array.from(matrices.slice(0, 16)) });
     },
     releaseInstances(id) { rec.instances.delete(id); },
+    uploadSkin(id, indices, weights, vertexCount) {
+      const g = rec.geometries.get(id);
+      if (!g || g.vertexCount !== vertexCount) return false;
+      if (indices.length < vertexCount * 4 || weights.length < vertexCount * 4) throw new RangeError('skin buffers');
+      (rec.skins ||= new Map()).set(id, { indices: Float32Array.from(indices), weights: Float32Array.from(weights) });
+      return true;
+    },
     submitUi(packet, floats, strings) {
       if (floats > packet.length || (packet[0] !== 1 && packet[0] !== 2)) throw new RangeError('submitUi: bad packet');
       rec.uiSubmits = (rec.uiSubmits || 0) + 1;
       rec.ui = { floats: Float32Array.from(packet.subarray(0, floats)), strings: String(strings).split('\u001f') };
     },
     submitPass(packet, floats) {
-      const lights = packet[35], draws = packet[43];
-      if (PASS_HEADER_FLOATS + lights * LIGHT_FLOATS + draws * DRAW_FLOATS !== floats) throw new RangeError('submitPass: header counts do not match packet size');
+      if (passLayout(packet).floats !== floats) throw new RangeError('submitPass: header counts do not match packet size');
       rec.framePasses.push(Float32Array.from(packet.subarray(0, floats)));
     },
   };
@@ -301,10 +307,18 @@ export function decodePass(p) {
     cameraPosition: [p[32], p[33], p[34]], clear: [p[36], p[37], p[38], p[39]],
     ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], exposure: p[47], toneMapping: p[48], lights: [], draws: [],
     target: p[55],
-    shadow: p[56] ? { light: p[57], bias: p[58], normalBias: p[59], mapSize: p[60], radius: p[61], intensity: p[62], spot: !!p[63], viewProjection: Array.from(p.subarray(64, 80)) } : null,
+    shadowLights: [], shadowViews: [], bones: p[58],
   };
   let o = PASS_HEADER_FLOATS;
-  for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]] });
-  for (let i = 0; i < drawCount; i++, o += DRAW_FLOATS) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)), reflection: Array.from(p.subarray(o + 40, o + 48)), colorStage: p[o + 48], colorUniforms: [...p.subarray(o + 49, o + 61), ...p.subarray(o + 72, o + 88)], materialTextures: Array.from(p.subarray(o + 61, o + 70)), shadow: p[o + 88], standardMaps: p[o + 89], normalScale: [p[o + 90], p[o + 91]], aoMapIntensity: p[o + 92] });
+  for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]], shadow: p[o + 15] });
+  for (let i = 0; i < p[56]; i++, o += SHADOW_LIGHT_FLOATS) pass.shadowLights.push({ light: p[o], firstView: p[o + 1], point: p[o + 2] > 0, near: p[o + 2] > 0 ? p[o + 2] - 1 : 0, bias: p[o + 3], normalBias: p[o + 4], radius: p[o + 5], intensity: p[o + 6], far: p[o + 7] });
+  for (let i = 0; i < p[57]; i++, o += 16) pass.shadowViews.push(Array.from(p.subarray(o, o + 16)));
+  pass.boneMatrices = Array.from(p.subarray(o, o + p[58] * 16));
+  o += p[58] * 16;
+  pass.shadowMapSize = p[59];
+  // First shadow light in the old single-shadow shape (older tests).
+  const first = pass.shadowLights[0];
+  pass.shadow = first ? { ...first, mapSize: p[59], spot: pass.lights[first.light]?.type === 5, viewProjection: pass.shadowViews[first.firstView] } : null;
+  for (let i = 0; i < drawCount; i++, o += DRAW_FLOATS) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)), reflection: Array.from(p.subarray(o + 40, o + 48)), colorStage: p[o + 48], colorUniforms: [...p.subarray(o + 49, o + 61), ...p.subarray(o + 72, o + 88)], materialTextures: Array.from(p.subarray(o + 61, o + 70)), shadow: p[o + 88], standardMaps: p[o + 89], normalScale: [p[o + 90], p[o + 91]], aoMapIntensity: p[o + 92], bones: p[o + 93] });
   return pass;
 }

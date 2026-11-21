@@ -43,6 +43,10 @@ struct RecordingSink final : native_three::WebappRenderSink {
     void releaseGeometry(std::uint32_t id) override { geometryVertices.erase(id); }
     void uploadInstances(std::uint32_t id, const float*, const float*, std::uint32_t count) override { instanceCounts[id] = count; }
     void releaseInstances(std::uint32_t id) override { instanceCounts.erase(id); }
+    bool uploadSkin(std::uint32_t id, const float*, const float*, std::uint32_t vertexCount) override {
+        auto g = geometryVertices.find(id);
+        return g != geometryVertices.end() && g->second == vertexCount;
+    }
     bool registerColorPatch(std::uint32_t id, const std::string& source) override {
         std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
         const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
@@ -59,9 +63,9 @@ struct RecordingSink final : native_three::WebappRenderSink {
     void submitPass(const float* data, std::size_t floats) override {
         passes++;
         framePasses.emplace_back(data, data + floats);
-        const std::size_t lights = std::size_t(data[35]), draws = std::size_t(data[43]);
-        const float* d = data + native_three::kWebappPassHeaderFloats + lights * native_three::kWebappLightFloats;
-        for (std::size_t i = 0; i < draws; i++, d += native_three::kWebappDrawFloats) {
+        const native_three::WebappPassLayout layout = native_three::webappPassLayout(data);
+        const float* d = data + layout.drawOffset;
+        for (std::size_t i = 0; i < layout.draws; i++, d += native_three::kWebappDrawFloats) {
             if (!geometryVertices.count(std::uint32_t(d[0]))) badDraws++;
             if (d[1] > 0 && !instanceCounts.count(std::uint32_t(d[1]))) badDraws++;
         }
@@ -94,7 +98,8 @@ struct RecordingSink final : native_three::WebappRenderSink {
 };
 
 bool compileShaders() {
-    const char* entries[4][2] = {{"VSMain", "vs_5_0"}, {"PSMain", "ps_5_0"}, {"VSShadow", "vs_5_0"}, {"PSShadow", "ps_5_0"}};
+    const char* entries[5][2] = {{"VSMain", "vs_5_0"}, {"PSMain", "ps_5_0"}, {"VSShadow", "vs_5_0"}, {"PSShadow", "ps_5_0"},
+                                 {"PSShadowPoint", "ps_5_0"}};
     for (const auto& entry : entries) {
         Microsoft::WRL::ComPtr<ID3DBlob> code, error;
         const HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
@@ -132,7 +137,7 @@ int wmain(int argc, wchar_t** argv) {
     const bool expectBootError = argc > 3 && std::wcscmp(argv[3], L"expect-boot-error") == 0;
     const bool expectResize = argc > 3 && std::wcscmp(argv[3], L"expect-resize") == 0;
     const bool expectUi = argc > 3 && std::wcscmp(argv[3], L"expect-ui") == 0;
-    expect(compileShaders(), "webapp HLSL (VSMain/PSMain/VSShadow/PSShadow) compiles");
+    expect(compileShaders(), "webapp HLSL (VSMain/PSMain/VSShadow/PSShadow/PSShadowPoint) compiles");
 
     std::string shim, error;
     std::vector<native_three::WebappBuiltin> builtins;

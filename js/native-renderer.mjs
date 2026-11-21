@@ -12,13 +12,28 @@
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
 // Header 55: render target texture id (0 = window).
-// Header 56..63: shadow (enabled, light index, bias, normalBias, mapSize,
-// radius, intensity, perspective); 64..79: shadow camera view-projection.
+// Header 56: shadow lights, 57: shadow views (map slices), 58: bone matrices,
+// 59: shadow map size. After the lights come the shadow light records
+// (SHADOW_LIGHT_FLOATS each: light index, first slice, kind (0, or 1 + near
+// for point lights), bias, normalBias, radius, intensity, far), one
+// view-projection per shadow view, the bone matrices, then the draws.
 export const PASS_HEADER_FLOATS = 96;
 export const LIGHT_FLOATS = 16;
 export const DRAW_FLOATS = 96;
+export const SHADOW_LIGHT_FLOATS = 8;
+export const MAX_SHADOW_LIGHTS = 8, MAX_SHADOW_VIEWS = 16, MAX_BONES = 65536;
+// Section offsets of a pass packet (same as webappPassLayout in webapp_host.h).
+export function passLayout(p) {
+  const lights = p[35], shadowLights = p[56], shadowViews = p[57], bones = p[58], draws = p[43];
+  const shadowLightOffset = PASS_HEADER_FLOATS + lights * LIGHT_FLOATS;
+  const shadowViewOffset = shadowLightOffset + shadowLights * SHADOW_LIGHT_FLOATS;
+  const boneOffset = shadowViewOffset + shadowViews * 16;
+  const drawOffset = boneOffset + bones * 16;
+  return { lights, shadowLights, shadowViews, bones, draws, shadowLightOffset, shadowViewOffset, boneOffset, drawOffset, floats: drawOffset + draws * DRAW_FLOATS };
+}
 // Draw float 88: shadow bits (castShadow, receiveShadow, only in the shadow pass).
-// 89: standard map bits (StandardMaps), 90..91 normalScale, 92 aoMapIntensity.
+// 89: standard map bits (StandardMaps), 90..91 normalScale, 92 aoMapIntensity,
+// 93: first bone + 1 of a SkinnedMesh skinned on the GPU (0: not skinned).
 export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4 };
 // Material maps besides `map`, bound to t1..t6 (bit i = slot i).
 export const StandardMaps = { NORMAL: 1, ROUGHNESS: 2, METALNESS: 4, EMISSIVE: 8, AO: 16, ALPHA: 32 };
@@ -37,6 +52,8 @@ export const DrawFlags = {
   // the triangle winding is reversed, as Three.js' WebGLRenderer flips frontFace.
   MIRRORED: 524288,
   ADDITIVE: 1048576, PREMULTIPLIED_ADDITIVE: 2097152,
+  // InstancedMesh with at least one mirrored instance matrix (drawn without culling).
+  INSTANCE_MIRRORED: 4194304,
 };
 // nt.uploadTexture(id, bytes, width, height, flags): width 0 = encoded file bytes.
 export const TextureFlags = { SRGB: 1, MIPMAPS: 2 };
@@ -57,6 +74,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _shadowViewProj = new THREE.Matrix4();
   const _identityMatrix = new THREE.Matrix4();
   const _skinBone = new THREE.Matrix4();
+  const _faceMatrix = new THREE.Matrix4();
+  const _faceProjection = new THREE.Matrix4();
+  const _faceTarget = new THREE.Vector3();
+  const _faceUp = new THREE.Vector3();
+  const _sphere = THREE.Sphere ? new THREE.Sphere() : null; // (minimal fakes in unit tests lack it)
+  // Point light shadows: six views (+x -x +y -y +z -z) slightly wider than 90
+  // degrees, so the soft edge of one face still has map around it.
+  const CUBE_DIRECTIONS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  const CUBE_UPS = [[0, 1, 0], [0, 1, 0], [0, 0, 1], [0, 0, 1], [0, 1, 0], [0, 1, 0]];
   const _frustum = new THREE.Frustum();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -413,9 +439,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     // SkinnedMesh and morph targets: the deformed shape of this frame, computed
     // on the CPU the way Three.js' skinning/morph shader chunks do it, as a
     // geometry that shares every other attribute with the original.
-    _deformedGeometry(mesh, geometry) {
+    _deformedGeometry(mesh, geometry, gpuSkin = false) {
       const attributes = geometry.attributes;
-      const skinned = mesh.isSkinnedMesh && mesh.skeleton && attributes.skinIndex && attributes.skinWeight;
+      const skinned = !gpuSkin && mesh.isSkinnedMesh && mesh.skeleton && attributes.skinIndex && attributes.skinWeight;
       const morphs = geometry.morphAttributes?.position;
       const influences = mesh.morphTargetInfluences;
       const morphed = !!(morphs && morphs.length && influences && influences.length && !mesh.isInstancedMesh);
@@ -424,7 +450,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const n = source.count;
       if (!this._deformed) this._deformed = new WeakMap();
       let d = this._deformed.get(mesh);
-      if (!d || d.source !== geometry || d.count !== n) {
+      if (!d || d.source !== geometry || d.count !== n || d.gpuSkin !== gpuSkin) {
         const g = new THREE.BufferGeometry();
         for (const [name, attr] of Object.entries(attributes)) if (name !== 'position' && name !== 'normal') g.setAttribute(name, attr);
         g.setIndex(geometry.index);
@@ -441,7 +467,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           baseNormal = rest.attributes.normal.array.slice();
         }
         if (d) d.geometry.dispose();
-        d = { geometry: g, source: geometry, count: n, frame: -1, baseNormal, work: new Float32Array(n * 6), bones: new Float32Array(0) };
+        d = { geometry: g, source: geometry, count: n, frame: -1, baseNormal, work: new Float32Array(n * 6), bones: new Float32Array(0), gpuSkin };
         this._deformed.set(mesh, d);
       }
       const frame = this.info.render.frame;
@@ -533,6 +559,49 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return d.geometry;
     }
 
+    // GPU skinning: skinIndex/skinWeight of a geometry record (indices outside
+    // the skeleton get weight 0), uploaded again when they change.
+    _skinRecord(record, geometry, boneCount) {
+      const si = geometry.attributes.skinIndex, sw = geometry.attributes.skinWeight;
+      const key = `${record.id}:${record.revision}:${attributeVersion(si)}:${attributeVersion(sw)}:${boneCount}`;
+      if (record.skinKey === key) return record.skinOk;
+      const n = record.vertexCount;
+      if (si.count !== n || sw.count !== n) { record.skinKey = key; record.skinOk = false; return false; }
+      const indices = new Float32Array(n * 4), weights = new Float32Array(n * 4);
+      for (let i = 0; i < n; i++) {
+        for (let j = 0; j < 4; j++) {
+          const b = j < si.itemSize ? si.getComponent(i, j) : 0;
+          const w = j < sw.itemSize ? sw.getComponent(i, j) : 0;
+          const valid = b >= 0 && b < boneCount;
+          indices[i * 4 + j] = valid ? b : 0;
+          weights[i * 4 + j] = valid ? w : 0;
+        }
+      }
+      record.skinKey = key;
+      record.skinOk = !!nt.uploadSkin(record.id, indices, weights, n);
+      return record.skinOk;
+    }
+    // Bone matrices of a SkinnedMesh for this pass: bindMatrixInverse * bone *
+    // bindMatrix (skinning_vertex). Returns the index of the first one.
+    _addBones(mesh) {
+      const skeleton = mesh.skeleton, frame = this.info.render.frame;
+      if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+      const count = skeleton.bones.length, first = this._boneCount;
+      if (first + count > MAX_BONES) return -1;
+      if (this._bones.length < (first + count) * 16) {
+        const grown = new Float32Array(Math.max(this._bones.length * 2, (first + count) * 16));
+        grown.set(this._bones.subarray(0, first * 16));
+        this._bones = grown;
+      }
+      const bm = skeleton.boneMatrices;
+      for (let b = 0; b < count; b++) {
+        _skinBone.fromArray(bm, b * 16).premultiply(mesh.bindMatrixInverse).multiply(mesh.bindMatrix);
+        this._bones.set(_skinBone.elements, (first + b) * 16);
+      }
+      this._boneCount += count;
+      return first;
+    }
+
     _instanceRecord(mesh) {
       let record = this._instances.get(mesh);
       const im = mesh.instanceMatrix, ic = mesh.instanceColor;
@@ -551,6 +620,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         const matrices = im.array instanceof Float32Array ? im.array : Float32Array.from(im.array);
         const colors = ic ? (ic.array instanceof Float32Array ? ic.array : Float32Array.from(ic.array)) : null;
         nt.uploadInstances(record.id, matrices, colors, capacity);
+        // A mirrored instance (negative determinant) needs per-instance face culling.
+        record.mirrored = false;
+        for (let i = 0, o = 0; i < capacity; i++, o += 16) {
+          const det = matrices[o] * (matrices[o + 5] * matrices[o + 10] - matrices[o + 6] * matrices[o + 9]) -
+            matrices[o + 4] * (matrices[o + 1] * matrices[o + 10] - matrices[o + 2] * matrices[o + 9]) +
+            matrices[o + 8] * (matrices[o + 1] * matrices[o + 6] - matrices[o + 2] * matrices[o + 5]);
+          if (det < 0) { record.mirrored = true; break; }
+        }
         record.matrixVersion = im.version;
         record.colorVersion = ic ? ic.version : -1;
         record.colorRef = ic;
@@ -679,21 +756,22 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
-      this._shadowLight = null;
+      this._shadowLights = this._shadowLights || [];
+      this._shadowLights.length = 0;
+      this._shadowViewCount = 0;
+      this._boneCount = 0;
+      if (!this._bones) this._bones = new Float32Array(1024);
       this._offscreenCasters = this._offscreenCasters || [];
       this._offscreenCasters.length = 0;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
-      const shadow = this.shadowMap.enabled ? this._shadowLight : null;
-      if (shadow) {
-        const light = shadow, ls = light.shadow;
-        if (!light.target.parent) light.target.updateMatrixWorld();
-        ls.updateMatrices(light);
-        // Casters outside the camera view whose shadow falls inside the shadow camera.
-        const shadowFrustum = ls.getFrustum();
+      const shadowLights = this.shadowMap.enabled ? this._shadowLights : [];
+      if (shadowLights.length) {
+        if (!this._shadowViews) this._shadowViews = new Float32Array(MAX_SHADOW_VIEWS * 16);
+        for (const entry of shadowLights) this._shadowCamera(entry);
+        // Casters outside the camera view whose shadow falls inside a shadow camera.
         this._shadowPass = true;
         for (const mesh of this._offscreenCasters) {
-          if (!shadowFrustum.intersectsObject(mesh)) continue;
-          this._addMesh(mesh, camera, opaque, transparent);
+          if (shadowLights.some(entry => this._castsInto(entry, mesh))) this._addMesh(mesh, camera, opaque, transparent);
         }
         this._shadowPass = false;
       }
@@ -709,7 +787,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const drawCount = opaque.length + transparent.length;
       const lightCount = Math.min(lights.length, MAX_LIGHTS);
       if (lights.length > MAX_LIGHTS) warnOnce('too-many-lights', `Only the first ${MAX_LIGHTS} lights are used (scene has ${lights.length})`);
-      const floats = PASS_HEADER_FLOATS + lightCount * LIGHT_FLOATS + drawCount * DRAW_FLOATS;
+      const shadowCount = shadowLights.length, viewCount = shadowCount ? this._shadowViewCount : 0, boneCount = this._boneCount;
+      const floats = PASS_HEADER_FLOATS + lightCount * LIGHT_FLOATS + shadowCount * SHADOW_LIGHT_FLOATS + viewCount * 16 +
+        boneCount * 16 + drawCount * DRAW_FLOATS;
       if (this._packet.length < floats) this._packet = new Float32Array(Math.ceil(floats * 1.5));
       const p = this._packet;
       p.fill(0, 0, PASS_HEADER_FLOATS);
@@ -743,13 +823,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           : tm === THREE.AgXToneMapping ? ToneMapping.AGX : tm === THREE.NeutralToneMapping ? ToneMapping.NEUTRAL : ToneMapping.NONE;
       if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
       const fog = scene.fog;
-      if (shadow) {
-        const ls = shadow.shadow;
-        p[56] = 1; p[57] = this._shadowLightIndex; p[58] = ls.bias; p[59] = ls.normalBias;
-        p[60] = Math.min(4096, Math.max(256, ls.mapSize.x)); p[61] = ls.radius; p[62] = ls.intensity ?? 1;
-        p[63] = shadow.isSpotLight ? 1 : 0;
-        _shadowViewProj.multiplyMatrices(ls.camera.projectionMatrix, ls.camera.matrixWorldInverse);
-        p.set(_shadowViewProj.elements, 64);
+      p[56] = shadowCount; p[57] = viewCount; p[58] = boneCount;
+      if (shadowCount) {
+        // One map size for the whole array: the largest mapSize, kept under ~160 MB.
+        let size = 256;
+        for (const { light } of shadowLights) size = Math.max(size, Math.min(4096, light.shadow.mapSize.x || 512));
+        while (size > 512 && size * size * 4 * viewCount > 160 * 1024 * 1024) size /= 2;
+        p[59] = size;
       }
       if (fog?.isFog || fog?.isFogExp2) {
         fog.color.getRGB(_srgb, THREE.SRGBColorSpace);
@@ -761,6 +841,15 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
       let o = PASS_HEADER_FLOATS;
       for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) writeLight(p, o, lights[i]);
+      for (const entry of shadowLights) {
+        const ls = entry.light.shadow, point = entry.light.isPointLight;
+        p[o] = entry.index; p[o + 1] = entry.first; p[o + 2] = point ? 1 + ls.camera.near : 0;
+        p[o + 3] = ls.bias; p[o + 4] = ls.normalBias; p[o + 5] = ls.radius; p[o + 6] = ls.intensity ?? 1;
+        p[o + 7] = point ? ls.camera.far : 0;
+        o += SHADOW_LIGHT_FLOATS;
+      }
+      if (viewCount) { p.set(this._shadowViews.subarray(0, viewCount * 16), o); o += viewCount * 16; }
+      if (boneCount) { p.set(this._bones.subarray(0, boneCount * 16), o); o += boneCount * 16; }
       for (const d of opaque) { writeDraw(p, o, d); o += DRAW_FLOATS; }
       for (const d of transparent) { writeDraw(p, o, d); o += DRAW_FLOATS; }
 
@@ -792,7 +881,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (light.isAmbientLight) { ambient[0] += c.r * k; ambient[1] += c.g * k; ambient[2] += c.b * k; return; }
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
-      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
+      const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0, shadow: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
       if (light.isHemisphereLight) {
@@ -815,13 +904,46 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         rec.type = LightType.POINT; rec.distance = light.distance; rec.decay = light.decay;
       } else return;
       lights.push(rec);
-      if (light.castShadow && light.shadow) {
-        if (light.isPointLight) unsupported('PointLight shadows', 'only directional and spot lights cast shadows');
-        else if (!this._shadowLight && lights.length <= MAX_LIGHTS) {
-          this._shadowLight = light;
-          this._shadowLightIndex = lights.length - 1;
-        } else if (this._shadowLight !== light) warnOnce('one-shadow-light', 'Only one shadow-casting light is used per render()');
+      if (light.castShadow && light.shadow && this.shadowMap.enabled) {
+        // Directional and spot lights: one shadow map slice; point lights: six (cube faces).
+        const views = light.isPointLight ? 6 : 1;
+        if (this._shadowLights.length < MAX_SHADOW_LIGHTS && this._shadowViewCount + views <= MAX_SHADOW_VIEWS && lights.length <= MAX_LIGHTS) {
+          this._shadowLights.push({ light, index: lights.length - 1, first: this._shadowViewCount, views, frustum: null, position: new THREE.Vector3() });
+          rec.shadow = this._shadowLights.length;
+          this._shadowViewCount += views;
+        } else warnOnce('shadow-lights', `Shadows of at most ${MAX_SHADOW_LIGHTS} lights (${MAX_SHADOW_VIEWS} map slices, a point light uses 6) are drawn per render()`);
       }
+    }
+
+    // View-projection of every shadow map slice of one light.
+    _shadowCamera(entry) {
+      const light = entry.light, ls = light.shadow, out = this._shadowViews;
+      if (light.isPointLight) {
+        const near = ls.camera.near, far = ls.camera.far, t = near * 1.05;
+        _faceProjection.makePerspective(-t, t, t, -t, near, far);
+        entry.position.setFromMatrixPosition(light.matrixWorld);
+        for (let face = 0; face < 6; face++) {
+          const d = CUBE_DIRECTIONS[face], u = CUBE_UPS[face];
+          _faceTarget.set(entry.position.x + d[0], entry.position.y + d[1], entry.position.z + d[2]);
+          _faceUp.set(u[0], u[1], u[2]);
+          _faceMatrix.lookAt(entry.position, _faceTarget, _faceUp).setPosition(entry.position).invert();
+          _shadowViewProj.multiplyMatrices(_faceProjection, _faceMatrix);
+          out.set(_shadowViewProj.elements, (entry.first + face) * 16);
+        }
+        return;
+      }
+      if (!light.target.parent) light.target.updateMatrixWorld();
+      ls.updateMatrices(light);
+      entry.frustum = ls.getFrustum();
+      _shadowViewProj.multiplyMatrices(ls.camera.projectionMatrix, ls.camera.matrixWorldInverse);
+      out.set(_shadowViewProj.elements, entry.first * 16);
+    }
+    _castsInto(entry, mesh) {
+      if (entry.frustum) return entry.frustum.intersectsObject(mesh);
+      const geometry = mesh.geometry;
+      if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+      _sphere.copy(geometry.boundingSphere).applyMatrix4(mesh.matrixWorld);
+      return _sphere.center.distanceTo(entry.position) - _sphere.radius <= entry.light.shadow.camera.far;
     }
 
     // THREE.Sprite: a camera-facing textured quad (SpriteMaterial is unlit).
@@ -954,15 +1076,30 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         return;
       }
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
-      const record = this._geometryRecord(this._deformedGeometry(mesh, geometry));
+      // SkinnedMesh: bones applied in the vertex shader (CPU only without engine support).
+      const gpuSkin = !!(mesh.isSkinnedMesh && mesh.skeleton && geometry.attributes.skinIndex && geometry.attributes.skinWeight &&
+        nt.uploadSkin && !this._noGpuSkin);
+      let shape = this._deformedGeometry(mesh, geometry, gpuSkin);
+      let record = this._geometryRecord(shape);
       if (!record) return;
+      let bones = 0;
+      if (gpuSkin) {
+        const first = this._skinRecord(record, shape, mesh.skeleton.bones.length) ? this._addBones(mesh) : -1;
+        if (first >= 0) bones = first + 1;
+        else { // not possible here: skin on the CPU
+          if (!record.skinOk) { this._noGpuSkin = true; warnOnce('gpu-skinning', 'GPU skinning is not available: SkinnedMesh is skinned on the CPU'); }
+          shape = this._deformedGeometry(mesh, geometry, false);
+          record = this._geometryRecord(shape);
+          if (!record) return;
+        }
+      }
       if (mesh.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender) mesh.onBeforeRender(this, null, camera, geometry, mesh.material, null);
       const instances = mesh.isInstancedMesh ? this._instanceRecord(mesh) : null;
       _vec.setFromMatrixPosition(mesh.matrixWorld).applyMatrix4(_projScreen);
       const z = _vec.z;
       const total = record.indexCount || record.vertexCount;
       const range = geometry.drawRange;
-      const base = { mesh, record, instances, z };
+      const base = { mesh, record, instances, z, bones };
       if (Array.isArray(mesh.material)) {
         const groups = geometry.groups.length ? geometry.groups : [{ start: 0, count: total, materialIndex: 0 }];
         for (const group of groups) {
@@ -994,6 +1131,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.depthTest === false) flags |= DrawFlags.NO_DEPTH_TEST;
       if (m.flatShading) flags |= DrawFlags.FLAT;
       if (base.instances && mesh.instanceColor) flags |= DrawFlags.INSTANCE_COLORS;
+      if (base.instances?.mirrored) flags |= DrawFlags.INSTANCE_MIRRORED;
       if (!mesh.isSprite && mesh.matrixWorld.determinant() < 0) flags |= DrawFlags.MIRRORED;
       let roughness = 1, metalness = 0, shininess = -1;
       let color = m.color || null, opacity = m.opacity ?? 1;
@@ -1036,7 +1174,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           }
           if (/gl_Position\.z\s*=\s*gl_Position\.w/.test(m.vertexShader || '')) flags |= DrawFlags.FAR_DEPTH;
         }
-        if (!/tonemapping_fragment/.test(m.fragmentShader || '')) flags |= DrawFlags.NO_TONE_MAP;
+        // OutputPass: <tonemapping_pars_fragment> + a *_TONE_MAPPING define = the renderer's tone mapping.
+        const toneMapped = /tonemapping_fragment/.test(m.fragmentShader || '') ||
+          (/#include\s+<tonemapping_pars_fragment>/.test(m.fragmentShader || '') && Object.keys(m.defines ?? {}).some((k) => /_TONE_MAPPING$/.test(k)));
+        if (!toneMapped) flags |= DrawFlags.NO_TONE_MAP;
       }
       else if (m.isMeshMatcapMaterial) unsupported('MeshMatcapMaterial', 'drawn as lit colour');
       else if (m.isMeshDepthMaterial || m.isMeshDistanceMaterial) return;
@@ -1141,7 +1282,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         stdMaps, normalScaleX: normalScale ? normalScale.x : 1, normalScaleY: (normalScale ? normalScale.y : 1) * uvFlip,
         aoIntensity: m.aoMapIntensity ?? 1,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
-        matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
+        matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0, bones: base.bones || 0,
         shadow: (mesh.castShadow && !(flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? ShadowFlags.CAST : 0) |
           (mesh.receiveShadow && !(flags & DrawFlags.UNLIT) ? ShadowFlags.RECEIVE : 0) | (this._shadowPass ? ShadowFlags.ONLY : 0),
       };
@@ -1165,7 +1306,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o] = l.type; p[o + 1] = l.r; p[o + 2] = l.g; p[o + 3] = l.b;
     p[o + 4] = l.px; p[o + 5] = l.py; p[o + 6] = l.pz; p[o + 7] = l.distance;
     p[o + 8] = l.dx; p[o + 9] = l.dy; p[o + 10] = l.dz; p[o + 11] = l.decay;
-    p[o + 12] = l.extra0; p[o + 13] = l.extra1; p[o + 14] = l.extra2; p[o + 15] = 0;
+    p[o + 12] = l.extra0; p[o + 13] = l.extra1; p[o + 14] = l.extra2; p[o + 15] = l.shadow || 0; // shadow light + 1
   }
   function writeDraw(p, o, d) {
     p[o] = d.geometryId; p[o + 1] = d.instanceId; p[o + 2] = d.instanceCount; p[o + 3] = d.flags;
@@ -1178,11 +1319,12 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     if (!d.reflection && !d.colorStage && !d.stdMaps) {
       p.fill(0, o + 40, o + DRAW_FLOATS);
       p[o + 88] = d.shadow || 0;
+      p[o + 93] = d.bones || 0;
       return;
     }
     p[o + 88] = d.shadow || 0;
     p[o + 89] = d.stdMaps || 0; p[o + 90] = d.normalScaleX ?? 1; p[o + 91] = d.normalScaleY ?? 1; p[o + 92] = d.aoIntensity ?? 1;
-    p[o + 93] = 0; p[o + 94] = 0; p[o + 95] = 0;
+    p[o + 93] = d.bones || 0; p[o + 94] = 0; p[o + 95] = 0;
     const reflection = d.reflection;
     const sky = reflection?.uniform.value;
     p[o + 40] = sky ? sky.r * reflection.intensity : 0;
@@ -1196,7 +1338,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p[o + 48] = d.colorStage?.id ?? 0;
     for (let i = 0; i < STAGE_UNIFORM_FLOATS; i++) {
       const binding = d.colorStage?.uniforms[i];
-      const uniform = binding?.uniform.value;
+      const uniform = binding?.index !== undefined ? binding.uniform.value?.[binding.index] : binding?.uniform.value;
       const component = binding?.component;
       const value = component && uniform?.isColor ? uniform['rgb'['xyz'.indexOf(component)]]
         : component ? uniform?.[component] : uniform;
@@ -1265,18 +1407,42 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   // with interpolated inputs and the current draw's uniforms and samplers.
   function translateMaterialStage(shader, standalone = false) {
     const clean = source => source.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '');
-    const fragment = clean(shader.fragmentShader);
-    const vertex = clean(shader.vertexShader);
-    if (standalone && Object.keys(shader.defines ?? {}).length) return null;
-    const uniforms = [], textures = [], attributes = new Map(), inputs = [];
+    let fragment = clean(shader.fragmentShader);
+    let vertex = clean(shader.vertexShader);
+    if (standalone) {
+      // ShaderMaterial (post-processing passes ...): defines and #if blocks resolved here.
+      fragment = preprocessGlsl(fragment, shader.defines);
+      vertex = preprocessGlsl(vertex, shader.defines);
+      if (fragment === null || vertex === null) return null;
+    }
+    const uniforms = [], textures = [], attributes = new Map(), inputs = [], arrays = [];
     let valid = true;
     const channels = 'xyzw';
     function components(expression, offset, size) {
       return expression + '.' + channels.slice(offset, offset + size);
     }
     function declarations(source, stage) {
-      return source.replace(/\b(uniform|varying|attribute)\s+(float|vec[234]|sampler2D)\s+([A-Za-z_]\w*)\s*;/g, (_, storage, type, name) => {
+      return source.replace(/\b(uniform|varying|attribute)\s+(float|vec[234]|sampler2D)\s+([A-Za-z_]\w*)\s*(?:\[\s*(\d+)\s*\])?\s*;/g, (_, storage, type, name, length) => {
         const width = type === 'float' ? 1 : Number(type.at(-1));
+        if (length !== undefined) {
+          // uniform float weights[N]: every element packed like a scalar/vector uniform.
+          const uniform = shader.uniforms[name], n = Number(length);
+          if (storage !== 'uniform' || type === 'sampler2D' || !uniform || !Array.isArray(uniform.value) ||
+              uniforms.length + width * n > STAGE_UNIFORM_FLOATS) { valid = false; return ''; }
+          const elements = [];
+          for (let k = 0; k < n; k++) {
+            const expressions = [];
+            for (let i = 0; i < width; i++) {
+              const index = uniforms.length;
+              const register = index < 12 ? 'gColorStage[' + Math.floor(index / 4) + ']' : 'gColorStageMore[' + Math.floor((index - 12) / 4) + ']';
+              expressions.push(components(register, index % 4, 1));
+              uniforms.push({ uniform, component: width === 1 ? null : channels[i], index: k });
+            }
+            elements.push(width === 1 ? expressions[0] : type + '(' + expressions.join(', ') + ')');
+          }
+          arrays.push({ name, type, elements });
+          return '';
+        }
         if (storage === 'uniform' && !inputs.some(input => input.name === name)) {
           // Reflected sky color is already packed by the native Fresnel stage.
           if (stage === 'fragment' && !new RegExp('\\b' + name + '\\b').test([source.replace(_ , ''), body, normal, roughness, alpha].join('\n'))) return '';
@@ -1335,11 +1501,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const expression = new RegExp('\\b' + name + '\\s*=\\s*([^;]+);').exec(vertexBody)?.[1];
       if (!expression) return null;
       if (standalone) {
-        if (type === 'vec2' && expression.trim() === 'uv') assignments.push(type + ' ' + name + ' = i.rawUv;');
+        if (type === 'vec2' && expression.trim() === 'uv') assignments.push(type + ' ' + name + ' = ntIn.rawUv;');
         else if (type === 'float' && /^fract\s*\(\s*\w+\[3\]\.x\s*\*\s*[\d.]+\s*\+\s*\w+\[3\]\.z\s*\*\s*[\d.]+\s*\)$/.test(expression.trim())) {
           const matrix = expression.match(/\b(\w+)\[3\]/)[1];
           if (!new RegExp('\\bmat4\\s+' + matrix + '\\s*=\\s*modelMatrix\\s*;').test(vertex)) return null;
-          assignments.push(type + ' ' + name + ' = ' + expression.replace(new RegExp('\\b' + matrix + '\\[3\\]', 'g'), 'i.origin') + ';');
+          assignments.push(type + ' ' + name + ' = ' + expression.replace(new RegExp('\\b' + matrix + '\\[3\\]', 'g'), 'ntIn.origin') + ';');
         } else return null;
       } else {
         assignments.push(type + ' ' + name + ' = ' + expression + ';');
@@ -1361,7 +1527,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     let cursor = 0;
     for (const { name, width } of uses.values()) {
       const type = width === 1 ? 'float' : 'vec' + width;
-      inputs.push({ name, type, expression: components('i.attributes', cursor, width) });
+      inputs.push({ name, type, expression: components('ntIn.attributes', cursor, width) });
       cursor += width;
     }
     if (!valid || cursor > 4) return null;
@@ -1387,12 +1553,19 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const reflectionScale = /outgoingLight\s*=\s*mix\s*\(\s*outgoingLight\s*,\s*\w+\s*\*\s*\(([^;()]+)\)\s*,/.exec(fragment)?.[1];
     const functions = [...helpers.matchAll(/\b(?:float|vec[234])\s+([A-Za-z_]\w*)\s*\([^()]*\)\s*\{/g)].map(match => match[1]);
     const code = [helpers, body, normal, roughness, alpha, ...locals, ...assignments, reflectionScale || ''].join('\n');
-    if (code.length > 18000 || /[^\w\s.,;(){}+*/%<>!=?:&|\-\[\]]/.test(code) ||
-        /\b(?:for|while|do|switch|register|static|uniform|varying|layout|texture|samplerCube|cbuffer)\b/.test(code)) return null;
+    // Loops only with constant bounds (blur kernels): `for (int i = 1; i < 22; i++)`.
+    let loopsOk = true;
+    const checked = code.replace(FOR_LOOP, (_, variable, from, op, to) => {
+      if (Number(to) - Number(from) + (op === '<=' ? 1 : 0) > 64) loopsOk = false;
+      return '';
+    });
+    if (!loopsOk || code.length > 18000 || /[^\w\s.,;(){}+*/%<>!=?:&|\-\[\]]/.test(checked) ||
+        /\b(?:for|while|do|switch|register|static|uniform|varying|layout|texture|samplerCube|cbuffer)\b/.test(checked)) return null;
     const calls = new Set(['vec2', 'vec3', 'vec4', 'float', 'abs', 'min', 'max', 'clamp', 'mix', 'smoothstep',
       'step', 'pow', 'sin', 'cos', 'floor', 'ceil', 'fract', 'dot', 'normalize', 'length', 'sqrt', 'exp',
-      'fwidth', 'cross', 'sign', 'texture2D', 'if', 'return', ...functions]);
-    for (const [, name] of code.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name)) return null;
+      'fwidth', 'cross', 'sign', 'texture2D', 'if', 'return', 'luminance', 'int', 'log', 'log2', 'exp2', 'atan',
+      'reflect', 'distance', 'tan', 'asin', 'acos', ...functions]);
+    for (const [, name] of checked.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (!calls.has(name)) return null;
 
     // GLSL carries a combined texture/sampler through helper parameters.
     // Pass its uniform slot through the HLSL helper and select the sampler
@@ -1404,7 +1577,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         .replace(HLSL_RESERVED, 'nt_$1')
         .replace(/\bvec([234])\b/g, 'float$1').replace(/\bmix\s*\(/g, 'lerp(').replace(/\bfract\s*\(/g, 'frac(')
         .replace(/\bposition\b/g, 'ntPosition').replace(/\bobjectNormal\b/g, 'ntNormal')
-        .replace(/\(\s*viewMatrix\s*\*\s*float4\(([^;]+?),\s*0\.0\)\s*\)\.xyz/g, 'mul((float3x3)gView, float3($1))');
+        .replace(/\(\s*viewMatrix\s*\*\s*float4\(([^;]+?),\s*0\.0\)\s*\)\.xyz/g, 'mul((float3x3)gView, float3($1))')
+        .replace(/\bconst\s+in\b/g, 'in').replace(/\bfor\s*\(/g, '[unroll] for (')
+        .replace(/\batan\s*\(([^(),]+),/g, 'atan2($1,');
       textures.forEach(({ name }, slot) => { result = result.replace(new RegExp('\\b' + name + '\\b', 'g'), String(slot)); });
       return splatConstructors(result);
     };
@@ -1416,17 +1591,67 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     const init = (type, name, expression) => (globalNames.has(name) ? '' : type + ' ') + name + ' = ' + expression + ';';
     const varyingInit = assignments.map(line => line.replace(/^(\w+) (\w+) = (.*);$/, (_, type, name, expression) => init(type, name, expression)));
     const source = sample + translate(globals.map(({ type, name }) => 'static ' + type + ' ' + name + ';').join('\n') + '\n' +
+      arrays.map(({ type, name, elements }) => 'static ' + type + ' ' + name + '[' + elements.length + '];').join('\n') + '\n' +
       privates.map(code => 'static ' + code).join('\n') + '\n' + helpers) + '\n' +
-      'void nativeColorStage(VSOut i, inout float4 diffuseColor, inout float3 ntWorldNormal, inout float roughnessFactor, inout float skyScale, inout float alphaMask) {\n' +
-      'float3 ntPosition = i.localPosition, ntNormal = i.localNormal;\n' +
-      'float3 vViewPosition = -mul(gView, float4(i.world, 1.0)).xyz;\n' +
+      'void nativeColorStage(VSOut ntIn, inout float4 diffuseColor, inout float3 ntWorldNormal, inout float roughnessFactor, inout float skyScale, inout float alphaMask) {\n' +
+      'float3 ntPosition = ntIn.localPosition, ntNormal = ntIn.localNormal;\n' +
+      'float3 vViewPosition = -mul(gView, float4(ntIn.world, 1.0)).xyz;\n' +
       inputs.map(({ type, name, expression }) => translate(init(type, name, expression))).join('\n') + '\n' +
+      arrays.map(({ name, elements }) => elements.map((e, k) => translate(name + '[' + k + '] = ' + e + ';')).join('\n')).join('\n') + '\n' +
       translate(varyingInit.join('\n') + '\n' + locals.join('\n') + '\n' + body + '\n' + roughness + '\n' + alpha) + '\n' +
       (reflectionScale ? 'skyScale = ' + translate(reflectionScale) + ';\n' : '') +
       (normal ? 'float3 normal = normalize(mul((float3x3)gView, ntWorldNormal));\n' +
         translate(normal) + '\nntWorldNormal = normalize(mul(transpose((float3x3)gView), normal));\n' : '') +
       '}';
     return { source, uniforms, textures, attributes: [...uses.values()] };
+  }
+
+  const FOR_LOOP = /\bfor\s*\(\s*int\s+([A-Za-z_]\w*)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=?)\s*(-?\d+)\s*;\s*(?:\1\s*\+\+|\+\+\s*\1|\1\s*\+=\s*1)\s*\)/g;
+  // Minimal GLSL preprocessor for ShaderMaterial: material.defines and
+  // #define values, #ifdef/#ifndef/#if/#elif/#else/#endif. <common> is
+  // provided natively; other #include chunks are not translated (null).
+  function preprocessGlsl(source, defines) {
+    const values = new Map();
+    for (const [k, v] of Object.entries(defines ?? {})) values.set(k, v === true ? '1' : v === false ? '0' : String(v));
+    const evaluate = (expression) => {
+      let e = expression.replace(/\bdefined\s*\(\s*(\w+)\s*\)|\bdefined\s+(\w+)/g, (_, a, b) => (values.has(a || b) ? '1' : '0'));
+      e = e.replace(/\b[A-Za-z_]\w*\b/g, (name) => (values.has(name) && /^[\d.\s+-]+$/.test(values.get(name)) ? values.get(name) : '0'));
+      if (!/^[\d.\s()!&|=<>+\-*/]+$/.test(e)) return null;
+      try { return !!Function('return (' + e + ');')(); } catch { return null; }
+    };
+    const out = [], stack = [];
+    let active = true;
+    for (const raw of source.split('\n')) {
+      const line = raw.trim();
+      let m;
+      if ((m = /^#\s*(ifdef|ifndef)\s+(\w+)/.exec(line))) {
+        const cond = values.has(m[2]) === (m[1] === 'ifdef');
+        stack.push({ parent: active, taken: cond }); active = active && cond; continue;
+      }
+      if ((m = /^#\s*if\s+(.+)$/.exec(line))) {
+        const cond = evaluate(m[1]); if (cond === null) return null;
+        stack.push({ parent: active, taken: cond }); active = active && cond; continue;
+      }
+      if ((m = /^#\s*elif\s+(.+)$/.exec(line))) {
+        const top = stack.at(-1); if (!top) return null;
+        const cond = !top.taken && evaluate(m[1]); if (cond === null) return null;
+        active = top.parent && cond; top.taken = top.taken || cond; continue;
+      }
+      if (/^#\s*else\b/.test(line)) { const top = stack.at(-1); if (!top) return null; active = top.parent && !top.taken; top.taken = true; continue; }
+      if (/^#\s*endif\b/.test(line)) { const top = stack.pop(); if (!top) return null; active = top.parent; continue; }
+      if (!active) continue;
+      if ((m = /^#\s*define\s+(\w+)(\()?\s*(.*)$/.exec(line))) { if (m[2]) return null; values.set(m[1], m[3].trim()); continue; }
+      if (/^#\s*include\s+<(common|colorspace_fragment|tonemapping_fragment)>\s*$/.test(line)) continue;
+      if (/^precision\s+\w+\s+\w+\s*;$/.test(line)) continue;
+      if (line.startsWith('#')) return null;
+      out.push(raw);
+    }
+    if (stack.length) return null;
+    let code = out.join('\n');
+    for (let pass = 0; pass < 3; pass++) {
+      for (const [k, v] of values) if (v !== '') code = code.replace(new RegExp('\\b' + k + '\\b', 'g'), v);
+    }
+    return code;
   }
 
   // GLSL words that HLSL reserves (interpolation modifiers, types ...).

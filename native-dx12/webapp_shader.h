@@ -13,9 +13,12 @@ cbuffer Frame : register(b0) {
     float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure, z 1 = render target (linear)
     float4 gFogColor;
     float4 gFog;      // mode, near or density, far
-    float4x4 gShadowMatrix; // world -> shadow light clip (light.shadow.camera)
-    float4 gShadow;   // enabled, light index, bias, normalBias
-    float4 gShadow2;  // 1 / map size, radius, intensity, unused
+    float4x4 gShadowMatrices[16]; // world -> shadow clip, one per shadow map slice (point lights: 6)
+    float4 gShadowLight[8];  // first slice, bias, normalBias, intensity
+    float4 gShadowLight2[8]; // kind (1 = point light), radius, far, near
+    float4 gShadowLight3[8]; // light position, unused
+    float4 gShadowPass;      // 1 / map size, slice being drawn, point light near, unused
+    float4 gShadowPass2;     // drawn slice's point light position, far
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
@@ -29,7 +32,7 @@ cbuffer Draw : register(b1) {
     float4 gColorStage[3]; // live uniforms from the translated material
     float4 gMaterialOptions; // flip Y, repeat, mirror bitmasks
     float4 gColorStageMore[4]; // translated material uniforms 12..27
-    float4 gStdMap;   // normalScale x, y (sign: uv flip), aoMapIntensity, unused
+    float4 gStdMap;   // normalScale x, y (sign: uv flip), aoMapIntensity, first bone + 1 (0: not skinned)
 };
 Texture2D gMap : register(t0);
 Texture2D gMaterialMap0 : register(t1);
@@ -44,11 +47,14 @@ Texture2D gMaterialMap8 : register(t9);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
-Texture2D<float> gShadowMap : register(t10);
+Texture2DArray<float> gShadowMap : register(t10);
+// SkinnedMesh bone matrices of this pass (bindMatrixInverse * bone * bindMatrix).
+struct NtBone { column_major float4x4 m; };
+StructuredBuffer<NtBone> gBones : register(t11);
 SamplerComparisonState gShadowSampler : register(s3);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
-                  F_MIRRORED = 524288;
+                  F_MIRRORED = 524288, F_INSTANCE_MIRRORED = 4194304;
 static const float PI = 3.14159265;
 
 struct VSIn {
@@ -56,11 +62,13 @@ struct VSIn {
     float4 attributes : TEXCOORD1;
     float4 r0 : IROW0; float4 r1 : IROW1; float4 r2 : IROW2; float4 r3 : IROW3;
     float3 icol : ICOLOR;
+    float4 skinIndex : SKININDEX; float4 skinWeight : SKINWEIGHT;
 };
 struct VSOut {
     float4 pos : SV_Position; float3 world : WORLDPOS; float3 nrm : NORMAL; float4 col : COLOR; float2 uv : TEXCOORD0; float fogDepth : TEXCOORD1;
     float3 localPosition : TEXCOORD2; float3 localNormal : TEXCOORD3;
     float4 attributes : TEXCOORD4; float2 rawUv : TEXCOORD5; float3 origin : TEXCOORD6;
+    nointerpolation float mirror : TEXCOORD7; // 1: this instance's matrix is mirrored
 };
 
 float3 cofactorNormal(float3x3 m, float3 n) {
@@ -75,13 +83,24 @@ VSOut VSMain(VSIn i) {
     VSOut o;
     uint flags = (uint)gParams.z;
     float4x4 instT = float4x4(i.r0, i.r1, i.r2, i.r3);      // rows = instance matrix columns
-    float4 local = mul(float4(i.pos, 1), instT);
+    float3 pos = i.pos, nrm = i.nrm;
+    if (gStdMap.w > 0) { // skinning_vertex: weighted bone matrices
+        uint b = (uint)gStdMap.w - 1;
+        float4x4 skin = gBones[b + (uint)i.skinIndex.x].m * i.skinWeight.x + gBones[b + (uint)i.skinIndex.y].m * i.skinWeight.y +
+                        gBones[b + (uint)i.skinIndex.z].m * i.skinWeight.z + gBones[b + (uint)i.skinIndex.w].m * i.skinWeight.w;
+        if (dot(i.skinWeight, float4(1, 1, 1, 1)) > 0) {
+            pos = mul(skin, float4(pos, 1)).xyz;
+            nrm = mul((float3x3)skin, nrm);
+        }
+    }
+    o.mirror = determinant((float3x3)instT) < 0 ? 1 : 0;
+    float4 local = mul(float4(pos, 1), instT);
     float4 world = mul(gModel, local);
     float4 view = mul(gView, world);
     float4 clip = mul(gProj, view);
     o.fogDepth = -view.z;
-    o.localPosition = i.pos;
-    o.localNormal = normalize(i.nrm);
+    o.localPosition = pos;
+    o.localNormal = normalize(nrm);
     o.attributes = i.attributes;
     o.rawUv = i.uv;
     o.origin = mul(gModel, i.r3).xyz;
@@ -92,17 +111,18 @@ VSOut VSMain(VSIn i) {
     o.uv = float2(dot(gUvU.xyz, uv1), dot(gUvV.xyz, uv1));
     o.world = world.xyz;
     float3x3 w = mul((float3x3)gModel, transpose((float3x3)instT));
-    o.nrm = cofactorNormal(w, i.nrm);
+    o.nrm = cofactorNormal(w, nrm);
     float4 c = (flags & F_VERTEX_COLORS) ? i.col : float4(1, 1, 1, 1);   // rgba vertex colours: alpha too
     if (flags & F_INSTANCE_COLORS) c.rgb *= i.icol;
     o.col = c;
     return o;
 }
 
-// Depth pass for light.shadow (one directional or spot light per render()).
+// Depth pass for light.shadow: one slice of the shadow map array per call
+// (directional and spot lights: 1, point lights: 6 cube faces).
 VSOut VSShadow(VSIn i) {
     VSOut o = VSMain(i);
-    float4 clip = mul(gShadowMatrix, float4(o.world, 1));
+    float4 clip = mul(gShadowMatrices[(uint)gShadowPass.y], float4(o.world, 1));
     clip.z = 0.5 * (clip.z + clip.w);
     o.pos = clip;
     return o;
@@ -114,19 +134,34 @@ void PSShadow(VSOut i) {
         if (a < gUvU.w) discard;   // alphaTest cut-outs (leaves) cast cut-out shadows
     }
 }
-// Three.js PCF: 1 = lit, 0 = in shadow. normalBias moves along the normal, bias shifts depth.
-float shadowFactor(float3 world, float3 n) {
-    float4 s = mul(gShadowMatrix, float4(world + n * gShadow.w, 1));
+// Point lights store distance / far (like MeshDistanceMaterial), not depth.
+float PSShadowPoint(VSOut i) : SV_Depth {
+    PSShadow(i);
+    return saturate((length(i.world - gShadowPass2.xyz) - gShadowPass.z) / (gShadowPass2.w - gShadowPass.z));
+}
+// Three.js PCF for shadow light k: 1 = lit, 0 = in shadow. normalBias moves
+// along the normal, bias shifts the compared depth.
+float shadowFactor(uint k, float3 world, float3 n) {
+    float4 L = gShadowLight[k], L2 = gShadowLight2[k];
+    float3 p = world + n * L.z;
+    uint slice = (uint)L.x;
+    float ref = 0;
+    if (L2.x > 0) { // point light: the cube face the point is in
+        float3 d = p - gShadowLight3[k].xyz, a = abs(d);
+        slice += (a.x >= a.y && a.x >= a.z) ? (d.x > 0 ? 0u : 1u) : (a.y >= a.z) ? (d.y > 0 ? 2u : 3u) : (d.z > 0 ? 4u : 5u);
+        ref = (length(d) - L2.w) / (L2.z - L2.w) + L.y;
+    }
+    float4 s = mul(gShadowMatrices[slice], float4(p, 1));
     if (s.w <= 0) return 1;
     s.xyz /= s.w;
     float2 uv = float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
-    float depth = s.z * 0.5 + 0.5 + gShadow.z;
-    if (uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || depth > 1) return 1;
-    float spread = gShadow2.x * max(gShadow2.y, 1);
+    if (L2.x <= 0) ref = s.z * 0.5 + 0.5 + L.y;
+    if (uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || ref > 1) return 1;
+    float spread = gShadowPass.x * max(L2.y, 1);
     float sum = 0;
     [unroll] for (int y = -1; y <= 1; y++)
         [unroll] for (int x = -1; x <= 1; x++)
-            sum += gShadowMap.SampleCmpLevelZero(gShadowSampler, uv + float2(x, y) * spread, depth);
+            sum += gShadowMap.SampleCmpLevelZero(gShadowSampler, float3(uv + float2(x, y) * spread, slice), ref);
     return sum / 9;
 }
 
@@ -136,6 +171,8 @@ float3 toSRGB(float3 c) {
     return c < 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 float3 fresnel(float3 f0, float vh) { return f0 + (1 - f0) * pow(1 - vh, 5); }
+// Three.js <common> helpers used by translated ShaderMaterials.
+float luminance(float3 rgb) { return dot(float3(0.2126729, 0.7151522, 0.0721750), rgb); }
 
 // Three.js r181 tone mapping curves (tonemapping_pars_fragment).
 float3 rrtOdt(float3 v) { return (v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.4329510) + 0.238081); }
@@ -190,6 +227,12 @@ float4 stdSample(Texture2D t, uint slot, float2 uv, float2 dx, float2 dy) {
 
 float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     uint flags = (uint)gParams.z;
+    if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
+    if (flags & F_INSTANCE_MIRRORED) {
+        // Some instances are mirrored: drawn without culling, the hidden side is dropped here.
+        if (i.mirror > 0.5) front = !front;
+        if (!(flags & 2u) && ((flags & 4u) ? front : !front)) discard;
+    }
     float3 albedo = gColor.rgb * i.col.rgb;
     float alphaOut = gColor.a * i.col.a;
     float2 uvDx = ddx(i.uv), uvDy = ddy(i.uv);   // outside flow control (mip selection)
@@ -228,7 +271,6 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
 #ifdef NT_COLOR_PATCH
     N = patchedNormal;
 #endif
-    if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
     if (!front) N = -N;
     if (flags & F_FLAT) N = flatN;
 #ifndef NT_COLOR_PATCH
@@ -267,12 +309,9 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
     float3 indirect = gAmbient.rgb;
     float3 direct = 0;
-    float shadow = 1;
-    if (gShadow.x > 0 && ((uint)gParams.w & 2u)) {   // mesh.receiveShadow
-        float3 geometric = normalize(i.nrm);
-        if (!front) geometric = -geometric;
-        shadow = lerp(1, shadowFactor(i.world, geometric), saturate(gShadow2.z));
-    }
+    bool receive = ((uint)gParams.w & 2u) != 0;   // mesh.receiveShadow
+    float3 geometric = normalize(i.nrm);
+    if (!front) geometric = -geometric;
     uint count = (uint)gCamera.w;
     for (uint li = 0; li < count; li++) {
         float4 a = gLights[li * 4 + 0], b = gLights[li * 4 + 1], c = gLights[li * 4 + 2], d = gLights[li * 4 + 3];
@@ -295,7 +334,9 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
             if (cutoff > 0) { float r = saturate(1 - pow(dist / cutoff, 4)); attenuation *= r * r; }
             if (type == 5) attenuation *= smoothstep(d.x, d.y, dot(-L, c.xyz));
         }
-        if (li == (uint)gShadow.y) attenuation *= shadow;
+        uint sk = (uint)d.w;   // shadow light + 1
+        if (sk > 0 && receive && attenuation > 0)
+            attenuation *= lerp(1, shadowFactor(sk - 1, i.world, geometric), saturate(gShadowLight[sk - 1].w));
         float nl = saturate(dot(N, L));
         if (nl <= 0 || attenuation <= 0) continue;
         float3 irradiance = color * (nl * attenuation);

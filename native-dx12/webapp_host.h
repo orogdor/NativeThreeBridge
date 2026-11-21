@@ -57,6 +57,12 @@ public:
     virtual void uploadInstances(std::uint32_t id, const float* matrices, const float* colors,
                                  std::uint32_t count) = 0;
     virtual void releaseInstances(std::uint32_t id) = 0;
+    // SkinnedMesh: skinIndex and skinWeight (4 floats each per vertex) of
+    // geometry `id`, skinned on the GPU with the pass's bone matrices.
+    virtual bool uploadSkin(std::uint32_t id, const float* indices, const float* weights, std::uint32_t vertexCount) {
+        (void)id; (void)indices; (void)weights; (void)vertexCount;
+        return false;
+    }
     virtual bool registerColorPatch(std::uint32_t id, const std::string& source) {
         (void)id; (void)source;
         return false;
@@ -122,6 +128,32 @@ constexpr std::size_t kWebappLightFloats = 16;
 constexpr std::size_t kWebappDrawFloats = 96;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
+// Pass sections after the lights (header floats 56, 57, 58 hold the counts):
+// shadow lights (8 floats each), shadow views (view-projection, 16 floats),
+// bone matrices for GPU skinning (16 floats), then the draw records.
+constexpr std::size_t kWebappShadowLightFloats = 8;
+constexpr std::size_t kWebappMaxShadowLights = 8, kWebappMaxShadowViews = 16, kWebappMaxBones = 65536;
+struct WebappPassLayout {
+    std::size_t lights = 0, shadowLights = 0, shadowViews = 0, bones = 0, draws = 0;
+    std::size_t shadowLightOffset = 0, shadowViewOffset = 0, boneOffset = 0, drawOffset = 0, floats = 0;
+    bool valid = false;
+};
+inline WebappPassLayout webappPassLayout(const float* p) {
+    WebappPassLayout l;
+    l.lights = std::size_t(p[35]);
+    l.draws = std::size_t(p[43]);
+    l.shadowLights = std::size_t(p[56]);
+    l.shadowViews = std::size_t(p[57]);
+    l.bones = std::size_t(p[58]);
+    l.shadowLightOffset = kWebappPassHeaderFloats + l.lights * kWebappLightFloats;
+    l.shadowViewOffset = l.shadowLightOffset + l.shadowLights * kWebappShadowLightFloats;
+    l.boneOffset = l.shadowViewOffset + l.shadowViews * 16;
+    l.drawOffset = l.boneOffset + l.bones * 16;
+    l.floats = l.drawOffset + l.draws * kWebappDrawFloats;
+    l.valid = l.lights <= kWebappMaxLights && l.shadowLights <= kWebappMaxShadowLights &&
+              l.shadowViews <= kWebappMaxShadowViews && l.bones <= kWebappMaxBones;
+    return l;
+}
 
 // Game-folder path checks shared by the module loader and file reads.
 // Returns a normalized relative path ("js/app.js") or an empty string.

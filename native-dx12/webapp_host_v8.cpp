@@ -851,6 +851,18 @@ void ntReleaseInstances(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseInstances(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntUploadSkin(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 4) return self->throwError("type", "uploadSkin(id, indices, weights, vertexCount)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const std::uint32_t id = info[0]->Uint32Value(ctx).FromMaybe(0), count = info[3]->Uint32Value(ctx).FromMaybe(0);
+    const float *indices, *weights;
+    std::size_t nI, nW;
+    if (!typedView(self, info[1], indices, nI, false, "indices") || !typedView(self, info[2], weights, nW, false, "weights")) return;
+    if (nI < std::size_t(count) * 4 || nW < std::size_t(count) * 4)
+        return self->throwError("range", "Skin buffers smaller than vertexCount");
+    info.GetReturnValue().Set(bool(self->sink && self->sink->uploadSkin(id, indices, weights, count)));
+}
 void ntRegisterColorPatch(const v8::FunctionCallbackInfo<v8::Value>& info) {
     auto* self = Impl::fromInfo(info);
     if (info.Length() < 2 || !self->sink || !info[1]->IsString()) return;
@@ -865,8 +877,8 @@ void ntSubmitPass(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (!typedView(self, info[0], data, available, false, "packet")) return;
     const std::uint32_t floats = info[1]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0);
     if (floats > available || floats < kWebappPassHeaderFloats) return self->throwError("range", "submitPass: bad packet size");
-    const std::size_t lights = std::size_t(data[35]), draws = std::size_t(data[43]);
-    if (lights > kWebappMaxLights || kWebappPassHeaderFloats + lights * kWebappLightFloats + draws * kWebappDrawFloats != floats)
+    const WebappPassLayout layout = webappPassLayout(data);
+    if (!layout.valid || layout.floats != floats)
         return self->throwError("range", "submitPass: header counts do not match packet size");
     if (self->sink) self->sink->submitPass(data, floats);
 }
@@ -1651,6 +1663,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"setImportMap", ntSetImportMap}, {"evalScript", ntEvalScript}, {"evalModule", ntEvalModule},
         {"uploadGeometry", ntUploadGeometry}, {"releaseGeometry", ntReleaseGeometry},
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
+        {"uploadSkin", ntUploadSkin},
         {"registerColorPatch", ntRegisterColorPatch},
         {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
         {"createRenderTarget", ntCreateRenderTarget},

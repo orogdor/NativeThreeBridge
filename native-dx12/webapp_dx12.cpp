@@ -21,6 +21,7 @@
 #include <share.h>
 #include <fstream>
 #include <map>
+#include <iterator>
 #include <regex>
 #include <atomic>
 #include <condition_variable>
@@ -57,10 +58,12 @@ constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kShadowSlot = kMaxTextures - 1;       // SRV of the shadow map (t10)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
-constexpr UINT kFrameCBBytes = 1536;                 // see cbuffer Frame (332 floats)
+constexpr UINT kFrameCBBytes = 2816;                 // see cbuffer Frame (668 floats)
 constexpr UINT kDrawCBBytes = 512; // cbuffer Draw (80 floats), CBVs are 256-byte aligned
 constexpr UINT kMaterialMapCount = 9;
 constexpr UINT kShadowParam = 3 + kMaterialMapCount; // root parameter of t10
+constexpr UINT kBoneParam = kShadowParam + 1;        // root SRV t11: bone matrices (GPU skinning)
+constexpr UINT kSkinStride = 8 * sizeof(float);      // skinIndex + skinWeight per vertex
 // Draw record float 88 (js/native-renderer.mjs ShadowFlags)
 constexpr UINT S_CAST = 1, S_RECEIVE = 2, S_ONLY = 4;
 const D3D12_INPUT_ELEMENT_DESC kInputLayout[] = {
@@ -74,11 +77,14 @@ const D3D12_INPUT_ELEMENT_DESC kInputLayout[] = {
     {"IROW", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
     {"IROW", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
     {"ICOLOR", 0, DXGI_FORMAT_R32G32B32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1},
+    {"SKININDEX", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"SKINWEIGHT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
 };
 // Draw flags (js/native-renderer.mjs DrawFlags)
 constexpr UINT F_TRANSPARENT = 1, F_DOUBLE = 2, F_BACK = 4, F_NO_DEPTH_WRITE = 32,
                F_NO_DEPTH_TEST = 64, F_LINES = 128, F_LINE_STRIP = 256, F_MAP = 4096,
-               F_MIRRORED = 524288, F_ADDITIVE = 1048576, F_PREMULTIPLIED_ADDITIVE = 2097152;
+               F_MIRRORED = 524288, F_ADDITIVE = 1048576, F_PREMULTIPLIED_ADDITIVE = 2097152,
+               F_INSTANCE_MIRRORED = 4194304;
 constexpr UINT P_CLEAR_COLOR = 1, P_CLEAR_DEPTH = 2;
 // Pipeline cache: 8 state bits per material shader (0 = stock shader).
 constexpr UINT kMaxColorPatches = 32;
@@ -113,7 +119,8 @@ D3D12_RESOURCE_DESC bufferDesc(UINT64 bytes) {
 
 struct Geometry {
     ComPtr<ID3D12Resource> vertices, indices;
-    D3D12_VERTEX_BUFFER_VIEW vbv{};
+    ComPtr<ID3D12Resource> skin;   // SkinnedMesh: skinIndex + skinWeight (vertex stream 2)
+    D3D12_VERTEX_BUFFER_VIEW vbv{}, skinView{};
     D3D12_INDEX_BUFFER_VIEW ibv{};
     UINT vertexCount = 0, indexCount = 0;
 };
@@ -274,6 +281,7 @@ public:
     bool createRenderTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
+    bool uploadSkin(std::uint32_t id, const float* indices, const float* weights, std::uint32_t vertexCount) override;
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
     void submitPass(const float* data, std::size_t floats) override {
@@ -429,8 +437,9 @@ private:
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
     ID3D12PipelineState* pipeline(UINT flags, UINT patchId, bool hdr = false);
-    ID3D12PipelineState* shadowPipeline();
-    void ensureShadowMap(UINT size);
+    ID3D12PipelineState* shadowPipeline(bool point);
+    void ensureShadowMap(UINT size, UINT slices);
+    void shadowSrvView(ID3D12Resource* map, UINT slices, D3D12_CPU_DESCRIPTOR_HANDLE cpu);
     void renderFrame(std::unique_lock<std::recursive_mutex>* resourceLock = nullptr);
     void recordGeometryCopies();
     // The worker submits the previous frame while V8 computes the next one.
@@ -538,8 +547,11 @@ private:
     ComPtr<ID3D12RootSignature> root_sig_;
     ComPtr<ID3DBlob> vs_, ps_;
     // light.shadow: depth map rendered before the pass that uses it.
-    ComPtr<ID3DBlob> shadowVs_, shadowPs_;
-    ComPtr<ID3D12PipelineState> shadowPso_;
+    ComPtr<ID3DBlob> shadowVs_, shadowPs_, shadowPointPs_;
+    ComPtr<ID3D12PipelineState> shadowPso_, shadowPointPso_;
+    UINT shadowSlices_ = 0;           // array slices of shadowMap_ (one per shadow view)
+    ComPtr<ID3D12Resource> zeroSkin_; // stream 2 of draws without skinning (stride 0)
+    D3D12_VERTEX_BUFFER_VIEW zeroSkinView_{};
     ComPtr<ID3D12Resource> shadowMap_;
     ComPtr<ID3D12DescriptorHeap> shadowDsvHeap_;
     UINT shadowSize_ = 0;
@@ -550,6 +562,7 @@ private:
         return gpu;
     }
     UINT lastShadowDraws_ = 0;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> shadowDrawConstants_; // per draw, reused by every shadow slice
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
     std::map<UINT, ComPtr<ID3D12PipelineState>> hdrPipelines_; // same keys, RGBA16F target (render targets)
     std::unordered_map<std::uint32_t, RenderTarget> renderTargets_; // gfxMutex_
@@ -746,8 +759,8 @@ void WebappWindow::initDevice() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 
     // Root signature: b0 = frame constants, b1 = per-draw constants,
-    // t0 = colour map, t1..t9 = material maps, t10 = shadow map.
-    D3D12_ROOT_PARAMETER params[4 + kMaterialMapCount]{};
+    // t0 = colour map, t1..t9 = material maps, t10 = shadow map array, t11 = bones.
+    D3D12_ROOT_PARAMETER params[5 + kMaterialMapCount]{};
     for (UINT i = 0; i < 2; i++) {
         params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         params[i].Descriptor.ShaderRegister = i;
@@ -768,6 +781,9 @@ void WebappWindow::initDevice() {
     params[kShadowParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[kShadowParam].DescriptorTable = {1, &shadowRange};
     params[kShadowParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[kBoneParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[kBoneParam].Descriptor.ShaderRegister = 11;
+    params[kBoneParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
     D3D12_STATIC_SAMPLER_DESC samplers[4]{};
     const D3D12_TEXTURE_ADDRESS_MODE modes[3] = {D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
                                                   D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
@@ -814,7 +830,14 @@ void WebappWindow::initDevice() {
         if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
         check(hr, stage ? "Compile webapp shadow pixel shader" : "Compile webapp shadow vertex shader");
     }
-    heap.NumDescriptors = 1;
+    {
+        ComPtr<ID3DBlob> err;
+        HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
+                                "PSShadowPoint", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shadowPointPs_, err.GetAddressOf());
+        if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
+        check(hr, "Compile webapp point shadow pixel shader");
+    }
+    heap.NumDescriptors = UINT(native_three::kWebappMaxShadowViews); // one DSV per shadow map slice
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     check(device_->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&shadowDsvHeap_)), "Shadow DSV heap");
@@ -824,21 +847,28 @@ void WebappWindow::initDevice() {
     identityView_.BufferLocation = identityInstance_->GetGPUVirtualAddress();
     identityView_.SizeInBytes = sizeof identity;
     identityView_.StrideInBytes = kInstanceStride;
+    const float zeroSkin[8] = {};
+    zeroSkin_ = uploadBuffer(zeroSkin, sizeof zeroSkin);
+    zeroSkinView_.BufferLocation = zeroSkin_->GetGPUVirtualAddress();
+    zeroSkinView_.SizeInBytes = sizeof zeroSkin;
+    zeroSkinView_.StrideInBytes = 0; // every vertex reads the same zero weights
     createSizeDependent();
     initTextures();
-    ensureShadowMap(1); // t10 always holds a valid view
+    ensureShadowMap(1, 1); // t10 always holds a valid view
     initUi();
 }
 
-// Depth texture for light.shadow (size = shadow.mapSize, clamped). Called
-// while a frame is being recorded: the old map and its SRV slot are retired
-// by fence like textures (never wait for the GPU here: that would also free
-// this frame's pending upload buffers).
-void WebappWindow::ensureShadowMap(UINT size) {
-    if (shadowMap_ && shadowSize_ == size) return;
+// Depth texture array for light.shadow: one slice per shadow view (size =
+// the largest shadow.mapSize, clamped). Called while a frame is being
+// recorded: the old map and its SRV slot are retired by fence like textures
+// (never wait for the GPU here: that would also free this frame's pending
+// upload buffers).
+void WebappWindow::ensureShadowMap(UINT size, UINT slices) {
+    if (shadowMap_ && shadowSize_ == size && shadowSlices_ >= slices) return;
+    slices = std::max(slices, shadowSlices_);
     UINT slot = shadowSlot_;
     if (shadowMap_) {
-        if (freeSlots_.empty()) return; // keep the current size
+        if (freeSlots_.empty()) return; // keep the current map
         slot = freeSlots_.back();
         freeSlots_.pop_back();
     }
@@ -848,7 +878,7 @@ void WebappWindow::ensureShadowMap(UINT size) {
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = size;
     desc.Height = size;
-    desc.DepthOrArraySize = 1;
+    desc.DepthOrArraySize = UINT16(slices);
     desc.MipLevels = 1;
     desc.Format = DXGI_FORMAT_R32_TYPELESS;
     desc.SampleDesc.Count = 1;
@@ -859,33 +889,49 @@ void WebappWindow::ensureShadowMap(UINT size) {
     ComPtr<ID3D12Resource> map;
     check(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                            &clear, IID_PPV_ARGS(&map)), "Create shadow map");
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
-    dsv.Format = DXGI_FORMAT_D32_FLOAT;
-    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    device_->CreateDepthStencilView(map.Get(), &dsv, shadowDsvHeap_->GetCPUDescriptorHandleForHeapStart());
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R32_FLOAT;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1;
+    const UINT dsvStep = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    for (UINT i = 0; i < slices; i++) {
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_D32_FLOAT;
+        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        dsv.Texture2DArray.FirstArraySlice = i;
+        dsv.Texture2DArray.ArraySize = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = shadowDsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += SIZE_T(i) * dsvStep;
+        device_->CreateDepthStencilView(map.Get(), &dsv, handle);
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += SIZE_T(slot) * texStep_;
-    device_->CreateShaderResourceView(map.Get(), &srv, cpu);
+    shadowSrvView(map.Get(), slices, cpu);
     if (shadowMap_) {
         retire(shadowMap_);
         retiredSlots_.push_back({shadowSlot_, fenceValue_ + kFrameCount});
     }
     shadowMap_ = map;
     shadowSize_ = size;
+    shadowSlices_ = slices;
     shadowSlot_ = slot;
 }
 
-ID3D12PipelineState* WebappWindow::shadowPipeline() {
-    if (shadowPso_) return shadowPso_.Get();
+void WebappWindow::shadowSrvView(ID3D12Resource* map, UINT slices, D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2DArray.MipLevels = 1;
+    srv.Texture2DArray.ArraySize = slices;
+    device_->CreateShaderResourceView(map, &srv, cpu);
+}
+
+// Point lights write distance / far as depth (PSShadowPoint).
+ID3D12PipelineState* WebappWindow::shadowPipeline(bool point) {
+    ComPtr<ID3D12PipelineState>& cached = point ? shadowPointPso_ : shadowPso_;
+    if (cached) return cached.Get();
+    ID3DBlob* pixel = point ? shadowPointPs_.Get() : shadowPs_.Get();
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.pRootSignature = root_sig_.Get();
     d.VS = {shadowVs_->GetBufferPointer(), shadowVs_->GetBufferSize()};
-    d.PS = {shadowPs_->GetBufferPointer(), shadowPs_->GetBufferSize()};
+    d.PS = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
     d.InputLayout = {kInputLayout, UINT(std::size(kInputLayout))};
     d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -900,8 +946,8 @@ ID3D12PipelineState* WebappWindow::shadowPipeline() {
     d.NumRenderTargets = 0;
     d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     d.SampleDesc.Count = 1;
-    check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&shadowPso_)), "Create shadow pipeline");
-    return shadowPso_.Get();
+    check(device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&cached)), "Create shadow pipeline");
+    return cached.Get();
 }
 
 // ------------------------------------------------------------- textures
@@ -939,14 +985,9 @@ void WebappWindow::resetTextures() {
     freeSlots_.clear();
     for (UINT slot = kShadowSlot - 1; slot >= 1; slot--) freeSlots_.push_back(slot); // kShadowSlot is reserved
     if (shadowMap_) { // a page reload keeps the shadow map; its view goes back to the reserved slot
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-        srv.Format = DXGI_FORMAT_R32_FLOAT;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
         cpu.ptr += SIZE_T(kShadowSlot) * texStep_;
-        device_->CreateShaderResourceView(shadowMap_.Get(), &srv, cpu);
+        shadowSrvView(shadowMap_.Get(), shadowSlices_, cpu);
         shadowSlot_ = kShadowSlot;
     }
     // slot 0: 1x1 white, bound for untextured draws
@@ -1641,6 +1682,7 @@ void WebappWindow::uploadGeometry(std::uint32_t id, const float* p, const float*
         pendingGeometryCopies_[id].push_back({destination, std::move(filled), bytes, drawState});
         return destination;
     };
+    if (g.vertexCount != vertexCount) retire(g.skin); // skin data belongs to the old vertices
     g.vertexCount = vertexCount;
     g.indexCount = idx ? indexCount : 0;
     g.vertices = place(std::move(vertexUpload), vertexBytes, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -1662,6 +1704,7 @@ void WebappWindow::releaseGeometry(std::uint32_t id) {
     pendingGeometryCopies_.erase(id);
     retire(it->second.vertices);
     retire(it->second.indices);
+    retire(it->second.skin);
     geometries_.erase(it);
 }
 
@@ -1699,12 +1742,48 @@ void WebappWindow::uploadInstances(std::uint32_t id, const float* m, const float
     set.version++;
 }
 
+bool WebappWindow::uploadSkin(std::uint32_t id, const float* indices, const float* weights, std::uint32_t vertexCount) {
+    // Filled before the lock, like vertex uploads; drawn from the upload heap.
+    ComPtr<ID3D12Resource> buffer = uploadBuffer(nullptr, UINT64(vertexCount) * kSkinStride);
+    if (vertexCount) {
+        float* mapped = nullptr;
+        D3D12_RANGE none{0, 0};
+        check(buffer->Map(0, &none, reinterpret_cast<void**>(&mapped)), "Map skin buffer");
+        for (std::uint32_t v = 0; v < vertexCount; v++, mapped += 8) {
+            std::memcpy(mapped, indices + std::size_t(v) * 4, 4 * sizeof(float));
+            std::memcpy(mapped + 4, weights + std::size_t(v) * 4, 4 * sizeof(float));
+        }
+        buffer->Unmap(0, nullptr);
+    }
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    auto it = geometries_.find(id);
+    if (it == geometries_.end() || it->second.vertexCount != vertexCount) return false;
+    Geometry& g = it->second;
+    retire(g.skin);
+    g.skin = buffer;
+    g.skinView.BufferLocation = buffer->GetGPUVirtualAddress();
+    g.skinView.SizeInBytes = UINT(UINT64(vertexCount) * kSkinStride);
+    g.skinView.StrideInBytes = kSkinStride;
+    return true;
+}
+
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (!id || id > kMaxColorPatches || source.size() > 24000 || colorPatches_.count(id)) return false;
     if (source.find_first_of("#\\\"'") != std::string::npos) return false;
-    static const std::regex control(R"(\b(for|while|do|goto|register|cbuffer|clip)\b)");
+    static const std::regex control(R"(\b(while|do|goto|register|cbuffer|clip)\b)");
     if (std::regex_search(source, control)) return false;
+    // Loops only with literal bounds (blur kernels), at most 256 iterations each.
+    static const std::regex anyFor(R"(\bfor\b)");
+    static const std::regex boundedFor(R"(\bfor\s*\(\s*int\s+(\w+)\s*=\s*(-?\d+)\s*;\s*\1\s*(<=?)\s*(-?\d+)\s*;\s*(\1\s*\+\+|\+\+\s*\1|\1\s*\+=\s*1)\s*\))");
+    const auto loops = std::distance(std::sregex_iterator(source.begin(), source.end(), anyFor), std::sregex_iterator());
+    std::ptrdiff_t bounded = 0;
+    for (auto it = std::sregex_iterator(source.begin(), source.end(), boundedFor); it != std::sregex_iterator(); ++it) {
+        const long from = std::stol((*it)[2].str()), to = std::stol((*it)[4].str());
+        if (to - from + ((*it)[3].str() == "<=" ? 1 : 0) > 256) return false;
+        bounded++;
+    }
+    if (loops != bounded) return false;
     std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
     const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
     shader.replace(shader.find(marker), marker.size(), source);
@@ -1727,6 +1806,8 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId, bool hdr) 
     // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
     // side that faces the camera is the other one (Three.js flips frontFace).
     if ((flags & F_MIRRORED) && cull != 1) cull = cull == 2 ? 0 : 2;
+    // InstancedMesh with mirrored instances: no culling, PSMain drops the hidden side per instance.
+    if ((flags & F_INSTANCE_MIRRORED) && !lines) cull = 1;
     const UINT state = (lines ? 1u : 0u) | (cull << 1) | ((flags & F_TRANSPARENT) ? 8u : 0u) |
                        ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
                        ((flags & F_ADDITIVE) ? 64u : 0u) | ((flags & F_PREMULTIPLIED_ADDITIVE) ? 128u : 0u);
@@ -1995,8 +2076,12 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
 
     // Size the per-frame constant ring for this frame's passes and draws.
     UINT64 needed = 0;
-    for (std::size_t i = 0; i < passCount_; i++)
-        needed += kFrameCBBytes + UINT64(passes_[i][43]) * kDrawCBBytes * (passes_[i][56] > 0 ? 2 : 1);
+    for (std::size_t i = 0; i < passCount_; i++) {
+        const native_three::WebappPassLayout l = native_three::webappPassLayout(passes_[i].data());
+        // frame constants (+ one per shadow view), draw constants (twice with shadows), bone matrices
+        needed += kFrameCBBytes * (1 + l.shadowViews) + UINT64(l.draws) * kDrawCBBytes * (l.shadowViews ? 2 : 1) +
+                  UINT64(l.bones) * 64 + 512;
+    }
     D3D12_RANGE none{0, 0};
     if (ringBytes_[frame] < needed || !ring_[frame]) {
         retire(ring_[frame]);
@@ -2051,7 +2136,8 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     UINT cachedPipelineFlags = 0, cachedPipelinePatch = 0;
     ID3D12PipelineState* cachedPipeline = nullptr;
     const UINT kPipelineFlagBits = F_TRANSPARENT | F_DOUBLE | F_BACK | F_NO_DEPTH_WRITE | F_NO_DEPTH_TEST |
-                                   F_LINES | F_LINE_STRIP | F_MIRRORED | F_ADDITIVE | F_PREMULTIPLIED_ADDITIVE;
+                                   F_LINES | F_LINE_STRIP | F_MIRRORED | F_ADDITIVE | F_PREMULTIPLIED_ADDITIVE |
+                                   F_INSTANCE_MIRRORED;
     D3D12_GPU_VIRTUAL_ADDRESS boundVertices = 0, boundInstances = 0, boundIndices = 0;
     UINT boundInstanceBytes = 0;
     ID3D12PipelineState* current = nullptr;
@@ -2120,7 +2206,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         return true;
     };
     // cbuffer Draw: model, colour+opacity, emissive+shininess, params.
-    auto writeDrawConstants = [&](const float* d, UINT drawFlags) {
+    auto writeDrawConstants = [&](const float* d, UINT drawFlags) -> D3D12_GPU_VIRTUAL_ADDRESS {
         float* dcb = reinterpret_cast<float*>(ring + ringOffset);
         std::memcpy(dcb, d + 16, 16 * sizeof(float));
         dcb[16] = d[8]; dcb[17] = d[9]; dcb[18] = d[10]; dcb[19] = d[11];
@@ -2136,9 +2222,12 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         dcb[58] = float(std::uint32_t(d[71]) >> 9);
         dcb[59] = d[89];                                     // standard material map bits
         std::memcpy(dcb + 60, d + 72, 16 * sizeof(float)); // translated material uniforms 12..27
-        dcb[76] = d[90]; dcb[77] = d[91]; dcb[78] = d[92]; dcb[79] = 0; // normalScale, aoMapIntensity
-        cmd_->SetGraphicsRootConstantBufferView(1, ringGpu + ringOffset);
+        dcb[76] = d[90]; dcb[77] = d[91]; dcb[78] = d[92]; // normalScale, aoMapIntensity
+        dcb[79] = d[93];                                     // first bone + 1 (GPU skinning)
+        const D3D12_GPU_VIRTUAL_ADDRESS address = ringGpu + ringOffset;
+        cmd_->SetGraphicsRootConstantBufferView(1, address);
         ringOffset += kDrawCBBytes;
+        return address;
     };
     auto bindColorMap = [&](const float* d, UINT drawFlags) {
         D3D12_GPU_DESCRIPTOR_HANDLE tex = whiteTexture;
@@ -2153,18 +2242,21 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         }
         if (tex.ptr != boundTexture) { cmd_->SetGraphicsRootDescriptorTable(2, tex); boundTexture = tex.ptr; }
     };
-    auto submitDraw = [&](const DrawInput& in) {
+    D3D12_GPU_VIRTUAL_ADDRESS boundSkin = 0;
+    auto submitDraw = [&](const DrawInput& in, bool skinned) {
         const Geometry& geometry = *in.geometry;
+        const D3D12_VERTEX_BUFFER_VIEW& skin = skinned && geometry.skin ? geometry.skinView : zeroSkinView_;
         if (geometry.vbv.BufferLocation != boundVertices || in.instanceAddress != boundInstances ||
-            in.instanceBytes != boundInstanceBytes) {
-            D3D12_VERTEX_BUFFER_VIEW views[2] = {geometry.vbv, identityView_};
+            in.instanceBytes != boundInstanceBytes || skin.BufferLocation != boundSkin) {
+            D3D12_VERTEX_BUFFER_VIEW views[3] = {geometry.vbv, identityView_, skin};
             views[1].BufferLocation = in.instanceAddress;
             views[1].SizeInBytes = in.instanceBytes;
             views[1].StrideInBytes = kInstanceStride;
-            cmd_->IASetVertexBuffers(0, 2, views);
+            cmd_->IASetVertexBuffers(0, 3, views);
             boundVertices = geometry.vbv.BufferLocation;
             boundInstances = in.instanceAddress;
             boundInstanceBytes = in.instanceBytes;
+            boundSkin = skin.BufferLocation;
         }
         if (geometry.indexCount) {
             if (geometry.ibv.BufferLocation != boundIndices) {
@@ -2177,13 +2269,15 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         }
     };
     cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv());
+    cmd_->SetGraphicsRootShaderResourceView(kBoneParam, ringGpu); // valid address; read only by skinned draws
 
     UINT drawsThisFrame = 0, shadowDrawsThisFrame = 0;
     auto toLinear = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
     for (std::size_t passIndex = 0; passIndex < passCount_; passIndex++) {
         const float* p = passes_[passIndex].data();
-        const UINT lightCount = UINT(p[35]);
-        const UINT drawCount = UINT(p[43]);
+        const native_three::WebappPassLayout layout = native_three::webappPassLayout(p);
+        const UINT lightCount = UINT(layout.lights);
+        const UINT drawCount = UINT(layout.draws);
         const UINT flags = UINT(p[44]);
         // Header float 55: render into WebGLRenderTarget `id` instead of the window.
         const std::uint32_t targetId = std::uint32_t(p[55]);
@@ -2230,23 +2324,50 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             for (int c = 0; c < 3; c++) fcb[300 + c] = toLinear(fcb[300 + c]);
         }
         std::memcpy(fcb + 304, p + 52, 3 * sizeof(float)); // mode, near or density, far
-        const bool shadows = p[56] > 0;
+        // Shadow lights: header 59 = map size; records of 8 floats (light index,
+        // first slice, kind, bias, normalBias, radius, intensity, far), then
+        // one view-projection per slice.
+        const UINT shadowLights = UINT(layout.shadowLights), shadowViews = UINT(layout.shadowViews);
+        const float* shadowRecords = p + layout.shadowLightOffset;
+        const bool shadows = shadowLights > 0 && shadowViews > 0;
+        std::array<bool, native_three::kWebappMaxShadowViews> pointView{};
+        std::array<UINT, native_three::kWebappMaxShadowViews> viewLight{};
         if (shadows) {
-            const UINT size = UINT(std::clamp(p[60], 256.0f, 4096.0f));
-            if (size != shadowSize_) {
-                ensureShadowMap(size);
+            const UINT size = UINT(std::clamp(p[59], 256.0f, 4096.0f));
+            if (size != shadowSize_ || shadowViews > shadowSlices_) {
+                ensureShadowMap(size, shadowViews);
                 cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv());
             }
-            std::memcpy(fcb + 308, p + 64, 16 * sizeof(float)); // shadow camera view-projection
-            fcb[324] = 1; fcb[325] = p[57]; fcb[326] = p[58]; fcb[327] = p[59];
-            fcb[328] = 1.0f / float(size); fcb[329] = p[61]; fcb[330] = p[62];
+            std::memcpy(fcb + 308, p + layout.shadowViewOffset, shadowViews * 16 * sizeof(float));
+            for (UINT k = 0; k < shadowLights; k++) {
+                const float* r = shadowRecords + k * native_three::kWebappShadowLightFloats;
+                const UINT light = UINT(r[0]), first = UINT(r[1]), views = r[2] > 0 ? 6u : 1u;
+                fcb[564 + k * 4] = r[1]; fcb[565 + k * 4] = r[3]; fcb[566 + k * 4] = r[4]; fcb[567 + k * 4] = r[6];
+                // kind: 0 directional/spot, 1 + camera.near for point lights
+                fcb[596 + k * 4] = r[2] > 0 ? 1.0f : 0.0f; fcb[597 + k * 4] = r[5]; fcb[598 + k * 4] = r[7];
+                fcb[599 + k * 4] = r[2] > 0 ? r[2] - 1.0f : 0.0f;
+                if (light < lightCount)
+                    std::memcpy(fcb + 628 + k * 4, p + native_three::kWebappPassHeaderFloats + light * native_three::kWebappLightFloats + 4,
+                                3 * sizeof(float));
+                for (UINT v = first; v < first + views && v < shadowViews; v++) { pointView[v] = r[2] > 0; viewLight[v] = k; }
+            }
+            fcb[660] = 1.0f / float(shadowSize_);
         }
-        cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
+        const D3D12_GPU_VIRTUAL_ADDRESS frameAddress = ringGpu + ringOffset;
+        cmd_->SetGraphicsRootConstantBufferView(0, frameAddress);
         ringOffset += kFrameCBBytes;
+        // SkinnedMesh bone matrices of this pass (draw float 93 = first bone + 1).
+        if (layout.bones) {
+            ringOffset = (ringOffset + 255) & ~UINT64(255);
+            std::memcpy(ring + ringOffset, p + layout.boneOffset, layout.bones * 16 * sizeof(float));
+            cmd_->SetGraphicsRootShaderResourceView(kBoneParam, ringGpu + ringOffset);
+            ringOffset += UINT64(layout.bones) * 64;
+            ringOffset = (ringOffset + 255) & ~UINT64(255);
+        }
 
-        const float* draws = p + native_three::kWebappPassHeaderFloats + lightCount * native_three::kWebappLightFloats;
-        if (shadows) {
-            // Shadow depth pass: every castShadow draw, from the light.
+        const float* draws = p + layout.drawOffset;
+        if (shadows && shadowMap_ && shadowSlices_ >= shadowViews) {
+            // Shadow depth pass: every castShadow draw, once per shadow view (slice).
             D3D12_RESOURCE_BARRIER toDepth{};
             toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toDepth.Transition.pResource = shadowMap_.Get();
@@ -2254,35 +2375,54 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             toDepth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             cmd_->ResourceBarrier(1, &toDepth);
-            const D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = shadowDsvHeap_->GetCPUDescriptorHandleForHeapStart();
-            cmd_->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
-            cmd_->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
             D3D12_VIEWPORT shadowViewport{0, 0, float(shadowSize_), float(shadowSize_), 0, 1};
             D3D12_RECT shadowScissor{0, 0, LONG(shadowSize_), LONG(shadowSize_)};
             cmd_->RSSetViewports(1, &shadowViewport);
             cmd_->RSSetScissorRects(1, &shadowScissor);
-            ID3D12PipelineState* shadowPso = shadowPipeline();
-            cmd_->SetPipelineState(shadowPso);
-            current = shadowPso;
             if (topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
                 cmd_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
             }
-            const float* d = draws;
-            for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
-                const UINT drawFlags = UINT(d[3]);
-                if (!(UINT(d[88]) & S_CAST) || (drawFlags & (F_LINES | F_LINE_STRIP))) continue;
-                DrawInput in;
-                if (!prepareDraw(d, in)) continue;
-                writeDrawConstants(d, drawFlags);
-                bindColorMap(d, drawFlags);
-                submitDraw(in);
-                shadowDrawsThisFrame++;
+            const UINT dsvStep = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+            // Draw constants are written in the first slice and reused by the others.
+            shadowDrawConstants_.assign(drawCount, 0);
+            for (UINT view = 0; view < shadowViews; view++) {
+                // Frame constants of this slice: a copy with the slice index (and point light).
+                float* scb = reinterpret_cast<float*>(ring + ringOffset);
+                std::memcpy(scb, fcb, kFrameCBBytes);
+                scb[661] = float(view);
+                if (pointView[view]) {
+                    const UINT k = viewLight[view];
+                    std::memcpy(scb + 664, fcb + 628 + k * 4, 3 * sizeof(float));
+                    scb[662] = fcb[599 + k * 4]; // near
+                    scb[667] = fcb[598 + k * 4]; // far
+                }
+                cmd_->SetGraphicsRootConstantBufferView(0, ringGpu + ringOffset);
+                ringOffset += kFrameCBBytes;
+                D3D12_CPU_DESCRIPTOR_HANDLE shadowDsv = shadowDsvHeap_->GetCPUDescriptorHandleForHeapStart();
+                shadowDsv.ptr += SIZE_T(view) * dsvStep;
+                cmd_->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+                cmd_->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+                ID3D12PipelineState* shadowPso = shadowPipeline(pointView[view]);
+                if (shadowPso != current) { cmd_->SetPipelineState(shadowPso); current = shadowPso; }
+                const float* d = draws;
+                for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
+                    const UINT drawFlags = UINT(d[3]);
+                    if (!(UINT(d[88]) & S_CAST) || (drawFlags & (F_LINES | F_LINE_STRIP))) continue;
+                    DrawInput in;
+                    if (!prepareDraw(d, in)) continue;
+                    if (!shadowDrawConstants_[i]) shadowDrawConstants_[i] = writeDrawConstants(d, drawFlags);
+                    else cmd_->SetGraphicsRootConstantBufferView(1, shadowDrawConstants_[i]);
+                    bindColorMap(d, drawFlags);
+                    submitDraw(in, d[93] > 0);
+                    shadowDrawsThisFrame++;
+                }
             }
             D3D12_RESOURCE_BARRIER toRead = toDepth;
             toRead.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             toRead.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             cmd_->ResourceBarrier(1, &toRead);
+            cmd_->SetGraphicsRootConstantBufferView(0, frameAddress);
             cmd_->OMSetRenderTargets(1, &passRtv, FALSE, &passDsv);
             cmd_->RSSetViewports(1, &passViewport);
             cmd_->RSSetScissorRects(1, &passScissor);
@@ -2320,7 +2460,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
                     boundMaterialMaps[slot] = map;
                 }
             }
-            submitDraw(in);
+            submitDraw(in, d[93] > 0);
             drawsThisFrame++;
         }
         if (target) {

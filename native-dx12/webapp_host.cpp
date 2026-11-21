@@ -402,6 +402,20 @@ JSValue jsReleaseInstances(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseInstances(id);
     return JS_UNDEFINED;
 }
+JSValue jsUploadSkin(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    if (argc < 4) return JS_ThrowTypeError(ctx, "uploadSkin(id, indices, weights, vertexCount)");
+    std::uint32_t id = 0, count = 0;
+    if (JS_ToUint32(ctx, &id, argv[0]) < 0 || JS_ToUint32(ctx, &count, argv[3]) < 0) return JS_EXCEPTION;
+    const float *indices = nullptr, *weights = nullptr;
+    std::size_t nIndices = 0, nWeights = 0;
+    if (!typedView(ctx, argv[1], indices, nIndices, false, "indices") ||
+        !typedView(ctx, argv[2], weights, nWeights, false, "weights"))
+        return JS_EXCEPTION;
+    if (nIndices < std::size_t(count) * 4 || nWeights < std::size_t(count) * 4)
+        return JS_ThrowRangeError(ctx, "Skin buffers smaller than vertexCount");
+    return JS_NewBool(ctx, self->sink && self->sink->uploadSkin(id, indices, weights, count));
+}
 JSValue jsRegisterColorPatch(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     if (argc < 2 || !self->sink || !JS_IsString(argv[1])) return JS_FALSE;
@@ -420,10 +434,8 @@ JSValue jsSubmitPass(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
         return JS_EXCEPTION;
     if (floats > available || floats < kWebappPassHeaderFloats)
         return JS_ThrowRangeError(ctx, "submitPass: bad packet size");
-    const std::size_t lights = static_cast<std::size_t>(data[35]);
-    const std::size_t draws = static_cast<std::size_t>(data[43]);
-    if (lights > kWebappMaxLights ||
-        kWebappPassHeaderFloats + lights * kWebappLightFloats + draws * kWebappDrawFloats != floats)
+    const WebappPassLayout layout = webappPassLayout(data);
+    if (!layout.valid || layout.floats != floats)
         return JS_ThrowRangeError(ctx, "submitPass: header counts do not match packet size");
     if (self->sink) self->sink->submitPass(data, floats);
     return JS_UNDEFINED;
@@ -587,6 +599,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"evalScript", jsEvalScript, 2}, {"evalModule", jsEvalModule, 2},
         {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
+        {"uploadSkin", jsUploadSkin, 4},
         {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
         {"uploadCanvasTexture", jsUploadCanvasTexture, 3}, {"createRenderTarget", jsCreateRenderTarget, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
