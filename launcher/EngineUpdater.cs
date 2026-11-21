@@ -9,7 +9,10 @@ using NativeThreeBridge.Updates;
 // game1\ and game2\ are never opened.
 internal static class UpdateEngine
 {
-    private const string Repository = "orogdor/NativeThreeBridge";
+    private static string Repository => Config.EngineRepository;
+    // Launcher.exe / NativeThree-Updater.exe were replaced (they were running: renamed, not locked).
+    internal static bool LauncherReplaced;
+    private static readonly string[] RunningFiles = { "Launcher.exe", "NativeThree-Updater.exe" };
     private const string ManifestName = "engine-update-v2.json";
     private const string VersionFile = "engine-version.txt";
     private static readonly Regex SafeName = new(@"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$", RegexOptions.CultureInvariant);
@@ -27,14 +30,20 @@ internal static class UpdateEngine
     internal static bool EngineFile(string name)
     {
         if (!SafeName.IsMatch(name) || name.Contains("..")) return false;
-        foreach (string excluded in new[] { "UpdateEngine.exe", "UpdateKuningriigid.exe", VersionFile })
+        foreach (string excluded in new[] { "UpdateEngine.exe", "UpdateKuningriigid.exe", VersionFile, "launcher.json" })
             if (name.Equals(excluded, StringComparison.OrdinalIgnoreCase)) return false;
         if (name.StartsWith("game", StringComparison.OrdinalIgnoreCase))
             return name.Equals("Game1.exe", StringComparison.OrdinalIgnoreCase) || name.Equals("Game2.exe", StringComparison.OrdinalIgnoreCase);
         return true;
     }
 
-    private static async Task<string> Update()
+    internal static string Installed()
+    {
+        string path = Path.Combine(Common.Root, VersionFile);
+        return File.Exists(path) ? File.ReadAllText(path).Trim() : "v0.0.0";
+    }
+
+    internal static async Task<string> Update()
     {
         string root = Common.Root;
         string versionPath = Path.Combine(root, VersionFile);
@@ -69,7 +78,7 @@ internal static class UpdateEngine
             !assets.TryGetValue(package, out string? packageUrl))
             throw new InvalidDataException("Engine'i uuenduse manifest ei vasta GitHubi väljalaskele.");
 
-        Console.WriteLine($"Laen alla engine {tag} ({size / 1_000_000} MB)...");
+        Out.Say($"Laen alla engine {tag} ({size / 1_000_000} MB)...");
         ProgressMeter meter = new("Engine");
         byte[] zip = await Common.Download(packageUrl, size, current => meter.Report(current, size));
         meter.Report(size, size);
@@ -100,11 +109,12 @@ internal static class UpdateEngine
         {
             string target = Path.Combine(root, name);
             if (!File.Exists(target)) continue;
+            if (RunningFiles.Contains(name, StringComparer.OrdinalIgnoreCase)) continue; // a running EXE can still be renamed
             try { using FileStream lockTest = new(target, FileMode.Open, FileAccess.ReadWrite, FileShare.None); }
             catch (IOException) { Common.DeleteTree(stage); throw new InvalidOperationException($"{name} on kasutusel. Sulge Game1/Game2 ja proovi uuesti."); }
         }
 
-        Common.DeleteTree(previous);
+        DeletePrevious(previous);
         Directory.CreateDirectory(previous);
         List<string> moved = new(), installedFiles = new();
         try
@@ -117,6 +127,7 @@ internal static class UpdateEngine
                 installedFiles.Add(name);
             }
             File.WriteAllText(versionPath, tag);
+            LauncherReplaced = files.Any(f => RunningFiles.Contains(f, StringComparer.OrdinalIgnoreCase));
         }
         catch
         {
@@ -128,16 +139,26 @@ internal static class UpdateEngine
         return $"Engine uuendatud: {installed} → {tag} ({files.Count} faili).\nEelmine versioon on kaustas engine.previous.\ngame1 ja game2 kaustu ei muudetud.";
     }
 
-    private static void SelfTest()
+    // engine.previous may hold the launcher of the last update while it is still exiting.
+    private static void DeletePrevious(string previous)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try { Common.DeleteTree(previous); return; }
+            catch (UnauthorizedAccessException) when (attempt < 20) { Thread.Sleep(250); }
+            catch (IOException) when (attempt < 20) { Thread.Sleep(250); }
+        }
+    }
+
+    internal static void SelfTest()
     {
         if (!Newer("v0.30.1", "v0.30.0") || Newer("v0.29.9", "v0.30.0") || !Newer("v1.0.0", "v0.99.99") || Newer("v0.30.0", "v0.30.0"))
             throw new Exception("Version ordering failed.");
-        foreach (string ok in new[] { "NativeThree-Engine.exe", "v8.dll", "icudtl.dat", "Game1.exe", "Game2.exe", "README-WINDOWS.txt" })
+        foreach (string ok in new[] { "NativeThree-Engine.exe", "v8.dll", "icudtl.dat", "Game1.exe", "Game2.exe", "README-WINDOWS.txt", "Launcher.exe", "NativeThree-Updater.exe" })
             if (!EngineFile(ok)) throw new Exception("Engine file rejected: " + ok);
-        foreach (string bad in new[] { "../x.dll", "game1", "game2.dll", "UpdateEngine.exe", "UpdateKuningriigid.exe", "engine-version.txt", ".hidden", "a b.dll" })
+        foreach (string bad in new[] { "../x.dll", "game1", "game2.dll", "UpdateEngine.exe", "UpdateKuningriigid.exe", "engine-version.txt", ".hidden", "a b.dll", "launcher.json" })
             if (EngineFile(bad)) throw new Exception("Unsafe engine file accepted: " + bad);
         if (ProgressMeter.Percent(50, 200) != 25) throw new Exception("Percent failed.");
     }
 
-    private static int Main(string[] args) => Common.Run("UpdateEngine", args, Update, SelfTest);
 }

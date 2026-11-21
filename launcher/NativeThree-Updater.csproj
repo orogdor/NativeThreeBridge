@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Self-contained single-file Windows updater; no .NET install needed. -->
+  <!-- Update helper of Launcher.exe (engine + game from GitHub). Self-contained
+       single-file Windows EXE; no .NET install needed. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>
@@ -10,13 +11,16 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <InvariantGlobalization>true</InvariantGlobalization>
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
-    <AssemblyName>UpdateKuningriigid</AssemblyName>
+    <AssemblyName>NativeThree-Updater</AssemblyName>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="UpdaterCommon.cs" />
-    <Compile Include="UpdateKuningriigid.cs" />
+    <Compile Include="EngineUpdater.cs" />
+    <Compile Include="GameUpdater.cs" />
+    <Compile Include="LauncherInfo.cs" />
+    <Compile Include="Program.cs" />
   </ItemGroup>
 </Project>

@@ -1,3 +1,13 @@
+# NativeThreeBridge v0.36.0 — one Launcher.exe instead of Game2/UpdateEngine/UpdateKuningriigid
+
+`Launcher.exe` is the game's start window. On the left it shows the game picture and name; on the right, as many of the latest changes as fit (game commits and stable engine releases). At the bottom are the installed engine and game versions, each with a ring that is red until the version is current and green once it is, plus the status text, the download progress and the start button. It checks GitHub and installs a newer engine first; if that update replaced the launcher, the launcher restarts itself. It then installs the newer game: only changed files are downloaded, SHA-checked, with a rollback copy kept. The start button is enabled only when both are current. Offline, an installed game can still be started (yellow status). After the button is pressed the launcher shows "Laen mängu…" over the progress bar and closes once the game's window is visible.
+
+- The picture comes from the game's `native-launcher.json` (`name`, `version`, `image`). If there is none, the launcher uses the game's main-menu background, found as the last CSS rule on a menu/start/title element with a `background` `url()`, in stylesheet order. The name and version come from `<title>` (e.g. "Kuningriigid · V353").
+- `launcher.json` next to the EXEs chooses the game folder and the GitHub repositories (default: game2, `orogdor/Kuningriigid`, `main`).
+- `NativeThree-Updater.exe` (C#) is the helper that does the work, replacing `UpdateEngine.exe` and `UpdateKuningriigid.exe`. It has the commands `local`, `status`, `update-engine`, `update-game` and `cleanup`, and with `--machine` it prints one line per report. Both the helper and the launcher are part of the engine package, so they update themselves. On first start the old `Game2.exe`, `UpdateEngine.exe` and `UpdateKuningriigid.exe` are removed.
+- `Game1.exe` (forest battle test) stays as before.
+- CI runs the launcher end to end against GitHub with a Kuningriigid checkout: ready window screenshot, then `--autostart` until the game window is open.
+
 # NativeThreeBridge v0.35.0 — several shadow lights incl. PointLight, GPU skinning, post-processing, Canvas 2D shadows and patterns
 
 - **Shadows from several lights per render()**: up to 8 shadow-casting lights in a 16-slice shadow map array. `PointLight.castShadow` renders six cube faces and stores distance (like MeshDistanceMaterial, `shadow.camera.near/far`). Directional and spot lights take one slice each. The map size is the largest `shadow.mapSize`, kept under ~160 MB.

@@ -248,7 +248,7 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
-      - name: Build Game1/Game2 launchers, updaters and package the two-game layout
+      - name: Build Launcher.exe, its update helper, Game1.exe and package the layout
         shell: pwsh
         env:
           CI: '1'
@@ -259,7 +259,7 @@ jobs:
           # Shared engine (forest battle + webapp mode, V8 for webapps)
           Copy-Item build/Release/NativeThree-Diagnostics.exe dist/NativeThree-Engine.exe
           Copy-Item third_party/v8pkg/v8.redist-v143-x64.13.0.245.25/lib/Release/* dist/
-          # game1: forest battle test (scene.js); game2: empty until UpdateKuningriigid.exe
+          # game1: forest battle test (scene.js); game2: empty until Launcher.exe installs the game
           Copy-Item game/scene.js dist/game1/scene.js
           Copy-Item game/ui.html dist/game1/ui.html
           Copy-Item game/ui.css dist/game1/ui.css
@@ -267,29 +267,28 @@ jobs:
           Copy-Item generated/soldier-rigged.glb dist/game1/odamees-rigged.glb
           Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
           Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
-          foreach ($n in 1, 2) {
-            cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=$n launcher/Game-Launcher.c /Fe:dist/Game$n.exe /link /SUBSYSTEM:WINDOWS user32.lib
-            if ($LASTEXITCODE -ne 0) { throw "Game$n launcher failed to compile" }
-          }
+          cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=1 launcher/Game-Launcher.c /Fe:dist/Game1.exe /link /SUBSYSTEM:WINDOWS user32.lib
+          if ($LASTEXITCODE -ne 0) { throw "Game1 launcher failed to compile" }
+          # Launcher.exe: update check, engine + game install, start window
+          cl /nologo /O2 /W4 /EHsc /std:c++17 /utf-8 launcher/Launcher.cpp /Fe:dist/Launcher.exe /link /SUBSYSTEM:WINDOWS
+          if ($LASTEXITCODE -ne 0) { throw "Launcher.exe failed to compile" }
           Remove-Item dist/*.obj -ErrorAction SilentlyContinue
           Remove-Item *.obj -ErrorAction SilentlyContinue
-          foreach ($u in 'UpdateEngine', 'UpdateKuningriigid') {
-            dotnet publish launcher/$u.csproj -c Release -o build/$u
-            if ($LASTEXITCODE -ne 0) { throw "$u failed to build" }
-            Copy-Item build/$u/$u.exe dist/$u.exe
-            $p = Start-Process -FilePath (Resolve-Path dist/$u.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
-            if ($p.ExitCode -ne 0) { throw "$u self-test failed" }
-          }
-          # Game2 with an empty game2 folder must stop with a message, not start the engine.
-          $g2 = Start-Process -FilePath (Resolve-Path dist/Game2.exe) -Wait -PassThru
-          if ($g2.ExitCode -ne 42) { throw "Game2.exe did not detect the empty game2 folder (exit $($g2.ExitCode))" }
+          $p = Start-Process -FilePath (Resolve-Path dist/Launcher.exe) -ArgumentList '--self-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Launcher.exe self-test failed" }
+          dotnet publish launcher/NativeThree-Updater.csproj -c Release -o build/updater
+          if ($LASTEXITCODE -ne 0) { throw "NativeThree-Updater failed to build" }
+          Copy-Item build/updater/NativeThree-Updater.exe dist/NativeThree-Updater.exe
+          $p = Start-Process -FilePath (Resolve-Path dist/NativeThree-Updater.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
+          if ($p.ExitCode -ne 0) { throw "NativeThree-Updater self-test failed" }
+          '{ "gameFolder": "game2", "gameRepository": "orogdor/Kuningriigid", "gameBranch": "main", "engineRepository": "orogdor/NativeThreeBridge" }' | Set-Content dist/launcher.json -Encoding utf8
           Set-Content dist/engine-version.txt -Value "v$v" -Encoding ascii -NoNewline
           Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
           Copy-Item third_party/quickjs/LICENSE dist/LICENSE-QuickJS.txt
           Copy-Item node_modules/three/LICENSE dist/LICENSE-ThreeJS.txt
-          # Engine-only package for UpdateEngine.exe (never contains game folders or updaters)
+          # Engine-only package (Launcher.exe and its helper included, never game folders or launcher.json)
           New-Item -ItemType Directory -Force engine-package | Out-Null
-          Get-ChildItem dist -File | Where-Object { $_.Name -notin @('UpdateEngine.exe','UpdateKuningriigid.exe','engine-version.txt','Run-Hello-Webapp.bat') } | Copy-Item -Destination engine-package
+          Get-ChildItem dist -File | Where-Object { $_.Name -notin @('engine-version.txt','Run-Hello-Webapp.bat','launcher.json') } | Copy-Item -Destination engine-package
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path engine-package), (Join-Path (Get-Location) 'release/NativeThreeBridge-Engine-x64.zip'))
           $engineZip = Get-Item release/NativeThreeBridge-Engine-x64.zip
@@ -297,10 +296,9 @@ jobs:
           @{ tag = "v$v"; package = 'NativeThreeBridge-Engine-x64.zip'; sha256 = $engineHash; size = $engineZip.Length } | ConvertTo-Json -Compress | Set-Content release/engine-update-v2.json -Encoding utf8
           # Full download (ZipFile keeps the empty game2 folder)
           [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path dist), (Join-Path (Get-Location) 'release/NativeThreeBridge-Windows-x64.zip'))
-          Copy-Item dist/UpdateEngine.exe, dist/UpdateKuningriigid.exe release/
           New-Item -ItemType Directory -Force verify | Out-Null
           Expand-Archive release/NativeThreeBridge-Windows-x64.zip -DestinationPath verify -Force
-          foreach ($f in 'Game1.exe','Game2.exe','NativeThree-Engine.exe','UpdateEngine.exe','UpdateKuningriigid.exe','engine-version.txt','v8.dll','v8_libplatform.dll','game1/scene.js','game1/ui.css','game1/ui.html','game1/odamees-rigged.glb','game1/audio/signal.wav','game1/audio/step.wav','game1/audio/restart.wav','game1/audio/swing.wav','game1/audio/hit.wav','game1/audio/death.wav','webapps/hello-webapp/index.html','Run-Hello-Webapp.bat') {
+          foreach ($f in 'Game1.exe','Launcher.exe','NativeThree-Updater.exe','launcher.json','NativeThree-Engine.exe','engine-version.txt','v8.dll','v8_libplatform.dll','game1/scene.js','game1/ui.css','game1/ui.html','game1/odamees-rigged.glb','game1/audio/signal.wav','game1/audio/step.wav','game1/audio/restart.wav','game1/audio/swing.wav','game1/audio/hit.wav','game1/audio/death.wav','webapps/hello-webapp/index.html','Run-Hello-Webapp.bat') {
             if (!(Test-Path "verify/$f")) { throw "Incomplete ZIP structure: $f" }
           }
           if (!(Test-Path verify/game2 -PathType Container)) { throw "Empty game2 folder missing from ZIP" }
@@ -424,6 +422,67 @@ jobs:
           if ($post -notmatch '\[material-color\] compiled GLSL material stage' -or $post -match '\[material-color\] (shader patch skipped|pipeline could not)') {
             throw "A post-processing pass (bloom, copy) did not compile on DX12"
           }
+      - name: Launcher end to end (GitHub check, ready window, hands over to Kuningriigid)
+        shell: pwsh
+        env:
+          NTB_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          function Save-Screen($file) {
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save($file)
+            $g.Dispose(); $bmp.Dispose()
+          }
+          function Print-Shot($file, $name) {
+            $img = [System.Drawing.Image]::FromFile($file)
+            $ms = New-Object System.IO.MemoryStream
+            $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }
+            $ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+            $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter ([System.Drawing.Imaging.Encoder]::Quality), 88L
+            $img.Save($ms, $codec, $ep)
+            $img.Dispose()
+            $b64 = [Convert]::ToBase64String($ms.ToArray())
+            Write-Host "BEGIN-SHOT $name"
+            for ($i = 0; $i -lt $b64.Length; $i += 4000) { Write-Host ("SHOT " + $b64.Substring($i, [Math]::Min(4000, $b64.Length - $i))) }
+            Write-Host "END-SHOT $name"
+          }
+          New-Item -ItemType Directory -Force shots | Out-Null
+          if (!(Test-Path kuningriigid-check/index.html)) { throw "Kuningriigid checkout is missing" }
+          # Installed layout: this build's engine (newer than the latest stable) and the current game commit.
+          New-Item -ItemType Directory -Force launcher-check | Out-Null
+          Get-ChildItem dist -File | Copy-Item -Destination launcher-check
+          Copy-Item kuningriigid-check -Destination launcher-check/game2 -Recurse
+          Remove-Item launcher-check/game2/.git -Recurse -Force
+          $commit = (git -C kuningriigid-check rev-parse HEAD).Trim()
+          @{ Repository = 'orogdor/Kuningriigid'; Commit = $commit; Files = @{} } | ConvertTo-Json | Set-Content launcher-check/game2/.native-three-game-manifest.json -Encoding utf8
+          $launcher = (Resolve-Path launcher-check/Launcher.exe).Path
+          $p = Start-Process -FilePath $launcher -PassThru
+          Start-Sleep -Seconds 25
+          Save-Screen (Join-Path (Get-Location) 'shots/launcher-ready.png')
+          Print-Shot (Join-Path (Get-Location) 'shots/launcher-ready.png') 'launcher-ready'
+          Get-Content launcher-check/NativeThree-Updater.log -ErrorAction SilentlyContinue
+          if ($p.HasExited) { throw "Launcher.exe closed by itself (exit $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Start-Sleep -Seconds 2
+          # --autostart: starts when everything is current; closes once the game window is on screen.
+          $p = Start-Process -FilePath $launcher -ArgumentList '--autostart' -PassThru
+          if (!$p.WaitForExit(180000)) {
+            Save-Screen (Join-Path (Get-Location) 'shots/launcher-timeout.png')
+            Print-Shot (Join-Path (Get-Location) 'shots/launcher-timeout.png') 'launcher-timeout'
+            Stop-Process -Id $p.Id -Force
+            throw "Launcher.exe did not hand over to the game within 180 s"
+          }
+          Start-Sleep -Seconds 3
+          $game = Get-Process NativeThree-Engine -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+          Save-Screen (Join-Path (Get-Location) 'shots/launcher-game.png')
+          Print-Shot (Join-Path (Get-Location) 'shots/launcher-game.png') 'launcher-game'
+          if (!$game) { throw "The launcher closed but no game window is open" }
+          Write-Host "Launcher handed over to the game window: $($game.MainWindowTitle)"
+          $game | Stop-Process -Force
       - name: Upload UI screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -464,11 +523,11 @@ jobs:
                 if ($LASTEXITCODE -ne 0 -or $previous -notin @('9121b71763bfaad374e2b37ba6f20fa960d3c33b', $env:GITHUB_SHA)) {
                   throw "Unexpected source revision for $tag"
                 }
-                gh release upload $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/UpdateEngine.exe release/UpdateKuningriigid.exe release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --clobber
+                gh release upload $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --clobber
                 if ($LASTEXITCODE -ne 0) { throw "Could not upload the tested packages for $tag" }
                 gh api --method PATCH $ref -f "sha=$env:GITHUB_SHA" -F force=true --silent
                 if ($LASTEXITCODE -ne 0) { throw "Could not point $tag at the tested commit" }
-                gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --notes "Stable Windows release with expanded DirectX 12 shader support for water, fire and terrain. UpdateEngine.exe installs the verified engine files."
+                gh release edit $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --notes "Stable Windows release. Launcher.exe keeps the engine and the game up to date and starts the game; Game1.exe is the forest battle test."
                 if ($LASTEXITCODE -ne 0) { throw "Could not update the release notes for $tag" }
               }
               gh release edit $tag --repo $env:GITHUB_REPOSITORY --prerelease=false --latest
@@ -478,7 +537,7 @@ jobs:
               Write-Host "Test release $tag already exists; it is NOT overwritten"
             }
           } else {
-            gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json release/UpdateEngine.exe release/UpdateKuningriigid.exe --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA @releaseFlags --title "NativeThreeBridge $tag – Game1 forest battle, Game2 webapps" --notes "Download NativeThreeBridge-Windows-x64.zip and extract everything. Game1.exe starts the forest battle test (game1). Game2.exe opens the webapp in game2 (empty at first). UpdateKuningriigid.exe downloads or updates Kuningriigid from GitHub into game2 (only changed files, rollback copy in game2.previous). UpdateEngine.exe updates only the shared engine files from the newest stable release (engine-update-v2.json, SHA-256 checked); game folders are never touched. Webapp JavaScript runs on V8 13; rendering is the NativeThreeBridge DX12 engine. The game's HTML/CSS UI (buttons, panels, images, text) is laid out by the engine and drawn natively over the 3D scene. 3D textures, Canvas 2D and sprites are drawn; custom GLSL is approximated by its colour uniforms; shadows are not drawn yet."
+            gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA @releaseFlags --title "NativeThreeBridge $tag – Launcher + Kuningriigid, Game1 forest battle" --notes "Download NativeThreeBridge-Windows-x64.zip and extract everything. Launcher.exe checks GitHub, installs the newest engine and Kuningriigid (only changed files, SHA checked, rollback copies in engine.previous and game2.previous) and enables Mängi only when both are current; it stays open until the game window is on screen. Game1.exe starts the forest battle test (game1). Webapp JavaScript runs on V8 13; rendering is the NativeThreeBridge DX12 engine."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
       - name: Publish downloadable webapp test pre-release for this pull request
@@ -496,5 +555,5 @@ jobs:
             gh release delete $tag --repo $env:GITHUB_REPOSITORY --yes --cleanup-tag
             if ($LASTEXITCODE -ne 0) { throw "Could not replace the previous test pre-release" }
           }
-          gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – Three.js webapp test build" --notes "Test build from pull request #$env:PR_NUMBER (commit $env:HEAD_SHA). Download NativeThreeBridge-Windows-x64.zip, extract everything: Game1.exe = forest battle, Game2.exe = game2 webapp (run UpdateKuningriigid.exe first). Not a stable release; it is replaced on every push to the pull request."
+          gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --target $env:HEAD_SHA --prerelease --title "NativeThreeBridge $tag – Three.js webapp test build" --notes "Test build from pull request #$env:PR_NUMBER (commit $env:HEAD_SHA). Download NativeThreeBridge-Windows-x64.zip, extract everything: Launcher.exe = updates and starts Kuningriigid, Game1.exe = forest battle. Not a stable release; it is replaced on every push to the pull request."
           if ($LASTEXITCODE -ne 0) { throw "Test pre-release failed" }

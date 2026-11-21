@@ -16,9 +16,9 @@ internal sealed partial class GameStateJson : JsonSerializerContext { }
 
 internal static class GameUpdater
 {
-    private const string Repository = "orogdor/Kuningriigid";
-    private const string Manifest = ".native-three-game-manifest.json";
-    private const string GameFolder = "game2";
+    private static string Repository => Config.GameRepository;
+    internal const string Manifest = ".native-three-game-manifest.json";
+    private static string GameFolder => Config.GameFolder;
 
     private static string GitBlobSha(byte[] bytes)
     {
@@ -29,7 +29,7 @@ internal static class GameUpdater
         return Convert.ToHexString(SHA1.HashData(blob)).ToLowerInvariant();
     }
 
-    private static GameState ReadOld(string game)
+    internal static GameState ReadOld(string game)
     {
         string path = Path.Combine(game, Manifest);
         if (!File.Exists(path)) return new(Repository, "", new(StringComparer.OrdinalIgnoreCase));
@@ -44,7 +44,7 @@ internal static class GameUpdater
         return state;
     }
 
-    private static async Task<string> Update()
+    internal static async Task<string> Update()
     {
         string game = Path.Combine(Common.Root, GameFolder);
         string stage = Path.Combine(Common.Root, GameFolder + ".next");
@@ -55,10 +55,10 @@ internal static class GameUpdater
         Common.RejectLinks(game);
         GameState old = ReadOld(game);
 
-        using JsonDocument head = await Common.GetJson("https://api.github.com/repos/orogdor/Kuningriigid/commits/main");
+        using JsonDocument head = await Common.GetJson($"https://api.github.com/repos/{Repository}/commits/{Uri.EscapeDataString(Config.GameBranch)}");
         string commit = head.RootElement.GetProperty("sha").GetString() ?? "";
         if (!Common.HashValid(commit, 40)) throw new InvalidDataException("Invalid Kuningriigid commit SHA.");
-        using JsonDocument tree = await Common.GetJson($"https://api.github.com/repos/orogdor/Kuningriigid/git/trees/{commit}?recursive=1");
+        using JsonDocument tree = await Common.GetJson($"https://api.github.com/repos/{Repository}/git/trees/{commit}?recursive=1");
         if (tree.RootElement.GetProperty("truncated").GetBoolean()) throw new InvalidDataException("GitHub returned a truncated repository tree; no files were changed.");
 
         Dictionary<string, (string sha, long size)> wanted = new(StringComparer.OrdinalIgnoreCase);
@@ -81,25 +81,25 @@ internal static class GameUpdater
             if (!wanted.TryAdd(relative, (sha, size)))
                 throw new InvalidDataException("Case-colliding paths cannot be installed on Windows: " + relative);
         }
-        if (!wanted.ContainsKey("index.html")) throw new InvalidDataException("Kuningriigid index.html was not found; refusing an unexpected repository tree.");
+        if (!wanted.ContainsKey("index.html")) throw new InvalidDataException("The game's index.html was not found; refusing an unexpected repository tree.");
 
         // Already the newest commit with every tracked file intact: nothing to do.
         if (old.Commit == commit && old.Files.Count == wanted.Count &&
             wanted.All(w => old.Files.TryGetValue(w.Key, out GameFile? f) && f.GitSha == w.Value.sha &&
                             File.Exists(Common.SafePath(game, w.Key)) && new FileInfo(Common.SafePath(game, w.Key)).Length == f.Size))
-            return $"Kuningriigid on juba uusim (commit {commit[..12]}).\nKausta game2 ei muudetud.";
+            return $"Mäng on juba uusim (commit {commit[..12]}).";
 
         // Never overwrite a locally edited file that belonged to the previous snapshot.
         foreach ((string relative, GameFile oldFile) in old.Files)
         {
             string current = Common.SafePath(game, relative);
             if (File.Exists(current) && Common.Sha256File(current) != oldFile.Sha256)
-                throw new InvalidOperationException($"Faili game2\\{relative} on käsitsi muudetud. Salvesta see mujale või nimeta ümber ja proovi uuesti.");
+                throw new InvalidOperationException($"Faili {GameFolder}\\{relative} on käsitsi muudetud. Salvesta see mujale või nimeta ümber ja proovi uuesti.");
         }
         foreach (string relative in wanted.Keys)
             if (!old.Files.ContainsKey(relative) && File.Exists(Common.SafePath(game, relative)))
-                throw new InvalidOperationException($"Kaustas game2 on võõras fail {relative}, mis kirjutataks üle. Tõsta see ära ja proovi uuesti.");
-        Console.WriteLine($"Teen tagasivõtu koopia ({wanted.Count} faili)...");
+                throw new InvalidOperationException($"Kaustas {GameFolder} on võõras fail {relative}, mis kirjutataks üle. Tõsta see ära ja proovi uuesti.");
+        Out.Say($"Teen tagasivõtu koopia ({wanted.Count} faili)...");
         Common.CopyTree(game, stage);
         int downloaded = 0, removed = 0;
         Dictionary<string, GameFile> nextFiles = new(StringComparer.OrdinalIgnoreCase);
@@ -118,7 +118,7 @@ internal static class GameUpdater
             List<(string relative, string sha, long size)> needed = wanted
                 .Where(w => !unchanged.Contains(w.Key)).Select(w => (w.Key, w.Value.sha, w.Value.size)).ToList();
             foreach (string relative in unchanged) nextFiles.Add(relative, old.Files[relative]);
-            Console.WriteLine($"Vaja alla laadida {needed.Count} faili ({downloadBytes / 1_000_000} MB).");
+            Out.Say($"Vaja alla laadida {needed.Count} faili ({downloadBytes / 1_000_000} MB).");
             object gate = new();
             // Verifies one downloaded file against its Git blob SHA-1 and writes it to the stage.
             bool Install(string relative, string sha, long size, byte[] bytes)
@@ -140,11 +140,11 @@ internal static class GameUpdater
                 string archive = Path.Combine(Common.Root, GameFolder + ".download.zip");
                 try
                 {
-                    Console.WriteLine("Laen alla Kuningriigid ühe ZIP-failina...");
+                    Out.Say("Laen mängu alla ühe ZIP-failina...");
                     await Common.DownloadToFile($"https://codeload.github.com/{Repository}/zip/{commit}", archive, 3_000_000_000,
-                        (done, total) => ProgressMeter.Bytes("Kuningriigid", done, total > 0 ? total : 0));
+                        (done, total) => ProgressMeter.Bytes("Laen mängu alla", done, total > 0 ? total : 0));
                     Console.WriteLine();
-                    Console.WriteLine("Kontrollin ja paigaldan faile...");
+                    Out.Say("Kontrollin ja paigaldan faile...");
                     Dictionary<string, System.IO.Compression.ZipArchiveEntry> entries = new(StringComparer.OrdinalIgnoreCase);
                     using System.IO.Compression.ZipArchive zip = System.IO.Compression.ZipFile.OpenRead(archive);
                     foreach (var entry in zip.Entries)
@@ -179,7 +179,7 @@ internal static class GameUpdater
                 long remainingBytes = remaining.Sum(r => r.size), doneBytes = 0;
                 int doneFiles = 0;
                 using SemaphoreSlim slots = new(8);
-                ProgressMeter.Files("Kuningriigid", 0, remaining.Count, 0, remainingBytes);
+                ProgressMeter.Files("Laen mängu alla", 0, remaining.Count, 0, remainingBytes);
                 await Task.WhenAll(remaining.Select(async item =>
                 {
                     await slots.WaitAsync();
@@ -191,7 +191,7 @@ internal static class GameUpdater
                             throw new InvalidDataException("Git blob checksum mismatch: " + item.relative);
                         long b = Interlocked.Add(ref doneBytes, item.size);
                         int f = Interlocked.Increment(ref doneFiles);
-                        lock (gate) ProgressMeter.Files("Kuningriigid", f, remaining.Count, b, remainingBytes);
+                        lock (gate) ProgressMeter.Files("Laen mängu alla", f, remaining.Count, b, remainingBytes);
                     }
                     finally { slots.Release(); }
                 }));
@@ -205,7 +205,7 @@ internal static class GameUpdater
             }
             File.WriteAllText(Path.Combine(stage, Manifest), JsonSerializer.Serialize(new GameState(Repository, commit, nextFiles), GameStateJson.Default.GameState));
             Common.RejectLinks(stage);
-            Console.WriteLine("Paigaldan kontrollitud failid kausta game2...");
+            Out.Say("Paigaldan kontrollitud failid...");
             if (Directory.Exists(previous)) Common.DeleteTree(previous);
             if (Directory.Exists(game)) Directory.Move(game, previous);
             try { Directory.Move(stage, game); }
@@ -213,10 +213,10 @@ internal static class GameUpdater
         }
         catch { if (Directory.Exists(stage)) Common.DeleteTree(stage); throw; }
         string from = old.Commit.Length >= 12 ? old.Commit[..12] : "puudus";
-        return $"Kuningriigid uuendatud: {from} → {commit[..12]}.\nAlla laaditud {downloaded} muutunud faili, eemaldatud {removed} vananenud faili.\nEelmine versioon on kaustas game2.previous.\nMängi: Game2.exe";
+        return $"Mäng uuendatud: {from} → {commit[..12]}. Alla laaditud {downloaded} muutunud faili, eemaldatud {removed} vananenud faili.";
     }
 
-    private static void SelfTest()
+    internal static void SelfTest()
     {
         if (ProgressMeter.Percent(0, 100) != 0 || ProgressMeter.Percent(50, 100) != 50 ||
             ProgressMeter.Percent(100, 100) != 100)
@@ -230,5 +230,4 @@ internal static class GameUpdater
         }
     }
 
-    private static int Main(string[] args) => Common.Run("UpdateKuningriigid", args, Update, SelfTest);
 }
