@@ -180,3 +180,28 @@ test('showing and hiding a fixed panel lays out only that panel', { skip }, asyn
   assert.equal(t1.fullLayouts - t0.fullLayouts, 0, 'no whole-page layout');
   assert.ok(t1.partialLayouts > t0.partialLayouts, 'panel-only layouts');
 });
+
+test('a material stage with more than 12 uniform floats and a depth texture is translated, not hidden', { skip }, async () => {
+  const { rec, status, context } = await runWebapp(fileURLToPath(new URL('./fixtures/webapp-shader-limits', import.meta.url)), { frames: 4 });
+  assert.equal(status.bootError, null);
+  assert.ok(!status.unsupported.includes('material.onBeforeCompile alpha masks'), 'the sea is not left out');
+  const pass = decodePass(rec.passes.at(-1));
+  const sea = pass.draws.find((d) => d.colorStage && d.materialTextures.filter((id) => id > 0).length === 1);
+  assert.ok(sea, 'the sea has a native material stage');
+  const source = rec.colorPatches.get(sea.colorStage);
+  assert.match(source, /gColorStageMore\[\d\]/, 'uniforms past the 12th use the second register block');
+  assert.ok(sea.materialTextures[0] > 0, 'the depth texture is bound');
+  // uTime, uFx, uBox(4), uDeep(3), uShallow(3), uSky(3), uOrigin(2) = 17 floats
+  const values = sea.colorUniforms.slice(0, 17);
+  assert.ok(near(values[0], 0.5) && near(values[1], 1));
+  assert.ok(values.slice(15, 17).every((v, i) => near(v, [0.25, 0.75][i])), `uOrigin packed after the 12th float: ${values}`);
+  context.setSeaTime(2);
+  const ground = pass.draws.find((d) => d.colorStage && d !== sea);
+  assert.ok(ground, 'the nine-texture ground has a native material stage');
+  const hlsl = rec.colorPatches.get(ground.colorStage);
+  assert.equal(ground.materialTextures.filter((id) => id > 0).length, 9);
+  assert.match(hlsl, /\(\(float3\)\(top\)\)/, 'vec3(x) becomes a cast HLSL accepts');
+  assert.match(hlsl, /static float bumpG;/, 'globals the colour code writes are private');
+  assert.match(hlsl, /\bnt_sample\b/, 'HLSL keywords used as GLSL names are renamed');
+  assert.doesNotMatch(hlsl, /\bfloat[234]\(\s*[\w.]+\s*\)/, 'no one-value vector constructors remain');
+});

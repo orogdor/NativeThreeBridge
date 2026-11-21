@@ -25,6 +25,7 @@ cbuffer Draw : register(b1) {
     float4 gFresnel;    // base, amplitude, exponent, alpha gain (negative: masked)
     float4 gColorStage[3]; // live uniforms from the translated material
     float4 gMaterialOptions; // flip Y, repeat, mirror bitmasks
+    float4 gColorStageMore[4]; // translated material uniforms 12..27
 };
 Texture2D gMap : register(t0);
 Texture2D gMaterialMap0 : register(t1);

@@ -1,4 +1,4 @@
-NativeThreeBridge v0.33.0 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.33.1 - KAKS MÄNGU, ÜKS ENGINE
 =================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -12,6 +12,14 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.33.1 PARANDUS: mängude GLSL-shaderid tõlgitakse laiemalt.
+- Kuni 28 uniform-float'i (enne 12): Kuningriikide meri sügavustekstuuriga
+  joonistatakse jälle (enne oli näha ainult merepõhi).
+- vec3(x) ühe väärtusega konstruktorid, kirjutatavad globaalsed muutujad ja
+  HLSL-i reserveeritud nimed: Kuningriikide detailvaate maapinna fotod.
+- Tekstuuride taustadekodeerimine STA-lõimedes; kui pilti seal lugeda ei
+  saa, dekodeeritakse see akna lõimes nagu enne v0.33.
 
 v0.33.0 - MITU TUUMA: mängu JavaScript ei pea enam kõike ühe lõime peal
 ootama. Kehtib kõigile veebirakendustele, mänguspetsiifilist koodi pole.
