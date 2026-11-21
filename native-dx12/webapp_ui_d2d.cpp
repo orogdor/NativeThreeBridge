@@ -15,6 +15,8 @@
 #endif
 #include <windows.h>
 #include <d2d1_3.h>
+#include <d2d1_1helper.h>
+#include <d2d1effects.h>
 #include <dwrite_1.h>
 #include <wincodec.h>
 #include <shlwapi.h>
@@ -39,6 +41,7 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "dxguid.lib") // CLSID_D2D1Shadow
 
 using Microsoft::WRL::ComPtr;
 
@@ -327,6 +330,13 @@ struct WebappUiRenderer::Impl {
         std::unordered_map<std::uint32_t, std::pair<std::uint64_t, ComPtr<ID2D1Bitmap>>> canvasBitmaps; // other canvases
         ComPtr<ID2D1Bitmap> uiBitmap;      // for the UI render target
         std::uint64_t uiVersion = ~0ull;
+        // shadowBlur, shadowOffsetX/Y (device pixels) and shadowColor (straight rgba).
+        float shadowBlur = 0, shadowX = 0, shadowY = 0;
+        float shadowColor[4] = {0, 0, 0, 0};
+        std::string fillSrc, strokeSrc;           // image key of a createPattern brush
+        ComPtr<ID2D1BitmapRenderTarget> shadowRt; // the shape alone, before blurring
+        ComPtr<ID2D1Effect> shadowEffect;
+        bool shadowEffectTried = false;
     };
     std::unordered_map<std::uint32_t, Canvas> canvases;
     int canvasBatches = 0;
@@ -341,12 +351,16 @@ struct WebappUiRenderer::Impl {
         c.family = "sans-serif"; c.fontSize = 10; c.weight = 400; c.italic = false; c.align = 0; c.baseline = 0;
         c.path.clear(); c.pathGeometry.Reset();
         c.clips.assign(1, {});
+        c.shadowBlur = c.shadowX = c.shadowY = 0;
+        c.shadowColor[0] = c.shadowColor[1] = c.shadowColor[2] = c.shadowColor[3] = 0;
+        c.fillSrc.clear(); c.strokeSrc.clear();
     }
     bool ensureCanvas(Canvas& c, unsigned w, unsigned h) {
         w = std::max(1u, std::min(w, 16384u));
         h = std::max(1u, std::min(h, 16384u));
         if (c.rt && c.w == w && c.h == h) return true;
         c.rt.Reset(); c.dc.Reset(); c.solid.Reset(); c.bitmap.Reset();
+        c.shadowRt.Reset(); c.shadowEffect.Reset(); c.shadowEffectTried = false;
         c.bitmaps.clear(); c.canvasBitmaps.clear(); c.uiBitmap.Reset();
         if (!wic || FAILED(wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &c.bitmap))) return false;
         const D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
@@ -359,10 +373,21 @@ struct WebappUiRenderer::Impl {
         resetCanvasState(c);
         return true;
     }
-    ComPtr<ID2D1Brush> canvasBrush(Canvas& c, const std::vector<float>& st) {
+    ComPtr<ID2D1Brush> canvasBrush(Canvas& c, const std::vector<float>& st, const std::string& src) {
         ComPtr<ID2D1Brush> out;
         if (st.empty()) return out;
         const int kind = int(st[0]);
+        if (kind == 3 && st.size() >= 11) { // createPattern: [3, kind, ref, repeatX, repeatY, a b c d e f]
+            ID2D1Bitmap* bmp = canvasImage(c, int(st[1]), std::uint32_t(st[2]), src);
+            if (!bmp) return out;
+            const D2D1_MATRIX_3X2_F pm = D2D1::Matrix3x2F(st[5], st[6], st[7], st[8], st[9], st[10]);
+            const D2D1_BITMAP_BRUSH_PROPERTIES bbp = D2D1::BitmapBrushProperties(
+                st[3] > 0.5f ? D2D1_EXTEND_MODE_WRAP : D2D1_EXTEND_MODE_CLAMP,
+                st[4] > 0.5f ? D2D1_EXTEND_MODE_WRAP : D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            ComPtr<ID2D1BitmapBrush> b;
+            if (SUCCEEDED(c.rt->CreateBitmapBrush(bmp, bbp, D2D1::BrushProperties(clamp01(c.alpha), pm * c.m), &b))) out = b;
+            return out;
+        }
         if (kind == 0 && st.size() >= 5) {
             c.solid->SetColor(colorOf(st.data() + 1));
             c.solid->SetOpacity(clamp01(c.alpha));
@@ -472,14 +497,68 @@ struct WebappUiRenderer::Impl {
         c.dc->SetPrimitiveBlend(blend);
     }
     // destination-out is approximated by erasing (COPY of transparent black).
-    ComPtr<ID2D1Brush> paintBrush(Canvas& c, const std::vector<float>& st) {
+    ComPtr<ID2D1Brush> paintBrush(Canvas& c, bool fill) {
+        const std::vector<float>& st = fill ? c.fill : c.stroke;
         if (c.comp == 3) {
             c.solid->SetColor(D2D1::ColorF(0, 0, 0, 0));
             c.solid->SetOpacity(1);
             ComPtr<ID2D1Brush> b = c.solid;
             return b;
         }
-        return canvasBrush(c, st);
+        return canvasBrush(c, st, fill ? c.fillSrc : c.strokeSrc);
+    }
+    // Canvas shadows: the shape is drawn alone into shadowRt, then its alpha,
+    // blurred (standard deviation shadowBlur / 2) and tinted with shadowColor,
+    // goes under the shape at the shadow offset.
+    bool shadowActive(const Canvas& c) const {
+        return c.shadowColor[3] > 0 && c.comp != 3 && (c.shadowBlur > 0 || c.shadowX != 0 || c.shadowY != 0);
+    }
+    template <class Draw>
+    void withShadow(Canvas& c, Draw&& draw) {
+        if (shadowActive(c)) drawShadow(c, draw);
+        draw(c.rt.Get());
+    }
+    template <class Draw>
+    void drawShadow(Canvas& c, Draw& draw) {
+        if (!c.shadowRt && FAILED(c.rt->CreateCompatibleRenderTarget(&c.shadowRt))) return;
+        c.shadowRt->BeginDraw();
+        c.shadowRt->SetTransform(D2D1::IdentityMatrix());
+        c.shadowRt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        c.shadowRt->Clear(D2D1::ColorF(0, 0, 0, 0));
+        draw(static_cast<ID2D1RenderTarget*>(c.shadowRt.Get()));
+        if (FAILED(c.shadowRt->EndDraw())) { c.shadowRt.Reset(); return; }
+        ComPtr<ID2D1Bitmap> mask;
+        if (FAILED(c.shadowRt->GetBitmap(&mask))) return;
+        const float* col = c.shadowColor;
+        c.rt->SetTransform(D2D1::IdentityMatrix());
+        if (!c.shadowEffectTried) {
+            c.shadowEffectTried = true;
+            if (c.dc) c.dc->CreateEffect(CLSID_D2D1Shadow, &c.shadowEffect);
+        }
+        if (c.shadowEffect) {
+            c.shadowEffect->SetInput(0, mask.Get());
+            c.shadowEffect->SetValue(D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, std::max(0.0f, c.shadowBlur / 2));
+            c.shadowEffect->SetValue(D2D1_SHADOW_PROP_COLOR, D2D1::Vector4F(clamp01(col[0]), clamp01(col[1]), clamp01(col[2]), clamp01(col[3])));
+            c.dc->DrawImage(c.shadowEffect.Get(), D2D1::Point2F(c.shadowX, c.shadowY));
+        } else {
+            // No effects on this target: the alpha mask stamped on a small grid approximates the blur.
+            const D2D1_ANTIALIAS_MODE aa = c.rt->GetAntialiasMode();
+            c.rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            const D2D1_SIZE_F size = mask->GetSize();
+            const float r = c.shadowBlur / 2;
+            const int taps = r < 0.5f ? 1 : 3;
+            c.solid->SetColor(D2D1::ColorF(clamp01(col[0]), clamp01(col[1]), clamp01(col[2]), 1));
+            c.solid->SetOpacity(clamp01(col[3]) / float(taps * taps));
+            for (int y = 0; y < taps; y++)
+                for (int x = 0; x < taps; x++) {
+                    const float dx = taps == 1 ? 0 : (x - 1) * r, dy = taps == 1 ? 0 : (y - 1) * r;
+                    const D2D1_RECT_F dst = D2D1::RectF(c.shadowX + dx, c.shadowY + dy, c.shadowX + dx + size.width, c.shadowY + dy + size.height);
+                    c.rt->FillOpacityMask(mask.Get(), c.solid.Get(), D2D1_OPACITY_MASK_CONTENT_GRAPHICS, &dst, nullptr);
+                }
+            c.rt->SetAntialiasMode(aa);
+        }
+        c.rt->Flush(); // shadowRt is drawn into again by the next shadowed shape
+        if (c.shadowEffect) c.shadowEffect->SetInput(0, nullptr);
     }
     ID2D1Bitmap* canvasImage(Canvas& c, int kind, std::uint32_t ref, const std::string& src) {
         if (kind == 1) {
@@ -501,7 +580,7 @@ struct WebappUiRenderer::Impl {
         if (c.bitmaps.size() > 256) c.bitmaps.clear();
         return (c.bitmaps[src] = bmp).Get();
     }
-    void canvasText(Canvas& c, const float* a, const std::string& text, ID2D1Brush* brush) {
+    void canvasText(Canvas& c, ID2D1RenderTarget* t, const float* a, const std::string& text, ID2D1Brush* brush) {
         const std::wstring wtext = wide(text);
         if (wtext.empty() || !brush) return;
         IDWriteTextFormat* f = format(c.family, c.fontSize, c.weight, c.italic);
@@ -530,9 +609,9 @@ struct WebappUiRenderer::Impl {
         case 4: y -= base * 0.2f; break;                  // hanging
         default: y -= base; break;                        // alphabetic
         }
-        c.rt->SetTransform(D2D1::Matrix3x2F::Scale(sx, 1, D2D1::Point2F(x, y)) * D2D1::Matrix3x2F(c.m._11, c.m._12, c.m._21, c.m._22, c.m._31, c.m._32));
-        c.rt->DrawTextLayout(D2D1::Point2F(x, y), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-        c.rt->SetTransform(D2D1::IdentityMatrix());
+        t->SetTransform(D2D1::Matrix3x2F::Scale(sx, 1, D2D1::Point2F(x, y)) * D2D1::Matrix3x2F(c.m._11, c.m._12, c.m._21, c.m._22, c.m._31, c.m._32));
+        t->DrawTextLayout(D2D1::Point2F(x, y), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+        t->SetTransform(D2D1::IdentityMatrix());
     }
     void runCanvas(std::uint32_t id, unsigned w, unsigned h, const float* ops, std::size_t floats, const std::vector<std::string>& strs) {
         Canvas& c = canvases[id];
@@ -584,8 +663,8 @@ struct WebappUiRenderer::Impl {
                 break;
             }
             case 2: if (n >= 6) c.m = D2D1::Matrix3x2F(a[0], a[1], a[2], a[3], a[4], a[5]); break;
-            case 3: c.fill.assign(a, a + n); break;
-            case 4: c.stroke.assign(a, a + n); break;
+            case 3: c.fill.assign(a, a + n); c.fillSrc = n >= 3 && a[0] == 3 && a[1] == 0 ? str(a[2]) : std::string(); break;
+            case 4: c.stroke.assign(a, a + n); c.strokeSrc = n >= 3 && a[0] == 3 && a[1] == 0 ? str(a[2]) : std::string(); break;
             case 5: if (n >= 4) { c.lineWidth = a[0]; c.cap = int(a[1]); c.join = int(a[2]); c.miter = std::max(1.0f, a[3]); c.strokeDirty = true; } break;
             case 6: if (n >= 2) { c.dashOffset = a[0]; c.dash.assign(a + 2, a + std::min<std::size_t>(n, 2 + std::size_t(std::max(0.0f, a[1])))); c.strokeDirty = true; } break;
             case 7: if (n >= 2) { c.alpha = a[0]; c.comp = int(a[1]); setBlend(c); } break;
@@ -606,25 +685,32 @@ struct WebappUiRenderer::Impl {
                     c.pathGeometry.Reset(); // the clip keeps this geometry; later edits need a new one
                     break;
                 }
-                ComPtr<ID2D1Brush> b = paintBrush(c, op == 20 ? c.fill : c.stroke);
+                ComPtr<ID2D1Brush> b = paintBrush(c, op == 20);
                 if (!b) break;
-                if (op == 20) c.rt->FillGeometry(g.Get(), b.Get());
-                else c.rt->DrawGeometry(g.Get(), b.Get(), c.lineWidth, canvasStroke(c));
+                ID2D1StrokeStyle* style = op == 21 ? canvasStroke(c) : nullptr;
+                withShadow(c, [&](ID2D1RenderTarget* t) {
+                    if (op == 20) t->FillGeometry(g.Get(), b.Get());
+                    else t->DrawGeometry(g.Get(), b.Get(), c.lineWidth, style);
+                });
                 break;
             }
             case 23: { // FILL_RECT device x y w h
                 if (n < 4) break;
-                ComPtr<ID2D1Brush> b = paintBrush(c, c.fill);
-                if (b) c.rt->FillRectangle(D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]), b.Get());
+                ComPtr<ID2D1Brush> b = paintBrush(c, true);
+                const D2D1_RECT_F rect = D2D1::RectF(a[0], a[1], a[0] + a[2], a[1] + a[3]);
+                if (b) withShadow(c, [&](ID2D1RenderTarget* t) { t->FillRectangle(rect, b.Get()); });
                 break;
             }
             case 24: case 25: { // FILL_QUAD / STROKE_QUAD
                 if (n < 8) break;
                 ComPtr<ID2D1Geometry> g = quadGeometry(a);
-                ComPtr<ID2D1Brush> b = paintBrush(c, op == 24 ? c.fill : c.stroke);
+                ComPtr<ID2D1Brush> b = paintBrush(c, op == 24);
                 if (!g || !b) break;
-                if (op == 24) c.rt->FillGeometry(g.Get(), b.Get());
-                else c.rt->DrawGeometry(g.Get(), b.Get(), c.lineWidth, canvasStroke(c));
+                ID2D1StrokeStyle* style = op == 25 ? canvasStroke(c) : nullptr;
+                withShadow(c, [&](ID2D1RenderTarget* t) {
+                    if (op == 24) t->FillGeometry(g.Get(), b.Get());
+                    else t->DrawGeometry(g.Get(), b.Get(), c.lineWidth, style);
+                });
                 break;
             }
             case 26: { // CLEAR_RECT device
@@ -636,8 +722,9 @@ struct WebappUiRenderer::Impl {
             }
             case 30: { // TEXT stroke strIdx x y maxWidth
                 if (n < 5) break;
-                ComPtr<ID2D1Brush> b = paintBrush(c, a[0] > 0.5f ? c.stroke : c.fill);
-                canvasText(c, a, str(a[1]), b.Get());
+                ComPtr<ID2D1Brush> b = paintBrush(c, a[0] <= 0.5f);
+                const std::string& text = str(a[1]);
+                if (b) withShadow(c, [&](ID2D1RenderTarget* t) { canvasText(c, t, a, text, b.Get()); });
                 break;
             }
             case 31: if (n >= 4) { c.family = str(a[0]); c.fontSize = std::max(1.0f, a[1]); c.weight = int(a[2]); c.italic = a[3] > 0.5f; } break;
@@ -648,12 +735,20 @@ struct WebappUiRenderer::Impl {
                 if (!bmp) break;
                 const D2D1_RECT_F src = D2D1::RectF(a[2], a[3], a[2] + a[4], a[3] + a[5]);
                 const D2D1_RECT_F dst = D2D1::RectF(a[6], a[7], a[6] + a[8], a[7] + a[9]);
-                c.rt->SetTransform(c.m);
-                c.rt->DrawBitmap(bmp, dst, clamp01(c.alpha), a[10] > 0.5f ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
-                c.rt->SetTransform(D2D1::IdentityMatrix());
+                withShadow(c, [&](ID2D1RenderTarget* t) {
+                    t->SetTransform(c.m);
+                    t->DrawBitmap(bmp, dst, clamp01(c.alpha), a[10] > 0.5f ? D2D1_BITMAP_INTERPOLATION_MODE_LINEAR : D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src);
+                    t->SetTransform(D2D1::IdentityMatrix());
+                });
                 break;
             }
             case 41: c.clips.emplace_back(); break;
+            case 43: // SHADOW blur offsetX offsetY r g b a
+                if (n >= 7) {
+                    c.shadowBlur = std::max(0.0f, a[0]); c.shadowX = a[1]; c.shadowY = a[2];
+                    for (int k = 0; k < 4; k++) c.shadowColor[k] = a[3 + k];
+                }
+                break;
             case 42:
                 if (c.clips.size() > 1) {
                     popCanvasClips(c, int(c.clips.back().size()));
