@@ -55,6 +55,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const _projScreen = new THREE.Matrix4();
   const _shadowViewProj = new THREE.Matrix4();
   const _identityMatrix = new THREE.Matrix4();
+  const _skinBone = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -377,6 +378,129 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       Object.assign(record, { key, mask, colorAttribute: original, hasColors: true, hasUvs: !!uvs,
         vertexCount, indexCount: base.indexCount });
       return record;
+    }
+
+    // SkinnedMesh and morph targets: the deformed shape of this frame, computed
+    // on the CPU the way Three.js' skinning/morph shader chunks do it, as a
+    // geometry that shares every other attribute with the original.
+    _deformedGeometry(mesh, geometry) {
+      const attributes = geometry.attributes;
+      const skinned = mesh.isSkinnedMesh && mesh.skeleton && attributes.skinIndex && attributes.skinWeight;
+      const morphs = geometry.morphAttributes?.position;
+      const influences = mesh.morphTargetInfluences;
+      const morphed = !!(morphs && morphs.length && influences && influences.length && !mesh.isInstancedMesh);
+      if (!skinned && !morphed) return geometry;
+      const source = attributes.position, sourceNormal = attributes.normal;
+      const n = source.count;
+      if (!this._deformed) this._deformed = new WeakMap();
+      let d = this._deformed.get(mesh);
+      if (!d || d.source !== geometry || d.count !== n) {
+        const g = new THREE.BufferGeometry();
+        for (const [name, attr] of Object.entries(attributes)) if (name !== 'position' && name !== 'normal') g.setAttribute(name, attr);
+        g.setIndex(geometry.index);
+        g.groups = geometry.groups;
+        g.drawRange = geometry.drawRange;
+        g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+        g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+        let baseNormal = null;
+        if (!sourceNormal) { // rest-pose normals, then deformed like real ones
+          const rest = new THREE.BufferGeometry();
+          rest.setAttribute('position', source);
+          rest.setIndex(geometry.index);
+          rest.computeVertexNormals();
+          baseNormal = rest.attributes.normal.array.slice();
+        }
+        if (d) d.geometry.dispose();
+        d = { geometry: g, source: geometry, count: n, frame: -1, baseNormal, work: new Float32Array(n * 6), bones: new Float32Array(0) };
+        this._deformed.set(mesh, d);
+      }
+      const frame = this.info.render.frame;
+      if (d.frame === frame) return d.geometry;
+      d.frame = frame;
+      const out = d.geometry.attributes.position.array, outN = d.geometry.attributes.normal.array;
+      const work = d.work; // morphed position (0..3n) and normal (3n..6n)
+      for (let i = 0; i < n; i++) {
+        work[i * 3] = source.getX(i); work[i * 3 + 1] = source.getY(i); work[i * 3 + 2] = source.getZ(i);
+        if (sourceNormal) {
+          work[n * 3 + i * 3] = sourceNormal.getX(i); work[n * 3 + i * 3 + 1] = sourceNormal.getY(i); work[n * 3 + i * 3 + 2] = sourceNormal.getZ(i);
+        } else {
+          work[n * 3 + i * 3] = d.baseNormal[i * 3]; work[n * 3 + i * 3 + 1] = d.baseNormal[i * 3 + 1]; work[n * 3 + i * 3 + 2] = d.baseNormal[i * 3 + 2];
+        }
+      }
+      if (morphed) {
+        // morphTargetsRelative: p += w * delta; otherwise p += w * (target - base).
+        const relative = geometry.morphTargetsRelative;
+        const morphNormals = geometry.morphAttributes.normal;
+        for (let k = 0; k < morphs.length && k < influences.length; k++) {
+          const w = influences[k];
+          if (!w) continue;
+          const target = morphs[k], targetNormal = morphNormals?.[k];
+          for (let i = 0; i < n; i++) {
+            const o = i * 3;
+            if (relative) {
+              work[o] += w * target.getX(i); work[o + 1] += w * target.getY(i); work[o + 2] += w * target.getZ(i);
+            } else {
+              work[o] += w * (target.getX(i) - source.getX(i)); work[o + 1] += w * (target.getY(i) - source.getY(i)); work[o + 2] += w * (target.getZ(i) - source.getZ(i));
+            }
+            if (targetNormal) {
+              const on = n * 3 + o;
+              if (relative) { work[on] += w * targetNormal.getX(i); work[on + 1] += w * targetNormal.getY(i); work[on + 2] += w * targetNormal.getZ(i); }
+              else if (sourceNormal) {
+                work[on] += w * (targetNormal.getX(i) - sourceNormal.getX(i)); work[on + 1] += w * (targetNormal.getY(i) - sourceNormal.getY(i));
+                work[on + 2] += w * (targetNormal.getZ(i) - sourceNormal.getZ(i));
+              }
+            }
+          }
+        }
+      }
+      if (skinned) {
+        const skeleton = mesh.skeleton;
+        if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+        // Per bone: bindMatrixInverse * boneMatrix * bindMatrix (skinning_vertex).
+        const boneCount = skeleton.bones.length;
+        if (d.bones.length < boneCount * 16) d.bones = new Float32Array(boneCount * 16);
+        const bm = skeleton.boneMatrices;
+        for (let b = 0; b < boneCount; b++) {
+          _skinBone.fromArray(bm, b * 16).premultiply(mesh.bindMatrixInverse).multiply(mesh.bindMatrix);
+          d.bones.set(_skinBone.elements, b * 16);
+        }
+        const bones = d.bones, skinIndex = attributes.skinIndex, skinWeight = attributes.skinWeight;
+        for (let i = 0; i < n; i++) {
+          const o = i * 3, on = n * 3 + o;
+          const x = work[o], y = work[o + 1], z = work[o + 2], nx = work[on], ny = work[on + 1], nz = work[on + 2];
+          let px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, total = 0;
+          for (let j = 0; j < 4; j++) {
+            const w = skinWeight.getComponent(i, j);
+            if (!w) continue;
+            const b = skinIndex.getComponent(i, j);
+            if (b >= boneCount) continue;
+            const e = b * 16;
+            px += w * (bones[e] * x + bones[e + 4] * y + bones[e + 8] * z + bones[e + 12]);
+            py += w * (bones[e + 1] * x + bones[e + 5] * y + bones[e + 9] * z + bones[e + 13]);
+            pz += w * (bones[e + 2] * x + bones[e + 6] * y + bones[e + 10] * z + bones[e + 14]);
+            qx += w * (bones[e] * nx + bones[e + 4] * ny + bones[e + 8] * nz);
+            qy += w * (bones[e + 1] * nx + bones[e + 5] * ny + bones[e + 9] * nz);
+            qz += w * (bones[e + 2] * nx + bones[e + 6] * ny + bones[e + 10] * nz);
+            total += w;
+          }
+          if (total > 0) {
+            out[o] = px; out[o + 1] = py; out[o + 2] = pz;
+            const len = Math.hypot(qx, qy, qz) || 1;
+            outN[o] = qx / len; outN[o + 1] = qy / len; outN[o + 2] = qz / len;
+          } else {
+            out[o] = x; out[o + 1] = y; out[o + 2] = z; outN[o] = nx; outN[o + 1] = ny; outN[o + 2] = nz;
+          }
+        }
+      } else {
+        out.set(work.subarray(0, n * 3));
+        for (let i = 0; i < n; i++) {
+          const o = n * 3 + i * 3, len = Math.hypot(work[o], work[o + 1], work[o + 2]) || 1;
+          outN[i * 3] = work[o] / len; outN[i * 3 + 1] = work[o + 1] / len; outN[i * 3 + 2] = work[o + 2] / len;
+        }
+      }
+      d.geometry.attributes.position.needsUpdate = true;
+      d.geometry.attributes.normal.needsUpdate = true;
+      return d.geometry;
     }
 
     _instanceRecord(mesh) {
@@ -793,10 +917,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (mesh.castShadow && this.shadowMap.enabled) this._offscreenCasters.push(mesh);
         return;
       }
-      if (mesh.isSkinnedMesh) unsupported('Skinned meshes (SkinnedMesh animation)', 'drawn in bind pose');
-      if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
-      const record = this._geometryRecord(geometry);
+      const record = this._geometryRecord(this._deformedGeometry(mesh, geometry));
       if (!record) return;
       if (mesh.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender) mesh.onBeforeRender(this, null, camera, geometry, mesh.material, null);
       const instances = mesh.isInstancedMesh ? this._instanceRecord(mesh) : null;
