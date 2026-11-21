@@ -219,7 +219,11 @@ export async function runWebapp(root, options = {}) {
       rec.textureUploads = (rec.textureUploads || 0) + 1;
       return true;
     },
-    releaseTexture(id) { rec.textures.delete(id); },
+    releaseTexture(id) { rec.textures.delete(id); rec.renderTargets?.delete(id); },
+    createRenderTarget(id, width, height) {
+      (rec.renderTargets ||= new Map()).set(id, { width, height });
+      return true;
+    },
     // Canvas 2D command batches (executed by Direct2D in the engine).
     canvasCommands(id, width, height, ops, floats, strings) {
       view(ops, 'canvas commands');
@@ -296,6 +300,7 @@ export function decodePass(p) {
     view: Array.from(p.subarray(0, 16)), projection: Array.from(p.subarray(16, 32)),
     cameraPosition: [p[32], p[33], p[34]], clear: [p[36], p[37], p[38], p[39]],
     ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], exposure: p[47], toneMapping: p[48], lights: [], draws: [],
+    target: p[55],
     shadow: p[56] ? { light: p[57], bias: p[58], normalBias: p[59], mapSize: p[60], radius: p[61], intensity: p[62], spot: !!p[63], viewProjection: Array.from(p.subarray(64, 80)) } : null,
   };
   let o = PASS_HEADER_FLOATS;

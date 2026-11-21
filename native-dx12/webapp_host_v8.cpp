@@ -813,6 +813,14 @@ void ntReleaseTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseTexture(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntCreateRenderTarget(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "createRenderTarget(id, width, height)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const bool ok = self->sink && self->sink->createRenderTarget(info[0]->Uint32Value(ctx).FromMaybe(0), info[1]->Uint32Value(ctx).FromMaybe(0),
+                                                                 info[2]->Uint32Value(ctx).FromMaybe(0));
+    info.GetReturnValue().Set(ok);
+}
 void ntUploadCanvasTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() < 3) return self->throwError("type", "uploadCanvasTexture(id, canvasId, flags)");
@@ -1645,6 +1653,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
         {"registerColorPatch", ntRegisterColorPatch},
         {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
+        {"createRenderTarget", ntCreateRenderTarget},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
         {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor}, {"reportUi", ntReportUi},
         {"setPointerLock", ntSetPointerLock}, {"setFullscreen", ntSetFullscreen},

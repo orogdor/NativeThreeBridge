@@ -11,6 +11,7 @@
 //     a fixed-size record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
+// Header 55: render target texture id (0 = window).
 // Header 56..63: shadow (enabled, light index, bias, normalBias, mapSize,
 // radius, intensity, perspective); 64..79: shadow camera view-projection.
 export const PASS_HEADER_FLOATS = 96;
@@ -223,7 +224,36 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     getRenderTarget() { return this._renderTarget; }
     setRenderTarget(target) {
       this._renderTarget = target || null;
-      if (target) unsupported('Render targets (render-to-texture, post-processing)', 'those passes are skipped');
+      if (target) this._targetRecord(target);
+    }
+    // WebGLRenderTarget -> native render target (linear RGBA16F + depth) whose
+    // colour is a texture id that materials can sample (target.texture).
+    _targetRecord(target) {
+      if (!this._targets) this._targets = new Map();
+      if (target.isWebGLCubeRenderTarget || target.isCubeRenderTarget) { unsupported('Cube render targets (CubeCamera)'); return null; }
+      if (target.textures && target.textures.length > 1) unsupported('Multiple render target attachments (MRT)', 'only the first is drawn');
+      if (target.depthTexture) unsupported('WebGLRenderTarget.depthTexture', 'depth is not readable');
+      if (!nt.createRenderTarget) { unsupported('Render targets (render-to-texture, post-processing)', 'those passes are skipped'); return null; }
+      let record = this._targets.get(target);
+      const width = Math.max(1, Math.round(target.width)), height = Math.max(1, Math.round(target.height));
+      if (!record) {
+        record = { id: nextTextureId++, width: 0, height: 0, ok: false };
+        this._targets.set(target, record);
+        if (!this._targetTextures) this._targetTextures = new WeakMap();
+        const onDispose = () => {
+          target.removeEventListener('dispose', onDispose);
+          this._targets.delete(target);
+          nt.releaseTexture(record.id);
+        };
+        target.addEventListener('dispose', onDispose);
+      }
+      if (record.width !== width || record.height !== height) {
+        record.ok = !!nt.createRenderTarget(record.id, width, height);
+        record.width = width; record.height = height;
+        if (!record.ok) warnOnce('render-target-failed', `Render target ${width}x${height} could not be created`);
+      }
+      this._targetTextures.set(target.texture, record);
+      return record.ok ? record : null;
     }
     getActiveCubeFace() { return 0; }
     getActiveMipmapLevel() { return 0; }
@@ -531,7 +561,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
     // One native texture per image (THREE.Source), re-sent when needsUpdate.
     _textureRecord(texture) {
-      if (!texture || !texture.isTexture || texture.isCubeTexture || texture.isCompressedTexture || texture.isData3DTexture || texture.isDataArrayTexture || texture.isRenderTargetTexture || texture.isVideoTexture) return null;
+      if (texture && texture.isRenderTargetTexture) {
+        const record = this._targetTextures?.get(texture);
+        return record && record.ok ? record : null;
+      }
+      if (!texture || !texture.isTexture || texture.isCubeTexture || texture.isCompressedTexture || texture.isData3DTexture || texture.isDataArrayTexture || texture.isVideoTexture) return null;
       const source = texture.source || texture;
       const image = source.data !== undefined ? source.data : texture.image;
       if (!image) return null;
@@ -626,7 +660,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       globalThis.__ntLastRender = { scene, camera, renderer: this };
       if (this._disposed) return;
       if (!camera || !camera.isCamera) { warnOnce('render-no-camera', 'render() called without a camera'); return; }
-      if (this._renderTarget) return; // render-to-texture is not supported yet: skip, do not draw to screen
+      const target = this._renderTarget ? this._targetRecord(this._renderTarget) : null;
+      if (this._renderTarget && !target) return; // unsupported target: skip, do not draw to the screen
 
       const timings = this.collectTimings ? {} : null;
       let start = timings ? performance.now() : 0;
@@ -699,7 +734,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       }
       this._pendingClear = 0;
       p[44] = flags;
-      p[45] = this._width; p[46] = this._height;
+      p[45] = target ? target.width : this._width; p[46] = target ? target.height : this._height;
+      p[55] = target ? target.id : 0;
       p[47] = this.toneMappingExposure;
       const tm = this.toneMapping;
       p[48] = tm === THREE.LinearToneMapping ? ToneMapping.LINEAR : tm === THREE.ReinhardToneMapping ? ToneMapping.REINHARD
@@ -1056,7 +1092,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (map.matrixAutoUpdate) map.updateMatrix();
         const e = map.matrix.elements;
         let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
-        if (map.flipY) { b = -b; d = -d; ty = 1 - ty; }
+        // Render target textures: rows run top-down in the engine, v = 0 is the bottom in Three.js.
+        if (map.flipY || map.isRenderTargetTexture) { b = -b; d = -d; ty = 1 - ty; }
         uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
       };
       let uvSource = null;
@@ -1171,7 +1208,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 61 + i] = binding?.id ?? 0;
       const texture = binding?.texture;
       if (!texture) continue;
-      if (texture.flipY && !binding.std) flip |= 1 << i; // standard maps use the draw's uv (flip included)
+      if ((texture.flipY || texture.isRenderTargetTexture) && !binding.std) flip |= 1 << i; // standard maps use the draw's uv (flip included)
       if (texture.wrapS === THREE.RepeatWrapping || texture.wrapT === THREE.RepeatWrapping) repeat |= 1 << i;
       else if (texture.wrapS === THREE.MirroredRepeatWrapping || texture.wrapT === THREE.MirroredRepeatWrapping) mirror |= 1 << i;
     }

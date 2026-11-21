@@ -361,6 +361,13 @@ JSValue jsReleaseTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* a
     if (argc >= 1 && JS_ToUint32(ctx, &id, argv[0]) == 0 && self->sink) self->sink->releaseTexture(id);
     return JS_UNDEFINED;
 }
+JSValue jsCreateRenderTarget(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t v[3] = {};
+    if (argc < 3) return JS_ThrowTypeError(ctx, "createRenderTarget(id, width, height)");
+    for (int i = 0; i < 3; i++) if (JS_ToUint32(ctx, &v[i], argv[i])) return JS_EXCEPTION;
+    return JS_NewBool(ctx, self->sink && self->sink->createRenderTarget(v[0], v[1], v[2]));
+}
 JSValue jsUploadCanvasTexture(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     std::uint32_t id = 0, canvas = 0, flags = 0;
@@ -581,7 +588,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadGeometry", jsUploadGeometry, 6}, {"releaseGeometry", jsReleaseGeometry, 1},
         {"uploadInstances", jsUploadInstances, 4}, {"releaseInstances", jsReleaseInstances, 1},
         {"uploadTexture", jsUploadTexture, 5}, {"releaseTexture", jsReleaseTexture, 1},
-        {"uploadCanvasTexture", jsUploadCanvasTexture, 3},
+        {"uploadCanvasTexture", jsUploadCanvasTexture, 3}, {"createRenderTarget", jsCreateRenderTarget, 3},
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
         {"registerImage", jsRegisterImage, 2},
         {"registerColorPatch", jsRegisterColorPatch, 2}, {"submitPass", jsSubmitPass, 2},

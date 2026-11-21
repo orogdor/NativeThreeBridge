@@ -138,6 +138,12 @@ struct Retired {
     ComPtr<ID3D12Resource> resource;
     UINT64 fence;
 };
+// WebGLRenderTarget: colour (also a Texture in textures_) + depth.
+struct RenderTarget {
+    ComPtr<ID3D12Resource> color, depth;
+    ComPtr<ID3D12DescriptorHeap> rtv, dsv;
+    UINT width = 0, height = 0;
+};
 struct Texture {
     ComPtr<ID3D12Resource> resource;
     UINT slot = 0;
@@ -265,6 +271,7 @@ public:
     bool uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
                        std::uint32_t height, std::uint32_t flags) override;
     void releaseTexture(std::uint32_t id) override;
+    bool createRenderTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) override;
     bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) override;
     void uploadInstances(std::uint32_t id, const float* m, const float* c, std::uint32_t count) override;
     void releaseInstances(std::uint32_t id) override;
@@ -421,7 +428,7 @@ private:
                                           std::uint32_t vertexCount, std::uint32_t colorChannels, const float* shaderAttributes);
     void retire(ComPtr<ID3D12Resource>& resource);
     void collectRetired();
-    ID3D12PipelineState* pipeline(UINT flags, UINT patchId);
+    ID3D12PipelineState* pipeline(UINT flags, UINT patchId, bool hdr = false);
     ID3D12PipelineState* shadowPipeline();
     void ensureShadowMap(UINT size);
     void renderFrame(std::unique_lock<std::recursive_mutex>* resourceLock = nullptr);
@@ -544,6 +551,8 @@ private:
     }
     UINT lastShadowDraws_ = 0;
     std::map<UINT, ComPtr<ID3D12PipelineState>> pipelines_;
+    std::map<UINT, ComPtr<ID3D12PipelineState>> hdrPipelines_; // same keys, RGBA16F target (render targets)
+    std::unordered_map<std::uint32_t, RenderTarget> renderTargets_; // gfxMutex_
     // Same pipelines addressed directly by their key: the per-draw lookup is one array read.
     std::array<ID3D12PipelineState*, kPipelineSlots> pipelineTable_{};
     std::map<UINT, ComPtr<ID3DBlob>> colorPatches_;
@@ -924,6 +933,7 @@ void WebappWindow::resetTextures() {
     retired_.clear();
     retiredSlots_.clear();
     textures_.clear();
+    renderTargets_.clear();
     textureBytes_ = 0;
     textureFailures_ = 0;
     freeSlots_.clear();
@@ -1129,11 +1139,83 @@ bool WebappWindow::createTexture(std::uint32_t id, std::vector<std::vector<std::
 void WebappWindow::releaseTexture(std::uint32_t id) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
     if (id != 0) textureVersions_.erase(id);
+    auto rt = renderTargets_.find(id);
+    if (rt != renderTargets_.end()) {
+        retire(rt->second.depth);
+        renderTargets_.erase(rt);
+    }
     auto it = textures_.find(id);
     if (it == textures_.end() || id == 0) return;
     retire(it->second.resource);
     retiredSlots_.push_back({it->second.slot, fenceValue_ + kFrameCount});
     textures_.erase(it);
+}
+
+bool WebappWindow::createRenderTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+    if (id == 0) return false;
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    releaseTexture(id);
+    if (freeSlots_.empty()) return false;
+    width = std::clamp<std::uint32_t>(width, 1, 8192);
+    height = std::clamp<std::uint32_t>(height, 1, 8192);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clearColor{};
+    clearColor.Format = desc.Format;
+    RenderTarget rt;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                &clearColor, IID_PPV_ARGS(&rt.color)))) {
+        log("warn", "Render target " + std::to_string(width) + "x" + std::to_string(height) + " could not be created");
+        return false;
+    }
+    desc.Format = DXGI_FORMAT_D32_FLOAT;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+    D3D12_CLEAR_VALUE clearDepth{};
+    clearDepth.Format = DXGI_FORMAT_D32_FLOAT;
+    clearDepth.DepthStencil.Depth = 1.0f;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearDepth,
+                                                IID_PPV_ARGS(&rt.depth))))
+        return false;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.NumDescriptors = 1;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt.rtv)), "Render target RTV heap");
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rt.dsv)), "Render target DSV heap");
+    device_->CreateRenderTargetView(rt.color.Get(), nullptr, rt.rtv->GetCPUDescriptorHandleForHeapStart());
+    device_->CreateDepthStencilView(rt.depth.Get(), nullptr, rt.dsv->GetCPUDescriptorHandleForHeapStart());
+    const UINT slot = freeSlots_.back();
+    freeSlots_.pop_back();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = texHeap_->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += SIZE_T(slot) * texStep_;
+    device_->CreateShaderResourceView(rt.color.Get(), &srv, cpu);
+    rt.width = width;
+    rt.height = height;
+    Texture texture;
+    texture.resource = rt.color;
+    texture.slot = slot;
+    texture.width = width;
+    texture.height = height;
+    texture.mips = 1;
+    texture.format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    textures_[id] = texture;
+    textureVersions_[id] = ++textureVersionCounter_;
+    renderTargets_[id] = std::move(rt);
+    return true;
 }
 
 bool WebappWindow::uploadTexture(std::uint32_t id, const std::uint8_t* data, std::size_t bytes, std::uint32_t width,
@@ -1639,7 +1721,7 @@ bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& sourc
     return true;
 }
 
-ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
+ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId, bool hdr) {
     const bool lines = (flags & (F_LINES | F_LINE_STRIP)) != 0;
     UINT cull = (flags & F_DOUBLE) || lines ? 1 : (flags & F_BACK) ? 2 : 0;
     // A mirrored mesh (det(matrixWorld) < 0) has its winding reversed, so the
@@ -1649,14 +1731,15 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
                        ((flags & F_NO_DEPTH_WRITE) ? 16u : 0u) | ((flags & F_NO_DEPTH_TEST) ? 32u : 0u) |
                        ((flags & F_ADDITIVE) ? 64u : 0u) | ((flags & F_PREMULTIPLIED_ADDITIVE) ? 128u : 0u);
     // Hot path (once per draw): pipelines that exist are found with one array read.
-    if (patchId <= kMaxColorPatches) {
+    if (!hdr && patchId <= kMaxColorPatches) {
         if (ID3D12PipelineState* ready = pipelineTable_[(patchId << 8) | state]) return ready;
     }
     const auto patch = colorPatches_.find(patchId);
     if (patch == colorPatches_.end()) patchId = 0;
     const UINT key = (patchId << 8) | state;
-    auto found = pipelines_.find(key);
-    if (found != pipelines_.end()) return found->second.Get();
+    auto& cache = hdr ? hdrPipelines_ : pipelines_;
+    auto found = cache.find(key);
+    if (found != cache.end()) return found->second.Get();
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
     d.pRootSignature = root_sig_.Get();
@@ -1701,20 +1784,20 @@ ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId) {
     d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
     d.SampleMask = UINT_MAX;
     d.NumRenderTargets = 1;
-    d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.RTVFormats[0] = hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     d.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     d.SampleDesc.Count = 1;
     ComPtr<ID3D12PipelineState> pso;
     const auto hr = device_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
     if (FAILED(hr) && patchId) {
         log("warn", "[material-color] pipeline could not use shader patch " + std::to_string(patchId));
-        pipelines_[key] = pipeline(flags, 0);
-        return pipelines_[key].Get();
+        cache[key] = pipeline(flags, 0, hdr);
+        return cache[key].Get();
     }
     check(hr, "Create webapp pipeline");
     ID3D12PipelineState* raw = pso.Get();
-    pipelines_[key] = pso;
-    if (key < kPipelineSlots) pipelineTable_[key] = raw;
+    cache[key] = pso;
+    if (!hdr && key < kPipelineSlots) pipelineTable_[key] = raw;
     return raw;
 }
 
@@ -2096,16 +2179,41 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     cmd_->SetGraphicsRootDescriptorTable(kShadowParam, shadowSrv());
 
     UINT drawsThisFrame = 0, shadowDrawsThisFrame = 0;
+    auto toLinear = [](float c) { return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f); };
     for (std::size_t passIndex = 0; passIndex < passCount_; passIndex++) {
         const float* p = passes_[passIndex].data();
         const UINT lightCount = UINT(p[35]);
         const UINT drawCount = UINT(p[43]);
         const UINT flags = UINT(p[44]);
-        if (flags & P_CLEAR_COLOR) {
-            const float clear[4] = {p[36], p[37], p[38], p[39]};
-            cmd_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        // Header float 55: render into WebGLRenderTarget `id` instead of the window.
+        const std::uint32_t targetId = std::uint32_t(p[55]);
+        RenderTarget* target = nullptr;
+        if (targetId) {
+            auto found = renderTargets_.find(targetId);
+            if (found == renderTargets_.end()) continue;
+            target = &found->second;
+            D3D12_RESOURCE_BARRIER toTarget{};
+            toTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toTarget.Transition.pResource = target->color.Get();
+            toTarget.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmd_->ResourceBarrier(1, &toTarget);
         }
-        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        const D3D12_CPU_DESCRIPTOR_HANDLE passRtv = target ? target->rtv->GetCPUDescriptorHandleForHeapStart() : rtv;
+        const D3D12_CPU_DESCRIPTOR_HANDLE passDsv = target ? target->dsv->GetCPUDescriptorHandleForHeapStart() : dsv;
+        const D3D12_VIEWPORT passViewport = target ? D3D12_VIEWPORT{0, 0, float(target->width), float(target->height), 0, 1} : viewport;
+        const D3D12_RECT passScissor = target ? D3D12_RECT{0, 0, LONG(target->width), LONG(target->height)} : scissor;
+        cmd_->OMSetRenderTargets(1, &passRtv, FALSE, &passDsv);
+        cmd_->RSSetViewports(1, &passViewport);
+        cmd_->RSSetScissorRects(1, &passScissor);
+        cachedPipeline = nullptr; // pipelines differ by target format
+        if (flags & P_CLEAR_COLOR) {
+            float clear[4] = {p[36], p[37], p[38], p[39]};
+            if (target) for (int c = 0; c < 3; c++) clear[c] = toLinear(clear[c]); // render targets hold linear colour
+            cmd_->ClearRenderTargetView(passRtv, clear, 0, nullptr);
+        }
+        if (flags & P_CLEAR_DEPTH) cmd_->ClearDepthStencilView(passDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
         // cbuffer Frame: view, projection, camera+lightCount, ambient+exposure, lights.
         float* fcb = reinterpret_cast<float*>(ring + ringOffset);
@@ -2117,6 +2225,10 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
                     lightCount * native_three::kWebappLightFloats * sizeof(float));
         fcb[296] = p[48]; fcb[297] = p[47] > 0 ? p[47] : 1.0f; // tone mapping curve, exposure
         std::memcpy(fcb + 300, p + 49, 3 * sizeof(float)); // fog RGB in framebuffer space
+        if (target) {
+            fcb[298] = 1; // linear output, no tone mapping
+            for (int c = 0; c < 3; c++) fcb[300 + c] = toLinear(fcb[300 + c]);
+        }
         std::memcpy(fcb + 304, p + 52, 3 * sizeof(float)); // mode, near or density, far
         const bool shadows = p[56] > 0;
         if (shadows) {
@@ -2171,9 +2283,9 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             toRead.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             toRead.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             cmd_->ResourceBarrier(1, &toRead);
-            cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-            cmd_->RSSetViewports(1, &viewport);
-            cmd_->RSSetScissorRects(1, &scissor);
+            cmd_->OMSetRenderTargets(1, &passRtv, FALSE, &passDsv);
+            cmd_->RSSetViewports(1, &passViewport);
+            cmd_->RSSetScissorRects(1, &passScissor);
         }
 
         const float* d = draws;
@@ -2185,7 +2297,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             const UINT patchId = UINT(d[48]);
             const UINT pipelineFlags = drawFlags & kPipelineFlagBits;
             if (!cachedPipeline || pipelineFlags != cachedPipelineFlags || patchId != cachedPipelinePatch) {
-                cachedPipeline = pipeline(drawFlags, patchId);
+                cachedPipeline = pipeline(drawFlags, patchId, target != nullptr);
                 cachedPipelineFlags = pipelineFlags;
                 cachedPipelinePatch = patchId;
             }
@@ -2195,11 +2307,14 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
                                                   : (drawFlags & F_LINES)    ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                                                              : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
             if (wanted != topology) { cmd_->IASetPrimitiveTopology(wanted); topology = wanted; }
-            writeDrawConstants(d, drawFlags);
-            bindColorMap(d, drawFlags);
+            // A render target cannot be sampled while it is being drawn into.
+            const UINT sampleFlags = targetId && std::uint32_t(d[32]) == targetId ? (drawFlags & ~F_MAP) : drawFlags;
+            writeDrawConstants(d, sampleFlags);
+            bindColorMap(d, sampleFlags);
             if (patchId || d[89] > 0) { // material stage textures or standard maps (normalMap ...)
                 for (UINT slot = 0; slot < kMaterialMapCount; slot++) {
-                    const auto map = textureHandle(std::uint32_t(d[61 + slot]));
+                    const std::uint32_t mapId = std::uint32_t(d[61 + slot]);
+                    const auto map = textureHandle(targetId && mapId == targetId ? 0u : mapId);
                     if (map.ptr == boundMaterialMaps[slot].ptr) continue;
                     cmd_->SetGraphicsRootDescriptorTable(3 + slot, map);
                     boundMaterialMaps[slot] = map;
@@ -2208,7 +2323,19 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             submitDraw(in);
             drawsThisFrame++;
         }
+        if (target) {
+            D3D12_RESOURCE_BARRIER toRead{};
+            toRead.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toRead.Transition.pResource = target->color.Get();
+            toRead.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toRead.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            toRead.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            cmd_->ResourceBarrier(1, &toRead);
+        }
     }
+    cmd_->OMSetRenderTargets(1, &rtv, FALSE, &dsv); // the window again (HTML/CSS UI)
+    cmd_->RSSetViewports(1, &viewport);
+    cmd_->RSSetScissorRects(1, &scissor);
     lastShadowDraws_ = shadowDrawsThisFrame;
     lastDraws_ = drawsThisFrame;
     if (uiReady_) {

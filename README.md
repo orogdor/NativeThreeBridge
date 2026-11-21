@@ -1,3 +1,16 @@
+# NativeThreeBridge v0.34.0 — shadows, standard material maps, render targets, points, skinning, pointer lock
+
+Features most Three.js games expect, all generic:
+
+- **Shadow maps.** `renderer.shadowMap.enabled` with one `castShadow` DirectionalLight or SpotLight per `render()`: a D32 depth pass from the light (`shadow.camera`, `bias`, `normalBias`, `mapSize`, `radius`, `intensity`), 3×3 PCF, `castShadow`/`receiveShadow` per mesh, alphaTest cut-outs leave holes, off-screen casters still cast.
+- **MeshStandardMaterial / MeshPhysicalMaterial maps:** `normalMap` (+`normalScale`, tangent-free), `roughnessMap`, `metalnessMap`, `emissiveMap`, `aoMap` (+`aoMapIntensity`), `alphaMap`.
+- **WebGLRenderTarget.** `setRenderTarget(rt)` renders into a native RGBA16F colour + depth texture that can be used as `material.map` (mirrors, minimaps, portals); linear output, no tone mapping inside the target.
+- **THREE.Points** with `PointsMaterial` (`size`, `sizeAttenuation`, `map`, vertex colours, `alphaTest`).
+- **SkinnedMesh and morph targets** drawn in their animated pose (CPU deformation per frame, same result as `Mesh.getVertexPosition`).
+- **Pointer Lock and Fullscreen.** `requestPointerLock()` uses raw mouse input (`movementX/Y`), the cursor is hidden and held; Escape or losing focus releases it. `requestFullscreen()` / `exitFullscreen()` switch to borderless fullscreen; `pointerlockchange`, `fullscreenchange` events.
+
+Packets: pass header 96 floats, draw 96 floats. Fixtures `webapp-shadows`, `webapp-material-maps`, `webapp-points`, `webapp-skinning`, `webapp-render-target` and `webapp-pointer-lock` run in tests and are screenshotted on Windows CI.
+
 # NativeThreeBridge v0.33.1 — wider GLSL translation (sea depth maps, photo ground), safer background decoding
 
 Translated material stages now take up to 28 uniform floats (was 12; draw packet 88 floats, cbuffer Draw 512 bytes), so a sea that reads its depth from a texture is drawn instead of hidden; a translated stage also evaluates its own texture alpha mask. The GLSL→HLSL step turns one-value constructors (`vec3(x)`) into casts, makes written top-level globals `static`, and renames HLSL keywords. Background image decoding uses single-threaded COM apartments and falls back to the window thread when a decoder fails there. New `webapp-shader-limits` fixture is compiled with D3DCompile in CI.

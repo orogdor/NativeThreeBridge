@@ -43,6 +43,12 @@ public:
         return false;
     }
     virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // WebGLRenderTarget: texture `id` that passes with header float 55 == id
+    // render into (linear RGBA16F colour + depth). releaseTexture frees it.
+    virtual bool createRenderTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+        (void)id; (void)width; (void)height;
+        return false;
+    }
     // Texture `id` from the current pixels of Canvas 2D surface `canvasId`.
     virtual bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
         (void)id; (void)canvasId; (void)flags;

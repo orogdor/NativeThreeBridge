@@ -10,7 +10,7 @@ cbuffer Frame : register(b0) {
     float4 gCamera;   // xyz position, w light count
     float4 gAmbient;  // rgb ambient irradiance, w exposure
     float4 gLights[64];
-    float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
+    float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure, z 1 = render target (linear)
     float4 gFogColor;
     float4 gFog;      // mode, near or density, far
     float4x4 gShadowMatrix; // world -> shadow light clip (light.shadow.camera)
@@ -167,7 +167,9 @@ float3 toneMap(float3 c, uint flags) {
 }
 
 float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
-    float3 color = toSRGB(toneMap(rgb, flags));
+    // Render targets keep linear colour without tone mapping (like Three.js);
+    // the screen gets tone mapping and sRGB.
+    float3 color = gTone.z > 0 ? rgb : toSRGB(toneMap(rgb, flags));
     if ((flags & F_FOG) && gFog.x != 0) {
         float d = gFog.y * depth;
         float f = gFog.x == 2 ? 1 - exp(-d * d) : smoothstep(gFog.y, gFog.z, depth);

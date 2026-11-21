@@ -1,4 +1,4 @@
-NativeThreeBridge v0.33.1 - KAKS MÄNGU, ÜKS ENGINE
+NativeThreeBridge v0.34.0 - KAKS MÄNGU, ÜKS ENGINE
 =================================================
 Game1.exe            metsalahingu test (kaust game1)
 Game2.exe            webapp kaustas game2 (alguses tühi)
@@ -12,6 +12,17 @@ UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
 Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
 Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
 Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+
+v0.34.0 UUS: Three.js võimalused, mis enne puudu olid (kõigile mängudele).
+- Varjud: renderer.shadowMap.enabled + castShadow suunatuli või prožektor,
+  castShadow/receiveShadow mudelitel, pehme serv (PCF), lehtede augud.
+- Standardmaterjali kaardid: normalMap, roughnessMap, metalnessMap,
+  emissiveMap, aoMap, alphaMap.
+- Render target (WebGLRenderTarget): peeglid, minikaardid, portaalid.
+- THREE.Points (osakesed, tähed, sädemed).
+- Luustikuga mudelid (SkinnedMesh) ja morph-animatsioonid liiguvad.
+- Hiire lukustus (requestPointerLock, FPS-kaamera) ja täisekraan
+  (requestFullscreen). Esc vabastab hiire.
 
 v0.33.1 PARANDUS: mängude GLSL-shaderid tõlgitakse laiemalt.
 - Kuni 28 uniform-float'i (enne 12): Kuningriikide meri sügavustekstuuriga
