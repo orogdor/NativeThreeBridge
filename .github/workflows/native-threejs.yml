@@ -551,7 +551,10 @@ jobs:
               Write-Host "Test release $tag already exists; it is NOT overwritten"
             }
           } else {
-            gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA @releaseFlags --title "NativeThreeBridge $tag – Launcher + Kuningriigid, Game1 forest battle" --notes "Download NativeThreeBridge-Windows-x64.zip and extract everything. Launcher.exe checks GitHub, installs the newest engine and Kuningriigid (only changed files, SHA checked, rollback copies in engine.previous and game2.previous) and enables Mängi only when both are current; it stays open until the game window is on screen. Game1.exe starts the forest battle test (game1). Webapp JavaScript runs on V8 13; rendering is the NativeThreeBridge DX12 engine."
+            # Release title = what the README says about this version (Launcher.exe shows it as news).
+            $summary = ((Get-Content README.md -First 1) -replace '^#\s*NativeThreeBridge\s+v\S+\s*[—–-]\s*', '').Trim()
+            if (!$summary) { $summary = 'Windows release' }
+            gh release create $tag release/NativeThreeBridge-Windows-x64.zip release/NativeThreeBridge-Engine-x64.zip release/engine-update-v2.json --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA @releaseFlags --title "NativeThreeBridge $tag – $summary" --notes "Download NativeThreeBridge-Windows-x64.zip and extract everything. Launcher.exe checks GitHub, installs the newest engine and Kuningriigid (only changed files, SHA checked, rollback copies in engine.previous and game2.previous) and enables Mängi only when both are current; it stays open until the game window is on screen. Game1.exe starts the forest battle test (game1). Webapp JavaScript runs on V8 13; rendering is the NativeThreeBridge DX12 engine."
             if ($LASTEXITCODE -ne 0) { throw "GitHub release failed" }
           }
       - name: Publish downloadable webapp test pre-release for this pull request

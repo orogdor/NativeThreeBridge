@@ -125,7 +125,11 @@ internal static class LauncherInfo
                 if (engineLatest == "") engineLatest = tag;
                 string title = release.TryGetProperty("name", out JsonElement n) && n.ValueKind == JsonValueKind.String ? n.GetString()! : tag;
                 if (DateTimeOffset.TryParse(release.GetProperty("published_at").GetString(), out DateTimeOffset date))
+                {
+                    // "NativeThreeBridge v0.36.0 – Launcher ..." -> "v0.36.0 – Launcher ..."
+                    if (title.StartsWith("NativeThreeBridge ", StringComparison.Ordinal)) title = title["NativeThreeBridge ".Length..];
                     news.Add((date, "Engine", title.Contains(tag) ? title : tag + " – " + title));
+                }
             }
         }
         string commit = "";
