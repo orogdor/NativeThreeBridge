@@ -593,6 +593,7 @@ private:
     std::vector<std::vector<float>> pendingPasses_, passes_;
     std::size_t pendingPassCount_ = 0, passCount_ = 0;
     UINT lastDraws_ = 0;
+    bool shownSignaled_ = false; // Launcher.exe's "game window is showing the game" event
     // Mouse moves are delivered to JavaScript once per frame (as browsers
     // do), not once per Windows message: a 1000 Hz mouse would otherwise run
     // the game's pointermove handler (often a raycast) ~16 times per frame.
@@ -2510,6 +2511,12 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     const auto presentStart = std::chrono::steady_clock::now();
     const HRESULT present = swap_->Present(presentInterval_, 0);
     presentMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - presentStart).count();
+    // Launcher.exe waits for the first frame that shows something (3D or HTML UI).
+    if (!shownSignaled_ && (drawsThisFrame > 0 || (uiReady_ && uiVisible_))) {
+        shownSignaled_ = true;
+        const std::wstring name = L"Local\\NativeThreeBridge-Shown-" + std::to_wstring(GetCurrentProcessId());
+        if (HANDLE shown = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str())) { SetEvent(shown); CloseHandle(shown); }
+    }
     if (present == DXGI_ERROR_DEVICE_REMOVED || present == DXGI_ERROR_DEVICE_RESET) check(present, "Present (GPU device lost)");
 }
 

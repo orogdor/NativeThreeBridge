@@ -1776,7 +1776,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR commandLine,int show) {
             return NativeWebapp_Run(instance,webappRoot);
         if(!missingWebapp.empty()){
             const std::wstring text=L"No index.html in "+missingWebapp.wstring()+
-                L"\nThe webapp folder is empty or incomplete. For game2 run UpdateKuningriigid.exe first.";
+                L"\nThe webapp folder is empty or incomplete. For game2 start Launcher.exe: it installs the game first.";
             if(GetEnvironmentVariableA("CI",nullptr,0)==0)
                 MessageBoxW(nullptr,text.c_str(),L"NativeThreeBridge",MB_OK|MB_ICONWARNING);
             return 43;

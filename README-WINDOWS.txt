@@ -1,17 +1,24 @@
-NativeThreeBridge v0.35.0 - KAKS MÄNGU, ÜKS ENGINE
-=================================================
+NativeThreeBridge v0.36.0 - KÄIVITAJA + METSALAHINGU TEST
+=========================================================
+Launcher.exe         mängu käivitaja (Kuningriigid kaustas game2):
+                     kontrollib GitHubist uusimat engine'i ja mängu,
+                     paigaldab need (ainult muutunud failid, SHA kontroll,
+                     eelmised versioonid kaustades engine.previous ja
+                     game2.previous) ning lubab nupu MÄNGI alles siis, kui
+                     mõlemad on uusimad (roheline ring). Käivitaja jääb lahti
+                     sildiga "Laen mängu…", kuni mänguaken on ekraanil.
 Game1.exe            metsalahingu test (kaust game1)
-Game2.exe            webapp kaustas game2 (alguses tühi)
-UpdateKuningriigid.exe  laeb Kuningriigid GitHubist kausta game2 või uuendab
-                     selle uusimale versioonile (ainult muutunud failid,
-                     eelmine versioon jääb kausta game2.previous)
-UpdateEngine.exe     uuendab GitHubi uusimast stabiilsest väljalaskest ainult
-                     engine'i faile (NativeThree-Engine.exe, Game1/Game2,
-                     V8 DLL-id); game1 ja game2 kaustu ei puudutata.
-                     Eelmine engine jääb kausta engine.previous.
-Esimene kord: käivita UpdateKuningriigid.exe (umbes 550 MB), siis Game2.exe.
-Kuningriigid käivitub umbes 25 s (maailma genereerimine) enne akna avanemist.
-Mõlemad uuendajad nõuavad, et Game1/Game2 oleks suletud.
+NativeThree-Updater.exe, NativeThree-Engine.exe: käivitaja abiprogrammid,
+                     neid ei pea ise avama.
+launcher.json        millist mängu käivitaja paigaldab (GitHubi hoidla, kaust).
+Esimene kord: käivita Launcher.exe. Kuningriigid laaditakse alla (umbes
+550 MB) ja mäng käivitub umbes 25 s (maailma genereerimine).
+Kui internetti pole, saab paigaldatud mängu ikkagi käivitada.
+Pilt: mängu native-launcher.json "image" või mängu peamenüü taustapilt.
+Uudised: mängu viimased GitHubi muudatused ja engine'i väljalasked.
+
+v0.36.0 UUS: Game2.exe, UpdateKuningriigid.exe ja UpdateEngine.exe asemel
+on üks Launcher.exe (vanad failid eemaldatakse esimesel käivitusel).
 
 v0.35.0 UUS (kõigile mängudele):
 - Varjud mitmest tulest korraga (kuni 8), ka PointLight (lamp, tõrvik)
@@ -66,8 +73,7 @@ v0.32.20 TEST: Three.js veebirakenduste staatiline geomeetria joonistatakse
 DX12 GPU-lokaalsest mälust. Dünaamilise geomeetria üleslaadimine jätkub
 voogedastusmälust. Eraldi DX12 renderduslõime kasutamisel võib JavaScript
 järgmise kaadri andmeid saata eelmise kaadri kuvamise ooteajal.
-Testimiseks paki Windowsi ZIP eraldi kausta. UpdateEngine.exe valib
-jätkuvalt uusima stabiilse versiooni.
+Testimiseks paki Windowsi ZIP eraldi kausta.
 
 v0.32.1 PARANDUS: onBeforeCompile materjalides, mille tipuatribuut juhib
 smoothstep-läbipaistvust, tõlgitakse mask nüüd RGBA tipuvärvideks.

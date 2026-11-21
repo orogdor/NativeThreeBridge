@@ -1,42 +1,69 @@
 using System.Net;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 namespace NativeThreeBridge.Updates;
 
+// launcher.json next to the EXEs: which game folder and GitHub repositories
+// the launcher installs (defaults: Kuningriigid in game2).
+internal static class Config
+{
+    internal static string GameFolder = "game2";
+    internal static string GameRepository = "orogdor/Kuningriigid";
+    internal static string GameBranch = "main";
+    internal static string EngineRepository = "orogdor/NativeThreeBridge";
+
+    internal static void Load()
+    {
+        string path = Path.Combine(Common.Root, "launcher.json");
+        if (!File.Exists(path)) return;
+        using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(path));
+        JsonElement r = doc.RootElement;
+        string Get(string key, string fallback) => r.TryGetProperty(key, out JsonElement v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : fallback;
+        GameFolder = Get("gameFolder", GameFolder);
+        GameRepository = Get("gameRepository", GameRepository);
+        GameBranch = Get("gameBranch", GameBranch);
+        EngineRepository = Get("engineRepository", EngineRepository);
+        if (!System.Text.RegularExpressions.Regex.IsMatch(GameFolder, @"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$") ||
+            !System.Text.RegularExpressions.Regex.IsMatch(GameRepository, @"^[\w.-]+/[\w.-]+$") ||
+            !System.Text.RegularExpressions.Regex.IsMatch(EngineRepository, @"^[\w.-]+/[\w.-]+$") ||
+            !System.Text.RegularExpressions.Regex.IsMatch(GameBranch, @"^[\w./-]{1,80}$"))
+            throw new InvalidDataException("launcher.json has an invalid value.");
+    }
+}
+
+// Launcher protocol: with --machine every report is one UTF-8 line on stdout
+// (PROGRESS <permille>\t<text>, DONE\t<text>, ERROR\t<text>, ...).
+internal static class Out
+{
+    internal static bool Machine;
+    private static readonly object Gate = new();
+    internal static void Line(string text)
+    {
+        lock (Gate) { Console.Out.Write(text.Replace('\r', ' ').Replace('\n', ' ') + "\n"); Console.Out.Flush(); }
+    }
+    internal static void Progress(long done, long total, string text)
+    {
+        if (Machine) Line($"PROGRESS {(total > 0 ? Math.Clamp(done * 1000 / total, 0, 1000) : -1)}\t{text}");
+    }
+    internal static void Say(string text)
+    {
+        if (Machine) Line("STEP\t" + text); else Console.WriteLine(text);
+    }
+}
+
 internal static class Common
 {
     internal static readonly string Root = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
     internal static readonly HttpClient Http = new(new HttpClientHandler { AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate })
     { Timeout = TimeSpan.FromMinutes(5) };
-    static Common() => Http.DefaultRequestHeaders.UserAgent.ParseAdd("NativeThreeBridge-Updater/0.30");
-
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-    private static extern int MessageBoxW(nint window, string message, string caption, uint flags);
-
-    internal static int Run(string name, string[] args, Func<Task<string>> action, Action selfTest)
+    static Common()
     {
-        try
-        {
-            if (args.SequenceEqual(["--self-test"])) { selfTest(); return 0; }
-            if (args.Length != 0) throw new InvalidOperationException("Tundmatu valik. Käivita uuendaja ilma argumentideta.");
-            Console.WriteLine(name + ": kontrollin GitHubi...");
-            string message = action().GetAwaiter().GetResult();
-            Console.WriteLine(message);
-            File.AppendAllText(Path.Combine(Root, name + ".log"), $"{DateTimeOffset.UtcNow:u} {message}{Environment.NewLine}");
-            if (Environment.GetEnvironmentVariable("CI") is null) MessageBoxW(0, message, name, 0x40);
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            string message = ex.GetBaseException().Message;
-            Console.Error.WriteLine("Uuendamine ebaõnnestus: " + message);
-            try { File.AppendAllText(Path.Combine(Root, name + ".log"), $"{DateTimeOffset.UtcNow:u} ERROR: {message}{Environment.NewLine}"); } catch { }
-            if (Environment.GetEnvironmentVariable("CI") is null) MessageBoxW(0, "Uuendamine ebaõnnestus. Paigaldust ei muudetud.\n\n" + message, name, 0x10);
-            return 1;
-        }
+        Http.DefaultRequestHeaders.UserAgent.ParseAdd("NativeThreeBridge-Updater/0.36");
+        // CI: a token lifts GitHub's anonymous rate limit (60 API calls per hour).
+        string? token = Environment.GetEnvironmentVariable("NTB_GITHUB_TOKEN");
+        if (!string.IsNullOrWhiteSpace(token)) Http.DefaultRequestHeaders.Authorization = new("Bearer", token);
     }
 
     internal static async Task<JsonDocument> GetJson(string url)
@@ -160,6 +187,7 @@ internal sealed class ProgressMeter(string label)
     {
         string text = total > 0 ? $"{label}: {done / 1_000_000} / {total / 1_000_000} MB ({Percent(done, total)}%)"
                                 : $"{label}: {done / 1_000_000} MB alla laaditud";
+        if (Out.Machine) { Out.Progress(done, total, text); return; }
         Console.Write("\r" + text.PadRight(60));
         try { Console.Title = text; } catch { }
     }
@@ -167,6 +195,7 @@ internal sealed class ProgressMeter(string label)
     internal static void Files(string label, int done, int total, long doneBytes = -1, long totalBytes = -1)
     {
         string text = $"{label}: {done} / {total} faili" + (totalBytes > 0 ? $", {doneBytes / 1_000_000} / {totalBytes / 1_000_000} MB" : "");
+        if (Out.Machine) { Out.Progress(totalBytes > 0 ? doneBytes : done, totalBytes > 0 ? totalBytes : total, text); return; }
         Console.Write("\r" + text.PadRight(60));
         try { Console.Title = text; } catch { }
     }
@@ -179,6 +208,7 @@ internal sealed class ProgressMeter(string label)
         int percent = Percent(completed, total);
         if (percent == lastPercent) return;
         lastPercent = percent;
+        if (Out.Machine) { Out.Progress(completed, total, $"{label}: {completed / 1_000_000} / {total / 1_000_000} MB"); return; }
         Console.Write($"\r{label}: {percent,3}%");
         try { Console.Title = $"{label}: {percent}%"; } catch { }
         if (percent == 100) Console.WriteLine();

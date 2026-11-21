@@ -1,7 +1,8 @@
-/* Game1.exe / Game2.exe: tiny launchers that start the shared engine
- * (NativeThree-Engine.exe) on one game folder. Built twice from this file:
- *   cl /DNTB_GAME=1 ... /Fe:Game1.exe   -> forest battle in game1\ (scene.js)
- *   cl /DNTB_GAME=2 ... /Fe:Game2.exe   -> webapp in game2\ (index.html, Kuningriigid)
+/* Game1.exe: tiny launcher that starts the shared engine (NativeThree-Engine.exe)
+ * on the forest battle test in game1\ (scene.js):
+ *   cl /DNTB_GAME=1 ... /Fe:Game1.exe
+ * The real game (game2, Kuningriigid) is started by Launcher.exe, which
+ * updates the engine and the game first. NTB_GAME=2 is no longer shipped.
  * Updating the engine never touches the game folders, and updating a game
  * never touches the engine.
  */
@@ -34,7 +35,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR args, int sho
 
     swprintf_s(engine, MAX_PATH, L"%s\\NativeThree-Engine.exe", folder);
     if (!exists(engine)) {
-        message(L"NativeThree-Engine.exe puudub.\nPaki kogu ZIP lahti või käivita UpdateEngine.exe.");
+        message(L"NativeThree-Engine.exe puudub.\nPaki kogu ZIP uuesti lahti.");
         return 41;
     }
 #if NTB_GAME == 1
@@ -47,7 +48,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR args, int sho
 #else
     swprintf_s(check, MAX_PATH, L"%s\\game2\\index.html", folder);
     if (!exists(check)) {
-        message(L"Kaust game2 on tühi.\nKäivita UpdateKuningriigid.exe, et Kuningriigid GitHubist alla laadida, ja ava siis uuesti Game2.exe.");
+        message(L"Kaust game2 on tühi.\nKäivita Launcher.exe.");
         return 42;
     }
     swprintf_s(command, 3 * MAX_PATH, L"\"%s\" --webapp \"%s\\game2\"", engine, folder);

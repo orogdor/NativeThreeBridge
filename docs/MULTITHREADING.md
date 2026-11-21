@@ -47,7 +47,7 @@ Not in workers: DOM, `OffscreenCanvas`/WebGL, `MessageChannel`, nested
 workers. Messages and worker errors reach the page at the start of the next
 frame, like browser tasks between frames.
 
-Only the V8 build (Game2.exe, the shipped engine) has workers; the QuickJS
+Only the V8 build (the shipped engine started by Launcher.exe) has workers; the QuickJS
 test build keeps `Worker` undefined, so feature detection still works.
 
 ## Measuring
