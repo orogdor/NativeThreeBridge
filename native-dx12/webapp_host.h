@@ -43,6 +43,12 @@ public:
         return false;
     }
     virtual void releaseTexture(std::uint32_t id) { (void)id; }
+    // WebGLRenderTarget: texture `id` that passes with header float 55 == id
+    // render into (linear RGBA16F colour + depth). releaseTexture frees it.
+    virtual bool createRenderTarget(std::uint32_t id, std::uint32_t width, std::uint32_t height) {
+        (void)id; (void)width; (void)height;
+        return false;
+    }
     // Texture `id` from the current pixels of Canvas 2D surface `canvasId`.
     virtual bool uploadCanvasTexture(std::uint32_t id, std::uint32_t canvasId, std::uint32_t flags) {
         (void)id; (void)canvasId; (void)flags;
@@ -91,6 +97,11 @@ public:
     }
     // CSS cursor name under the pointer ("pointer", "text", "auto" ...).
     virtual void setCursor(const std::string& cursor) { (void)cursor; }
+    // Element.requestPointerLock(): hide the cursor, keep it in the window
+    // and report raw movement (WebappHost::pointerMovement). false: refused.
+    virtual bool setPointerLock(bool locked) { (void)locked; return false; }
+    // Element.requestFullscreen(): borderless window over the monitor.
+    virtual bool setFullscreen(bool fullscreen) { (void)fullscreen; return false; }
     // Width in px of `text` in the first installed family of the comma
     // separated `families`; negative when the sink cannot measure text.
     virtual double measureText(const std::string& families, double sizePx, int weight, bool italic,
@@ -106,9 +117,9 @@ inline std::size_t webappUiHeaderFloats(float version) {
 }
 
 // Same numbers as js/native-renderer.mjs.
-constexpr std::size_t kWebappPassHeaderFloats = 64;
+constexpr std::size_t kWebappPassHeaderFloats = 96;
 constexpr std::size_t kWebappLightFloats = 16;
-constexpr std::size_t kWebappDrawFloats = 88;
+constexpr std::size_t kWebappDrawFloats = 96;
 constexpr std::uint32_t kWebappTextureSrgb = 1, kWebappTextureMipmaps = 2;
 constexpr std::size_t kWebappMaxLights = 16;
 
@@ -160,6 +171,10 @@ public:
              bool alt, bool ctrl, bool shift, bool meta);
     void pointer(const char* kind, double x, double y, int button);   // "down" | "up" | "move"
     void wheel(double x, double y, double deltaX, double deltaY);
+    // While the pointer is locked: relative mouse movement in pixels.
+    void pointerMovement(double dx, double dy);
+    // The engine ended pointer lock or fullscreen (Escape, focus loss).
+    void lockChanged(bool pointerLocked, bool fullscreen);
     void focus(bool focused);
     // JSON: {booted, frame, title, errors, errorCount, bootError, unsupported}
     std::string statusJson();

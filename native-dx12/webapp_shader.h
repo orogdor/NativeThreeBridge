@@ -2,7 +2,7 @@
 // HLSL for the generic webapp renderer (webapp_dx12.cpp). Approximates the
 // Three.js r181 MeshStandard/Lambert/Phong/Basic lighting with
 // physically based light units (same light intensities as WebGLRenderer).
-// Kept well below MSVC's 16 KB string-literal limit.
+// Split into adjacent raw literals: MSVC limits each piece to 16 KB.
 static const char* kWebappShader = R"HLSL(
 cbuffer Frame : register(b0) {
     float4x4 gView;
@@ -10,9 +10,12 @@ cbuffer Frame : register(b0) {
     float4 gCamera;   // xyz position, w light count
     float4 gAmbient;  // rgb ambient irradiance, w exposure
     float4 gLights[64];
-    float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure
+    float4 gTone;     // x tone mapping curve (THREE.*ToneMapping), y exposure, z 1 = render target (linear)
     float4 gFogColor;
     float4 gFog;      // mode, near or density, far
+    float4x4 gShadowMatrix; // world -> shadow light clip (light.shadow.camera)
+    float4 gShadow;   // enabled, light index, bias, normalBias
+    float4 gShadow2;  // 1 / map size, radius, intensity, unused
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
@@ -26,6 +29,7 @@ cbuffer Draw : register(b1) {
     float4 gColorStage[3]; // live uniforms from the translated material
     float4 gMaterialOptions; // flip Y, repeat, mirror bitmasks
     float4 gColorStageMore[4]; // translated material uniforms 12..27
+    float4 gStdMap;   // normalScale x, y (sign: uv flip), aoMapIntensity, unused
 };
 Texture2D gMap : register(t0);
 Texture2D gMaterialMap0 : register(t1);
@@ -40,6 +44,8 @@ Texture2D gMaterialMap8 : register(t9);
 SamplerState gRepeat : register(s0);
 SamplerState gClamp : register(s1);
 SamplerState gMirror : register(s2);
+Texture2D<float> gShadowMap : register(t10);
+SamplerComparisonState gShadowSampler : register(s3);
 static const uint F_VERTEX_COLORS = 8, F_UNLIT = 16, F_NORMAL_COLOR = 512, F_INSTANCE_COLORS = 1024, F_FLAT = 2048,
                   F_MAP = 4096, F_MAP_REPEAT = 8192, F_MAP_MIRROR = 16384, F_FAR_DEPTH = 32768, F_NO_TONE_MAP = 65536, F_FOG = 131072, F_FRESNEL = 262144,
                   F_MIRRORED = 524288;
@@ -93,6 +99,38 @@ VSOut VSMain(VSIn i) {
     return o;
 }
 
+// Depth pass for light.shadow (one directional or spot light per render()).
+VSOut VSShadow(VSIn i) {
+    VSOut o = VSMain(i);
+    float4 clip = mul(gShadowMatrix, float4(o.world, 1));
+    clip.z = 0.5 * (clip.z + clip.w);
+    o.pos = clip;
+    return o;
+}
+void PSShadow(VSOut i) {
+    uint flags = (uint)gParams.z;
+    if ((flags & F_MAP) && gUvU.w > 0) {
+        float a = gColor.a * i.col.a * ((flags & F_MAP_REPEAT) ? gMap.Sample(gRepeat, i.uv).a : gMap.Sample(gClamp, i.uv).a);
+        if (a < gUvU.w) discard;   // alphaTest cut-outs (leaves) cast cut-out shadows
+    }
+}
+// Three.js PCF: 1 = lit, 0 = in shadow. normalBias moves along the normal, bias shifts depth.
+float shadowFactor(float3 world, float3 n) {
+    float4 s = mul(gShadowMatrix, float4(world + n * gShadow.w, 1));
+    if (s.w <= 0) return 1;
+    s.xyz /= s.w;
+    float2 uv = float2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5);
+    float depth = s.z * 0.5 + 0.5 + gShadow.z;
+    if (uv.x < 0 || uv.y < 0 || uv.x > 1 || uv.y > 1 || depth > 1) return 1;
+    float spread = gShadow2.x * max(gShadow2.y, 1);
+    float sum = 0;
+    [unroll] for (int y = -1; y <= 1; y++)
+        [unroll] for (int x = -1; x <= 1; x++)
+            sum += gShadowMap.SampleCmpLevelZero(gShadowSampler, uv + float2(x, y) * spread, depth);
+    return sum / 9;
+}
+
+)HLSL" R"HLSL(
 float3 toSRGB(float3 c) {
     c = saturate(c);
     return c < 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
@@ -129,13 +167,23 @@ float3 toneMap(float3 c, uint flags) {
 }
 
 float4 shadeOutput(float3 rgb, float alpha, uint flags, float depth) {
-    float3 color = toSRGB(toneMap(rgb, flags));
+    // Render targets keep linear colour without tone mapping (like Three.js);
+    // the screen gets tone mapping and sRGB.
+    float3 color = gTone.z > 0 ? rgb : toSRGB(toneMap(rgb, flags));
     if ((flags & F_FOG) && gFog.x != 0) {
         float d = gFog.y * depth;
         float f = gFog.x == 2 ? 1 - exp(-d * d) : smoothstep(gFog.y, gFog.z, depth);
         color = lerp(color, gFogColor.rgb, f);
     }
     return float4(color, alpha);
+}
+
+// Standard material maps in t1..t6 (normal, roughness, metalness, emissive, ao, alpha).
+float4 stdSample(Texture2D t, uint slot, float2 uv, float2 dx, float2 dy) {
+    uint bit = 1u << slot;
+    if (((uint)gMaterialOptions.y & bit) != 0) return t.SampleGrad(gRepeat, uv, dx, dy);
+    if (((uint)gMaterialOptions.z & bit) != 0) return t.SampleGrad(gMirror, uv, dx, dy);
+    return t.SampleGrad(gClamp, uv, dx, dy);
 }
 
 // NT_COLOR_PATCH_FUNCTION
@@ -151,6 +199,11 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         albedo *= t.rgb;
         alphaOut *= t.a;
     }
+    float3 dpx = ddx(i.world), dpy = ddy(i.world);
+#ifndef NT_COLOR_PATCH
+    uint stdMaps = (uint)gMaterialOptions.w;
+    if (stdMaps & 32u) alphaOut *= stdSample(gMaterialMap5, 5, i.uv, uvDx, uvDy).g;   // alphaMap
+#endif
 #ifdef NT_COLOR_PATCH
     float4 patchedColor = float4(albedo, alphaOut);
     float3 patchedNormal = normalize(i.nrm);
@@ -169,7 +222,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         return shadeOutput(albedo, alphaOut, flags, i.fogDepth);
     }
     float3 V = normalize(gCamera.xyz - i.world);
-    float3 flatN = normalize(cross(ddx(i.world), ddy(i.world)));
+    float3 flatN = normalize(cross(dpx, dpy));
     if (dot(flatN, V) < 0) flatN = -flatN;
     float3 N = normalize(i.nrm);
 #ifdef NT_COLOR_PATCH
@@ -178,6 +231,19 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
     if (flags & F_MIRRORED) front = !front;   // reversed winding: SV_IsFrontFace is inverted
     if (!front) N = -N;
     if (flags & F_FLAT) N = flatN;
+#ifndef NT_COLOR_PATCH
+    if ((stdMaps & 1u) && !(flags & F_FLAT)) {
+        // normalMap without tangents: Three.js perturbNormal2Arb (screen-space derivatives).
+        float3 mapN = stdSample(gMaterialMap0, 0, i.uv, uvDx, uvDy).xyz * 2 - 1;
+        mapN.xy *= gStdMap.xy;
+        float3 q1perp = cross(dpy, N), q0perp = cross(N, dpx);
+        float3 T = q1perp * uvDx.x + q0perp * uvDy.x;
+        float3 B = q1perp * uvDx.y + q0perp * uvDy.y;
+        float det = max(dot(T, T), dot(B, B));
+        float scale = det == 0 ? 0 : rsqrt(det);
+        N = normalize(T * (mapN.x * scale) + B * (mapN.y * scale) + N * mapN.z);
+    }
+#endif
     if (flags & F_NORMAL_COLOR) {
         float3 vn = normalize(mul((float3x3)gView, N));
         return float4(vn * 0.5 + 0.5, alphaOut);
@@ -187,12 +253,26 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
 #ifdef NT_COLOR_PATCH
     rough = clamp(roughness, 0.04, 1.0);
 #endif
+    float3 emissive = gEmissive.rgb;
+    float ao = 1;
+#ifndef NT_COLOR_PATCH
+    if (stdMaps & 2u) rough = clamp(rough * stdSample(gMaterialMap1, 1, i.uv, uvDx, uvDy).g, 0.04, 1.0);
+    if (stdMaps & 4u) metal = saturate(metal * stdSample(gMaterialMap2, 2, i.uv, uvDx, uvDy).b);
+    if (stdMaps & 8u) emissive *= stdSample(gMaterialMap3, 3, i.uv, uvDx, uvDy).rgb;
+    if (stdMaps & 16u) ao = lerp(1, stdSample(gMaterialMap4, 4, i.uv, uvDx, uvDy).r, gStdMap.z);
+#endif
     float alpha = rough * rough;
     float shininess = gEmissive.w;
     float3 diffuse = albedo * (1 - metal);
     float3 f0 = lerp(float3(0.04, 0.04, 0.04), albedo, metal);
     float3 indirect = gAmbient.rgb;
     float3 direct = 0;
+    float shadow = 1;
+    if (gShadow.x > 0 && ((uint)gParams.w & 2u)) {   // mesh.receiveShadow
+        float3 geometric = normalize(i.nrm);
+        if (!front) geometric = -geometric;
+        shadow = lerp(1, shadowFactor(i.world, geometric), saturate(gShadow2.z));
+    }
     uint count = (uint)gCamera.w;
     for (uint li = 0; li < count; li++) {
         float4 a = gLights[li * 4 + 0], b = gLights[li * 4 + 1], c = gLights[li * 4 + 2], d = gLights[li * 4 + 3];
@@ -215,6 +295,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
             if (cutoff > 0) { float r = saturate(1 - pow(dist / cutoff, 4)); attenuation *= r * r; }
             if (type == 5) attenuation *= smoothstep(d.x, d.y, dot(-L, c.xyz));
         }
+        if (li == (uint)gShadow.y) attenuation *= shadow;
         float nl = saturate(dot(N, L));
         if (nl <= 0 || attenuation <= 0) continue;
         float3 irradiance = color * (nl * attenuation);
@@ -235,7 +316,7 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         }
         direct += irradiance * (diffuse / PI + spec);
     }
-    float3 lit = indirect * diffuse / PI + direct + gEmissive.rgb;
+    float3 lit = indirect * ao * diffuse / PI + direct + emissive;
     if (flags & F_FRESNEL) {
         float angle = 1 - saturate(dot(N, V));
         float amount = saturate(gFresnel.x + gFresnel.y * pow(angle, gFresnel.z));

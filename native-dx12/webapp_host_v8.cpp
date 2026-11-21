@@ -813,6 +813,14 @@ void ntReleaseTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     if (info.Length() >= 1 && self->sink)
         self->sink->releaseTexture(info[0]->Uint32Value(self->isolate->GetCurrentContext()).FromMaybe(0));
 }
+void ntCreateRenderTarget(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    if (info.Length() < 3) return self->throwError("type", "createRenderTarget(id, width, height)");
+    v8::Local<v8::Context> ctx = self->isolate->GetCurrentContext();
+    const bool ok = self->sink && self->sink->createRenderTarget(info[0]->Uint32Value(ctx).FromMaybe(0), info[1]->Uint32Value(ctx).FromMaybe(0),
+                                                                 info[2]->Uint32Value(ctx).FromMaybe(0));
+    info.GetReturnValue().Set(ok);
+}
 void ntUploadCanvasTexture(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() < 3) return self->throwError("type", "uploadCanvasTexture(id, canvasId, flags)");
@@ -883,6 +891,16 @@ void ntReportUi(const v8::FunctionCallbackInfo<v8::Value>& info) {
 void ntSetCursor(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
     if (info.Length() >= 1 && self->sink) self->sink->setCursor(self->utf8(info[0]));
+}
+void ntSetPointerLock(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    const bool ok = info.Length() >= 1 && self->sink && self->sink->setPointerLock(info[0]->BooleanValue(self->isolate));
+    info.GetReturnValue().Set(ok);
+}
+void ntSetFullscreen(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Impl* self = Impl::fromInfo(info);
+    const bool ok = info.Length() >= 1 && self->sink && self->sink->setFullscreen(info[0]->BooleanValue(self->isolate));
+    info.GetReturnValue().Set(ok);
 }
 void ntMeasureText(const v8::FunctionCallbackInfo<v8::Value>& info) {
     Impl* self = Impl::fromInfo(info);
@@ -1635,8 +1653,10 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"uploadInstances", ntUploadInstances}, {"releaseInstances", ntReleaseInstances}, {"submitPass", ntSubmitPass},
         {"registerColorPatch", ntRegisterColorPatch},
         {"uploadTexture", ntUploadTexture}, {"releaseTexture", ntReleaseTexture}, {"uploadCanvasTexture", ntUploadCanvasTexture},
+        {"createRenderTarget", ntCreateRenderTarget},
         {"canvasCommands", ntCanvasCommands}, {"canvasRead", ntCanvasRead}, {"canvasWrite", ntCanvasWrite}, {"registerImage", ntRegisterImage},
         {"submitUi", ntSubmitUi}, {"measureText", ntMeasureText}, {"setCursor", ntSetCursor}, {"reportUi", ntReportUi},
+        {"setPointerLock", ntSetPointerLock}, {"setFullscreen", ntSetFullscreen},
         {"workerCreate", ntWorkerCreate}, {"workerPost", ntWorkerPost}, {"workerTerminate", ntWorkerTerminate},
         {"structuredClone", ntStructuredClone}, {"hardwareConcurrency", ntHardwareConcurrency}, {"now", ntNow},
         {"readBinaryAsync", ntReadBinaryAsync},
@@ -1739,6 +1759,16 @@ void WebappHost::wheel(double x, double y, double deltaX, double deltaY) {
     v8::Local<v8::Value> args[4] = {v8::Number::New(isolate, x), v8::Number::New(isolate, y),
                                     v8::Number::New(isolate, deltaX), v8::Number::New(isolate, deltaY)};
     impl_->callHost("wheel", 4, args);
+}
+void WebappHost::pointerMovement(double dx, double dy) {
+    NT_V8_SCOPE();
+    v8::Local<v8::Value> args[2] = {v8::Number::New(isolate, dx), v8::Number::New(isolate, dy)};
+    impl_->callHost("pointerMovement", 2, args);
+}
+void WebappHost::lockChanged(bool pointerLocked, bool fullscreen) {
+    NT_V8_SCOPE();
+    v8::Local<v8::Value> args[2] = {v8::Boolean::New(isolate, pointerLocked), v8::Boolean::New(isolate, fullscreen)};
+    impl_->callHost("lockChanged", 2, args);
 }
 void WebappHost::focus(bool focused) {
     NT_V8_SCOPE();

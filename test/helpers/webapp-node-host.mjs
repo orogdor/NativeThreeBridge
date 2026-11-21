@@ -203,7 +203,7 @@ export async function runWebapp(root, options = {}) {
           alphaMax = Math.max(alphaMax, a);
         }
       }
-      rec.geometries.set(id, { vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax, gpuLocal });
+      rec.geometries.set(id, { positions: Float32Array.from(positions), vertexCount, indexCount: indices ? indices.length : 0, hasNormals: !!normals, hasColors: !!colors, colorChannels: colors ? colors.length / (positions.length / 3) : 0, hasUvs: !!uvs, alphaMin, alphaMax, gpuLocal });
     },
     // Encoded image bytes (width 0) or raw RGBA8 pixels. The engine decodes
     // natively with WIC; here only the header is checked.
@@ -219,7 +219,11 @@ export async function runWebapp(root, options = {}) {
       rec.textureUploads = (rec.textureUploads || 0) + 1;
       return true;
     },
-    releaseTexture(id) { rec.textures.delete(id); },
+    releaseTexture(id) { rec.textures.delete(id); rec.renderTargets?.delete(id); },
+    createRenderTarget(id, width, height) {
+      (rec.renderTargets ||= new Map()).set(id, { width, height });
+      return true;
+    },
     // Canvas 2D command batches (executed by Direct2D in the engine).
     canvasCommands(id, width, height, ops, floats, strings) {
       view(ops, 'canvas commands');
@@ -296,9 +300,11 @@ export function decodePass(p) {
     view: Array.from(p.subarray(0, 16)), projection: Array.from(p.subarray(16, 32)),
     cameraPosition: [p[32], p[33], p[34]], clear: [p[36], p[37], p[38], p[39]],
     ambient: [p[40], p[41], p[42]], flags: p[44], size: [p[45], p[46]], exposure: p[47], toneMapping: p[48], lights: [], draws: [],
+    target: p[55],
+    shadow: p[56] ? { light: p[57], bias: p[58], normalBias: p[59], mapSize: p[60], radius: p[61], intensity: p[62], spot: !!p[63], viewProjection: Array.from(p.subarray(64, 80)) } : null,
   };
   let o = PASS_HEADER_FLOATS;
   for (let i = 0; i < lightCount; i++, o += LIGHT_FLOATS) pass.lights.push({ type: p[o], color: [p[o + 1], p[o + 2], p[o + 3]], position: [p[o + 4], p[o + 5], p[o + 6]], distance: p[o + 7], direction: [p[o + 8], p[o + 9], p[o + 10]], decay: p[o + 11], extra: [p[o + 12], p[o + 13], p[o + 14]] });
-  for (let i = 0; i < drawCount; i++, o += DRAW_FLOATS) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)), reflection: Array.from(p.subarray(o + 40, o + 48)), colorStage: p[o + 48], colorUniforms: [...p.subarray(o + 49, o + 61), ...p.subarray(o + 72, o + 88)], materialTextures: Array.from(p.subarray(o + 61, o + 70)) });
+  for (let i = 0; i < drawCount; i++, o += DRAW_FLOATS) pass.draws.push({ geometryId: p[o], instanceId: p[o + 1], instanceCount: p[o + 2], flags: p[o + 3], start: p[o + 4], count: p[o + 5], roughness: p[o + 6], metalness: p[o + 7], color: [p[o + 8], p[o + 9], p[o + 10]], opacity: p[o + 11], emissive: [p[o + 12], p[o + 13], p[o + 14]], shininess: p[o + 15], matrix: Array.from(p.subarray(o + 16, o + 32)), textureId: p[o + 32], alphaTest: p[o + 33], uvTransform: Array.from(p.subarray(o + 34, o + 40)), reflection: Array.from(p.subarray(o + 40, o + 48)), colorStage: p[o + 48], colorUniforms: [...p.subarray(o + 49, o + 61), ...p.subarray(o + 72, o + 88)], materialTextures: Array.from(p.subarray(o + 61, o + 70)), shadow: p[o + 88], standardMaps: p[o + 89], normalScale: [p[o + 90], p[o + 91]], aoMapIntensity: p[o + 92] });
   return pass;
 }

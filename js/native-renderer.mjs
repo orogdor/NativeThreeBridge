@@ -11,9 +11,18 @@
 //     a fixed-size record per visible draw.
 // This module has no imports so it can be unit tested with any THREE + fake nt.
 
-export const PASS_HEADER_FLOATS = 64;
+// Header 55: render target texture id (0 = window).
+// Header 56..63: shadow (enabled, light index, bias, normalBias, mapSize,
+// radius, intensity, perspective); 64..79: shadow camera view-projection.
+export const PASS_HEADER_FLOATS = 96;
 export const LIGHT_FLOATS = 16;
-export const DRAW_FLOATS = 88;
+export const DRAW_FLOATS = 96;
+// Draw float 88: shadow bits (castShadow, receiveShadow, only in the shadow pass).
+// 89: standard map bits (StandardMaps), 90..91 normalScale, 92 aoMapIntensity.
+export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4 };
+// Material maps besides `map`, bound to t1..t6 (bit i = slot i).
+export const StandardMaps = { NORMAL: 1, ROUGHNESS: 2, METALNESS: 4, EMISSIVE: 8, AO: 16, ALPHA: 32 };
+const STANDARD_MAP_KEYS = ['normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'aoMap', 'alphaMap'];
 // Translated material stages: up to 28 uniform floats (draw floats 49..60 and 72..87).
 const STAGE_UNIFORM_FLOATS = 28;
 export const MAX_LIGHTS = 16;
@@ -45,6 +54,9 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   const unsupported = (feature, detail) => (host && host.unsupported ? host.unsupported(feature, detail) : undefined);
 
   const _projScreen = new THREE.Matrix4();
+  const _shadowViewProj = new THREE.Matrix4();
+  const _identityMatrix = new THREE.Matrix4();
+  const _skinBone = new THREE.Matrix4();
   const _frustum = new THREE.Frustum();
   const _vec = new THREE.Vector3();
   const _vec2 = new THREE.Vector3();
@@ -212,7 +224,36 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     getRenderTarget() { return this._renderTarget; }
     setRenderTarget(target) {
       this._renderTarget = target || null;
-      if (target) unsupported('Render targets (render-to-texture, post-processing)', 'those passes are skipped');
+      if (target) this._targetRecord(target);
+    }
+    // WebGLRenderTarget -> native render target (linear RGBA16F + depth) whose
+    // colour is a texture id that materials can sample (target.texture).
+    _targetRecord(target) {
+      if (!this._targets) this._targets = new Map();
+      if (target.isWebGLCubeRenderTarget || target.isCubeRenderTarget) { unsupported('Cube render targets (CubeCamera)'); return null; }
+      if (target.textures && target.textures.length > 1) unsupported('Multiple render target attachments (MRT)', 'only the first is drawn');
+      if (target.depthTexture) unsupported('WebGLRenderTarget.depthTexture', 'depth is not readable');
+      if (!nt.createRenderTarget) { unsupported('Render targets (render-to-texture, post-processing)', 'those passes are skipped'); return null; }
+      let record = this._targets.get(target);
+      const width = Math.max(1, Math.round(target.width)), height = Math.max(1, Math.round(target.height));
+      if (!record) {
+        record = { id: nextTextureId++, width: 0, height: 0, ok: false };
+        this._targets.set(target, record);
+        if (!this._targetTextures) this._targetTextures = new WeakMap();
+        const onDispose = () => {
+          target.removeEventListener('dispose', onDispose);
+          this._targets.delete(target);
+          nt.releaseTexture(record.id);
+        };
+        target.addEventListener('dispose', onDispose);
+      }
+      if (record.width !== width || record.height !== height) {
+        record.ok = !!nt.createRenderTarget(record.id, width, height);
+        record.width = width; record.height = height;
+        if (!record.ok) warnOnce('render-target-failed', `Render target ${width}x${height} could not be created`);
+      }
+      this._targetTextures.set(target.texture, record);
+      return record.ok ? record : null;
     }
     getActiveCubeFace() { return 0; }
     getActiveMipmapLevel() { return 0; }
@@ -369,6 +410,129 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       return record;
     }
 
+    // SkinnedMesh and morph targets: the deformed shape of this frame, computed
+    // on the CPU the way Three.js' skinning/morph shader chunks do it, as a
+    // geometry that shares every other attribute with the original.
+    _deformedGeometry(mesh, geometry) {
+      const attributes = geometry.attributes;
+      const skinned = mesh.isSkinnedMesh && mesh.skeleton && attributes.skinIndex && attributes.skinWeight;
+      const morphs = geometry.morphAttributes?.position;
+      const influences = mesh.morphTargetInfluences;
+      const morphed = !!(morphs && morphs.length && influences && influences.length && !mesh.isInstancedMesh);
+      if (!skinned && !morphed) return geometry;
+      const source = attributes.position, sourceNormal = attributes.normal;
+      const n = source.count;
+      if (!this._deformed) this._deformed = new WeakMap();
+      let d = this._deformed.get(mesh);
+      if (!d || d.source !== geometry || d.count !== n) {
+        const g = new THREE.BufferGeometry();
+        for (const [name, attr] of Object.entries(attributes)) if (name !== 'position' && name !== 'normal') g.setAttribute(name, attr);
+        g.setIndex(geometry.index);
+        g.groups = geometry.groups;
+        g.drawRange = geometry.drawRange;
+        g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+        g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+        let baseNormal = null;
+        if (!sourceNormal) { // rest-pose normals, then deformed like real ones
+          const rest = new THREE.BufferGeometry();
+          rest.setAttribute('position', source);
+          rest.setIndex(geometry.index);
+          rest.computeVertexNormals();
+          baseNormal = rest.attributes.normal.array.slice();
+        }
+        if (d) d.geometry.dispose();
+        d = { geometry: g, source: geometry, count: n, frame: -1, baseNormal, work: new Float32Array(n * 6), bones: new Float32Array(0) };
+        this._deformed.set(mesh, d);
+      }
+      const frame = this.info.render.frame;
+      if (d.frame === frame) return d.geometry;
+      d.frame = frame;
+      const out = d.geometry.attributes.position.array, outN = d.geometry.attributes.normal.array;
+      const work = d.work; // morphed position (0..3n) and normal (3n..6n)
+      for (let i = 0; i < n; i++) {
+        work[i * 3] = source.getX(i); work[i * 3 + 1] = source.getY(i); work[i * 3 + 2] = source.getZ(i);
+        if (sourceNormal) {
+          work[n * 3 + i * 3] = sourceNormal.getX(i); work[n * 3 + i * 3 + 1] = sourceNormal.getY(i); work[n * 3 + i * 3 + 2] = sourceNormal.getZ(i);
+        } else {
+          work[n * 3 + i * 3] = d.baseNormal[i * 3]; work[n * 3 + i * 3 + 1] = d.baseNormal[i * 3 + 1]; work[n * 3 + i * 3 + 2] = d.baseNormal[i * 3 + 2];
+        }
+      }
+      if (morphed) {
+        // morphTargetsRelative: p += w * delta; otherwise p += w * (target - base).
+        const relative = geometry.morphTargetsRelative;
+        const morphNormals = geometry.morphAttributes.normal;
+        for (let k = 0; k < morphs.length && k < influences.length; k++) {
+          const w = influences[k];
+          if (!w) continue;
+          const target = morphs[k], targetNormal = morphNormals?.[k];
+          for (let i = 0; i < n; i++) {
+            const o = i * 3;
+            if (relative) {
+              work[o] += w * target.getX(i); work[o + 1] += w * target.getY(i); work[o + 2] += w * target.getZ(i);
+            } else {
+              work[o] += w * (target.getX(i) - source.getX(i)); work[o + 1] += w * (target.getY(i) - source.getY(i)); work[o + 2] += w * (target.getZ(i) - source.getZ(i));
+            }
+            if (targetNormal) {
+              const on = n * 3 + o;
+              if (relative) { work[on] += w * targetNormal.getX(i); work[on + 1] += w * targetNormal.getY(i); work[on + 2] += w * targetNormal.getZ(i); }
+              else if (sourceNormal) {
+                work[on] += w * (targetNormal.getX(i) - sourceNormal.getX(i)); work[on + 1] += w * (targetNormal.getY(i) - sourceNormal.getY(i));
+                work[on + 2] += w * (targetNormal.getZ(i) - sourceNormal.getZ(i));
+              }
+            }
+          }
+        }
+      }
+      if (skinned) {
+        const skeleton = mesh.skeleton;
+        if (skeleton._ntFrame !== frame) { skeleton.update(); skeleton._ntFrame = frame; }
+        // Per bone: bindMatrixInverse * boneMatrix * bindMatrix (skinning_vertex).
+        const boneCount = skeleton.bones.length;
+        if (d.bones.length < boneCount * 16) d.bones = new Float32Array(boneCount * 16);
+        const bm = skeleton.boneMatrices;
+        for (let b = 0; b < boneCount; b++) {
+          _skinBone.fromArray(bm, b * 16).premultiply(mesh.bindMatrixInverse).multiply(mesh.bindMatrix);
+          d.bones.set(_skinBone.elements, b * 16);
+        }
+        const bones = d.bones, skinIndex = attributes.skinIndex, skinWeight = attributes.skinWeight;
+        for (let i = 0; i < n; i++) {
+          const o = i * 3, on = n * 3 + o;
+          const x = work[o], y = work[o + 1], z = work[o + 2], nx = work[on], ny = work[on + 1], nz = work[on + 2];
+          let px = 0, py = 0, pz = 0, qx = 0, qy = 0, qz = 0, total = 0;
+          for (let j = 0; j < 4; j++) {
+            const w = skinWeight.getComponent(i, j);
+            if (!w) continue;
+            const b = skinIndex.getComponent(i, j);
+            if (b >= boneCount) continue;
+            const e = b * 16;
+            px += w * (bones[e] * x + bones[e + 4] * y + bones[e + 8] * z + bones[e + 12]);
+            py += w * (bones[e + 1] * x + bones[e + 5] * y + bones[e + 9] * z + bones[e + 13]);
+            pz += w * (bones[e + 2] * x + bones[e + 6] * y + bones[e + 10] * z + bones[e + 14]);
+            qx += w * (bones[e] * nx + bones[e + 4] * ny + bones[e + 8] * nz);
+            qy += w * (bones[e + 1] * nx + bones[e + 5] * ny + bones[e + 9] * nz);
+            qz += w * (bones[e + 2] * nx + bones[e + 6] * ny + bones[e + 10] * nz);
+            total += w;
+          }
+          if (total > 0) {
+            out[o] = px; out[o + 1] = py; out[o + 2] = pz;
+            const len = Math.hypot(qx, qy, qz) || 1;
+            outN[o] = qx / len; outN[o + 1] = qy / len; outN[o + 2] = qz / len;
+          } else {
+            out[o] = x; out[o + 1] = y; out[o + 2] = z; outN[o] = nx; outN[o + 1] = ny; outN[o + 2] = nz;
+          }
+        }
+      } else {
+        out.set(work.subarray(0, n * 3));
+        for (let i = 0; i < n; i++) {
+          const o = n * 3 + i * 3, len = Math.hypot(work[o], work[o + 1], work[o + 2]) || 1;
+          outN[i * 3] = work[o] / len; outN[i * 3 + 1] = work[o + 1] / len; outN[i * 3 + 2] = work[o + 2] / len;
+        }
+      }
+      d.geometry.attributes.position.needsUpdate = true;
+      d.geometry.attributes.normal.needsUpdate = true;
+      return d.geometry;
+    }
+
     _instanceRecord(mesh) {
       let record = this._instances.get(mesh);
       const im = mesh.instanceMatrix, ic = mesh.instanceColor;
@@ -397,7 +561,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
 
     // One native texture per image (THREE.Source), re-sent when needsUpdate.
     _textureRecord(texture) {
-      if (!texture || !texture.isTexture || texture.isCubeTexture || texture.isCompressedTexture || texture.isData3DTexture || texture.isDataArrayTexture || texture.isRenderTargetTexture || texture.isVideoTexture) return null;
+      if (texture && texture.isRenderTargetTexture) {
+        const record = this._targetTextures?.get(texture);
+        return record && record.ok ? record : null;
+      }
+      if (!texture || !texture.isTexture || texture.isCubeTexture || texture.isCompressedTexture || texture.isData3DTexture || texture.isDataArrayTexture || texture.isVideoTexture) return null;
       const source = texture.source || texture;
       const image = source.data !== undefined ? source.data : texture.image;
       if (!image) return null;
@@ -492,7 +660,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       globalThis.__ntLastRender = { scene, camera, renderer: this };
       if (this._disposed) return;
       if (!camera || !camera.isCamera) { warnOnce('render-no-camera', 'render() called without a camera'); return; }
-      if (this._renderTarget) return; // render-to-texture is not supported yet: skip, do not draw to screen
+      const target = this._renderTarget ? this._targetRecord(this._renderTarget) : null;
+      if (this._renderTarget && !target) return; // unsupported target: skip, do not draw to the screen
 
       const timings = this.collectTimings ? {} : null;
       let start = timings ? performance.now() : 0;
@@ -510,7 +679,24 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
       this._spriteCount = 0;
+      this._shadowLight = null;
+      this._offscreenCasters = this._offscreenCasters || [];
+      this._offscreenCasters.length = 0;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      const shadow = this.shadowMap.enabled ? this._shadowLight : null;
+      if (shadow) {
+        const light = shadow, ls = light.shadow;
+        if (!light.target.parent) light.target.updateMatrixWorld();
+        ls.updateMatrices(light);
+        // Casters outside the camera view whose shadow falls inside the shadow camera.
+        const shadowFrustum = ls.getFrustum();
+        this._shadowPass = true;
+        for (const mesh of this._offscreenCasters) {
+          if (!shadowFrustum.intersectsObject(mesh)) continue;
+          this._addMesh(mesh, camera, opaque, transparent);
+        }
+        this._shadowPass = false;
+      }
       if (timings) { const now = performance.now(); timings.collect = now - start; start = now; }
 
       if (this.sortObjects) {
@@ -548,7 +734,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       }
       this._pendingClear = 0;
       p[44] = flags;
-      p[45] = this._width; p[46] = this._height;
+      p[45] = target ? target.width : this._width; p[46] = target ? target.height : this._height;
+      p[55] = target ? target.id : 0;
       p[47] = this.toneMappingExposure;
       const tm = this.toneMapping;
       p[48] = tm === THREE.LinearToneMapping ? ToneMapping.LINEAR : tm === THREE.ReinhardToneMapping ? ToneMapping.REINHARD
@@ -556,6 +743,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           : tm === THREE.AgXToneMapping ? ToneMapping.AGX : tm === THREE.NeutralToneMapping ? ToneMapping.NEUTRAL : ToneMapping.NONE;
       if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
       const fog = scene.fog;
+      if (shadow) {
+        const ls = shadow.shadow;
+        p[56] = 1; p[57] = this._shadowLightIndex; p[58] = ls.bias; p[59] = ls.normalBias;
+        p[60] = Math.min(4096, Math.max(256, ls.mapSize.x)); p[61] = ls.radius; p[62] = ls.intensity ?? 1;
+        p[63] = shadow.isSpotLight ? 1 : 0;
+        _shadowViewProj.multiplyMatrices(ls.camera.projectionMatrix, ls.camera.matrixWorldInverse);
+        p.set(_shadowViewProj.elements, 64);
+      }
       if (fog?.isFog || fog?.isFogExp2) {
         fog.color.getRGB(_srgb, THREE.SRGBColorSpace);
         p[49] = _srgb.r; p[50] = _srgb.g; p[51] = _srgb.b;
@@ -585,7 +780,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         if (object.isLOD && object.autoUpdate !== false) object.update(camera);
         if (object.isLight) this._addLight(object, lights, ambient);
         else if (object.isMesh || object.isLine) this._addMesh(object, camera, opaque, transparent);
-        else if (object.isPoints) unsupported('THREE.Points', 'point clouds are not drawn yet');
+        else if (object.isPoints) this._addPoints(object, camera, opaque, transparent);
         else if (object.isSprite) this._addSprite(object, camera, opaque, transparent);
       }
       const children = object.children;
@@ -597,7 +792,6 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (light.isAmbientLight) { ambient[0] += c.r * k; ambient[1] += c.g * k; ambient[2] += c.b * k; return; }
       if (light.isLightProbe) { unsupported('LightProbe'); return; }
       if (light.isRectAreaLight) { unsupported('RectAreaLight'); return; }
-      if (light.castShadow) unsupported('Shadow maps in webapps', 'lights work, shadows are not rendered yet');
       const rec = { type: 0, r: c.r * k, g: c.g * k, b: c.b * k, px: 0, py: 0, pz: 0, distance: 0, dx: 0, dy: -1, dz: 0, decay: 2, extra0: 0, extra1: 0, extra2: 0 };
       _vec.setFromMatrixPosition(light.matrixWorld);
       rec.px = _vec.x; rec.py = _vec.y; rec.pz = _vec.z;
@@ -621,6 +815,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         rec.type = LightType.POINT; rec.distance = light.distance; rec.decay = light.decay;
       } else return;
       lights.push(rec);
+      if (light.castShadow && light.shadow) {
+        if (light.isPointLight) unsupported('PointLight shadows', 'only directional and spot lights cast shadows');
+        else if (!this._shadowLight && lights.length <= MAX_LIGHTS) {
+          this._shadowLight = light;
+          this._shadowLightIndex = lights.length - 1;
+        } else if (this._shadowLight !== light) warnOnce('one-shadow-light', 'Only one shadow-casting light is used per render()');
+      }
     }
 
     // THREE.Sprite: a camera-facing textured quad (SpriteMaterial is unlit).
@@ -628,15 +829,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const m = sprite.material;
       if (!m || !m.visible) return;
       if (sprite.frustumCulled && !_frustum.intersectsSprite(sprite)) return;
-      if (!this._spriteGeometry) {
-        const g = new THREE.BufferGeometry();
-        g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
-        g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
-        g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
-        g.setIndex([0, 1, 2, 0, 2, 3]);
-        this._spriteGeometry = g;
-      }
-      const record = this._geometryRecord(this._spriteGeometry);
+      const record = this._geometryRecord(this._spriteQuad());
       if (!record) return;
       _vec.setFromMatrixPosition(sprite.matrixWorld);
       _spriteScale.setFromMatrixScale(sprite.matrixWorld);
@@ -656,6 +849,96 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const proxy = { isSprite: true, matrixWorld: matrix, renderOrder: sprite.renderOrder || 0, name: sprite.name, type: 'Sprite', geometry: this._spriteGeometry };
       this._queue({ mesh: proxy, record, instances: null, z: _vec.z }, m, 0, 6, opaque, transparent);
     }
+    _spriteQuad() {
+      if (!this._spriteGeometry) {
+        const g = new THREE.BufferGeometry();
+        g.setAttribute('position', new THREE.Float32BufferAttribute([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0], 3));
+        g.setAttribute('normal', new THREE.Float32BufferAttribute([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1], 3));
+        g.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 1, 0, 1, 1, 0, 1], 2));
+        g.setIndex([0, 1, 2, 0, 2, 3]);
+        this._spriteGeometry = g;
+      }
+      return this._spriteGeometry;
+    }
+
+    // THREE.Points: every point is a camera-facing quad of PointsMaterial.size
+    // (pixels, shrinking with distance when sizeAttenuation), all points of
+    // one object in a single instanced draw.
+    _addPoints(points, camera, opaque, transparent) {
+      const geometry = points.geometry, m = points.material;
+      if (!geometry || !geometry.attributes || !geometry.attributes.position || !m) return;
+      if (Array.isArray(m)) { unsupported('THREE.Points with several materials'); return; }
+      if (!m.visible) return;
+      if (points.frustumCulled && geometry.boundingSphere !== undefined && !_frustum.intersectsObject(points)) return;
+      if (!m.isPointsMaterial) unsupported('THREE.Points with ' + m.type, 'drawn as PointsMaterial squares');
+      const position = geometry.attributes.position, colorAttr = geometry.attributes.color;
+      const range = geometry.drawRange;
+      const first = Math.max(0, range.start);
+      const last = Math.min(position.count, range.start + range.count);
+      let count = last - first;
+      if (count <= 0) return;
+      if (count > 262144) { warnOnce('points-cap', 'Only the first 262144 points of a THREE.Points are drawn'); count = 262144; }
+      const quad = this._geometryRecord(this._spriteQuad());
+      if (!quad) return;
+      if (!this._pointRecords) this._pointRecords = new Map();
+      let rec = this._pointRecords.get(points);
+      if (!rec) {
+        rec = { id: nextInstanceId++, matrices: new Float32Array(0), colors: null };
+        this._pointRecords.set(points, rec);
+        const onDispose = () => {
+          points.removeEventListener('dispose', onDispose);
+          this._pointRecords.delete(points);
+          nt.releaseInstances(rec.id);
+        };
+        points.addEventListener('dispose', onDispose);
+      }
+      if (rec.matrices.length < count * 16) rec.matrices = new Float32Array(Math.ceil(count * 1.25) * 16);
+      const useColors = !!(m.vertexColors && colorAttr);
+      if (useColors && (!rec.colors || rec.colors.length < count * 3)) rec.colors = new Float32Array(Math.ceil(count * 1.25) * 3);
+      const ce = camera.matrixWorld.elements;
+      _vec2.set(ce[0], ce[1], ce[2]).normalize();
+      const rx = _vec2.x, ry = _vec2.y, rz = _vec2.z;
+      _vec2.set(ce[4], ce[5], ce[6]).normalize();
+      const ux = _vec2.x, uy = _vec2.y, uz = _vec2.z;
+      _vec2.set(ce[8], ce[9], ce[10]).normalize();
+      const fx = _vec2.x, fy = _vec2.y, fz = _vec2.z;
+      const cx = ce[12], cy = ce[13], cz = ce[14];
+      const height = Math.max(1, this._height || 1);
+      const size = m.size ?? 1;
+      let perPixelAtDepth = 0, fixedWorld = 0;
+      if (camera.isPerspectiveCamera) {
+        const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) / (camera.zoom || 1);
+        if (m.sizeAttenuation !== false) fixedWorld = size * tanHalf;      // gl_PointSize = size * (h/2) / -z
+        else perPixelAtDepth = 2 * tanHalf / height;                       // constant size in pixels
+      } else {
+        fixedWorld = size * (camera.top - camera.bottom) / (camera.zoom || 1) / height;
+      }
+      const out = rec.matrices, colors = rec.colors, mw = points.matrixWorld;
+      let zSum = 0;
+      for (let i = 0; i < count; i++) {
+        _vec.fromBufferAttribute(position, first + i).applyMatrix4(mw);
+        const depth = (cx - _vec.x) * fx + (cy - _vec.y) * fy + (cz - _vec.z) * fz; // distance in front of the camera
+        zSum += depth;
+        const w = fixedWorld || size * perPixelAtDepth * Math.max(depth, 0);
+        const o = i * 16;
+        out[o] = rx * w; out[o + 1] = ry * w; out[o + 2] = rz * w; out[o + 3] = 0;
+        out[o + 4] = ux * w; out[o + 5] = uy * w; out[o + 6] = uz * w; out[o + 7] = 0;
+        out[o + 8] = fx; out[o + 9] = fy; out[o + 10] = fz; out[o + 11] = 0;
+        out[o + 12] = _vec.x; out[o + 13] = _vec.y; out[o + 14] = _vec.z; out[o + 15] = 1;
+        if (useColors) {
+          colors[i * 3] = colorAttr.getX(first + i); colors[i * 3 + 1] = colorAttr.getY(first + i); colors[i * 3 + 2] = colorAttr.getZ(first + i);
+        }
+      }
+      nt.uploadInstances(rec.id, out.subarray(0, count * 16), useColors ? colors.subarray(0, count * 3) : null, count);
+      _vec.set(cx - fx * zSum / count, cy - fy * zSum / count, cz - fz * zSum / count).applyMatrix4(_projScreen);
+      const proxy = {
+        isPoints: true, matrixWorld: _identityMatrix, renderOrder: points.renderOrder || 0, name: points.name, type: 'Points',
+        geometry: this._spriteGeometry, count, instanceColor: useColors ? colorAttr : null, castShadow: false, receiveShadow: false,
+      };
+      this._queue({ mesh: proxy, record: quad, instances: rec, z: _vec.z }, m, 0, 6, opaque, transparent);
+      this.info.render.points += count;
+    }
+
     _spriteMatrix(i) {
       if (!this._spriteMatrices) this._spriteMatrices = [];
       return this._spriteMatrices[i] || (this._spriteMatrices[i] = new THREE.Matrix4());
@@ -665,11 +948,13 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const geometry = mesh.geometry;
       if (!geometry || !geometry.isBufferGeometry || !geometry.attributes.position) return;
       if (mesh.isInstancedMesh && mesh.count === 0) return;
-      if (mesh.frustumCulled && !_frustum.intersectsObject(mesh)) return;
-      if (mesh.isSkinnedMesh) unsupported('Skinned meshes (SkinnedMesh animation)', 'drawn in bind pose');
-      if (geometry.morphAttributes && geometry.morphAttributes.position) unsupported('Morph targets', 'base shape is drawn');
+      if (mesh.frustumCulled && !this._shadowPass && !_frustum.intersectsObject(mesh)) {
+        // Off screen, but its shadow may still fall into the view.
+        if (mesh.castShadow && this.shadowMap.enabled) this._offscreenCasters.push(mesh);
+        return;
+      }
       if (mesh.isBatchedMesh) { unsupported('BatchedMesh'); return; }
-      const record = this._geometryRecord(geometry);
+      const record = this._geometryRecord(this._deformedGeometry(mesh, geometry));
       if (!record) return;
       if (mesh.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender) mesh.onBeforeRender(this, null, camera, geometry, mesh.material, null);
       const instances = mesh.isInstancedMesh ? this._instanceRecord(mesh) : null;
@@ -714,7 +999,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       let color = m.color || null, opacity = m.opacity ?? 1;
       let shaderMap = null, reflection = null, reflectionMask = false, colorStage = null;
       if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.isLineDashedMaterial) flags |= DrawFlags.UNLIT;
-      else if (m.isSpriteMaterial) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
+      else if (m.isSpriteMaterial || m.isPointsMaterial || mesh.isPoints) flags |= DrawFlags.UNLIT | DrawFlags.DOUBLE_SIDED;
       else if (m.isMeshNormalMaterial) flags |= DrawFlags.NORMAL_COLOR;
       else if (m.isMeshStandardMaterial) { roughness = m.roughness; metalness = m.metalness; }
       else if (m.isMeshPhongMaterial) { shininess = m.shininess; roughness = Math.sqrt(2 / (m.shininess + 2)); }
@@ -758,8 +1043,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (m.toneMapped === false) flags |= DrawFlags.NO_TONE_MAP;
       if (m.fog !== false && (!(m.isShaderMaterial || m.isRawShaderMaterial) ||
           (m.fog && /#include\s+<fog_fragment>/.test(m.fragmentShader)))) flags |= DrawFlags.FOG;
-      if (m.normalMap || m.roughnessMap || m.metalnessMap || m.emissiveMap || m.aoMap || m.alphaMap || m.envMap || m.lightMap || m.bumpMap) {
-        unsupported('Textures other than map (normalMap, envMap …)', 'only the colour map is drawn');
+      if (m.envMap || m.lightMap || m.bumpMap || m.displacementMap) {
+        unsupported('envMap / lightMap / bumpMap / displacementMap', 'drawn without them');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
       if (hasCompilePatch(m.onBeforeCompile)) {
@@ -802,6 +1087,16 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const uvt = _uvIdentity;
       uvt[0] = 1; uvt[1] = 0; uvt[2] = 0; uvt[3] = 1; uvt[4] = 0; uvt[5] = 0;
       const colorMap = m.map || shaderMap;
+      // u' = a u + c v + e ; v' = b u + d v + f  (D3D rows run top-down: flipY mirrors v)
+      const setUv = (map) => {
+        if (map.matrixAutoUpdate) map.updateMatrix();
+        const e = map.matrix.elements;
+        let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
+        // Render target textures: rows run top-down in the engine, v = 0 is the bottom in Three.js.
+        if (map.flipY || map.isRenderTargetTexture) { b = -b; d = -d; ty = 1 - ty; }
+        uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
+      };
+      let uvSource = null;
       if (colorMap && base.record.hasUvs) {
         const tex = this._textureRecord(colorMap);
         if (tex) {
@@ -810,14 +1105,26 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
           flags |= DrawFlags.MAP;
           if (map.wrapS === THREE.RepeatWrapping || map.wrapT === THREE.RepeatWrapping) flags |= DrawFlags.MAP_REPEAT;
           else if (map.wrapS === THREE.MirroredRepeatWrapping || map.wrapT === THREE.MirroredRepeatWrapping) flags |= DrawFlags.MAP_MIRROR;
-          if (map.matrixAutoUpdate) map.updateMatrix();
-          const e = map.matrix.elements;
-          // u' = a u + c v + e ; v' = b u + d v + f  (D3D rows run top-down: flipY mirrors v)
-          let a = e[0], b = e[1], c = e[3], d = e[4], tx = e[6], ty = e[7];
-          if (map.flipY) { b = -b; d = -d; ty = 1 - ty; }
-          uvt[0] = a; uvt[1] = b; uvt[2] = c; uvt[3] = d; uvt[4] = tx; uvt[5] = ty;
+          setUv(map);
+          uvSource = map;
         }
       }
+      // normalMap, roughnessMap, metalnessMap, emissiveMap, aoMap, alphaMap:
+      // sampled with the colour map's uv transform (or the first of them).
+      let stdMaps = 0, stdTextures = null;
+      if (!colorStage && base.record.hasUvs) {
+        for (let slot = 0; slot < STANDARD_MAP_KEYS.length; slot++) {
+          const texture = m[STANDARD_MAP_KEYS[slot]];
+          if (!texture || !texture.isTexture) continue;
+          const tex = this._textureRecord(texture);
+          if (!tex) continue;
+          if (!uvSource) { setUv(texture); uvSource = texture; }
+          (stdTextures ||= [])[slot] = { id: tex.id, texture, std: true };
+          stdMaps |= 1 << slot;
+        }
+      }
+      const normalScale = m.normalScale;
+      const uvFlip = uvSource?.flipY ? -1 : 1;
       const emissive = m.emissive || null;
       const ei = m.emissiveIntensity ?? 1;
       const draw = {
@@ -827,12 +1134,16 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         ua: uvt[0], ub: uvt[1], uc: uvt[2], ud: uvt[3], ue: uvt[4], uf: uvt[5],
         r: color && color.isColor ? color.r : 1, g: color && color.isColor ? color.g : 1, b: color && color.isColor ? color.b : 1,
         opacity, reflection, reflectionMask, colorStage,
-        materialTextures: colorStage?.textures.map(({ uniform }) => {
+        materialTextures: colorStage ? colorStage.textures.map(({ uniform }) => {
           const texture = uniform.value;
           return { id: this._textureRecord(texture)?.id ?? 0, texture };
-        }),
+        }) : stdTextures,
+        stdMaps, normalScaleX: normalScale ? normalScale.x : 1, normalScaleY: (normalScale ? normalScale.y : 1) * uvFlip,
+        aoIntensity: m.aoMapIntensity ?? 1,
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0,
+        shadow: (mesh.castShadow && !(flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? ShadowFlags.CAST : 0) |
+          (mesh.receiveShadow && !(flags & DrawFlags.UNLIT) ? ShadowFlags.RECEIVE : 0) | (this._shadowPass ? ShadowFlags.ONLY : 0),
       };
       if (globalThis.__ntDebugDraws) {
         const g = mesh.geometry, c = g.attributes.color;
@@ -864,10 +1175,14 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     p.set(d.matrix, o + 16);
     p[o + 32] = d.textureId; p[o + 33] = d.alphaTest;
     p[o + 34] = d.ua; p[o + 35] = d.ub; p[o + 36] = d.uc; p[o + 37] = d.ud; p[o + 38] = d.ue; p[o + 39] = d.uf;
-    if (!d.reflection && !d.colorStage) {
+    if (!d.reflection && !d.colorStage && !d.stdMaps) {
       p.fill(0, o + 40, o + DRAW_FLOATS);
+      p[o + 88] = d.shadow || 0;
       return;
     }
+    p[o + 88] = d.shadow || 0;
+    p[o + 89] = d.stdMaps || 0; p[o + 90] = d.normalScaleX ?? 1; p[o + 91] = d.normalScaleY ?? 1; p[o + 92] = d.aoIntensity ?? 1;
+    p[o + 93] = 0; p[o + 94] = 0; p[o + 95] = 0;
     const reflection = d.reflection;
     const sky = reflection?.uniform.value;
     p[o + 40] = sky ? sky.r * reflection.intensity : 0;
@@ -893,7 +1208,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       p[o + 61 + i] = binding?.id ?? 0;
       const texture = binding?.texture;
       if (!texture) continue;
-      if (texture.flipY) flip |= 1 << i;
+      if ((texture.flipY || texture.isRenderTargetTexture) && !binding.std) flip |= 1 << i; // standard maps use the draw's uv (flip included)
       if (texture.wrapS === THREE.RepeatWrapping || texture.wrapT === THREE.RepeatWrapping) repeat |= 1 << i;
       else if (texture.wrapS === THREE.MirroredRepeatWrapping || texture.wrapT === THREE.MirroredRepeatWrapping) mirror |= 1 << i;
     }
