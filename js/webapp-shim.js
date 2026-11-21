@@ -953,7 +953,7 @@
   const CV = { RESET: 1, TRANSFORM: 2, FILL_STYLE: 3, STROKE_STYLE: 4, LINE: 5, DASH: 6, ALPHA: 7,
     BEGIN: 10, MOVE: 11, LINE_TO: 12, BEZIER: 13, CLOSE: 14,
     FILL: 20, STROKE: 21, CLIP: 22, FILL_RECT: 23, FILL_QUAD: 24, STROKE_QUAD: 25, CLEAR_RECT: 26,
-    TEXT: 30, FONT: 31, TEXT_ALIGN: 32, IMAGE: 40, SAVE: 41, RESTORE: 42 };
+    TEXT: 30, FONT: 31, TEXT_ALIGN: 32, IMAGE: 40, SAVE: 41, RESTORE: 42, SHADOW: 43 };
   let nextCanvasId = 1;
   const dirtyCanvases = new Set();
   const COMPOSITE = { 'source-over': 0, copy: 1, lighter: 2, 'destination-out': 3, 'source-atop': 4, 'destination-over': 5, multiply: 6, screen: 7, 'destination-in': 8, 'source-in': 9 };
@@ -966,7 +966,13 @@
       this._stops.sort((a, b) => a[0] - b[0]);
     }
   }
-  class CanvasPattern { constructor(image, repetition) { this._image = image; this._repetition = repetition; } setTransform() {} }
+  class CanvasPattern {
+    constructor(image, repetition) { this._image = image; this._repetition = repetition || 'repeat'; this._m = [1, 0, 0, 1, 0, 0]; }
+    setTransform(m) {
+      m = m || {};
+      this._m = [m.a ?? m.m11 ?? 1, m.b ?? m.m12 ?? 0, m.c ?? m.m21 ?? 0, m.d ?? m.m22 ?? 1, m.e ?? m.m41 ?? 0, m.f ?? m.m42 ?? 0];
+    }
+  }
   class ImageData {
     constructor(a, b, c) {
       if (a instanceof Uint8ClampedArray) { this.data = a; this.width = b; this.height = c ?? (a.length / 4 / b); }
@@ -1091,8 +1097,20 @@
         return out;
       }
       if (style instanceof CanvasPattern) {
-        warnOnce('canvas-pattern', 'Canvas 2D createPattern is drawn as a flat grey fill');
-        return [0, 0.5, 0.5, 0.5, 1];
+        // [3, image kind (0 image, 1 canvas), ref, repeat x, repeat y, pattern matrix]
+        const image = style._image, rep = style._repetition;
+        const rx = rep === 'repeat' || rep === 'repeat-x' ? 1 : 0, ry = rep === 'repeat' || rep === 'repeat-y' ? 1 : 0;
+        if (rep === 'no-repeat') warnOnce('canvas-pattern-no-repeat', "createPattern 'no-repeat' repeats the edge pixels");
+        const canvasSrc = image instanceof HTMLCanvasElement ? image : image && image._ntSource && image._ntSource.canvas ? image._ntSource.canvas : null;
+        if (canvasSrc) {
+          const c = canvasSrc._ctx2d;
+          if (!c) return [0, 0, 0, 0, 0];
+          c._sizeCheck(); c._flush();
+          return [3, 1, c._id, rx, ry, ...style._m];
+        }
+        const key = image && image._ntSource ? imageKey(image._ntSource) : null;
+        if (!key) { warnOnce('canvas-pattern-src', 'Canvas 2D createPattern: this image source is not supported'); return [0, 0, 0, 0, 0]; }
+        return [3, 0, this._str(key), rx, ry, ...style._m];
       }
       const c = parseCanvasColor(style) || [0, 0, 0, 1];
       return [0, c[0], c[1], c[2], c[3]];
@@ -1100,7 +1118,7 @@
     _sendStyle(which) {
       const style = which === 'fill' ? this._s.fillStyle : this._s.strokeStyle;
       const key = which === 'fill' ? 'fs' : 'ss';
-      if (style instanceof CanvasGradient) this._sendTransform(); // gradient coordinates are user space
+      if (style instanceof CanvasGradient || style instanceof CanvasPattern) this._sendTransform(); // user space brushes
       if (this._sent[key] === style && !(style instanceof CanvasGradient && this._sent[key + 'n'] !== style._stops.length)) return;
       this._sent[key] = style;
       if (style instanceof CanvasGradient) { this._sent[key + 'n'] = style._stops.length; this._sendTransform(); }
@@ -1124,7 +1142,17 @@
       this._op(CV.LINE, [w, cap, join, s.miterLimit]);
       this._op(CV.DASH, [s.lineDashOffset * k, s.dash.length, ...s.dash.map((d) => d * k)]);
     }
-    _shadowWarn() { if (this._s.shadowBlur > 0 || this._s.shadowOffsetX || this._s.shadowOffsetY) { const c = parseCanvasColor(this._s.shadowColor); if (c && c[3] > 0) warnOnce('canvas-shadow', 'Canvas 2D shadows are not drawn yet'); } }
+    // shadowBlur / shadowOffset are device pixels (not transformed), like browsers.
+    _sendShadow() {
+      const s = this._s;
+      const c = parseCanvasColor(s.shadowColor);
+      const on = c && c[3] > 0 && (s.shadowBlur > 0 || s.shadowOffsetX || s.shadowOffsetY);
+      const args = on ? [Math.max(0, +s.shadowBlur || 0), +s.shadowOffsetX || 0, +s.shadowOffsetY || 0, c[0], c[1], c[2], c[3]] : [0, 0, 0, 0, 0, 0, 0];
+      const key = args.join(',');
+      if (this._sent.shadow === key) return;
+      this._sent.shadow = key;
+      this._op(CV.SHADOW, args);
+    }
     // ---- state
     save() { const s = this._s; this._stack.push({ ...s, m: s.m.slice(), dash: s.dash.slice() }); this._op(CV.SAVE, []); }
     restore() { if (!this._stack.length) return; this._s = this._stack.pop(); this._op(CV.RESTORE, []); }
@@ -1239,12 +1267,12 @@
     fill(a, b) {
       const path = a instanceof Path2D ? a : null;
       const rule = (path ? b : a) === 'evenodd' ? 1 : 0;
-      const go = () => { this._shadowWarn(); this._sendAlpha(); this._sendStyle('fill'); this._op(CV.FILL, [rule]); };
+      const go = () => { this._sendShadow(); this._sendAlpha(); this._sendStyle('fill'); this._op(CV.FILL, [rule]); };
       if (path) { this._sizeCheck(); this.save(); this._withPath(path, go); this.restore(); return; }
       this._sizeCheck(); go();
     }
     stroke(path) {
-      const go = () => { this._shadowWarn(); this._sendAlpha(); this._sendStyle('stroke'); this._sendLine(); this._op(CV.STROKE, []); };
+      const go = () => { this._sendShadow(); this._sendAlpha(); this._sendStyle('stroke'); this._sendLine(); this._op(CV.STROKE, []); };
       if (path instanceof Path2D) { this._sizeCheck(); this.save(); this._withPath(path, go); this.restore(); return; }
       this._sizeCheck(); go();
     }
@@ -1261,7 +1289,7 @@
     _quad(x, y, w, h) { return [this._x(x, y), this._y(x, y), this._x(x + w, y), this._y(x + w, y), this._x(x + w, y + h), this._y(x + w, y + h), this._x(x, y + h), this._y(x, y + h)]; }
     fillRect(x, y, w, h) {
       if (![x, y, w, h].every(Number.isFinite) || !w || !h) return;
-      this._sizeCheck(); this._shadowWarn(); this._sendAlpha(); this._sendStyle('fill');
+      this._sizeCheck(); this._sendShadow(); this._sendAlpha(); this._sendStyle('fill');
       if (this._axisAligned()) {
         const x0 = this._x(x, y), y0 = this._y(x, y), x1 = this._x(x + w, y + h), y1 = this._y(x + w, y + h);
         this._op(CV.FILL_RECT, [Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)]);
@@ -1269,7 +1297,7 @@
     }
     strokeRect(x, y, w, h) {
       if (![x, y, w, h].every(Number.isFinite)) return;
-      this._sizeCheck(); this._sendAlpha(); this._sendStyle('stroke'); this._sendLine();
+      this._sizeCheck(); this._sendShadow(); this._sendAlpha(); this._sendStyle('stroke'); this._sendLine();
       this._op(CV.STROKE_QUAD, this._quad(x, y, w, h));
     }
     clearRect(x, y, w, h) {
@@ -1295,7 +1323,7 @@
     _text(text, x, y, maxWidth, stroke) {
       const t = String(text ?? '');
       if (!t || !Number.isFinite(x) || !Number.isFinite(y)) return;
-      this._sizeCheck(); this._sendAlpha(); this._sendTransform(); this._sendFont();
+      this._sizeCheck(); this._sendShadow(); this._sendAlpha(); this._sendTransform(); this._sendFont();
       if (stroke) { this._sendStyle('stroke'); this._sendLine(); } else this._sendStyle('fill');
       this._op(CV.TEXT, [stroke ? 1 : 0, this._str(t), x, y, Number.isFinite(maxWidth) && maxWidth > 0 ? maxWidth : 0]);
     }
@@ -1335,7 +1363,7 @@
       else if (a.length >= 4) [dx, dy, dw, dh] = a;
       else { [dx, dy] = a; dw = iw; dh = ih; }
       if (![sx, sy, sw, sh, dx, dy, dw, dh].every(Number.isFinite) || !dw || !dh || !sw || !sh) return;
-      this._sizeCheck(); this._sendAlpha(); this._sendTransform();
+      this._sizeCheck(); this._sendShadow(); this._sendAlpha(); this._sendTransform();
       this._op(CV.IMAGE, [kind, ref, sx, sy, sw, sh, dx, dy, dw, dh, this._s.imageSmoothingEnabled ? 1 : 0]);
       if (kind === 1) this._flush(); // the source may change before the next flush
     }
@@ -1402,6 +1430,7 @@
     get src() { return this._src ? (/^(data|blob):/i.test(this._src) ? this._src : new URL(this._src, documentURL).href) : ''; }
     set src(v) {
       this._src = String(v);
+      this.complete = false;
       this.setAttribute('src', this._src);
       // Images in the game folder load (the UI layer draws them natively;
       // 3D textures stay untextured). Anything else fails like a broken image
@@ -1429,7 +1458,16 @@
         } else this.dispatchEvent(new Event('error'));
       }, 0);
     }
-    decode() { return this.naturalWidth ? Promise.resolve() : Promise.reject(new Error('Image could not be decoded')); }
+    // Resolves once the image has loaded (like browsers), rejects when it cannot be.
+    decode() {
+      const settle = () => (this.naturalWidth ? Promise.resolve() : Promise.reject(Object.assign(new Error('Image could not be decoded'), { name: 'EncodingError' })));
+      if (this.complete || !this._src) return settle();
+      return new Promise((resolve, reject) => {
+        const done = () => { this.removeEventListener('load', done); this.removeEventListener('error', done); settle().then(resolve, reject); };
+        this.addEventListener('load', done);
+        this.addEventListener('error', done);
+      });
+    }
   }
   function dataUrlBytes(url) {
     const comma = url.indexOf(',');
