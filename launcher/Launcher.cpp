@@ -11,11 +11,18 @@
 //          --self-test (version and protocol checks, no window).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00 // per-monitor DPI (Windows 10)
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
@@ -25,6 +32,8 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cwctype>
 #include <cwchar>
 #include <functional>
 #include <mutex>
@@ -355,7 +364,7 @@ struct Graphics {
     ComPtr<ID2D1Bitmap> picture;
     ComPtr<IWICFormatConverter> pictureSource;
     std::wstring pictureFile;
-    ComPtr<IDWriteTextFormat> title, header, small, body, status, version, button, retry;
+    ComPtr<IDWriteTextFormat> title, header, tiny, body, status, version, button, retry;
     float dpi = 96;
 } g;
 
@@ -382,7 +391,7 @@ void initGraphics() {
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g.wic));
     g.title = font(46, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
     g.header = font(16, DWRITE_FONT_WEIGHT_SEMI_BOLD);
-    g.small = font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    g.tiny = font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     g.body = font(13.5f, DWRITE_FONT_WEIGHT_NORMAL);
     g.status = font(14, DWRITE_FONT_WEIGHT_NORMAL);
     g.version = font(13, DWRITE_FONT_WEIGHT_SEMI_BOLD);
@@ -425,7 +434,7 @@ ID2D1SolidColorBrush* color(UINT32 rgb, float alpha = 1) {
 }
 
 void text(const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, UINT32 rgb, float alpha = 1) {
-    g.rt->DrawTextW(s.c_str(), UINT32(s.size()), f, r, color(rgb, alpha), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    g.rt->DrawText(s.c_str(), UINT32(s.size()), f, r, color(rgb, alpha), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 const D2D1_RECT_F kPanel{20, 20, 1080, 556};
@@ -469,9 +478,9 @@ void drawNews(const State& s) {
         layout->GetMetrics(&m);
         const float height = 17 + m.height;
         if (y + height > kNews.bottom - 10) break; // as many as fit
-        text(item.date, g.small.Get(), D2D1::RectF(kNews.left + 14, y, kNews.left + 100, y + 16), 0x8c96a3);
+        text(item.date, g.tiny.Get(), D2D1::RectF(kNews.left + 14, y, kNews.left + 100, y + 16), 0x8c96a3);
         const bool engine = item.source == L"Engine";
-        text(item.source, g.small.Get(), D2D1::RectF(kNews.left + 96, y, kNews.right - 14, y + 16), engine ? 0x6fb3ff : 0xe8b95a);
+        text(item.source, g.tiny.Get(), D2D1::RectF(kNews.left + 96, y, kNews.right - 14, y + 16), engine ? 0x6fb3ff : 0xe8b95a);
         g.rt->DrawTextLayout(D2D1::Point2F(kNews.left + 14, y + 16), layout.Get(), color(0xe9e6de), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         y += height + 6;
         g.rt->DrawLine(D2D1::Point2F(kNews.left + 14, y - 3), D2D1::Point2F(kNews.right - 14, y - 3), color(0xffffff, 0.08f), 1);
@@ -703,7 +712,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     gRoot = path;
     gRoot.erase(gRoot.find_last_of(L'\\'));
     // launcher.json may name another game folder ({"gameFolder": "game2", ...}).
-    if (FILE* f = _wfopen((gRoot + L"\\launcher.json").c_str(), L"rb")) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, (gRoot + L"\\launcher.json").c_str(), L"rb") == 0 && f) {
         std::string json(4096, '\0');
         json.resize(std::fread(json.data(), 1, json.size(), f));
         std::fclose(f);
