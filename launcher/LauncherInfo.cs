@@ -137,8 +137,8 @@ internal static class LauncherInfo
         }
         if (name == "") name = Config.GameRepository.Split('/')[1];
         if (installed)
-            foreach ((string version, string text) in LocalNotes(game, 12))
-                Out.Line($"NEWS_LOCAL\t{version}\t{Config.GameNewsLabel}\t{text}");
+            foreach ((string noteVersion, string noteText) in LocalNotes(game, 12))
+                Out.Line($"NEWS_LOCAL\t{noteVersion}\t{Config.GameNewsLabel}\t{noteText}");
         Out.Line("INFO\tNAME\t" + name);
         Out.Line("INFO\tIMAGE\t" + image);
         Out.Line("INFO\tENGINE\t" + UpdateEngine.Installed());
