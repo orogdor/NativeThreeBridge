@@ -2813,7 +2813,7 @@ void WebappWindow::writePerfReport() {
     SYSTEMTIME t;
     GetLocalTime(&t);
     std::fprintf(f, "=== NativeThreeBridge perf report %04d-%02d-%02d %02d:%02d:%02d ===\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    std::fprintf(f, "engine %s | %s | GPU %s | window %ux%u%s\n", native_three::webappEngineName().c_str(), narrow(pageTitle_).c_str(),
+    std::fprintf(f, "engine %s | %s | GPU %s | window %ux%u%s\n", native_three::webappEngineName(), narrow(pageTitle_).c_str(),
                  narrow(adapterName_).c_str(), width_, height_, fullscreen_ ? " fullscreen" : "");
     std::fprintf(f, "last %zu s: %.1f FPS average, %.1f lowest second, %.1f ms per frame, worst frame %.1f ms\n",
                  count, sum.fps / n, count ? worst.fps : 0.0, sum.frameMs / n, worst.frameMax);
