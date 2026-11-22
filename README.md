@@ -1,3 +1,15 @@
+# NativeThreeBridge v0.37.0 — shader and V8 caches, F9 performance report, cascaded shadow maps, launcher icons and change notes
+
+- **Shader cache on disk**: compiled HLSL is stored in `%LOCALAPPDATA%\NativeThreeBridge\shader-cache`. The key is the source, entry point, target and flags, and each file is checksummed. The five stock shaders compile in parallel, and on the second start they load from disk. `NTB_SHADER_CACHE=0` turns the cache off.
+- **Background compile of material stages**: translated GLSL stages (ShaderMaterial, onBeforeCompile) compile on a worker thread. Objects that use a stage are drawn once it is ready instead of stalling the frame. A stage that fails is dropped, the same as before.
+- **V8 code cache**: game modules of 4 KB or more are stored compiled in `%LOCALAPPDATA%\NativeThreeBridge\v8-cache`, so the next start skips parsing. `NTB_V8_CACHE=0` turns it off. Log lines now carry seconds since start, and `[boot]` lines report how long the first frame and the first visible game frame took.
+- **F9 performance report**: F9 writes `NativeThreeBridge-perf-report.txt` next to the engine. It holds the last 10 seconds averaged, a per-frame breakdown (JavaScript, HTML UI raster, DX12 recording, GPU wait, present) and a "limit:" verdict. `NTB_PERF_REPORT_AFTER=<s>` writes it automatically.
+- **Cascaded shadow maps**: the three.js `CSM` addon works. Its directional lights become cascades, and each lights only its depth range for materials that CSM has set up.
+- **Launcher**: the engine and launcher have an icon. The game's `MUUDATUSED_V*.md` / `CHANGES_V*.md` files appear first in the news list, as heading plus first sentence.
+- **Code signing prep**: CI signs the EXEs when the `WINDOWS_SIGN_PFX` and `WINDOWS_SIGN_PASSWORD` secrets exist. Options and costs are in `docs/CODE-SIGNING.md`.
+
+Packets: header 60..62 = cascades, camera near, shadow far; 64..79 = cascade ranges. Draw shadow bit 8 = CSM material. New fixture: `webapp-csm`.
+
 # NativeThreeBridge v0.36.0 — one Launcher.exe instead of Game2/UpdateEngine/UpdateKuningriigid
 
 `Launcher.exe` is the game's start window. On the left it shows the game picture and name; on the right, as many of the latest changes as fit (game commits and stable engine releases). At the bottom are the installed engine and game versions, each with a ring that is red until the version is current and green once it is, plus the status text, the download progress and the start button. It checks GitHub and installs a newer engine first; if that update replaced the launcher, the launcher restarts itself. It then installs the newer game: only changed files are downloaded, SHA-checked, with a rollback copy kept. The start button is enabled only when both are current. Offline, an installed game can still be started (yellow status). After the button is pressed the launcher shows "Laen mängu…" over the progress bar and closes once the game's window is visible.

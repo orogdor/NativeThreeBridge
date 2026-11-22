@@ -254,6 +254,9 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          # Optional code signing (docs/CODE-SIGNING.md): base64 of a .pfx and its password.
+          WINDOWS_SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX }}
+          WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
         run: |
           $v = (Get-Content version.txt -Raw).Trim()
           if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
@@ -285,6 +288,23 @@ jobs:
           Copy-Item build/updater/NativeThree-Updater.exe dist/NativeThree-Updater.exe
           $p = Start-Process -FilePath (Resolve-Path dist/NativeThree-Updater.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
           if ($p.ExitCode -ne 0) { throw "NativeThree-Updater self-test failed" }
+          # Code signing: only when the certificate secrets exist, otherwise the files stay unsigned.
+          if ($env:WINDOWS_SIGN_PFX) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+            if (-not $signtool) { throw "signtool.exe not found" }
+            $files = 'NativeThree-Engine.exe','Launcher.exe','Game1.exe','NativeThree-Updater.exe' | ForEach-Object { (Resolve-Path "dist/$_").Path }
+            & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_SIGN_PASSWORD @files
+            $code = $LASTEXITCODE
+            Remove-Item $pfx -Force
+            if ($code -ne 0) { throw "Code signing failed" }
+            & $signtool.FullName verify /pa @files
+            if ($LASTEXITCODE -ne 0) { throw "Signature check failed" }
+            Write-Host "Signed: $($files -join ', ')"
+          } else {
+            Write-Host "Code signing skipped (no WINDOWS_SIGN_PFX secret, see docs/CODE-SIGNING.md)"
+          }
           '{ "gameFolder": "game2", "gameRepository": "orogdor/Kuningriigid", "gameBranch": "main", "engineRepository": "orogdor/NativeThreeBridge" }' | Set-Content dist/launcher.json -Encoding utf8
           Set-Content dist/engine-version.txt -Value "v$v" -Encoding ascii -NoNewline
           Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
