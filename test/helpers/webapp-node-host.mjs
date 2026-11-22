@@ -185,6 +185,8 @@ export async function runWebapp(root, options = {}) {
       rec.colorPatches.set(id, source);
       return true;
     },
+    // Tests may set rec.patchStatus (id -> 1 ready, 0 compiling, -1 failed).
+    colorPatchStatus(id) { return rec.patchStatus?.get(id) ?? rec.patchStatusDefault ?? 1; },
     uploadGeometry(id, positions, normals, colors, indices, uvs, gpuLocal = false) {
       view(positions, 'positions');
       if (positions.length % 3) throw new RangeError('positions not 3 per vertex');

@@ -13,6 +13,7 @@ internal static class Config
     internal static string GameRepository = "orogdor/Kuningriigid";
     internal static string GameBranch = "main";
     internal static string EngineRepository = "orogdor/NativeThreeBridge";
+    internal static string GameNewsLabel = "Mäng";
 
     internal static void Load()
     {

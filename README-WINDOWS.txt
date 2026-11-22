@@ -1,4 +1,4 @@
-NativeThreeBridge v0.36.0 - KÄIVITAJA + METSALAHINGU TEST
+NativeThreeBridge v0.37.0 - KÄIVITAJA + METSALAHINGU TEST
 =========================================================
 Launcher.exe         mängu käivitaja (Kuningriigid kaustas game2):
                      kontrollib GitHubist uusimat engine'i ja mängu,
@@ -16,6 +16,21 @@ Esimene kord: käivita Launcher.exe. Kuningriigid laaditakse alla (umbes
 Kui internetti pole, saab paigaldatud mängu ikkagi käivitada.
 Pilt: mängu native-launcher.json "image" või mängu peamenüü taustapilt.
 Uudised: mängu viimased GitHubi muudatused ja engine'i väljalasked.
+
+v0.37.0 UUS:
+- Teine käivitus on kiirem: varjutajad ja mängu JavaScript salvestatakse
+  kompileeritult kausta %LOCALAPPDATA%\NativeThreeBridge.
+- Materjalide varjutajad kompileeritakse taustal (mäng ei jää hetkeks
+  seisma, kui uus materjal ilmub).
+- F9 salvestab jõudlusraporti NativeThreeBridge-perf-report.txt
+  (viimased 10 s: mis võtab kaadris aega). Saada see koos logiga, kui
+  mõni kaart on aeglane.
+- Kaskaadvarjud (three.js CSM) töötavad.
+- Käivitajal ja mängul on ikoon; mängu MUUDATUSED_V*.md failid on
+  uudistes esimesena.
+- Windowsi hoiatus "Windows kaitses teie arvutit": vali "Rohkem teavet"
+  ja "Käivita ikkagi". Allkirjastamine on CI-s valmis, kui sertifikaat
+  lisatakse (docs/CODE-SIGNING.md).
 
 v0.36.0 UUS: Game2.exe, UpdateKuningriigid.exe ja UpdateEngine.exe asemel
 on üks Launcher.exe (vanad failid eemaldatakse esimesel käivitusel).

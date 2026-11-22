@@ -59,7 +59,8 @@ struct NewsItem { std::wstring date, source, text; };
 struct State {
     std::wstring name, image, engine, engineLatest, gameVersion, gameLatestVersion, gameCommit, gameLatestCommit;
     bool gameInstalled = false, engineOk = false, gameOk = false, checked = false;
-    std::vector<NewsItem> news;
+    std::vector<NewsItem> news;      // GitHub: engine releases, game commits
+    std::vector<NewsItem> notes;     // the installed game's change notes (MUUDATUSED_V*.md)
     std::wstring status = L"Kontrollin uuendusi…";
     int progress = -1;   // permille; -1 = working, length unknown (animated)
     Phase phase = Phase::Checking;
@@ -186,6 +187,7 @@ int runHelper(const std::wstring& args, const std::function<void(const std::wstr
 // INFO <key> <value> and NEWS <date> <source> <text> lines (under gMutex).
 void applyInfo(const std::vector<std::wstring>& f) {
     if (f[0] == L"NEWS" && f.size() >= 4) { gState.news.push_back({f[1], f[2], f[3]}); return; }
+    if (f[0] == L"NEWS_LOCAL" && f.size() >= 4) { gState.notes.push_back({f[1], f[2], f[3]}); return; }
     if (f[0] != L"INFO" || f.size() < 3) return;
     const std::wstring& key = f[1];
     const std::wstring& value = f[2];
@@ -244,6 +246,7 @@ void readLocal() {
     {
         std::lock_guard<std::mutex> lock(gMutex);
         gState.image.clear();
+        gState.notes.clear();
     }
     runStep(L"local", nullptr);
     post(WM_APP_IMAGE);
@@ -487,17 +490,27 @@ void versionBox(D2D1_RECT_F r, const std::wstring& label, const std::wstring& in
     g.rt->DrawEllipse(e, color(ring), 2.5f);
 }
 
+// The game's own notes first (when it has them, they replace its commit
+// messages), then the engine releases and game commits from GitHub.
+std::vector<NewsItem> newsList(const State& s) {
+    std::vector<NewsItem> list = s.notes;
+    for (const NewsItem& item : s.news)
+        if (s.notes.empty() || item.source == L"Engine") list.push_back(item);
+    return list;
+}
+
 void drawNews(const State& s) {
     g.rt->FillRoundedRectangle(D2D1::RoundedRect(kNews, 8, 8), color(0x0b0f14, 0.68f));
     text(L"Viimased uuendused", g.header.Get(), D2D1::RectF(kNews.left + 14, kNews.top + 10, kNews.right - 14, kNews.top + 34), 0xf2e6c4);
     float y = kNews.top + 42;
     const float width = kNews.right - kNews.left - 28;
-    if (s.news.empty()) {
+    const std::vector<NewsItem> items = newsList(s);
+    if (items.empty()) {
         const wchar_t* note = s.phase == Phase::Checking ? L"Laen uudiseid…" : L"Uudiseid ei saanud laadida.";
         text(note, g.body.Get(), D2D1::RectF(kNews.left + 14, y, kNews.right - 14, y + 40), 0xa8b0ba);
         return;
     }
-    for (const NewsItem& item : s.news) {
+    for (const NewsItem& item : items) {
         ComPtr<IDWriteTextLayout> layout;
         g.dwrite->CreateTextLayout(item.text.c_str(), UINT32(item.text.size()), g.body.Get(), width, 400, &layout);
         if (!layout) break;
@@ -779,7 +792,8 @@ owned:
     wc.lpfnWndProc = windowProc;
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); // Launcher.rc
+    if (!wc.hIcon) wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wc.lpszClassName = L"NativeThreeLauncher";
     RegisterClassW(&wc);
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;

@@ -13,7 +13,8 @@
 
 // Header 55: render target texture id (0 = window).
 // Header 56: shadow lights, 57: shadow views (map slices), 58: bone matrices,
-// 59: shadow map size. After the lights come the shadow light records
+// 59: shadow map size. 60..62: CSM cascades, camera near, shadow far;
+// 64..79: CSM cascade depth ranges (vec2 per cascade, at most 8). After the lights come the shadow light records
 // (SHADOW_LIGHT_FLOATS each: light index, first slice, kind (0, or 1 + near
 // for point lights), bias, normalBias, radius, intensity, far), one
 // view-projection per shadow view, the bone matrices, then the draws.
@@ -34,7 +35,9 @@ export function passLayout(p) {
 // Draw float 88: shadow bits (castShadow, receiveShadow, only in the shadow pass).
 // 89: standard map bits (StandardMaps), 90..91 normalScale, 92 aoMapIntensity,
 // 93: first bone + 1 of a SkinnedMesh skinned on the GPU (0: not skinned).
-export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4 };
+// CSM: the material uses three.js CSM (csm.setupMaterial): each cascade light
+// lights it only inside its own depth range.
+export const ShadowFlags = { CAST: 1, RECEIVE: 2, ONLY: 4, CSM: 8 };
 // Material maps besides `map`, bound to t1..t6 (bit i = slot i).
 export const StandardMaps = { NORMAL: 1, ROUGHNESS: 2, METALNESS: 4, EMISSIVE: 8, AO: 16, ALPHA: 32 };
 const STANDARD_MAP_KEYS = ['normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'aoMap', 'alphaMap'];
@@ -101,6 +104,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   let nextTextureId = 1;
   const colorPatches = new Map();
   const shaderMaterials = new WeakMap();
+  // Stages compile in the background (nt.colorPatchStatus); one that fails is
+  // dropped and the materials that used it are worked out again (patchEpoch).
+  const pendingPatchIds = new Set(), failedPatchIds = new Set();
+  let patchEpoch = 0;
+  function checkPendingPatches() {
+    if (!pendingPatchIds.size || !nt.colorPatchStatus) return;
+    for (const id of pendingPatchIds) {
+      const status = nt.colorPatchStatus(id);
+      if (status > 0) pendingPatchIds.delete(id);
+      else if (status < 0) { pendingPatchIds.delete(id); failedPatchIds.add(id); patchEpoch++; }
+    }
+  }
   const attributeGetters = ['getX', 'getY', 'getZ', 'getW'];
   function registerMaterialStage(stage) {
     if (!stage) return null;
@@ -108,9 +123,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     if (id === undefined && colorPatches.size < 32) {
       id = colorPatches.size + 1;
       if (!nt.registerColorPatch(id, stage.source)) id = 0;
+      else pendingPatchIds.add(id);
       colorPatches.set(stage.source, id);
     }
-    return id ? { ...stage, id } : null;
+    return id && !failedPatchIds.has(id) ? { ...stage, id } : null;
   }
   const SHADER_IDS = { MeshStandardMaterial: 'standard', MeshPhysicalMaterial: 'physical', MeshLambertMaterial: 'lambert', MeshPhongMaterial: 'phong', MeshBasicMaterial: 'basic', MeshToonMaterial: 'toon', MeshMatcapMaterial: 'matcap' };
 
@@ -700,10 +716,27 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     // patch once against Three.js' own shader source and remember which
     // colour uniforms it writes into diffuseColor, so the surface at least
     // gets the intended colour (e.g. a sea that mixes deep/shallow colours).
+    // CSM uniforms: the material's onBeforeCompile run once against a shader
+    // object that CSM keeps updating (csm.update() -> _updateUniforms).
+    _csmInfo(m) {
+      this._csmShaders ??= new WeakMap();
+      let entry = this._csmShaders.get(m);
+      if (!entry || entry.fn !== m.onBeforeCompile) {
+        const shader = { uniforms: {}, vertexShader: '', fragmentShader: '', defines: m.defines };
+        try { m.onBeforeCompile?.(shader, this); } catch (e) { warnOnce('csm-patch', 'CSM material patch failed: ' + e.message); }
+        entry = { fn: m.onBeforeCompile, shader };
+        this._csmShaders.set(m, entry);
+      }
+      const u = entry.shader.uniforms;
+      if (!u.CSM_cascades || !Array.isArray(u.CSM_cascades.value)) return null;
+      return { cascades: Math.min(8, Number(m.defines.CSM_CASCADES) || u.CSM_cascades.value.length), breaks: u.CSM_cascades.value,
+        near: u.cameraNear?.value ?? 0.1, far: u.shadowFar?.value ?? 1000 };
+    }
+
     _patchInfo(m) {
       let info = this._patches.get(m);
-      if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
-      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false, alphaRamp: null, colorRamp: null, reflection: null, colorStage: null };
+      if (info && info.fn === m.onBeforeCompile && info.version === m.version && info.epoch === patchEpoch) return info;
+      info = { fn: m.onBeforeCompile, version: m.version, epoch: patchEpoch, colors: null, alpha: null, hide: false, alphaRamp: null, colorRamp: null, reflection: null, colorStage: null };
       this._patches.set(m, info);
       const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
       const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
@@ -755,6 +788,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const opaque = this._opaque, transparent = this._transparent, lights = this._lights;
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
+      checkPendingPatches();
       this._spriteCount = 0;
       this._shadowLights = this._shadowLights || [];
       this._shadowLights.length = 0;
@@ -763,7 +797,16 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (!this._bones) this._bones = new Float32Array(1024);
       this._offscreenCasters = this._offscreenCasters || [];
       this._offscreenCasters.length = 0;
+      this._csm = null;
       this._collect(scene, camera, opaque, transparent, lights, ambient);
+      // CSM: the first N directional shadow lights are the cascades (three.js order).
+      if (this._csm) {
+        let cascade = 0;
+        for (const entry of this._shadowLights) {
+          if (!entry.light.isDirectionalLight || cascade >= this._csm.cascades) continue;
+          lights[entry.index].extra2 = ++cascade;
+        }
+      }
       const shadowLights = this.shadowMap.enabled ? this._shadowLights : [];
       if (shadowLights.length) {
         if (!this._shadowViews) this._shadowViews = new Float32Array(MAX_SHADOW_VIEWS * 16);
@@ -824,6 +867,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       if (tm === THREE.CustomToneMapping) unsupported('CustomToneMapping', 'no tone mapping is applied');
       const fog = scene.fog;
       p[56] = shadowCount; p[57] = viewCount; p[58] = boneCount;
+      if (this._csm && shadowCount) {
+        const c = this._csm;
+        p[60] = c.cascades; p[61] = c.near; p[62] = c.far;
+        for (let i = 0; i < c.cascades; i++) { p[64 + i * 2] = c.breaks[i]?.x ?? 0; p[65 + i * 2] = c.breaks[i]?.y ?? 1; }
+      }
       if (shadowCount) {
         // One map size for the whole array: the largest mapSize, kept under ~160 MB.
         let size = 256;
@@ -1146,8 +1194,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       else if (m.isShaderMaterial || m.isRawShaderMaterial) {
         if (nt.registerColorPatch) {
           let cached = shaderMaterials.get(m);
-          if (!cached || cached.version !== m.version) {
-            cached = { version: m.version, stage: registerMaterialStage(translateMaterialStage(m, true)) };
+          if (!cached || cached.version !== m.version || cached.epoch !== patchEpoch) {
+            cached = { version: m.version, epoch: patchEpoch, stage: registerMaterialStage(translateMaterialStage(m, true)) };
             shaderMaterials.set(m, cached);
           }
           colorStage = cached.stage;
@@ -1188,7 +1236,11 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         unsupported('envMap / lightMap / bumpMap / displacementMap', 'drawn without them');
       }
       if (m.wireframe) unsupported('Wireframe materials', 'drawn solid');
-      if (hasCompilePatch(m.onBeforeCompile)) {
+      // three.js CSM (addons/csm): its onBeforeCompile only adds uniforms; the
+      // cascade choice is done natively (ShadowFlags.CSM + pass data).
+      const csm = m.defines?.USE_CSM ? this._csmInfo(m) : null;
+      if (csm) { if (!this._csm) this._csm = csm; }
+      else if (hasCompilePatch(m.onBeforeCompile)) {
         const patch = this._patchInfo(m);
         // A translated stage evaluates the texture mask itself; only untranslated masks are left out.
         if (patch.hide && !patch.colorStage) { unsupported('material.onBeforeCompile alpha masks', 'surfaces cut out by their own texture are not drawn'); return; }
@@ -1284,7 +1336,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
         er: emissive ? emissive.r * ei : 0, eg: emissive ? emissive.g * ei : 0, eb: emissive ? emissive.b * ei : 0,
         matrix: mesh.matrixWorld.elements, z: base.z, renderOrder: mesh.renderOrder || 0, bones: base.bones || 0,
         shadow: (mesh.castShadow && !(flags & (DrawFlags.LINES | DrawFlags.LINE_STRIP)) ? ShadowFlags.CAST : 0) |
-          (mesh.receiveShadow && !(flags & DrawFlags.UNLIT) ? ShadowFlags.RECEIVE : 0) | (this._shadowPass ? ShadowFlags.ONLY : 0),
+          (mesh.receiveShadow && !(flags & DrawFlags.UNLIT) ? ShadowFlags.RECEIVE : 0) | (this._shadowPass ? ShadowFlags.ONLY : 0) |
+          (csm ? ShadowFlags.CSM : 0),
       };
       if (globalThis.__ntDebugDraws) {
         const g = mesh.geometry, c = g.attributes.color;

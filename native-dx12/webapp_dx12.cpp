@@ -37,6 +37,11 @@
 #include "webapp_host.h"
 #include "webapp_resources.h"
 #include "webapp_shader.h"
+#include "webapp_shader_cache.h"
+#include <cstdlib>
+#include <deque>
+#include <future>
+#include <set>
 #include "webapp_ui.h"
 
 #pragma comment(lib, "d3d12.lib")
@@ -58,12 +63,13 @@ constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kShadowSlot = kMaxTextures - 1;       // SRV of the shadow map (t10)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
-constexpr UINT kFrameCBBytes = 2816;                 // see cbuffer Frame (668 floats)
+constexpr UINT kFrameCBBytes = 2816;                 // see cbuffer Frame (688 floats)
 constexpr UINT kDrawCBBytes = 512; // cbuffer Draw (80 floats), CBVs are 256-byte aligned
 constexpr UINT kMaterialMapCount = 9;
 constexpr UINT kShadowParam = 3 + kMaterialMapCount; // root parameter of t10
 constexpr UINT kBoneParam = kShadowParam + 1;        // root SRV t11: bone matrices (GPU skinning)
 constexpr UINT kSkinStride = 8 * sizeof(float);      // skinIndex + skinWeight per vertex
+constexpr unsigned kPatchCompileFlags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
 // Draw record float 88 (js/native-renderer.mjs ShadowFlags)
 constexpr UINT S_CAST = 1, S_RECEIVE = 2, S_ONLY = 4;
 const D3D12_INPUT_ELEMENT_DESC kInputLayout[] = {
@@ -96,6 +102,14 @@ std::wstring widen(const std::string& s) {
     std::wstring w(n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
     return w;
+}
+
+std::string narrow(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
 }
 
 D3D12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE type) {
@@ -267,7 +281,16 @@ public:
     explicit WebappWindow(std::filesystem::path root) : root_(std::move(root)) {}
     // initUi() starts a worker before V8 boots. Drain it also on early boot
     // failure, not just on the normal WM_QUIT/reload paths.
-    ~WebappWindow() { decodeQueue_.stop(); stopRenderThread(); stopUiThread(); }
+    ~WebappWindow() {
+        {
+            std::lock_guard<std::mutex> lock(patchJobMutex_);
+            patchStop_ = true;
+            patchJobs_.clear();
+        }
+        patchJobCv_.notify_all();
+        if (patchThread_.joinable()) patchThread_.join();
+        decodeQueue_.stop(); stopRenderThread(); stopUiThread();
+    }
     int run(HINSTANCE instance);
 
     // ---- WebappRenderSink
@@ -284,6 +307,7 @@ public:
     bool uploadSkin(std::uint32_t id, const float* indices, const float* weights, std::uint32_t vertexCount) override;
     void releaseInstances(std::uint32_t id) override;
     bool registerColorPatch(std::uint32_t id, const std::string& source) override;
+    int colorPatchStatus(std::uint32_t id) override;
     void submitPass(const float* data, std::size_t floats) override {
         // Packet storage is recycled between frames: assign() into an
         // existing vector keeps its capacity, so a steady scene allocates nothing.
@@ -569,6 +593,17 @@ private:
     // Same pipelines addressed directly by their key: the per-draw lookup is one array read.
     std::array<ID3D12PipelineState*, kPipelineSlots> pipelineTable_{};
     std::map<UINT, ComPtr<ID3DBlob>> colorPatches_;
+    // GLSL material stages compile on a background thread (first run; later
+    // runs load them from the shader cache): their draws wait meanwhile.
+    struct PatchJob { UINT id; std::string shader; unsigned generation; };
+    std::set<UINT> colorPatchPending_;
+    std::mutex patchJobMutex_;
+    std::condition_variable patchJobCv_;
+    std::deque<PatchJob> patchJobs_;
+    std::thread patchThread_;
+    bool patchStop_ = false;
+    unsigned patchGeneration_ = 0; // a new page drops the old page's jobs
+    void patchCompileLoop();
     ComPtr<ID3D12Resource> ring_[kFrameCount];
     UINT64 ringBytes_[kFrameCount] = {};
     std::uint8_t* ringMapped_[kFrameCount] = {}; // upload heaps stay mapped for their lifetime
@@ -613,6 +648,15 @@ private:
     double fenceWaitMs_ = 0;
     double presentMs_ = 0;
     void writePerfRow(double atSeconds, double seconds);
+    // F9: performance report of the last seconds (NativeThreeBridge-perf-report.txt)
+    struct PerfSecond {
+        double at = 0, fps = 0, frameMs = 0, frameMax = 0, jsMs = 0, rasterMs = 0, renderMs = 0, fenceMs = 0, presentMs = 0;
+        unsigned draws = 0, shadowDraws = 0, passes = 0;
+    };
+    std::deque<PerfSecond> perfHistory_;
+    std::chrono::steady_clock::time_point reportShownUntil_{};
+    std::wstring reportNote_;
+    void writePerfReport();
     std::string uiLastStats_;
     HCURSOR cursor_ = LoadCursorW(nullptr, IDC_ARROW);
     bool cursorHidden_ = false;
@@ -695,7 +739,10 @@ void WebappWindow::log(const std::string& level, const std::string& text) {
     std::lock_guard<std::mutex> lock(logMutex_);
     if (level == "error") logErrors_++;
     if (log_) {
-        std::fprintf(log_, "[%s] %s\n", level.c_str(), text.c_str());
+        // Seconds since the engine started: shows where start-up time goes.
+        static const auto started = std::chrono::steady_clock::now();
+        const double at = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(log_, "[%s] %7.2fs %s\n", level.c_str(), at, text.c_str());
         std::fflush(log_);
     }
     OutputDebugStringA(("[webapp " + level + "] " + text + "\n").c_str());
@@ -813,30 +860,34 @@ void WebappWindow::initDevice() {
     check(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error), "Serialize root signature");
     check(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&root_sig_)), "Root signature");
 
-    for (int stage = 0; stage < 2; stage++) {
-        ComPtr<ID3DBlob> err;
-        ID3DBlob** out = stage ? ps_.ReleaseAndGetAddressOf() : vs_.ReleaseAndGetAddressOf();
-        HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
-                                stage ? "PSMain" : "VSMain", stage ? "ps_5_0" : "vs_5_0",
-                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, err.GetAddressOf());
-        if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
-        check(hr, stage ? "Compile webapp pixel shader" : "Compile webapp vertex shader");
-    }
-    for (int stage = 0; stage < 2; stage++) {
-        ComPtr<ID3DBlob> err;
-        ID3DBlob** out = stage ? shadowPs_.ReleaseAndGetAddressOf() : shadowVs_.ReleaseAndGetAddressOf();
-        HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
-                                stage ? "PSShadow" : "VSShadow", stage ? "ps_5_0" : "vs_5_0",
-                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, err.GetAddressOf());
-        if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
-        check(hr, stage ? "Compile webapp shadow pixel shader" : "Compile webapp shadow vertex shader");
-    }
     {
-        ComPtr<ID3DBlob> err;
-        HRESULT hr = D3DCompile(kWebappShader, std::strlen(kWebappShader), "webapp_shader", nullptr, nullptr,
-                                "PSShadowPoint", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shadowPointPs_, err.GetAddressOf());
-        if (FAILED(hr) && err) log("error", static_cast<const char*>(err->GetBufferPointer()));
-        check(hr, "Compile webapp point shadow pixel shader");
+        // The five stock entry points compile in parallel; from the second
+        // start on they come from the shader cache.
+        const auto started = std::chrono::steady_clock::now();
+        struct Entry { const char* entry; const char* target; ID3DBlob** out; const char* what; };
+        const Entry entries[] = {{"VSMain", "vs_5_0", vs_.ReleaseAndGetAddressOf(), "Compile webapp vertex shader"},
+                                 {"PSMain", "ps_5_0", ps_.ReleaseAndGetAddressOf(), "Compile webapp pixel shader"},
+                                 {"VSShadow", "vs_5_0", shadowVs_.ReleaseAndGetAddressOf(), "Compile webapp shadow vertex shader"},
+                                 {"PSShadow", "ps_5_0", shadowPs_.ReleaseAndGetAddressOf(), "Compile webapp shadow pixel shader"},
+                                 {"PSShadowPoint", "ps_5_0", shadowPointPs_.ReleaseAndGetAddressOf(), "Compile webapp point shadow pixel shader"}};
+        const std::string source = kWebappShader;
+        std::vector<std::future<std::pair<HRESULT, std::string>>> jobs;
+        for (const Entry& e : entries)
+            jobs.push_back(std::async(std::launch::async, [&source, e] {
+                ComPtr<ID3DBlob> err;
+                const HRESULT hr = native_three::compileShaderCached(source, "webapp_shader", e.entry, e.target,
+                                                                     D3DCOMPILE_OPTIMIZATION_LEVEL3, e.out, err.GetAddressOf());
+                return std::make_pair(hr, err ? std::string(static_cast<const char*>(err->GetBufferPointer())) : std::string());
+            }));
+        for (std::size_t i = 0; i < jobs.size(); i++) {
+            const auto [hr, error] = jobs[i].get();
+            if (FAILED(hr) && !error.empty()) log("error", error);
+            check(hr, entries[i].what);
+        }
+        const auto stats = native_three::shaderCacheStats();
+        log("info", "[shader-cache] stock shaders ready in " +
+                        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()) +
+                        " ms (" + std::to_string(stats.hits) + " from the cache, " + std::to_string(stats.compiles) + " compiled)");
     }
     heap.NumDescriptors = UINT(native_three::kWebappMaxShadowViews); // one DSV per shadow map slice
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
@@ -1011,6 +1062,12 @@ void WebappWindow::resetPage() {
     pipelines_.clear();
     pipelineTable_.fill(nullptr);
     colorPatches_.clear();
+    colorPatchPending_.clear();
+    {
+        std::lock_guard<std::mutex> lock(patchJobMutex_);
+        patchJobs_.clear();
+        patchGeneration_++;
+    }
     stopUiThread();
     {
         std::lock_guard<std::mutex> uiLock(uiMutex_);
@@ -1412,9 +1469,9 @@ void WebappWindow::initUi() {
     ComPtr<ID3DBlob> vs, ps;
     for (int stage = 0; stage < 2; stage++) {
         ComPtr<ID3DBlob> e;
-        const HRESULT hr = D3DCompile(kUiShader, std::strlen(kUiShader), "webapp_ui_shader", nullptr, nullptr,
-                                      stage ? "PSMain" : "VSMain", stage ? "ps_5_0" : "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                      stage ? ps.GetAddressOf() : vs.GetAddressOf(), e.GetAddressOf());
+        const HRESULT hr = native_three::compileShaderCached(kUiShader, "webapp_ui_shader", stage ? "PSMain" : "VSMain",
+                                                             stage ? "ps_5_0" : "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                                             stage ? ps.GetAddressOf() : vs.GetAddressOf(), e.GetAddressOf());
         if (FAILED(hr) && e) log("error", static_cast<const char*>(e->GetBufferPointer()));
         check(hr, stage ? "Compile UI pixel shader" : "Compile UI vertex shader");
     }
@@ -1770,7 +1827,7 @@ bool WebappWindow::uploadSkin(std::uint32_t id, const float* indices, const floa
 
 bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& source) {
     std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
-    if (!id || id > kMaxColorPatches || source.size() > 24000 || colorPatches_.count(id)) return false;
+    if (!id || id > kMaxColorPatches || source.size() > 24000 || colorPatches_.count(id) || colorPatchPending_.count(id)) return false;
     if (source.find_first_of("#\\\"'") != std::string::npos) return false;
     static const std::regex control(R"(\b(while|do|goto|register|cbuffer|clip)\b)");
     if (std::regex_search(source, control)) return false;
@@ -1788,17 +1845,57 @@ bool WebappWindow::registerColorPatch(std::uint32_t id, const std::string& sourc
     std::string shader = std::string("#define NT_COLOR_PATCH 1\n") + kWebappShader;
     const std::string marker = "// NT_COLOR_PATCH_FUNCTION";
     shader.replace(shader.find(marker), marker.size(), source);
-    ComPtr<ID3DBlob> code, errors;
-    const auto hr = D3DCompile(shader.data(), shader.size(), "webapp_color_patch", nullptr, nullptr,
-                               "PSMain", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                               &code, &errors);
-    if (FAILED(hr)) {
-        log("warn", "[material-color] shader patch skipped: " + std::string(errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compilation failed"));
-        return false;
+    ComPtr<ID3DBlob> code;
+    if (native_three::loadShaderCached(shader, "PSMain", "ps_5_0", kPatchCompileFlags, code.GetAddressOf())) {
+        colorPatches_.emplace(id, std::move(code));
+        log("info", "[material-color] compiled GLSL material stage " + std::to_string(id) + " (from the shader cache)");
+        return true;
     }
-    colorPatches_.emplace(id, std::move(code));
-    log("info", "[material-color] compiled GLSL material stage " + std::to_string(id));
+    // Not compiled on this machine yet: compile in the background, draws using it wait.
+    colorPatchPending_.insert(id);
+    {
+        std::lock_guard<std::mutex> lock(patchJobMutex_);
+        patchJobs_.push_back({id, std::move(shader), patchGeneration_});
+        if (!patchThread_.joinable()) patchThread_ = std::thread([this] { patchCompileLoop(); });
+    }
+    patchJobCv_.notify_one();
     return true;
+}
+
+void WebappWindow::patchCompileLoop() {
+    for (;;) {
+        PatchJob job;
+        {
+            std::unique_lock<std::mutex> lock(patchJobMutex_);
+            patchJobCv_.wait(lock, [this] { return patchStop_ || !patchJobs_.empty(); });
+            if (patchStop_) return;
+            job = std::move(patchJobs_.front());
+            patchJobs_.pop_front();
+        }
+        const auto started = std::chrono::steady_clock::now();
+        ComPtr<ID3DBlob> code, errors;
+        const HRESULT hr = native_three::compileShaderCached(job.shader, "webapp_color_patch", "PSMain", "ps_5_0", kPatchCompileFlags,
+                                                             code.GetAddressOf(), errors.GetAddressOf());
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+        {
+            std::lock_guard<std::mutex> lock(patchJobMutex_);
+            if (job.generation != patchGeneration_) continue; // the page was reloaded
+        }
+        colorPatchPending_.erase(job.id);
+        if (FAILED(hr)) {
+            log("warn", "[material-color] shader patch skipped: " + std::string(errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compilation failed"));
+            continue;
+        }
+        colorPatches_.emplace(job.id, std::move(code));
+        log("info", "[material-color] compiled GLSL material stage " + std::to_string(job.id) + " in " + std::to_string(ms) + " ms (background)");
+    }
+}
+
+int WebappWindow::colorPatchStatus(std::uint32_t id) {
+    std::lock_guard<std::recursive_mutex> gpuLock(gfxMutex_);
+    if (colorPatches_.count(id)) return 1;
+    return colorPatchPending_.count(id) ? 0 : -1;
 }
 
 ID3D12PipelineState* WebappWindow::pipeline(UINT flags, UINT patchId, bool hdr) {
@@ -2354,6 +2451,9 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             }
             fcb[660] = 1.0f / float(shadowSize_);
         }
+        // three.js CSM: header 60..62 (cascades, near, far), 64..79 cascade ranges.
+        fcb[668] = p[60]; fcb[669] = p[61]; fcb[670] = p[62]; fcb[671] = 0;
+        std::memcpy(fcb + 672, p + 64, 16 * sizeof(float));
         const D3D12_GPU_VIRTUAL_ADDRESS frameAddress = ringGpu + ringOffset;
         cmd_->SetGraphicsRootConstantBufferView(0, frameAddress);
         ringOffset += kFrameCBBytes;
@@ -2433,9 +2533,10 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
         for (UINT i = 0; i < drawCount; i++, d += native_three::kWebappDrawFloats) {
             if (UINT(d[88]) & S_ONLY) continue; // outside the view, only casts a shadow into it
             const UINT drawFlags = UINT(d[3]);
+            const UINT patchId = UINT(d[48]);
+            if (patchId && !colorPatchPending_.empty() && colorPatchPending_.count(patchId)) continue; // still compiling
             DrawInput in;
             if (!prepareDraw(d, in)) continue;
-            const UINT patchId = UINT(d[48]);
             const UINT pipelineFlags = drawFlags & kPipelineFlagBits;
             if (!cachedPipeline || pipelineFlags != cachedPipelineFlags || patchId != cachedPipelinePatch) {
                 cachedPipeline = pipeline(drawFlags, patchId, target != nullptr);
@@ -2514,6 +2615,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     // Launcher.exe waits for the first frame that shows something (3D or HTML UI).
     if (!shownSignaled_ && (drawsThisFrame > 0 || (uiReady_ && uiVisible_))) {
         shownSignaled_ = true;
+        log("info", std::string("[boot] first frame that shows the game (") + (drawsThisFrame > 0 ? "3D" : "HTML UI") + ")");
         const std::wstring name = L"Local\\NativeThreeBridge-Shown-" + std::to_wstring(GetCurrentProcessId());
         if (HANDLE shown = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str())) { SetEvent(shown); CloseHandle(shown); }
     }
@@ -2521,10 +2623,11 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
 }
 
 void WebappWindow::updateTitle(double fps) {
-    wchar_t text[512];
-    swprintf_s(text, L"%s \u2014 NativeThreeBridge webapp | %.0f FPS | %u draws | %s | %s%s",
+    wchar_t text[768];
+    const bool note = std::chrono::steady_clock::now() < reportShownUntil_;
+    swprintf_s(text, L"%s \u2014 NativeThreeBridge webapp | %.0f FPS | %u draws | %s | %s%s%s",
                pageTitle_.c_str(), fps, lastDraws_, widen(native_three::webappEngineName()).c_str(), adapterName_.c_str(),
-               logErrors_ ? L" | JS errors: see NativeThreeBridge-webapp-log.txt" : L"");
+               logErrors_ ? L" | JS errors: see NativeThreeBridge-webapp-log.txt" : L"", note ? reportNote_.c_str() : L"");
     SetWindowTextW(window_, text);
 }
 
@@ -2607,6 +2710,7 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             host_.lockChanged(false, false);
             return 0;
         }
+        if (wp == VK_F9 && !(lp & (1 << 30))) writePerfReport(); // the game still gets the key
         keyEvent(true, wp, lp);
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
@@ -2672,6 +2776,12 @@ LRESULT WebappWindow::handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 void WebappWindow::writePerfRow(double atSeconds, double seconds) {
     Perf& p = perf_;
+    if (p.frames > 0) {
+        const double n = p.frames;
+        perfHistory_.push_back({atSeconds, n / seconds, p.frameMs / n, p.frameMax, p.jsMs / n, p.rasterMs / n, p.renderMs / n,
+                                p.fenceMs / n, p.presentMs / n, lastDraws_, lastShadowDraws_, UINT(passCount_)});
+        while (perfHistory_.size() > 120) perfHistory_.pop_front();
+    }
     if (perfCsv_ && p.frames > 0) {
         const double n = p.frames;
         std::fprintf(perfCsv_, "%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%.2f\n",
@@ -2680,6 +2790,51 @@ void WebappWindow::writePerfRow(double atSeconds, double seconds) {
         std::fflush(perfCsv_);
     }
     p = Perf{};
+}
+
+// F9: what limits the frame rate here and now, as a text file to send.
+void WebappWindow::writePerfReport() {
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    const std::filesystem::path path = std::filesystem::path(exePath).parent_path() / L"NativeThreeBridge-perf-report.txt";
+    const std::size_t count = std::min<std::size_t>(perfHistory_.size(), 10); // the last 10 seconds
+    PerfSecond sum{}, worst{};
+    worst.fps = 1e9;
+    for (std::size_t i = perfHistory_.size() - count; i < perfHistory_.size(); i++) {
+        const PerfSecond& r = perfHistory_[i];
+        sum.fps += r.fps; sum.frameMs += r.frameMs; sum.jsMs += r.jsMs; sum.rasterMs += r.rasterMs; sum.renderMs += r.renderMs;
+        sum.fenceMs += r.fenceMs; sum.presentMs += r.presentMs; sum.draws += r.draws; sum.shadowDraws += r.shadowDraws; sum.passes += r.passes;
+        worst.fps = std::min(worst.fps, r.fps);
+        worst.frameMax = std::max(worst.frameMax, r.frameMax);
+    }
+    const double n = count ? double(count) : 1.0;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"ab") != 0 || !f) return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    std::fprintf(f, "=== NativeThreeBridge perf report %04d-%02d-%02d %02d:%02d:%02d ===\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    std::fprintf(f, "engine %s | %s | GPU %s | window %ux%u%s\n", native_three::webappEngineName(), narrow(pageTitle_).c_str(),
+                 narrow(adapterName_).c_str(), width_, height_, fullscreen_ ? " fullscreen" : "");
+    std::fprintf(f, "last %zu s: %.1f FPS average, %.1f lowest second, %.1f ms per frame, worst frame %.1f ms\n",
+                 count, sum.fps / n, count ? worst.fps : 0.0, sum.frameMs / n, worst.frameMax);
+    std::fprintf(f, "per frame: JavaScript %.2f ms | HTML UI raster %.2f ms | DX12 recording %.2f ms | waiting for the GPU %.2f ms | present %.2f ms\n",
+                 sum.jsMs / n, sum.rasterMs / n, sum.renderMs / n, sum.fenceMs / n, sum.presentMs / n);
+    std::fprintf(f, "scene: %.0f draws, %.0f shadow draws, %.1f render passes, %zu geometries, %zu instance sets, render thread %s\n",
+                 sum.draws / n, sum.shadowDraws / n, sum.passes / n, geometries_.size(), instances_.size(), renderThread_.joinable() ? "on" : "off");
+    // The largest share of the frame is what to make faster.
+    const double js = sum.jsMs / n, ui = sum.rasterMs / n, gpu = sum.fenceMs / n + sum.presentMs / n, record = sum.renderMs / n - gpu;
+    const char* verdict = "JavaScript (the game's own code per frame)";
+    double most = js;
+    if (gpu > most) { most = gpu; verdict = "GPU (too many pixels, draws or shadow passes for this graphics card)"; }
+    if (ui > most) { most = ui; verdict = "HTML/CSS UI drawing"; }
+    if (record > most) { verdict = "DX12 command recording on the CPU (many draws)"; }
+    std::fprintf(f, "limit: %s\n", verdict);
+    std::fprintf(f, "per-second history: NativeThreeBridge-webapp-frames.csv; log: NativeThreeBridge-webapp-log.txt\n\n");
+    std::fclose(f);
+    log("info", "[perf-report] F9: " + std::to_string(sum.fps / n) + " FPS, limit: " + verdict);
+    reportNote_ = L" | Mõõtmine salvestatud: NativeThreeBridge-perf-report.txt";
+    reportShownUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    MessageBeep(MB_OK);
 }
 
 int WebappWindow::run(HINSTANCE instance) {
@@ -2720,7 +2875,8 @@ int WebappWindow::run(HINSTANCE instance) {
     wc.hInstance = instance;
     wc.lpszClassName = L"NativeThreeWebappWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); // launcher/nativethree.ico
+    if (!wc.hIcon) wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassW(&wc);
     RECT rc{0, 0, LONG(width_), LONG(height_)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
@@ -2889,8 +3045,16 @@ int WebappWindow::run(HINSTANCE instance) {
             }
             const double since = std::chrono::duration<double>(tEnd - perfAt_).count();
             if (since >= 1.0) {
-                writePerfRow(std::chrono::duration<double>(tEnd - start).count(), since);
+                const double at = std::chrono::duration<double>(tEnd - start).count();
+                writePerfRow(at, since);
                 perfAt_ = tEnd;
+                // NTB_PERF_REPORT_AFTER=<seconds>: the F9 report without a key press (tests).
+                static const double reportAfter = [] {
+                    char value[16] = {};
+                    return GetEnvironmentVariableA("NTB_PERF_REPORT_AFTER", value, sizeof value) ? std::atof(value) : 0.0;
+                }();
+                static bool reported = false;
+                if (reportAfter > 0 && at >= reportAfter && !reported) { reported = true; writePerfReport(); }
             }
         }
         frameNumber++;

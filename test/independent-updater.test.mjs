@@ -27,7 +27,7 @@ test('DX12 projection uses correct row-vector convention', () => {
 
 test('Game1 opens the forest battle; Launcher.exe opens the game folder only after updating', () => {
   assert.match(launcher, /--scene game1/);
-  assert.match(flow, /\/DNTB_GAME=1 launcher\/Game-Launcher\.c \/Fe:dist\/Game1\.exe/);
+  assert.match(flow, /\/DNTB_GAME=1 launcher\/Game-Launcher\.c build\/Launcher\.res \/Fe:dist\/Game1\.exe/);
   assert.match(launcherApp, /--webapp \\""/, 'the launcher starts the engine on the game folder');
   assert.match(launcherApp, /update-engine/);
   assert.match(launcherApp, /update-game/);
@@ -35,7 +35,7 @@ test('Game1 opens the forest battle; Launcher.exe opens the game folder only aft
   assert.match(launcherApp, /startAllowed/, 'the start button waits for the updates');
   assert.match(launcherApp, /findGameWindow/, 'stays open until the game window is visible');
   assert.match(launcherApp, /Laen mängu/);
-  assert.match(flow, /Launcher\.cpp \/Fe:dist\/Launcher\.exe/);
+  assert.match(flow, /Launcher\.cpp build\/Launcher\.res \/Fe:dist\/Launcher\.exe/);
   assert.match(flow, /Launcher end to end/);
 });
 

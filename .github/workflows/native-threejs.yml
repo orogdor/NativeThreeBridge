@@ -142,6 +142,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "postprocessing fixture failed on V8 (HLSL of a translated pass?)" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-canvas2d 1
           if ($LASTEXITCODE -ne 0) { throw "canvas2d fixture failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-csm 5
+          if ($LASTEXITCODE -ne 0) { throw "csm fixture failed on V8" }
       - name: Verify native web storage survives a Windows restart
         shell: pwsh
         run: |
@@ -252,6 +254,9 @@ jobs:
         shell: pwsh
         env:
           CI: '1'
+          # Optional code signing (docs/CODE-SIGNING.md): base64 of a .pfx and its password.
+          WINDOWS_SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX }}
+          WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
         run: |
           $v = (Get-Content version.txt -Raw).Trim()
           if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid version" }
@@ -267,10 +272,12 @@ jobs:
           Copy-Item generated/soldier-rigged.glb dist/game1/odamees-rigged.glb
           Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
           Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
-          cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=1 launcher/Game-Launcher.c /Fe:dist/Game1.exe /link /SUBSYSTEM:WINDOWS user32.lib
+          rc /nologo /i launcher /fo build/Launcher.res launcher/Launcher.rc
+          if ($LASTEXITCODE -ne 0) { throw "Launcher icon resource failed" }
+          cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=1 launcher/Game-Launcher.c build/Launcher.res /Fe:dist/Game1.exe /link /SUBSYSTEM:WINDOWS user32.lib
           if ($LASTEXITCODE -ne 0) { throw "Game1 launcher failed to compile" }
           # Launcher.exe: update check, engine + game install, start window
-          cl /nologo /O2 /W4 /EHsc /std:c++17 /utf-8 launcher/Launcher.cpp /Fe:dist/Launcher.exe /link /SUBSYSTEM:WINDOWS
+          cl /nologo /O2 /W4 /EHsc /std:c++17 /utf-8 launcher/Launcher.cpp build/Launcher.res /Fe:dist/Launcher.exe /link /SUBSYSTEM:WINDOWS
           if ($LASTEXITCODE -ne 0) { throw "Launcher.exe failed to compile" }
           Remove-Item dist/*.obj -ErrorAction SilentlyContinue
           Remove-Item *.obj -ErrorAction SilentlyContinue
@@ -281,6 +288,23 @@ jobs:
           Copy-Item build/updater/NativeThree-Updater.exe dist/NativeThree-Updater.exe
           $p = Start-Process -FilePath (Resolve-Path dist/NativeThree-Updater.exe) -ArgumentList '--self-test' -Wait -PassThru -WindowStyle Hidden
           if ($p.ExitCode -ne 0) { throw "NativeThree-Updater self-test failed" }
+          # Code signing: only when the certificate secrets exist, otherwise the files stay unsigned.
+          if ($env:WINDOWS_SIGN_PFX) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX))
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+            if (-not $signtool) { throw "signtool.exe not found" }
+            $files = 'NativeThree-Engine.exe','Launcher.exe','Game1.exe','NativeThree-Updater.exe' | ForEach-Object { (Resolve-Path "dist/$_").Path }
+            & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $pfx /p $env:WINDOWS_SIGN_PASSWORD @files
+            $code = $LASTEXITCODE
+            Remove-Item $pfx -Force
+            if ($code -ne 0) { throw "Code signing failed" }
+            & $signtool.FullName verify /pa @files
+            if ($LASTEXITCODE -ne 0) { throw "Signature check failed" }
+            Write-Host "Signed: $($files -join ', ')"
+          } else {
+            Write-Host "Code signing skipped (no WINDOWS_SIGN_PFX secret, see docs/CODE-SIGNING.md)"
+          }
           '{ "gameFolder": "game2", "gameRepository": "orogdor/Kuningriigid", "gameBranch": "main", "engineRepository": "orogdor/NativeThreeBridge" }' | Set-Content dist/launcher.json -Encoding utf8
           Set-Content dist/engine-version.txt -Value "v$v" -Encoding ascii -NoNewline
           Copy-Item README-WINDOWS.txt dist/README-WINDOWS.txt
@@ -376,7 +400,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force shots | Out-Null
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
-          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 }, @{ name = 'shadows-fixture'; dir = 'test/fixtures/webapp-shadows'; wait = 10 }, @{ name = 'maps-fixture'; dir = 'test/fixtures/webapp-material-maps'; wait = 10 }, @{ name = 'points-fixture'; dir = 'test/fixtures/webapp-points'; wait = 10 }, @{ name = 'skinning-fixture'; dir = 'test/fixtures/webapp-skinning'; wait = 10 }, @{ name = 'render-target-fixture'; dir = 'test/fixtures/webapp-render-target'; wait = 10 }, @{ name = 'shadow-lights-fixture'; dir = 'test/fixtures/webapp-shadow-lights'; wait = 10 }, @{ name = 'postprocessing-fixture'; dir = 'test/fixtures/webapp-postprocessing'; wait = 24 }, @{ name = 'canvas2d-fixture'; dir = 'test/fixtures/webapp-canvas2d'; wait = 10 })
+          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 }, @{ name = 'shadows-fixture'; dir = 'test/fixtures/webapp-shadows'; wait = 10 }, @{ name = 'maps-fixture'; dir = 'test/fixtures/webapp-material-maps'; wait = 10 }, @{ name = 'points-fixture'; dir = 'test/fixtures/webapp-points'; wait = 10 }, @{ name = 'skinning-fixture'; dir = 'test/fixtures/webapp-skinning'; wait = 10 }, @{ name = 'render-target-fixture'; dir = 'test/fixtures/webapp-render-target'; wait = 10 }, @{ name = 'shadow-lights-fixture'; dir = 'test/fixtures/webapp-shadow-lights'; wait = 10 }, @{ name = 'postprocessing-fixture'; dir = 'test/fixtures/webapp-postprocessing'; wait = 24 }, @{ name = 'canvas2d-fixture'; dir = 'test/fixtures/webapp-canvas2d'; wait = 10 }, @{ name = 'csm-fixture'; dir = 'test/fixtures/webapp-csm'; wait = 12 })
           if (Test-Path kuningriigid-check/index.html) { $runs += @{ name = 'kuningriigid'; dir = 'kuningriigid-check'; wait = 40 } }
           foreach ($r in $runs) {
             $folder = (Resolve-Path $r.dir).Path
@@ -406,7 +430,7 @@ jobs:
       - name: Verify the engine ran the screenshot fixtures without crashing
         shell: pwsh
         run: |
-          foreach ($name in @('ui-fixture', 'textures-fixture', 'shadows-fixture', 'maps-fixture', 'points-fixture', 'skinning-fixture', 'render-target-fixture', 'shadow-lights-fixture', 'postprocessing-fixture', 'canvas2d-fixture')) {
+          foreach ($name in @('ui-fixture', 'textures-fixture', 'shadows-fixture', 'maps-fixture', 'points-fixture', 'skinning-fixture', 'render-target-fixture', 'shadow-lights-fixture', 'postprocessing-fixture', 'canvas2d-fixture', 'csm-fixture')) {
             $log = Get-Content "shots/$name-log.txt" -Raw -ErrorAction Stop
             if ($log -match '\[crash\]') { throw "$name crashed in the engine: $([regex]::Match($log, '\[crash\][^\r\n]*').Value)" }
             if ($log -notmatch 'frame 60: [1-9]') { throw "$name drew nothing by frame 60" }
@@ -422,6 +446,27 @@ jobs:
           if ($post -notmatch '\[material-color\] compiled GLSL material stage' -or $post -match '\[material-color\] (shader patch skipped|pipeline could not)') {
             throw "A post-processing pass (bloom, copy) did not compile on DX12"
           }
+      - name: Shader cache (second start loads the compiled shaders)
+        shell: pwsh
+        run: |
+          $first = Get-Content shots/postprocessing-fixture-log.txt -Raw
+          ([regex]::Matches($first, '\[(shader-cache|material-color)\][^\r\n]*') | ForEach-Object { $_.Value }) | Select-Object -First 12
+          $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
+          $folder = (Resolve-Path test/fixtures/webapp-postprocessing).Path
+          $env:NTB_PERF_REPORT_AFTER = '10'
+          Remove-Item dist/NativeThreeBridge-perf-report.txt -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $folder -WorkingDirectory (Resolve-Path dist).Path -PassThru
+          Start-Sleep -Seconds 14
+          $env:NTB_PERF_REPORT_AFTER = $null
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+          $log = Get-Content dist/NativeThreeBridge-webapp-log.txt -Raw
+          ([regex]::Matches($log, '\[(shader-cache|material-color)\][^\r\n]*') | ForEach-Object { $_.Value }) | Select-Object -First 12
+          if ($log -notmatch 'stock shaders ready in \d+ ms \(\d+ from the cache, 0 compiled\)') { throw "The stock shaders were compiled again instead of loaded from the shader cache" }
+          if ($log -notmatch 'GLSL material stage \d+ \(from the shader cache\)') { throw "The bloom passes were compiled again instead of loaded from the shader cache" }
+          # F9 performance report (written here by NTB_PERF_REPORT_AFTER)
+          Get-Content dist/NativeThreeBridge-perf-report.txt -ErrorAction Stop
+          if ((Get-Content dist/NativeThreeBridge-perf-report.txt -Raw) -notmatch 'limit: ') { throw "The performance report is incomplete" }
       - name: Launcher end to end (GitHub check, ready window, hands over to Kuningriigid)
         shell: pwsh
         env:
@@ -496,6 +541,11 @@ jobs:
           if (!$game) { throw "The launcher closed but no game window is open" }
           Get-Content launcher-check/Launcher.log -ErrorAction SilentlyContinue
           Write-Host "Launcher handed over to the game window: $($game.MainWindowTitle)"
+          # Start-up: the second Kuningriigid start (the screenshot step was the first) uses the caches.
+          Write-Host "---- first start (screenshot step) ----"
+          Select-String -Path shots/kuningriigid-log.txt -Pattern '\[(boot|v8-cache|shader-cache)\]' | ForEach-Object { $_.Line }
+          Write-Host "---- second start (launcher) ----"
+          Select-String -Path launcher-check/NativeThreeBridge-webapp-log.txt -Pattern '\[(boot|v8-cache|shader-cache)\]|frame 1:' | ForEach-Object { $_.Line }
           $game | Stop-Process -Force
       - name: Upload UI screenshots
         if: always()

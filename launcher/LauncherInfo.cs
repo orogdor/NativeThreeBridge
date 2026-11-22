@@ -81,6 +81,45 @@ internal static class LauncherInfo
         return found;
     }
 
+    // The game's own change notes (MUUDATUSED_V358.md, CHANGELOG_V2.md ...):
+    // newest versions first, "<heading>: <first sentence>".
+    private static readonly Regex NotesFile = new(@"^(?:MUUDATUSED|CHANGES|CHANGELOG|UPDATE|UUENDUS)(?:[_-]UI)?[_-]?V?(\d+(?:[._]\d+)*)\.md$", RegexOptions.IgnoreCase);
+    private static readonly Regex HeadingVersion = new(@"\b[vV](\d+(?:\.\d+)*)\b");
+
+    // Change notes in the game folder, newest first, as ("V227.3", "Heading. First sentence.").
+    // The version in the heading wins over the file name (MUUDATUSED_V2273.md is "# V227.3 – ...").
+    internal static List<(string version, string text)> LocalNotes(string game, int count)
+    {
+        var notes = new List<(Version order, string label, string text)>();
+        foreach (string file in Directory.EnumerateFiles(game, "*.md", SearchOption.TopDirectoryOnly))
+        {
+            Match m = NotesFile.Match(Path.GetFileName(file));
+            if (!m.Success) continue;
+            string number = m.Groups[1].Value.Replace('_', '.');
+            string[] lines;
+            try { lines = File.ReadAllLines(file).Select(l => l.Trim()).ToArray(); } catch (Exception) { continue; }
+            string heading = lines.FirstOrDefault(l => l.StartsWith('#'))?.TrimStart('#').Trim() ?? "";
+            Match hv = HeadingVersion.Match(heading);
+            if (hv.Success && hv.Index < 30)
+            {
+                number = hv.Groups[1].Value;
+                // "Kuningriigid V175.4 — sirge müür" -> "sirge müür"
+                heading = heading[(hv.Index + hv.Length)..].TrimStart(' ', '\u2013', '\u2014', '-', ':', '\u00b7', '/');
+            }
+            string padded = number.Contains('.') ? number : number + ".0";
+            if (!Version.TryParse(padded, out Version? order)) continue;
+            string paragraph = lines.FirstOrDefault(l => l.Length > 0 && !l.StartsWith('#') && !l.StartsWith("---")) ?? "";
+            paragraph = Regex.Replace(paragraph, @"[*_`]", "");
+            Match sentence = Regex.Match(paragraph, @"^.*?[.!?](\s|$)");
+            string first = sentence.Success ? sentence.Value.Trim() : paragraph;
+            if (first.Length > 170) first = first[..167].TrimEnd() + "…";
+            if (heading.Length > 0) heading = char.ToUpper(heading[0]) + heading[1..];
+            string text = heading.Length == 0 ? first : first.Length == 0 ? heading : heading + ". " + first;
+            if (text.Length > 0) notes.Add((order, "V" + number, text));
+        }
+        return notes.OrderByDescending(n => n.order).Take(count).Select(n => (n.label, n.text)).ToList();
+    }
+
     internal static void Local()
     {
         string game = Path.Combine(Common.Root, Config.GameFolder);
@@ -103,6 +142,9 @@ internal static class LauncherInfo
             try { commit = GameUpdater.ReadOld(game).Commit; } catch (Exception) { }
         }
         if (name == "") name = Config.GameRepository.Split('/')[1];
+        if (installed)
+            foreach ((string noteVersion, string noteText) in LocalNotes(game, 12))
+                Out.Line($"NEWS_LOCAL\t{noteVersion}\t{Config.GameNewsLabel}\t{noteText}");
         Out.Line("INFO\tNAME\t" + name);
         Out.Line("INFO\tIMAGE\t" + image);
         Out.Line("INFO\tENGINE\t" + UpdateEngine.Installed());
@@ -172,6 +214,21 @@ internal static class LauncherInfo
     internal static void SelfTest()
     {
         if (TitleInfo("<title>Kuningriigid · V353</title>") != ("Kuningriigid", "V353")) throw new Exception("Title parsing failed.");
+        string notesDir = Path.Combine(Path.GetTempPath(), "ntb-notes-test-" + Environment.ProcessId);
+        Directory.CreateDirectory(notesDir);
+        try
+        {
+            File.WriteAllText(Path.Combine(notesDir, "MUUDATUSED_V9.md"), "# V9 – vana\n\nVana asi.");
+            File.WriteAllText(Path.Combine(notesDir, "MUUDATUSED_V2273.md"), "# V227.3 – kiviaja mudelid\n\nUued mudelid on valmis. Teine lause.");
+            File.WriteAllText(Path.Combine(notesDir, "MUUDATUSED_V30.md"), "# V30 – keskmine\n\nKeskmine asi.");
+            File.WriteAllText(Path.Combine(notesDir, "MUUDATUSED_V175_1.md"), "# Kuningriigid V175.1 — müürid\n\nMüürid.");
+            File.WriteAllText(Path.Combine(notesDir, "MUUDATUSED_V361.md"), "# V361 – kivikindlustused\n\nUued kindlustused.");
+            var notes = LocalNotes(notesDir, 3);
+            if (notes.Count != 3 || notes[0].version != "V361" || notes[1].version != "V227.3" || notes[1].text != "Kiviaja mudelid. Uued mudelid on valmis."
+                || notes[2].version != "V175.1" || notes[2].text != "Müürid. Müürid.")
+                throw new Exception("Change notes: " + string.Join(" | ", notes));
+        }
+        finally { Directory.Delete(notesDir, true); }
         if (TitleInfo("<title>My Game</title>") != ("My Game", "")) throw new Exception("Title without version failed.");
         if (TitleInfo("<title>Space v1.2.3 - demo</title>") != ("Space - demo", "V1.2.3")) throw new Exception("Dotted version failed.");
         string dir = Path.Combine(Path.GetTempPath(), "ntb-launcher-test-" + Environment.ProcessId);
