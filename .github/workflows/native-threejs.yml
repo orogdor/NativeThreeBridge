@@ -142,6 +142,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "postprocessing fixture failed on V8 (HLSL of a translated pass?)" }
           & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-canvas2d 1
           if ($LASTEXITCODE -ne 0) { throw "canvas2d fixture failed on V8" }
+          & .\build\Release\WebappSmokeV8.exe test/fixtures/webapp-csm 5
+          if ($LASTEXITCODE -ne 0) { throw "csm fixture failed on V8" }
       - name: Verify native web storage survives a Windows restart
         shell: pwsh
         run: |
@@ -376,7 +378,7 @@ jobs:
           }
           New-Item -ItemType Directory -Force shots | Out-Null
           $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
-          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 }, @{ name = 'shadows-fixture'; dir = 'test/fixtures/webapp-shadows'; wait = 10 }, @{ name = 'maps-fixture'; dir = 'test/fixtures/webapp-material-maps'; wait = 10 }, @{ name = 'points-fixture'; dir = 'test/fixtures/webapp-points'; wait = 10 }, @{ name = 'skinning-fixture'; dir = 'test/fixtures/webapp-skinning'; wait = 10 }, @{ name = 'render-target-fixture'; dir = 'test/fixtures/webapp-render-target'; wait = 10 }, @{ name = 'shadow-lights-fixture'; dir = 'test/fixtures/webapp-shadow-lights'; wait = 10 }, @{ name = 'postprocessing-fixture'; dir = 'test/fixtures/webapp-postprocessing'; wait = 24 }, @{ name = 'canvas2d-fixture'; dir = 'test/fixtures/webapp-canvas2d'; wait = 10 })
+          $runs = @(@{ name = 'ui-fixture'; dir = 'test/fixtures/webapp-ui'; wait = 12 }, @{ name = 'textures-fixture'; dir = 'test/fixtures/webapp-textures'; wait = 12 }, @{ name = 'shadows-fixture'; dir = 'test/fixtures/webapp-shadows'; wait = 10 }, @{ name = 'maps-fixture'; dir = 'test/fixtures/webapp-material-maps'; wait = 10 }, @{ name = 'points-fixture'; dir = 'test/fixtures/webapp-points'; wait = 10 }, @{ name = 'skinning-fixture'; dir = 'test/fixtures/webapp-skinning'; wait = 10 }, @{ name = 'render-target-fixture'; dir = 'test/fixtures/webapp-render-target'; wait = 10 }, @{ name = 'shadow-lights-fixture'; dir = 'test/fixtures/webapp-shadow-lights'; wait = 10 }, @{ name = 'postprocessing-fixture'; dir = 'test/fixtures/webapp-postprocessing'; wait = 24 }, @{ name = 'canvas2d-fixture'; dir = 'test/fixtures/webapp-canvas2d'; wait = 10 }, @{ name = 'csm-fixture'; dir = 'test/fixtures/webapp-csm'; wait = 12 })
           if (Test-Path kuningriigid-check/index.html) { $runs += @{ name = 'kuningriigid'; dir = 'kuningriigid-check'; wait = 40 } }
           foreach ($r in $runs) {
             $folder = (Resolve-Path $r.dir).Path
@@ -406,7 +408,7 @@ jobs:
       - name: Verify the engine ran the screenshot fixtures without crashing
         shell: pwsh
         run: |
-          foreach ($name in @('ui-fixture', 'textures-fixture', 'shadows-fixture', 'maps-fixture', 'points-fixture', 'skinning-fixture', 'render-target-fixture', 'shadow-lights-fixture', 'postprocessing-fixture', 'canvas2d-fixture')) {
+          foreach ($name in @('ui-fixture', 'textures-fixture', 'shadows-fixture', 'maps-fixture', 'points-fixture', 'skinning-fixture', 'render-target-fixture', 'shadow-lights-fixture', 'postprocessing-fixture', 'canvas2d-fixture', 'csm-fixture')) {
             $log = Get-Content "shots/$name-log.txt" -Raw -ErrorAction Stop
             if ($log -match '\[crash\]') { throw "$name crashed in the engine: $([regex]::Match($log, '\[crash\][^\r\n]*').Value)" }
             if ($log -notmatch 'frame 60: [1-9]') { throw "$name drew nothing by frame 60" }

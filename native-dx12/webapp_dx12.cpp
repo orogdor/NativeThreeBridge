@@ -63,7 +63,7 @@ constexpr UINT kVertexStride = kVertexFloats * sizeof(float);
 constexpr UINT kMaxTextures = 4096;                  // shader-visible SRV slots (slot 0: white)
 constexpr UINT kShadowSlot = kMaxTextures - 1;       // SRV of the shadow map (t10)
 constexpr UINT kInstanceStride = 19 * sizeof(float); // 4x4 matrix + colour
-constexpr UINT kFrameCBBytes = 2816;                 // see cbuffer Frame (668 floats)
+constexpr UINT kFrameCBBytes = 2816;                 // see cbuffer Frame (688 floats)
 constexpr UINT kDrawCBBytes = 512; // cbuffer Draw (80 floats), CBVs are 256-byte aligned
 constexpr UINT kMaterialMapCount = 9;
 constexpr UINT kShadowParam = 3 + kMaterialMapCount; // root parameter of t10
@@ -2451,6 +2451,9 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
             }
             fcb[660] = 1.0f / float(shadowSize_);
         }
+        // three.js CSM: header 60..62 (cascades, near, far), 64..79 cascade ranges.
+        fcb[668] = p[60]; fcb[669] = p[61]; fcb[670] = p[62]; fcb[671] = 0;
+        std::memcpy(fcb + 672, p + 64, 16 * sizeof(float));
         const D3D12_GPU_VIRTUAL_ADDRESS frameAddress = ringGpu + ringOffset;
         cmd_->SetGraphicsRootConstantBufferView(0, frameAddress);
         ringOffset += kFrameCBBytes;

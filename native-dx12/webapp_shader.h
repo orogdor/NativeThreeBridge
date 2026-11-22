@@ -19,6 +19,8 @@ cbuffer Frame : register(b0) {
     float4 gShadowLight3[8]; // light position, unused
     float4 gShadowPass;      // 1 / map size, slice being drawn, point light near, unused
     float4 gShadowPass2;     // drawn slice's point light position, far
+    float4 gCsm;             // three.js CSM: cascades, camera near, shadow far, unused
+    float4 gCsmBreaks[4];    // cascade depth ranges (x, y) of cascades 0..7
 };
 cbuffer Draw : register(b1) {
     float4x4 gModel;
@@ -324,7 +326,19 @@ float4 PSMain(VSOut i, bool front : SV_IsFrontFace) : SV_Target {
         }
         float3 L;
         float attenuation = 1;
-        if (type == 3) L = -c.xyz;
+        if (type == 3) {
+            L = -c.xyz;
+            // CSM material: cascade light k lights it only within its depth range (last: beyond).
+            if (((uint)gParams.w & 8u) && d.z > 0 && gCsm.x > 0) {
+                uint k = (uint)d.z - 1;
+                if (k < (uint)gCsm.x) {
+                    float linearDepth = -mul(gView, float4(i.world, 1)).z / max(gCsm.z - gCsm.y, 1e-5);
+                    float4 pair = gCsmBreaks[k / 2];
+                    float2 range = (k & 1) ? pair.zw : pair.xy;
+                    if (linearDepth < range.x || (linearDepth >= range.y && k + 1 < (uint)gCsm.x)) continue;
+                }
+            }
+        }
         else {
             float3 toLight = b.xyz - i.world;
             float dist = length(toLight);
