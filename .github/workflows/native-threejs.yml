@@ -517,6 +517,11 @@ jobs:
           if (!$game) { throw "The launcher closed but no game window is open" }
           Get-Content launcher-check/Launcher.log -ErrorAction SilentlyContinue
           Write-Host "Launcher handed over to the game window: $($game.MainWindowTitle)"
+          # Start-up: the second Kuningriigid start (the screenshot step was the first) uses the caches.
+          Write-Host "---- first start (screenshot step) ----"
+          Select-String -Path shots/kuningriigid-log.txt -Pattern '\[(boot|v8-cache|shader-cache)\]' | ForEach-Object { $_.Line }
+          Write-Host "---- second start (launcher) ----"
+          Select-String -Path launcher-check/NativeThreeBridge-webapp-log.txt -Pattern '\[(boot|v8-cache|shader-cache)\]|frame 1:' | ForEach-Object { $_.Line }
           $game | Stop-Process -Force
       - name: Upload UI screenshots
         if: always()

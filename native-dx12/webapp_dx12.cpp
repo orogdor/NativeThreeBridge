@@ -739,7 +739,10 @@ void WebappWindow::log(const std::string& level, const std::string& text) {
     std::lock_guard<std::mutex> lock(logMutex_);
     if (level == "error") logErrors_++;
     if (log_) {
-        std::fprintf(log_, "[%s] %s\n", level.c_str(), text.c_str());
+        // Seconds since the engine started: shows where start-up time goes.
+        static const auto started = std::chrono::steady_clock::now();
+        const double at = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(log_, "[%s] %7.2fs %s\n", level.c_str(), at, text.c_str());
         std::fflush(log_);
     }
     OutputDebugStringA(("[webapp " + level + "] " + text + "\n").c_str());
@@ -2609,6 +2612,7 @@ void WebappWindow::renderFrame(std::unique_lock<std::recursive_mutex>* resourceL
     // Launcher.exe waits for the first frame that shows something (3D or HTML UI).
     if (!shownSignaled_ && (drawsThisFrame > 0 || (uiReady_ && uiVisible_))) {
         shownSignaled_ = true;
+        log("info", std::string("[boot] first frame that shows the game (") + (drawsThisFrame > 0 ? "3D" : "HTML UI") + ")");
         const std::wstring name = L"Local\\NativeThreeBridge-Shown-" + std::to_wstring(GetCurrentProcessId());
         if (HANDLE shown = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str())) { SetEvent(shown); CloseHandle(shown); }
     }

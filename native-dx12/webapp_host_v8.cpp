@@ -24,6 +24,7 @@
 #include <functional>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -424,14 +425,88 @@ struct WebappHost::Impl {
         }
         return compileModule(source, name);
     }
+    // ---- V8 code cache: the game's modules (>= 4 KB) as compiled by the last
+    // session, from %LOCALAPPDATA%\NativeThreeBridge\v8-cache. Written when
+    // the page closes, so it also holds the functions the game ran.
+    std::filesystem::path codeCacheDir;                    // empty: off (NTB_V8_CACHE=0)
+    std::map<std::string, std::uint64_t> codeCacheMissing; // module -> key, written at shutdown
+    double compileMs = 0;
+    int compiledModules = 0, cachedModules = 0;
+    bool bootLogged = false;
+    std::chrono::steady_clock::time_point firstFrameAt{};
+    static std::uint64_t fnv(const void* data, std::size_t size, std::uint64_t h) {
+        const auto* p = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < size; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+        return h;
+    }
+    std::filesystem::path codeCacheFile(std::uint64_t key) const {
+        char name[32];
+        std::snprintf(name, sizeof name, "%016llx.v8c", static_cast<unsigned long long>(key));
+        return codeCacheDir / name;
+    }
+    static std::uint64_t codeCacheKey(const std::string& source, const std::string& name) {
+        std::uint64_t h = 0xcbf29ce484222325ull;
+        const std::uint32_t tag = v8::ScriptCompiler::CachedDataVersionTag(); // V8 version + flags
+        h = fnv(&tag, sizeof tag, h);
+        h = fnv(name.data(), name.size() + 1, h);
+        return fnv(source.data(), source.size(), h);
+    }
     v8::MaybeLocal<v8::Module> compileModule(const std::string& source, const std::string& name) {
+        const auto started = std::chrono::steady_clock::now();
         v8::ScriptOrigin origin(str(name), 0, 0, false, -1, v8::Local<v8::Value>(), false, false, true);
-        v8::ScriptCompiler::Source src(str(source), origin);
+        const bool cacheable = !codeCacheDir.empty() && source.size() >= 4096 && name.rfind("nt:", 0) != 0;
+        const std::uint64_t key = cacheable ? codeCacheKey(source, name) : 0;
+        std::string bytes;
+        v8::ScriptCompiler::CachedData* cached = nullptr;
+        if (cacheable) {
+            std::ifstream in(codeCacheFile(key), std::ios::binary);
+            if (in) bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            if (!bytes.empty())
+                cached = new v8::ScriptCompiler::CachedData(reinterpret_cast<const std::uint8_t*>(bytes.data()), int(bytes.size()),
+                                                            v8::ScriptCompiler::CachedData::BufferNotOwned);
+        }
+        v8::ScriptCompiler::Source src(str(source), origin, cached); // owns `cached`, not `bytes`
         v8::Local<v8::Module> module;
-        if (!v8::ScriptCompiler::CompileModule(isolate, &src).ToLocal(&module)) return {};
+        if (!v8::ScriptCompiler::CompileModule(isolate, &src, cached ? v8::ScriptCompiler::kConsumeCodeCache
+                                                                     : v8::ScriptCompiler::kNoCompileOptions)
+                 .ToLocal(&module))
+            return {};
+        const bool hit = cached && !src.GetCachedData()->rejected;
+        if (hit) cachedModules++;
+        else if (cacheable) codeCacheMissing[name] = key; // none or stale: written at shutdown
+        compiledModules++;
+        compileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         modules[name].Reset(isolate, module);
         moduleNames.emplace(module->GetIdentityHash(), name);
         return module;
+    }
+    void writeCodeCache() {
+        if (codeCacheDir.empty() || codeCacheMissing.empty()) return;
+        std::size_t written = 0, total = 0;
+        for (const auto& [name, key] : codeCacheMissing) {
+            auto found = modules.find(name);
+            if (found == modules.end()) continue;
+            v8::Local<v8::Module> module = found->second.Get(isolate);
+            if (module->GetStatus() < v8::Module::kEvaluated) continue;
+            std::unique_ptr<v8::ScriptCompiler::CachedData> data(v8::ScriptCompiler::CreateCodeCache(module->GetUnboundModuleScript()));
+            if (!data || data->length <= 0) continue;
+            const std::filesystem::path file = codeCacheFile(key);
+            std::filesystem::path temp = file;
+            temp += ".tmp";
+            {
+                std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(data->data), data->length);
+                if (!out) continue;
+            }
+            std::error_code ec;
+            std::filesystem::rename(temp, file, ec);
+            if (ec) { std::filesystem::remove(temp, ec); continue; }
+            written++;
+            total += std::size_t(data->length);
+        }
+        codeCacheMissing.clear();
+        log("info", "[v8-cache] saved " + std::to_string(written) + " compiled modules (" + std::to_string(total / 1024) +
+                        " KB) for the next start");
     }
     std::string resolve(const std::string& base, const std::string& specifier) {
         std::string error;
@@ -1707,6 +1782,16 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
     s.hostObject.Reset(isolate, host.As<v8::Object>());
     s.afterHelper.Reset(isolate, after.As<v8::Function>());
     s.started = true;
+    {   // V8 code cache folder (beside the shader cache)
+        wchar_t base[MAX_PATH] = {}, off[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (n && n < MAX_PATH && !(GetEnvironmentVariableW(L"NTB_V8_CACHE", off, 8) && off[0] == L'0')) {
+            std::error_code ec;
+            const std::filesystem::path dir = std::filesystem::path(base) / L"NativeThreeBridge" / L"v8-cache";
+            std::filesystem::create_directories(dir, ec);
+            if (!ec) s.codeCacheDir = dir;
+        }
+    }
 
     resize(width, height, 1.0);
     v8::Local<v8::Value> args[] = {s.str(html), s.str(page.url), s.str(page.storage)};
@@ -1718,6 +1803,13 @@ void WebappHost::shutdown() {
     if (!impl_) return;
     Impl& s = *impl_;
     s.stopWorkers();
+    if (s.isolate && s.started) {
+        v8::Isolate::Scope isolateScope(s.isolate);
+        v8::HandleScope handles(s.isolate);
+        v8::Local<v8::Context> ctx = s.context.Get(s.isolate);
+        v8::Context::Scope contextScope(ctx);
+        s.writeCodeCache();
+    }
     if (s.isolate) {
         s.modules.clear();
         s.moduleNames.clear();
@@ -1753,6 +1845,16 @@ void WebappHost::resize(int width, int height, double pixelRatio) {
 }
 void WebappHost::frame(double timeMs) {
     NT_V8_SCOPE();
+    // Also save the code cache 15 s in (a game killed later still has it next time).
+    if (impl_->bootLogged && !impl_->codeCacheMissing.empty() &&
+        std::chrono::steady_clock::now() - impl_->firstFrameAt >= std::chrono::seconds(15))
+        impl_->writeCodeCache();
+    if (!impl_->bootLogged) {
+        impl_->bootLogged = true;
+        impl_->firstFrameAt = std::chrono::steady_clock::now();
+        impl_->log("info", "[boot] first frame: " + std::to_string(impl_->compiledModules) + " JavaScript modules compiled in " +
+                               std::to_string(int(impl_->compileMs)) + " ms (" + std::to_string(impl_->cachedModules) + " from the V8 code cache)");
+    }
     impl_->pumpNative();
     if (!running()) return;
     v8::Local<v8::Value> arg = v8::Number::New(isolate, timeMs);
