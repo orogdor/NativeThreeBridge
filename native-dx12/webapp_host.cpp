@@ -423,6 +423,12 @@ JSValue jsRegisterColorPatch(JSContext* ctx, JSValueConst, int argc, JSValueCons
     if (JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
     return JS_NewBool(ctx, self->sink->registerColorPatch(id, argString(ctx, argv[1])));
 }
+JSValue jsColorPatchStatus(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    Impl* self = Impl::from(ctx);
+    std::uint32_t id = 0;
+    if (argc < 1 || !self->sink || JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_NewInt32(ctx, -1);
+    return JS_NewInt32(ctx, self->sink->colorPatchStatus(id));
+}
 JSValue jsSubmitPass(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
     Impl* self = Impl::from(ctx);
     if (argc < 2) return JS_ThrowTypeError(ctx, "submitPass(packet, floats)");
@@ -605,6 +611,7 @@ bool WebappHost::start(const std::filesystem::path& root, const std::string& shi
         {"canvasCommands", jsCanvasCommands, 6}, {"canvasRead", jsCanvasRead, 5}, {"canvasWrite", jsCanvasWrite, 8},
         {"registerImage", jsRegisterImage, 2},
         {"registerColorPatch", jsRegisterColorPatch, 2}, {"submitPass", jsSubmitPass, 2},
+        {"colorPatchStatus", jsColorPatchStatus, 1},
         {"submitUi", jsSubmitUi, 3}, {"measureText", jsMeasureText, 5}, {"setCursor", jsSetCursor, 1}, {"reportUi", jsReportUi, 6},
         {"setPointerLock", jsSetPointerLock, 1}, {"setFullscreen", jsSetFullscreen, 1},
     };

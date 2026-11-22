@@ -78,6 +78,7 @@ add_executable(NativeThreeJS WIN32
   native-dx12/NativeThree-DX12.cpp
   native-dx12/three_js_host.cpp
   native-dx12/webapp_dx12.cpp
+  native-dx12/webapp_shader_cache.cpp
   native-dx12/webapp_ui_d2d.cpp
   ${WEBAPP_RUNTIME}
   ${ASSETS}

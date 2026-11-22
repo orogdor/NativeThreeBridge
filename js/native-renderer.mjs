@@ -101,6 +101,18 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
   let nextTextureId = 1;
   const colorPatches = new Map();
   const shaderMaterials = new WeakMap();
+  // Stages compile in the background (nt.colorPatchStatus); one that fails is
+  // dropped and the materials that used it are worked out again (patchEpoch).
+  const pendingPatchIds = new Set(), failedPatchIds = new Set();
+  let patchEpoch = 0;
+  function checkPendingPatches() {
+    if (!pendingPatchIds.size || !nt.colorPatchStatus) return;
+    for (const id of pendingPatchIds) {
+      const status = nt.colorPatchStatus(id);
+      if (status > 0) pendingPatchIds.delete(id);
+      else if (status < 0) { pendingPatchIds.delete(id); failedPatchIds.add(id); patchEpoch++; }
+    }
+  }
   const attributeGetters = ['getX', 'getY', 'getZ', 'getW'];
   function registerMaterialStage(stage) {
     if (!stage) return null;
@@ -108,9 +120,10 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     if (id === undefined && colorPatches.size < 32) {
       id = colorPatches.size + 1;
       if (!nt.registerColorPatch(id, stage.source)) id = 0;
+      else pendingPatchIds.add(id);
       colorPatches.set(stage.source, id);
     }
-    return id ? { ...stage, id } : null;
+    return id && !failedPatchIds.has(id) ? { ...stage, id } : null;
   }
   const SHADER_IDS = { MeshStandardMaterial: 'standard', MeshPhysicalMaterial: 'physical', MeshLambertMaterial: 'lambert', MeshPhongMaterial: 'phong', MeshBasicMaterial: 'basic', MeshToonMaterial: 'toon', MeshMatcapMaterial: 'matcap' };
 
@@ -702,8 +715,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
     // gets the intended colour (e.g. a sea that mixes deep/shallow colours).
     _patchInfo(m) {
       let info = this._patches.get(m);
-      if (info && info.fn === m.onBeforeCompile && info.version === m.version) return info;
-      info = { fn: m.onBeforeCompile, version: m.version, colors: null, alpha: null, hide: false, alphaRamp: null, colorRamp: null, reflection: null, colorStage: null };
+      if (info && info.fn === m.onBeforeCompile && info.version === m.version && info.epoch === patchEpoch) return info;
+      info = { fn: m.onBeforeCompile, version: m.version, epoch: patchEpoch, colors: null, alpha: null, hide: false, alphaRamp: null, colorRamp: null, reflection: null, colorStage: null };
       this._patches.set(m, info);
       const ShaderLib = shaders.ShaderLib || THREE.ShaderLib, UniformsUtils = shaders.UniformsUtils || THREE.UniformsUtils;
       const lib = ShaderLib && UniformsUtils && ShaderLib[SHADER_IDS[m.type]];
@@ -755,6 +768,7 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       const opaque = this._opaque, transparent = this._transparent, lights = this._lights;
       opaque.length = 0; transparent.length = 0; lights.length = 0;
       const ambient = [0, 0, 0];
+      checkPendingPatches();
       this._spriteCount = 0;
       this._shadowLights = this._shadowLights || [];
       this._shadowLights.length = 0;
@@ -1146,8 +1160,8 @@ export function createNativeRendererClasses(THREE, nt, host = globalThis.__ntHos
       else if (m.isShaderMaterial || m.isRawShaderMaterial) {
         if (nt.registerColorPatch) {
           let cached = shaderMaterials.get(m);
-          if (!cached || cached.version !== m.version) {
-            cached = { version: m.version, stage: registerMaterialStage(translateMaterialStage(m, true)) };
+          if (!cached || cached.version !== m.version || cached.epoch !== patchEpoch) {
+            cached = { version: m.version, epoch: patchEpoch, stage: registerMaterialStage(translateMaterialStage(m, true)) };
             shaderMaterials.set(m, cached);
           }
           colorStage = cached.stage;

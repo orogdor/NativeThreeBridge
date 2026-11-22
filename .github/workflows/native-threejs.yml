@@ -422,6 +422,27 @@ jobs:
           if ($post -notmatch '\[material-color\] compiled GLSL material stage' -or $post -match '\[material-color\] (shader patch skipped|pipeline could not)') {
             throw "A post-processing pass (bloom, copy) did not compile on DX12"
           }
+      - name: Shader cache (second start loads the compiled shaders)
+        shell: pwsh
+        run: |
+          $first = Get-Content shots/postprocessing-fixture-log.txt -Raw
+          ([regex]::Matches($first, '\[(shader-cache|material-color)\][^\r\n]*') | ForEach-Object { $_.Value }) | Select-Object -First 12
+          $engine = (Resolve-Path dist/NativeThree-Engine.exe).Path
+          $folder = (Resolve-Path test/fixtures/webapp-postprocessing).Path
+          $env:NTB_PERF_REPORT_AFTER = '10'
+          Remove-Item dist/NativeThreeBridge-perf-report.txt -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $engine -ArgumentList '--webapp', $folder -WorkingDirectory (Resolve-Path dist).Path -PassThru
+          Start-Sleep -Seconds 14
+          $env:NTB_PERF_REPORT_AFTER = $null
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+          $log = Get-Content dist/NativeThreeBridge-webapp-log.txt -Raw
+          ([regex]::Matches($log, '\[(shader-cache|material-color)\][^\r\n]*') | ForEach-Object { $_.Value }) | Select-Object -First 12
+          if ($log -notmatch 'stock shaders ready in \d+ ms \(\d+ from the cache, 0 compiled\)') { throw "The stock shaders were compiled again instead of loaded from the shader cache" }
+          if ($log -notmatch 'GLSL material stage \d+ \(from the shader cache\)') { throw "The bloom passes were compiled again instead of loaded from the shader cache" }
+          # F9 performance report (written here by NTB_PERF_REPORT_AFTER)
+          Get-Content dist/NativeThreeBridge-perf-report.txt -ErrorAction Stop
+          if ((Get-Content dist/NativeThreeBridge-perf-report.txt -Raw) -notmatch 'limit: ') { throw "The performance report is incomplete" }
       - name: Launcher end to end (GitHub check, ready window, hands over to Kuningriigid)
         shell: pwsh
         env:

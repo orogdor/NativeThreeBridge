@@ -67,6 +67,9 @@ public:
         (void)id; (void)source;
         return false;
     }
+    // A registered patch may compile in the background: 1 ready, 0 still
+    // compiling (its draws wait), -1 failed (the renderer stops using it).
+    virtual int colorPatchStatus(std::uint32_t id) { (void)id; return 1; }
     // One render() call. Layout: see js/native-renderer.mjs (PASS_HEADER_FLOATS etc).
     virtual void submitPass(const float* data, std::size_t floatCount) = 0;
     virtual void setTitle(const std::string& title) = 0;
