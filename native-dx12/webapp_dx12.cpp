@@ -2875,7 +2875,8 @@ int WebappWindow::run(HINSTANCE instance) {
     wc.hInstance = instance;
     wc.lpszClassName = L"NativeThreeWebappWindow";
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIcon(instance, MAKEINTRESOURCE(1)); // launcher/nativethree.ico
+    if (!wc.hIcon) wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassW(&wc);
     RECT rc{0, 0, LONG(width_), LONG(height_)};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);

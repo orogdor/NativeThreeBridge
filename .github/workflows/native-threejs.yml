@@ -269,10 +269,12 @@ jobs:
           Copy-Item generated/soldier-rigged.glb dist/game1/odamees-rigged.glb
           Copy-Item samples/hello-webapp/* dist/webapps/hello-webapp/
           Copy-Item samples/Run-Hello-Webapp.bat dist/Run-Hello-Webapp.bat
-          cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=1 launcher/Game-Launcher.c /Fe:dist/Game1.exe /link /SUBSYSTEM:WINDOWS user32.lib
+          rc /nologo /i launcher /fo build/Launcher.res launcher/Launcher.rc
+          if ($LASTEXITCODE -ne 0) { throw "Launcher icon resource failed" }
+          cl /nologo /O2 /W3 /utf-8 /DNTB_GAME=1 launcher/Game-Launcher.c build/Launcher.res /Fe:dist/Game1.exe /link /SUBSYSTEM:WINDOWS user32.lib
           if ($LASTEXITCODE -ne 0) { throw "Game1 launcher failed to compile" }
           # Launcher.exe: update check, engine + game install, start window
-          cl /nologo /O2 /W4 /EHsc /std:c++17 /utf-8 launcher/Launcher.cpp /Fe:dist/Launcher.exe /link /SUBSYSTEM:WINDOWS
+          cl /nologo /O2 /W4 /EHsc /std:c++17 /utf-8 launcher/Launcher.cpp build/Launcher.res /Fe:dist/Launcher.exe /link /SUBSYSTEM:WINDOWS
           if ($LASTEXITCODE -ne 0) { throw "Launcher.exe failed to compile" }
           Remove-Item dist/*.obj -ErrorAction SilentlyContinue
           Remove-Item *.obj -ErrorAction SilentlyContinue
